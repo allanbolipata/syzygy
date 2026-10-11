@@ -382,7 +382,7 @@ def test_trigger_pairing_for_normal_does_not_replace_existing(db, tumor_sample, 
     assert result.normal_id == normal_sample.id
 
 
-def test_trigger_pairing_for_normal_no_pairing_logic(db, tumor_sample, normal_sample):
+def test_trigger_pairing_for_normal_no_pairing_logic(db, tumor_sample, normal_sample, pairing_logic):
     trigger_pairing_for_normal(db, normal_sample, None)
     result = _get_latest_pairing(db, tumor_sample.id, pairing_logic.id)
     assert result is None

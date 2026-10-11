@@ -64,7 +64,6 @@ class PairingTable(Base):
             "uq_pairing_table_tumor_pairing_logic_latest",
             "tumor_id",
             "pairing_logic_id",
-            unique=True,
             postgresql_where=sa.text("latest"),
         ),
         sa.Index(
@@ -72,7 +71,6 @@ class PairingTable(Base):
             "tumor_id",
             "normal_id",
             "pairing_logic_id",
-            unique=True,
             postgresql_where=sa.text("latest"),
         ),
     )
