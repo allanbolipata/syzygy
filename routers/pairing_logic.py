@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import PairingLogic
+from pairing_strategies import strategies
 from schemas import PairingLogicCreate, PairingLogicRead
 
 
@@ -22,7 +23,16 @@ def create_pairing_logic(payload: PairingLogicCreate, db: Session = Depends(get_
     if existing is not None:
         raise HTTPException(status_code=409, detail="Pairing logic already registered")
 
-    logic = PairingLogic(name=payload.name, description=payload.description, active=payload.active)
+    if payload.strategy_name not in strategies:
+        raise HTTPException(status_code=400, detail="Unknown pairing strategy")
+
+    logic = PairingLogic(
+        name=payload.name,
+        description=payload.description,
+        active=payload.active,
+        strategy_name=payload.strategy_name,
+        config=payload.config,
+    )
     db.add(logic)
     try:
         db.commit()

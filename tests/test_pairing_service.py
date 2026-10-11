@@ -1,10 +1,11 @@
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from database import Base
 from models import PairingLogic, PairingTable, Sample
@@ -18,7 +19,33 @@ from pairing_service import (
     trigger_pairing,
     trigger_pairing_for_normal,
 )
+from pairing_strategies import get_pairing_strategy, strategies
 from schemas import TumorOrNormal
+
+
+class CustomPairingStrategy:
+    def matches(self, tumor: Sample, normal: Sample) -> bool:
+        return tumor.patient_id == normal.patient_id and tumor.gene_panel == normal.gene_panel
+
+    def select_latest_normal(self, db: Session, tumor: Sample) -> Optional[Sample]:
+        stmt = select(Sample).where(
+            Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
+            Sample.patient_id == tumor.patient_id,
+            Sample.gene_panel == tumor.gene_panel,
+        ).order_by(
+            Sample.sequencing_date.desc().nulls_last(),
+            Sample.created_date.desc(),
+            Sample.id.desc(),
+        )
+        return db.scalar(stmt)
+
+    def select_matching_tumors(self, db: Session, normal: Sample) -> list[Sample]:
+        stmt = select(Sample).where(
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            Sample.patient_id == normal.patient_id,
+            Sample.gene_panel == normal.gene_panel,
+        )
+        return db.scalars(stmt).all()
 
 
 @pytest.fixture
@@ -113,6 +140,12 @@ def non_matching_normal(db):
     db.commit()
     db.refresh(sample)
     return sample
+
+
+@pytest.fixture
+def custom_strategy(monkeypatch):
+    monkeypatch.setitem(strategies, "custom", CustomPairingStrategy())
+    return strategies["custom"]
 
 
 def test_resolve_pairing_logic_by_id(db, pairing_logic):
@@ -386,3 +419,127 @@ def test_trigger_pairing_for_normal_no_pairing_logic(db, tumor_sample, normal_sa
     trigger_pairing_for_normal(db, normal_sample, None)
     result = _get_latest_pairing(db, tumor_sample.id, pairing_logic.id)
     assert result is None
+
+
+def test_get_pairing_strategy_default(db):
+    logic = PairingLogic(name="DEFAULT")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    strategy = get_pairing_strategy(logic)
+    assert strategy is strategies["default"]
+
+
+def test_get_pairing_strategy_known_aliases(db):
+    for name in ("IMPACT", "TEMPO", "ACCESS"):
+        logic = PairingLogic(name=name)
+        db.add(logic)
+        db.commit()
+        db.refresh(logic)
+
+        strategy = get_pairing_strategy(logic)
+        assert strategy is strategies["default"]
+
+
+def test_get_pairing_strategy_unknown(db):
+    logic = PairingLogic(name="UNKNOWN", strategy_name="unknown")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_pairing_strategy(logic)
+    assert exc_info.value.status_code == 400
+
+
+def test_trigger_pairing_unknown_strategy(db, tumor_sample, normal_sample):
+    logic = PairingLogic(name="UNKNOWN", strategy_name="unknown")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    with pytest.raises(HTTPException) as exc_info:
+        trigger_pairing(db, tumor_sample, logic, "manual", normal_sample.id)
+    assert exc_info.value.status_code == 400
+
+
+def test_trigger_pairing_for_normal_unknown_strategy(db, tumor_sample, normal_sample):
+    logic = PairingLogic(name="UNKNOWN", strategy_name="unknown")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    with pytest.raises(HTTPException) as exc_info:
+        trigger_pairing_for_normal(db, normal_sample, logic)
+    assert exc_info.value.status_code == 400
+
+
+def test_custom_strategy_changes_matching(db, tumor_sample, custom_strategy):
+    normal = Sample(
+        primary_id="NORMAL-CUSTOM-1",
+        cmo_sample_name="Normal Custom 1",
+        patient_id="PATIENT-001",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-2",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sequencing_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+    )
+    db.add(normal)
+    db.commit()
+    db.refresh(normal)
+
+    logic = PairingLogic(name="CUSTOM", strategy_name="custom")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    result = trigger_pairing(db, tumor_sample, logic, "manual", normal.id)
+    assert result is not None
+    assert result.normal_id == normal.id
+
+
+def test_custom_strategy_selects_normal_ignoring_bait_set(db, tumor_sample, custom_strategy):
+    normal = Sample(
+        primary_id="NORMAL-CUSTOM-2",
+        cmo_sample_name="Normal Custom 2",
+        patient_id="PATIENT-001",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-2",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sequencing_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+    )
+    db.add(normal)
+    db.commit()
+    db.refresh(normal)
+
+    logic = PairingLogic(name="CUSTOM", strategy_name="custom")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    result = trigger_pairing(db, tumor_sample, logic, "automatic")
+    assert result is not None
+    assert result.normal_id == normal.id
+
+
+def test_custom_strategy_select_matching_tumors(db, tumor_sample, custom_strategy):
+    normal = Sample(
+        primary_id="NORMAL-CUSTOM-3",
+        cmo_sample_name="Normal Custom 3",
+        patient_id="PATIENT-001",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-2",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sequencing_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+    )
+    db.add(normal)
+    db.commit()
+    db.refresh(normal)
+
+    result = custom_strategy.select_matching_tumors(db, normal)
+    assert len(result) == 1
+    assert result[0].id == tumor_sample.id

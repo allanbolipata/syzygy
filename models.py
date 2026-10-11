@@ -20,6 +20,8 @@ class PairingLogic(Base):
     name: Mapped[str] = mapped_column(sa.String(255), unique=True, index=True)
     description: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    strategy_name: Mapped[str] = mapped_column(sa.String(100), default="default")
+    config: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
 
 

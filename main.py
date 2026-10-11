@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
         for name in ("TEMPO", "IMPACT", "ACCESS"):
             existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
             if existing is None:
-                db.add(PairingLogic(name=name))
+                db.add(PairingLogic(name=name, strategy_name="default"))
         db.commit()
     finally:
         db.close()

@@ -48,6 +48,8 @@ class PairingLogicCreate(BaseModel):
     name: str
     description: Optional[str] = None
     active: bool = True
+    strategy_name: str = "default"
+    config: Optional[dict[str, Any]] = None
 
 
 class PairingLogicRead(BaseModel):
@@ -57,6 +59,8 @@ class PairingLogicRead(BaseModel):
     name: str
     description: Optional[str] = None
     active: bool
+    strategy_name: str
+    config: Optional[dict[str, Any]] = None
     created_date: datetime
 
 

@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import PairingLogic, PairingTable, Sample, utcnow
+from pairing_strategies import get_pairing_strategy, strategies
 from schemas import TumorOrNormal
 
 
@@ -32,38 +33,15 @@ def resolve_pairing_logic(
 
 
 def _matches(tumor: Sample, normal: Sample) -> bool:
-    return (
-        tumor.patient_id == normal.patient_id
-        and tumor.sample_type == normal.sample_type
-        and tumor.gene_panel == normal.gene_panel
-        and tumor.bait_set == normal.bait_set
-    )
+    return strategies["default"].matches(tumor, normal)
 
 
 def _select_latest_normal(db: Session, tumor: Sample) -> Optional[Sample]:
-    stmt = select(Sample).where(
-        Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
-        Sample.patient_id == tumor.patient_id,
-        Sample.sample_type == tumor.sample_type,
-        Sample.gene_panel == tumor.gene_panel,
-        Sample.bait_set == tumor.bait_set,
-    ).order_by(
-        Sample.sequencing_date.desc().nulls_last(),
-        Sample.created_date.desc(),
-        Sample.id.desc(),
-    )
-    return db.scalar(stmt)
+    return strategies["default"].select_latest_normal(db, tumor)
 
 
 def _select_matching_tumors(db: Session, normal: Sample) -> list[Sample]:
-    stmt = select(Sample).where(
-        Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
-        Sample.patient_id == normal.patient_id,
-        Sample.sample_type == normal.sample_type,
-        Sample.gene_panel == normal.gene_panel,
-        Sample.bait_set == normal.bait_set,
-    )
-    return db.scalars(stmt).all()
+    return strategies["default"].select_matching_tumors(db, normal)
 
 
 def _get_latest_pairing(db: Session, tumor_id: UUID, pairing_logic_id: UUID) -> Optional[PairingTable]:
@@ -108,12 +86,14 @@ def trigger_pairing(
     if pairing_logic is None:
         return None
 
+    strategy = get_pairing_strategy(pairing_logic)
+
     existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
 
     if trigger_type == "automatic":
         if existing is not None:
             return existing
-        normal = _select_latest_normal(db, tumor)
+        normal = strategy.select_latest_normal(db, tumor)
         if normal is None:
             return None
         return _create_pairing(db, tumor, normal, pairing_logic)
@@ -122,10 +102,10 @@ def trigger_pairing(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=400, detail="Normal sample not found")
-        if not _matches(tumor, normal):
+        if not strategy.matches(tumor, normal):
             raise HTTPException(status_code=400, detail="Normal sample does not match tumor")
     else:
-        normal = _select_latest_normal(db, tumor)
+        normal = strategy.select_latest_normal(db, tumor)
         if normal is None:
             return None
 
@@ -149,12 +129,14 @@ def trigger_pairing_for_normal(
     if pairing_logic is None:
         return
 
-    tumors = _select_matching_tumors(db, normal)
+    strategy = get_pairing_strategy(pairing_logic)
+
+    tumors = strategy.select_matching_tumors(db, normal)
     for tumor in tumors:
         existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
         if existing is not None:
             continue
-        selected_normal = _select_latest_normal(db, tumor)
+        selected_normal = strategy.select_latest_normal(db, tumor)
         if selected_normal is None:
             continue
         _create_pairing(db, tumor, selected_normal, pairing_logic)
