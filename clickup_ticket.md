@@ -4,27 +4,28 @@
 
 The pairing service currently supports creating and listing samples, but it does not yet create tumor-normal pairings automatically. Add a trigger event so the service can evaluate samples and create a `PairingTable` row when a valid tumor and normal sample exist.
 
-Old pairings should be retained in the database. The `latest` flag represents the current/active pairing for a tumor sample.
+Old pairings should be retained in the database. The `latest` flag represents the current/active pairing for a tumor sample **within a specific `pairing_logic`**.
 
 ---
 
 ## Pairing cardinality
 
 - A tumor sample can have **multiple historical pairings**.
-- A tumor sample can have **only one active/latest pairing** at a time.
+- A tumor sample can have **at most one active/latest pairing per `pairing_logic`**.
 - A normal sample can be paired to **multiple tumor samples**.
+- A tumor sample may have different active/latest pairings with different normal samples if the pairings have different `pairing_logic` values.
 
 In other words:
 
-- Each `tumor_id` should have at most one row with `latest = true`.
-- The same `normal_id` may appear in multiple pairings, including multiple latest pairings if it is paired to different tumors.
+- Each `(tumor_id, pairing_logic)` should have at most one row with `latest = true`.
+- The same `normal_id` may appear in multiple pairings, including multiple latest pairings if it is paired to different tumors or different `pairing_logic` values.
 - Old pairings remain in the database with `latest = false`.
 
 ---
 
 ## Trigger modes
 
-The trigger should support at least three modes:
+The trigger should support at least three modes. Each trigger must identify the `pairing_logic` being evaluated. If a trigger does not specify a `pairing_logic`, it should not create a pairing unless a configured default is defined.
 
 ### 1. Automatic trigger
 
@@ -33,16 +34,16 @@ Trigger automatically when a sample is created.
 - If the newly created sample is a **TUMOR**:
   - Use that tumor as the target sample.
   - Find matching normal samples.
-  - If the tumor has no existing latest pairing, create a pairing.
-  - If the tumor already has a latest pairing, do **not** replace it automatically.
+  - If the tumor has no existing latest pairing for the requested `pairing_logic`, create a pairing with that `pairing_logic`.
+  - If the tumor already has a latest pairing for the requested `pairing_logic`, do **not** replace it automatically.
 
 - If the newly created sample is a **NORMAL**:
   - Use that normal as a candidate normal.
   - Find matching tumor samples.
-  - For matching tumors that do **not** already have a latest pairing, create a pairing.
-  - For matching tumors that already have a latest pairing, do **not** replace them automatically.
+  - For matching tumors that do **not** already have a latest pairing for the requested `pairing_logic`, create a pairing with that `pairing_logic`.
+  - For matching tumors that already have a latest pairing for the requested `pairing_logic`, do **not** replace them automatically.
 
-Automatic triggers should never replace an existing latest pairing.
+Automatic triggers should never replace an existing latest pairing for the same `tumor_id` and `pairing_logic`.
 
 ---
 
@@ -67,19 +68,17 @@ Example payload:
 
 }
 
-A manual trigger explicitly reinvokes pairing for a specific tumor.
+A manual trigger explicitly reinvokes pairing for a specific tumor and `pairing_logic`.
 
-- If the tumor has no latest pairing, create one.
+- If the tumor has no latest pairing for that `pairing_logic`, create one.
 
-- If the tumor already has a latest pairing, a manual trigger may replace it.
+- If the tumor already has a latest pairing for that `pairing_logic`, a manual trigger may replace it.
 
 - If the existing latest pairing is already with the same normal, do not create a duplicate.
 
 
 
 ---
-
-
 
 ### 3. Override trigger
 
@@ -105,13 +104,11 @@ or an `override: true` flag.
 
 
 
-An override should allow replacing an existing latest pairing even if the pairing would otherwise be locked.
+An override should allow replacing an existing latest pairing for the same `tumor_id` and `pairing_logic` even if the pairing would otherwise be locked.
 
 
 
 ---
-
-
 
 ## Minimum pairing rule
 
@@ -142,8 +139,6 @@ For a target tumor sample, the service should search for normal samples where al
 
 
 ---
-
-
 
 ## Latest normal selection logic
 
@@ -179,8 +174,6 @@ This selected normal becomes the normal for the new latest pairing.
 
 ---
 
-
-
 ## `pairing_logic` value
 
 
@@ -211,13 +204,11 @@ The pairing trigger should assign the appropriate pipeline value when creating o
 
 ---
 
-
-
 ## Re-pairing and override logic
 
 
 
-Once a tumor has an active/latest pairing, it should not be paired again automatically.
+Once a tumor has an active/latest pairing for a `pairing_logic`, it should not be paired again automatically for that `pairing_logic`.
 
 
 
@@ -227,21 +218,21 @@ A tumor may only be re-paired in the following cases:
 
 1. **Manual reinvocation**
 
-   - A user explicitly triggers pairing for that tumor.
+   - A user explicitly triggers pairing for that tumor and `pairing_logic`.
 
-   - The service may replace the existing latest pairing.
+   - The service may replace the existing latest pairing for that `pairing_logic`.
 
 
 
 2. **Override**
 
-   - An override signal is sent.
+   - An override signal is sent for that tumor and `pairing_logic`.
 
-   - The service may replace the existing latest pairing.
+   - The service may replace the existing latest pairing for that `pairing_logic`.
 
 
 
-Automatic triggers must not replace an existing latest pairing.
+Automatic triggers must not replace an existing latest pairing for the same `tumor_id` and `pairing_logic`.
 
 
 
@@ -249,13 +240,13 @@ Replacement behavior:
 
 
 
-- If the target tumor has no latest pairing:
+- If the target tumor has no latest pairing for the requested `pairing_logic`:
 
   - Create a new pairing with `latest = true`.
 
 
 
-- If the target tumor already has a latest pairing:
+- If the target tumor already has a latest pairing for the requested `pairing_logic`:
 
   - If the trigger is automatic:
 
@@ -281,66 +272,52 @@ Replacement behavior:
 
 ---
 
-
-
 ## Historical pairing behavior
 
 
 
 Old pairings should be retained.
 
+All pairings, including replaced historical pairings, must be retained in the database.
 
-
-When a new latest pairing replaces an older latest pairing:
-
-
+When a new latest pairing replaces an older latest pairing for the same `tumor_id` and `pairing_logic`:
 
 - The old row remains in `PairingTable`.
-
 - The old row is updated to `latest = false`.
-
 - The new row is created with `latest = true`.
 
-
-
-This preserves history while ensuring only one active pairing per tumor.
-
-
+This preserves history while ensuring only one active pairing per `tumor_id` and `pairing_logic`.
 
 ---
-
-
 
 ## Database enforcement
 
 
 
-Because historical pairings are retained, do **not** enforce a simple unique constraint on `tumor_id`.
+Because historical pairings are retained, do **not** enforce a simple unique constraint on `tumor_id` alone.
 
 
 
-Instead, enforce uniqueness only for active/latest pairings.
-
-
+Instead, enforce uniqueness only for active/latest pairings using `tumor_id` and `pairing_logic` as the uniqueness criteria.
 
 For PostgreSQL, this could be a partial unique index such as:
 
 
-CREATE UNIQUE INDEX uq_pairing_table_tumor_latest
+CREATE UNIQUE INDEX uq_pairing_table_tumor_pairing_logic_latest
 
-ON pairing_table (tumor_id)
+ON pairing_table (tumor_id, pairing_logic)
 
 WHERE latest;
 
 
 
 
-Optionally, to prevent duplicate latest pairings for the same tumor and normal:
+Optionally, to prevent duplicate latest pairings for the same tumor, normal, and pairing logic:
 
 
-CREATE UNIQUE INDEX uq_pairing_table_tumor_normal_latest
+CREATE UNIQUE INDEX uq_pairing_table_tumor_normal_pairing_logic_latest
 
-ON pairing_table (tumor_id, normal_id)
+ON pairing_table (tumor_id, normal_id, pairing_logic)
 
 WHERE latest;
 
@@ -353,20 +330,14 @@ Do **not** enforce a unique constraint on `normal_id`, because a normal sample m
 
 ---
 
-
-
 ## Acceptance criteria
 
 
 
 - A trigger mechanism exists for tumor-normal pairing.
-
 - Automatic triggering occurs when appropriate samples are created.
-
-- Manual triggering can be invoked for a specific tumor.
-
-- Override triggering can replace an existing latest pairing.
-
+- Manual triggering can be invoked for a specific tumor and `pairing_logic`.
+- Override triggering can replace an existing latest pairing for a specific tumor and `pairing_logic`.
 - A valid pairing requires matching:
 
   - `patient_id`
@@ -378,7 +349,6 @@ Do **not** enforce a unique constraint on `normal_id`, because a normal sample m
   - `bait_set`
 
 - When multiple matching normals exist, the trigger selects the latest normal based on the most recent sequencing timestamp or fallback timestamp.
-
 - `pairing_logic` is stored as one of:
 
   - `TEMPO`
@@ -388,12 +358,10 @@ Do **not** enforce a unique constraint on `normal_id`, because a normal sample m
   - `ACCESS`
 
 - A tumor sample can have multiple historical pairing rows.
-
-- A tumor sample cannot have more than one active/latest pairing.
-
+- A tumor sample cannot have more than one active/latest pairing for a given `pairing_logic`.
+- A tumor sample may have multiple active/latest pairings when they use different `pairing_logic` values.
 - A normal sample can be associated with multiple tumor pairings.
-
-- If a tumor already has an active/latest pairing:
+- If a tumor already has an active/latest pairing for a `pairing_logic`:
 
   - Automatic triggers do not replace it.
 
@@ -407,9 +375,6 @@ Do **not** enforce a unique constraint on `normal_id`, because a normal sample m
 
   - The new pairing is marked `latest = true`.
 
-- Repeated triggers do not create duplicate latest pairings for the same tumor and normal.
-
+- Repeated triggers do not create duplicate latest pairings for the same tumor, normal, and `pairing_logic`.
 - If no valid matching pair exists, no pairing is created.
-
-- Existing `GET /v1/pairing?latest=true` behavior remains correct.
-
+- Existing `GET /v1/pairing?latest=true` behavior remains correct, returning active/latest pairings by `tumor_id` and `pairing_logic`.
