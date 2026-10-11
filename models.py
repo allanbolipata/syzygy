@@ -42,3 +42,21 @@ class PairingTable(Base):
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     latest: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+    __table_args__ = (
+        sa.Index(
+            "uq_pairing_table_tumor_pairing_logic_latest",
+            "tumor_id",
+            "pairing_logic",
+            unique=True,
+            postgresql_where=sa.text("latest"),
+        ),
+        sa.Index(
+            "uq_pairing_table_tumor_normal_pairing_logic_latest",
+            "tumor_id",
+            "normal_id",
+            "pairing_logic",
+            unique=True,
+            postgresql_where=sa.text("latest"),
+        ),
+    )
