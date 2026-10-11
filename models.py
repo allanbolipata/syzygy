@@ -23,7 +23,7 @@ class Sample(Base):
     sample_type: Mapped[str] = mapped_column(sa.String(255))
     gene_panel: Mapped[str] = mapped_column(sa.String(255))
     bait_set: Mapped[str] = mapped_column(sa.String(255))
-    tumor_or_normal: Mapped[str] = mapped_column(sa.Enum("TUMOR", "NORMAL"))
+    tumor_or_normal: Mapped[str] = mapped_column(sa.Enum("TUMOR", "NORMAL", name="tumor_or_normal"))
     additional_metadata: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     errors: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
