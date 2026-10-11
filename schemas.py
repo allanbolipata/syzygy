@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -21,6 +21,9 @@ class SampleCreate(BaseModel):
     tumor_or_normal: TumorOrNormal
     additional_metadata: Optional[dict[str, Any]] = None
     errors: Optional[list[str]] = None
+    sequencing_date: Optional[datetime] = None
+    pairing_logic_id: Optional[UUID] = None
+    pairing_logic_name: Optional[str] = None
 
 
 class SampleRead(BaseModel):
@@ -36,14 +39,41 @@ class SampleRead(BaseModel):
     tumor_or_normal: TumorOrNormal
     additional_metadata: Optional[dict[str, Any]] = None
     errors: Optional[list[str]] = None
+    sequencing_date: Optional[datetime] = None
     created_date: datetime
     modified_date: datetime
+
+
+class PairingLogicCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    active: bool = True
+
+
+class PairingLogicRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    description: Optional[str] = None
+    active: bool
+    created_date: datetime
+
+
+class PairingTriggerCreate(BaseModel):
+    tumor_id: UUID
+    trigger_type: Literal["manual", "override"]
+    pairing_logic_id: Optional[UUID] = None
+    pairing_logic_name: Optional[str] = None
+    normal_id: Optional[UUID] = None
+    override: bool = False
 
 
 class PairingRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    pairing_logic_id: UUID
     pairing_logic: str
     tumor_id: UUID
     normal_id: UUID
