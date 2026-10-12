@@ -116,7 +116,18 @@ def trigger_pairing(
         existing.latest = False
         existing.modified_date = utcnow()
 
-    return _create_pairing(db, tumor, normal, pairing_logic)
+    result = _create_pairing(db, tumor, normal, pairing_logic)
+
+    # Guard against race condition: if a concurrent request created a different
+    # pairing, _create_pairing returns that one via the IntegrityError path.
+    # For overrides with a specific normal, this is a conflict, not a success.
+    if normal_id is not None and result.normal_id != normal_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Pairing conflict: a different pairing was created concurrently",
+        )
+
+    return result
 
 
 def trigger_pairing_for_normal(

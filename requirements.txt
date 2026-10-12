@@ -5,3 +5,4 @@ pydantic
 pydantic-settings
 psycopg2-binary
 pytest
+testcontainers[postgres]
