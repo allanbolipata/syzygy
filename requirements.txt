@@ -1,8 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 SQLAlchemy==2.0.36
-pydantic==2.10.4
-pydantic-settings==2.7.1
-psycopg2-binary==2.9.9
+pydantic==2.14.1
+pydantic-settings==2.15.0
+psycopg2-binary==2.9.13
 pytest==8.3.4
 testcontainers[postgres]==4.9.0
