@@ -1,3 +1,4 @@
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -6,7 +7,9 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
+import pairing_service
 from database import Base
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
@@ -74,7 +77,13 @@ def pg_engine():
         engine.dispose()
         pg.stop()
     else:
-        engine = create_engine("sqlite:///:memory:", echo=False)
+        # Single shared connection so multiple sessions (including the
+        # cross-thread race tests) see the same in-memory database.
+        engine = create_engine(
+            "sqlite://",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
         Base.metadata.create_all(bind=engine)
         yield engine
         engine.dispose()
@@ -179,10 +188,6 @@ def non_matching_normal(db):
 def custom_strategy(monkeypatch):
     monkeypatch.setitem(strategies, "custom", CustomPairingStrategy())
     return strategies["custom"]
-
-
-def _is_sqlite(engine) -> bool:
-    return engine.dialect.name == "sqlite"
 
 
 def test_resolve_pairing_logic_by_id(db, pairing_logic):
@@ -584,9 +589,6 @@ def test_custom_strategy_select_matching_tumors(db, tumor_sample, custom_strateg
 
 def test_create_pairing_integrity_error_returns_existing(db, tumor_sample, normal_sample, pairing_logic, pg_engine):
     """Verify _create_pairing handles IntegrityError from the partial unique index."""
-    if _is_sqlite(pg_engine):
-        pytest.skip("Partial unique index not supported in SQLite")
-
     pairing1 = _create_pairing(db, tumor_sample, normal_sample, pairing_logic)
     assert pairing1.latest is True
 
@@ -617,11 +619,18 @@ def test_create_pairing_integrity_error_returns_existing(db, tumor_sample, norma
         session2.close()
 
 
-def test_trigger_pairing_override_conflict_raises_409(db, tumor_sample, normal_sample, pairing_logic, pg_engine):
-    """Verify override with a specific normal raises 409 when a concurrent pairing wins."""
-    if _is_sqlite(pg_engine):
-        pytest.skip("Partial unique index not supported in SQLite")
+def test_trigger_pairing_override_conflict_raises_409(db, tumor_sample, normal_sample, pairing_logic, pg_engine, monkeypatch):
+    """Verify an override raises 409 when a concurrent override commits a different latest pairing.
 
+    The race is emulated with two sessions interlocking around the commit:
+      1. Baseline: the tumor is paired to normal_sample (latest).
+      2. Session A (worker thread) starts an override toward normal_b: it reads
+         the current latest pairing but has not committed yet.
+      3. Meanwhile the main session commits its own override toward normal_a.
+      4. Session A's commit then violates the partial unique index (two latest
+         pairings for the same tumor + pairing_logic), so _create_pairing rolls
+         back and returns the winner, and the override path surfaces a 409.
+    """
     trigger_pairing(db, tumor_sample, pairing_logic, "manual")
 
     normal_a = Sample(
@@ -648,35 +657,50 @@ def test_trigger_pairing_override_conflict_raises_409(db, tumor_sample, normal_s
     db.refresh(normal_a)
     db.refresh(normal_b)
 
-    result_a = trigger_pairing(db, tumor_sample, pairing_logic, "override", normal_a.id)
-    assert result_a.normal_id == normal_a.id
-
     SessionLocal = sessionmaker(bind=pg_engine, expire_on_commit=False)
-    session2 = SessionLocal()
+    session_a = SessionLocal()
+    read_event = threading.Event()
+    go_event = threading.Event()
+    outcome: dict = {}
+
+    real_get_latest = pairing_service._get_latest_pairing
+
+    def hooked_get_latest(db_session, tumor_id, pairing_logic_id):
+        result = real_get_latest(db_session, tumor_id, pairing_logic_id)
+        if db_session is session_a:
+            # Session A has read the current latest pairing; let the main
+            # session commit its competing override before A continues.
+            read_event.set()
+            assert go_event.wait(10)
+        return result
+
+    monkeypatch.setattr(pairing_service, "_get_latest_pairing", hooked_get_latest)
+
+    def worker():
+        tumor_a = session_a.get(Sample, tumor_sample.id)
+        logic_a = session_a.get(PairingLogic, pairing_logic.id)
+        try:
+            pairing = trigger_pairing(session_a, tumor_a, logic_a, "override", normal_b.id)
+            outcome["pairing_id"] = pairing.id if pairing is not None else None
+        except HTTPException as exc:
+            outcome["status_code"] = exc.status_code
+
+    thread = threading.Thread(target=worker)
+    thread.start()
     try:
-        tumor2 = session2.get(Sample, tumor_sample.id)
-        normal_b_obj = session2.get(Sample, normal_b.id)
-        logic2 = session2.get(PairingLogic, pairing_logic.id)
-
-        existing = _get_latest_pairing(session2, tumor_sample.id, pairing_logic.id)
-        assert existing is not None
-        assert existing.normal_id == normal_a.id
-
-        existing.latest = False
-        existing.modified_date = __import__("models").utcnow()
-
-        with pytest.raises(HTTPException) as exc_info:
-            _create_pairing(session2, tumor2, normal_b_obj, logic2)
+        assert read_event.wait(10)
+        winner = trigger_pairing(db, tumor_sample, pairing_logic, "override", normal_a.id)
+        assert winner.normal_id == normal_a.id
+        go_event.set()
+        thread.join(timeout=10)
     finally:
-        session2.close()
+        session_a.close()
 
-    session3 = SessionLocal()
-    try:
-        tumor3 = session3.get(Sample, tumor_sample.id)
-        normal_b_obj3 = session3.get(Sample, normal_b.id)
-        logic3 = session3.get(PairingLogic, pairing_logic.id)
+    assert not thread.is_alive()
+    assert outcome.get("status_code") == 409
+    assert "pairing_id" not in outcome
 
-        result_b = trigger_pairing(session3, tumor3, logic3, "override", normal_b.id)
-        assert result_b.normal_id == normal_b.id
-    finally:
-        session3.close()
+    # The winner remains the only latest pairing; session A's override was rolled back.
+    latest = _get_latest_pairing(db, tumor_sample.id, pairing_logic.id)
+    assert latest is not None
+    assert latest.normal_id == normal_a.id
