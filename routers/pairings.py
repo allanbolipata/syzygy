@@ -1,9 +1,10 @@
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db
 from models import PairingLogic, PairingTable, Sample
@@ -14,12 +15,33 @@ from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal
 router = APIRouter(prefix="/pairing", tags=["pairings"])
 
 
+# Sample attributes that can be filtered on either side of a pairing.
+SAMPLE_FILTER_FIELDS = (
+    "primary_id",
+    "cmo_sample_name",
+    "patient_id",
+    "sample_type",
+    "gene_panel",
+    "bait_set",
+    "tumor_or_normal",
+)
+
+
 @router.get("/", response_model=list[PairingRead])
 def list_pairings(
     latest: bool = False,
     sample_id: Optional[UUID] = None,
     pairing_logic_id: Optional[UUID] = None,
     pairing_logic_name: Optional[str] = None,
+    primary_id: Optional[str] = None,
+    cmo_sample_name: Optional[str] = None,
+    patient_id: Optional[str] = None,
+    sample_type: Optional[str] = None,
+    gene_panel: Optional[str] = None,
+    bait_set: Optional[str] = None,
+    tumor_or_normal: Optional[TumorOrNormal] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
@@ -38,6 +60,29 @@ def list_pairings(
         stmt = stmt.where(
             or_(PairingTable.tumor_id == sample_id, PairingTable.normal_id == sample_id)
         )
+    # Sample attribute filters: all specified fields must match the same
+    # sample, which may sit on either the tumor or the normal side.
+    sample_filters = [
+        (field, value)
+        for field, value in (
+            ("primary_id", primary_id),
+            ("cmo_sample_name", cmo_sample_name),
+            ("patient_id", patient_id),
+            ("sample_type", sample_type),
+            ("gene_panel", gene_panel),
+            ("bait_set", bait_set),
+            ("tumor_or_normal", tumor_or_normal.value if tumor_or_normal is not None else None),
+        )
+        if value is not None
+    ]
+    if sample_filters:
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        stmt = stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id)
+        stmt = stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id)
+        tumor_conds = [getattr(tumor_alias, field) == value for field, value in sample_filters]
+        normal_conds = [getattr(normal_alias, field) == value for field, value in sample_filters]
+        stmt = stmt.where(or_(and_(*tumor_conds), and_(*normal_conds)))
     if pairing_logic_id is not None:
         if db.get(PairingLogic, pairing_logic_id) is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
@@ -47,6 +92,10 @@ def list_pairings(
         if logic is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
         stmt = stmt.where(PairingTable.pairing_logic_id == logic.id)
+    if created_after is not None:
+        stmt = stmt.where(PairingTable.created_date >= created_after)
+    if created_before is not None:
+        stmt = stmt.where(PairingTable.created_date <= created_before)
     # Stable ordering so limit/offset pagination is deterministic.
     stmt = stmt.order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
     if limit is not None:
