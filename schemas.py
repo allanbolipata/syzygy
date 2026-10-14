@@ -70,7 +70,6 @@ class PairingTriggerCreate(BaseModel):
     pairing_logic_id: Optional[UUID] = None
     pairing_logic_name: Optional[str] = None
     normal_id: Optional[UUID] = None
-    override: bool = False
 
 
 class PairingRead(BaseModel):

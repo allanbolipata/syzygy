@@ -46,8 +46,7 @@ def trigger_pairing_endpoint(payload: PairingTriggerCreate, db: Session = Depend
     if pairing_logic is None:
         raise HTTPException(status_code=400, detail="pairing_logic_id or pairing_logic_name is required")
 
-    trigger_type = "override" if payload.override or payload.trigger_type == "override" else "manual"
-    pairing = trigger_pairing(db, tumor, pairing_logic, trigger_type, payload.normal_id)
+    pairing = trigger_pairing(db, tumor, pairing_logic, payload.trigger_type, payload.normal_id)
     if pairing is None:
         raise HTTPException(status_code=404, detail="No valid pairing could be created")
     return pairing
