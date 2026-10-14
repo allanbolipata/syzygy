@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import PairingLogic, PairingTable, Sample, utcnow
-from pairing_strategies import get_pairing_strategy, strategies
+from pairing_strategies import get_pairing_strategy
 from schemas import TumorOrNormal
 
 
@@ -37,18 +37,6 @@ def resolve_pairing_logic(
         raise HTTPException(status_code=404, detail="Pairing logic not found")
 
     return None
-
-
-def _matches(tumor: Sample, normal: Sample) -> bool:
-    return strategies["default"].matches(tumor, normal)
-
-
-def _select_latest_normal(db: Session, tumor: Sample) -> Optional[Sample]:
-    return strategies["default"].select_latest_normal(db, tumor)
-
-
-def _select_matching_tumors(db: Session, normal: Sample) -> list[Sample]:
-    return strategies["default"].select_matching_tumors(db, normal)
 
 
 def _get_latest_pairing(db: Session, tumor_id: UUID, pairing_logic_id: UUID) -> Optional[PairingTable]:

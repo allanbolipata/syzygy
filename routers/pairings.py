@@ -37,7 +37,7 @@ def list_pairings(
 
 
 @router.post("/trigger", response_model=PairingRead)
-def trigger_pairing_endpoint(payload: PairingTriggerCreate, db: Session = Depends(get_db)):
+def trigger_pairing_endpoint(payload: PairingTriggerCreate, db: Session = Depends(get_db)) -> PairingTable:
     tumor = db.get(Sample, payload.tumor_id)
     if tumor is None or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
         raise HTTPException(status_code=404, detail="Tumor sample not found")
