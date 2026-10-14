@@ -7,7 +7,12 @@ seeded at startup).
 ## Setup
 
     python -m venv .venv && . .venv/bin/activate
-    pip install -r requirements.txt
+    pip install -r requirements.txt        # runtime
+    pip install -r requirements-dev.txt    # runtime + test tooling
+
+`requirements-dev.txt` includes the runtime requirements plus test
+tooling (pytest, testcontainers). The Docker image installs only
+`requirements.txt` (runtime deps).
 
 Configuration comes from environment variables (see `Settings` in
 `database.py`):
@@ -43,8 +48,21 @@ existing tables. Schema changes are managed by Alembic (below).
   contains duplicate latest rows the migration will fail;
   deduplicate the data first.
 
+- Existing database from before the pairing strategy layer
+  (`pairing_logic` table lacks `strategy_name`/`config`):
+
+      psql "$DATABASE_URL" -f migrations/0001_add_pairing_logic_strategy.sql
+      alembic stamp 0001_baseline
+      alembic upgrade head
+
+  `migrations/0001_add_pairing_logic_strategy.sql` is the historical
+  ad-hoc migration for that schema; once it has run, the schema
+  matches the Alembic baseline. (It uses JSONB for `config`; the ORM's
+  JSON type reads it fine via psycopg2.)
+
 ## API
 
+- `GET /health` — liveness probe.
 - `POST /v1/sample` — create a sample. Tumor samples are paired
   automatically against the latest matching normal; normal samples are
   paired against tumors that have no pairing yet. Optional
@@ -54,15 +72,21 @@ existing tables. Schema changes are managed by Alembic (below).
 - `GET /v1/sample?limit=&offset=` — list samples, newest first.
 - `POST /v1/pairing/trigger` — create or override a pairing for a
   tumor. `trigger_type` is `manual` or `override`; optional `normal_id`
-  pins a specific normal sample.
-- `GET /v1/pairing?latest=&limit=&offset=` — list pairings, newest
-  first; `latest=true` restricts to current pairings.
-- `GET /v1/pairing-logic` — list pairing logics.
+  pins a specific normal sample. An `override` without `normal_id`
+  behaves like `manual` (re-pair against the latest matching normal).
+- `GET /v1/pairing` — list pairings, newest first. Optional filters
+  (combined with AND): `latest=true` restricts to current pairings;
+  `sample_id` matches pairings where the sample is tumor or normal;
+  `pairing_logic_id` / `pairing_logic_name` select the logic;
+  `limit` / `offset` paginate.
+- `GET /v1/pairing-logic?limit=&offset=` — list pairing logics,
+  newest first.
 - `POST /v1/pairing-logic` — register a pairing logic. `strategy_name`
   must be a registered strategy (`default`, `IMPACT`, `TEMPO`, `ACCESS`).
 
 ## Tests
 
+    pip install -r requirements-dev.txt
     pytest
 
 Tests run against PostgreSQL via testcontainers when Docker is
