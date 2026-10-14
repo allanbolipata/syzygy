@@ -21,7 +21,7 @@ from pairing_service import (
     trigger_pairing_for_normal,
 )
 from pairing_strategies import get_pairing_strategy, strategies
-from routers.pairing_logic import create_pairing_logic
+from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
 from routers.samples import create_sample, list_samples
 from schemas import PairingLogicCreate, PairingTriggerCreate, SampleCreate, TumorOrNormal
@@ -870,6 +870,103 @@ def test_list_pairings_ordered_and_paginated(db, tumor_sample, normal_sample, pa
 
 
 # ---------------------------------------------------------------------------
+# List endpoint filtering
+# ---------------------------------------------------------------------------
+
+
+def _make_pairing(db, tumor, normal, logic, latest=True, created_date=None):
+    pairing = PairingTable(
+        tumor_id=tumor.id,
+        normal_id=normal.id,
+        pairing_logic_id=logic.id,
+        latest=latest,
+    )
+    if created_date is not None:
+        pairing.created_date = created_date
+    db.add(pairing)
+    db.commit()
+    db.refresh(pairing)
+    return pairing
+
+
+def _extra_tumor(db, primary_id, patient_id):
+    sample = Sample(
+        primary_id=primary_id,
+        cmo_sample_name=f"{primary_id} name",
+        patient_id=patient_id,
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+    )
+    db.add(sample)
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_list_pairings_filter_by_sample_id(db, tumor_sample, normal_sample, pairing_logic):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    tumor_b = _extra_tumor(db, "TUMOR-002", "PATIENT-002")
+    p_a = _make_pairing(db, tumor_sample, normal_sample, pairing_logic, latest=True, created_date=d1)
+    p_b = _make_pairing(db, tumor_b, normal_sample, pairing_logic, latest=True, created_date=d2)
+
+    # Sample on the tumor side.
+    assert [p.id for p in list_pairings(sample_id=tumor_sample.id, limit=None, offset=None, db=db)] == [p_a.id]
+    assert [p.id for p in list_pairings(sample_id=tumor_b.id, limit=None, offset=None, db=db)] == [p_b.id]
+    # Sample on the normal side matches both pairings.
+    assert [p.id for p in list_pairings(sample_id=normal_sample.id, limit=None, offset=None, db=db)] == [p_b.id, p_a.id]
+
+
+def test_list_pairings_filter_by_pairing_logic(db, tumor_sample, normal_sample, pairing_logic):
+    other = PairingLogic(name="IMPACT")
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    tumor_b = _extra_tumor(db, "TUMOR-003", "PATIENT-003")
+    p_t = _make_pairing(db, tumor_sample, normal_sample, pairing_logic)
+    p_i = _make_pairing(db, tumor_b, normal_sample, other)
+
+    assert [p.id for p in list_pairings(pairing_logic_id=pairing_logic.id, limit=None, offset=None, db=db)] == [p_t.id]
+    assert [p.id for p in list_pairings(pairing_logic_name="IMPACT", limit=None, offset=None, db=db)] == [p_i.id]
+    assert [p.id for p in list_pairings(pairing_logic_name="TEMPO", limit=None, offset=None, db=db)] == [p_t.id]
+
+
+def test_list_pairings_combined_filters(db, tumor_sample, normal_sample, pairing_logic):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    tumor_b = _extra_tumor(db, "TUMOR-004", "PATIENT-004")
+    p_stale = _make_pairing(db, tumor_sample, normal_sample, pairing_logic, latest=False, created_date=d1)
+    p_current = _make_pairing(db, tumor_b, normal_sample, pairing_logic, latest=True, created_date=d2)
+
+    assert [p.id for p in list_pairings(sample_id=normal_sample.id, latest=True, limit=None, offset=None, db=db)] == [p_current.id]
+    assert [p.id for p in list_pairings(sample_id=tumor_b.id, pairing_logic_name="TEMPO", limit=None, offset=None, db=db)] == [p_current.id]
+    assert list_pairings(sample_id=tumor_sample.id, latest=True, limit=None, offset=None, db=db) == []
+    assert [p.id for p in list_pairings(sample_id=normal_sample.id, latest=True, limit=1, offset=1, db=db)] == []
+    # The stale pairing is still reachable without the latest filter.
+    assert [p.id for p in list_pairings(sample_id=tumor_sample.id, latest=False, limit=None, offset=None, db=db)] == [p_stale.id]
+
+
+def test_list_pairings_unknown_sample_id_404(db):
+    with pytest.raises(HTTPException) as exc:
+        list_pairings(sample_id=uuid.uuid4(), limit=None, offset=None, db=db)
+    assert exc.value.status_code == 404
+
+
+def test_list_pairings_unknown_pairing_logic_id_404(db):
+    with pytest.raises(HTTPException) as exc:
+        list_pairings(pairing_logic_id=uuid.uuid4(), limit=None, offset=None, db=db)
+    assert exc.value.status_code == 404
+
+
+def test_list_pairings_unknown_pairing_logic_name_404(db):
+    with pytest.raises(HTTPException) as exc:
+        list_pairings(pairing_logic_name="NOPE", limit=None, offset=None, db=db)
+    assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Sample creation with explicit / default pairing logic
 # ---------------------------------------------------------------------------
 
@@ -1068,3 +1165,43 @@ def test_trigger_pairing_override_normal_not_found_endpoint(db, tumor_sample, pa
     with pytest.raises(HTTPException) as exc:
         trigger_pairing_endpoint(payload, db=db)
     assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Pairing logic list ordering and pagination
+# ---------------------------------------------------------------------------
+
+
+def test_list_pairing_logic_ordered_and_paginated(db):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    l_old = PairingLogic(name="L-OLD", created_date=d1)
+    l_new = PairingLogic(name="L-NEW", created_date=d2)
+    db.add_all([l_old, l_new])
+    db.commit()
+
+    assert [l.name for l in list_pairing_logic(limit=None, offset=None, db=db)] == ["L-NEW", "L-OLD"]
+    assert [l.name for l in list_pairing_logic(limit=1, offset=0, db=db)] == ["L-NEW"]
+    assert [l.name for l in list_pairing_logic(limit=1, offset=1, db=db)] == ["L-OLD"]
+
+
+def test_list_pairing_logic_ties_broken_by_id(db):
+    d = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    l1 = PairingLogic(name="L-TIE-1", created_date=d)
+    l2 = PairingLogic(name="L-TIE-2", created_date=d)
+    db.add_all([l1, l2])
+    db.commit()
+
+    result = list_pairing_logic(limit=None, offset=None, db=db)
+    assert [l.id for l in result] == sorted([l1.id, l2.id], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# App health endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_health_endpoint():
+    from main import health
+
+    assert health() == {"status": "ok"}
