@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import database
 import pairing_service
 from database import Base
 from models import PairingLogic, PairingTable, Sample
@@ -23,7 +24,9 @@ from pairing_service import (
     trigger_pairing_for_normal,
 )
 from pairing_strategies import get_pairing_strategy, strategies
-from schemas import TumorOrNormal
+from routers.pairings import list_pairings, trigger_pairing_endpoint
+from routers.samples import create_sample, list_samples
+from schemas import PairingTriggerCreate, SampleCreate, TumorOrNormal
 
 
 class CustomPairingStrategy:
@@ -704,3 +707,165 @@ def test_trigger_pairing_override_conflict_raises_409(db, tumor_sample, normal_s
     latest = _get_latest_pairing(db, tumor_sample.id, pairing_logic.id)
     assert latest is not None
     assert latest.normal_id == normal_a.id
+
+
+# ---------------------------------------------------------------------------
+# Pairing logic "active" enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_pairing_logic_inactive_by_name(db):
+    logic = PairingLogic(name="IMPACT", active=False)
+    db.add(logic)
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        resolve_pairing_logic(db, pairing_logic_name="IMPACT")
+    assert exc.value.status_code == 400
+    assert "not active" in exc.value.detail
+
+
+def test_resolve_pairing_logic_inactive_by_id(db):
+    logic = PairingLogic(name="IMPACT", active=False)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    with pytest.raises(HTTPException) as exc:
+        resolve_pairing_logic(db, pairing_logic_id=logic.id)
+    assert exc.value.status_code == 400
+    assert "not active" in exc.value.detail
+
+
+def test_trigger_pairing_endpoint_inactive_logic(db, tumor_sample):
+    logic = PairingLogic(name="IMPACT", active=False)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    payload = PairingTriggerCreate(
+        tumor_id=tumor_sample.id,
+        trigger_type="manual",
+        pairing_logic_name="IMPACT",
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 400
+
+
+def test_create_sample_default_logic_active_pairs(db, normal_sample, monkeypatch):
+    logic = PairingLogic(name="TEMPO")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    monkeypatch.setattr(database.settings, "default_pairing_logic_name", "TEMPO")
+    payload = SampleCreate(
+        primary_id="TUMOR-010",
+        cmo_sample_name="Tumor Sample 10",
+        patient_id="PATIENT-001",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.TUMOR,
+    )
+    sample = create_sample(payload, db=db)
+    assert sample.id is not None
+    pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
+    assert pairing is not None
+    assert pairing.normal_id == normal_sample.id
+
+
+def test_create_sample_inactive_default_logic_skips_pairing(db, monkeypatch):
+    logic = PairingLogic(name="TEMPO", active=False)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    monkeypatch.setattr(database.settings, "default_pairing_logic_name", "TEMPO")
+    payload = SampleCreate(
+        primary_id="TUMOR-011",
+        cmo_sample_name="Tumor Sample 11",
+        patient_id="PATIENT-011",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.TUMOR,
+    )
+    sample = create_sample(payload, db=db)
+    assert sample.id is not None
+    pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
+    assert pairing is None
+
+
+# ---------------------------------------------------------------------------
+# List endpoint ordering and pagination
+# ---------------------------------------------------------------------------
+
+
+def _sample_with_created_date(db, primary_id, patient_id, created_date):
+    sample = Sample(
+        primary_id=primary_id,
+        cmo_sample_name=f"{primary_id} name",
+        patient_id=patient_id,
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        created_date=created_date,
+    )
+    db.add(sample)
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_list_samples_ordered_and_paginated(db):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    d3 = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    s1 = _sample_with_created_date(db, "N-001", "PAT-001", d1)
+    s2 = _sample_with_created_date(db, "N-002", "PAT-002", d2)
+    s3 = _sample_with_created_date(db, "N-003", "PAT-003", d3)
+
+    assert [s.id for s in list_samples(limit=None, offset=None, db=db)] == [s3.id, s2.id, s1.id]
+    assert [s.id for s in list_samples(limit=2, offset=0, db=db)] == [s3.id, s2.id]
+    assert [s.id for s in list_samples(limit=1, offset=1, db=db)] == [s2.id]
+    assert [s.id for s in list_samples(limit=1, offset=2, db=db)] == [s1.id]
+
+
+def test_list_samples_ties_broken_by_id(db):
+    d = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    s1 = _sample_with_created_date(db, "N-101", "PAT-101", d)
+    s2 = _sample_with_created_date(db, "N-102", "PAT-102", d)
+
+    result = list_samples(limit=None, offset=None, db=db)
+    assert [s.id for s in result] == sorted([s1.id, s2.id], reverse=True)
+
+
+def test_list_pairings_ordered_and_paginated(db, tumor_sample, normal_sample, pairing_logic):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    d3 = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    p_old = PairingTable(
+        tumor_id=tumor_sample.id,
+        normal_id=normal_sample.id,
+        pairing_logic_id=pairing_logic.id,
+        latest=False,
+        created_date=d1,
+    )
+    p_mid = PairingTable(
+        tumor_id=tumor_sample.id,
+        normal_id=normal_sample.id,
+        pairing_logic_id=pairing_logic.id,
+        latest=False,
+        created_date=d2,
+    )
+    p_new = PairingTable(
+        tumor_id=tumor_sample.id,
+        normal_id=normal_sample.id,
+        pairing_logic_id=pairing_logic.id,
+        latest=True,
+        created_date=d3,
+    )
+    db.add_all([p_old, p_mid, p_new])
+    db.commit()
+
+    assert [p.id for p in list_pairings(latest=False, limit=None, offset=None, db=db)] == [p_new.id, p_mid.id, p_old.id]
+    assert [p.id for p in list_pairings(latest=True, limit=None, offset=None, db=db)] == [p_new.id]
+    assert [p.id for p in list_pairings(latest=False, limit=1, offset=1, db=db)] == [p_mid.id]

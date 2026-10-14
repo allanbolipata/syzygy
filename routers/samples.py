@@ -17,8 +17,13 @@ router = APIRouter(prefix="/sample", tags=["samples"])
 def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
     pairing_logic = resolve_pairing_logic(db, payload.pairing_logic_id, payload.pairing_logic_name)
     if pairing_logic is None and settings.default_pairing_logic_name:
+        # An inactive default logic silently skips auto-pairing rather than
+        # failing sample creation.
         pairing_logic = db.scalar(
-            select(PairingLogic).where(PairingLogic.name == settings.default_pairing_logic_name)
+            select(PairingLogic).where(
+                PairingLogic.name == settings.default_pairing_logic_name,
+                PairingLogic.active.is_(True),
+            )
         )
 
     sample_data = payload.model_dump(exclude={"pairing_logic_id", "pairing_logic_name"})
@@ -42,7 +47,8 @@ def list_samples(
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
 ):
-    stmt = select(Sample)
+    # Stable ordering so limit/offset pagination is deterministic.
+    stmt = select(Sample).order_by(Sample.created_date.desc(), Sample.id.desc())
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:
