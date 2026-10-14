@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
@@ -14,6 +16,8 @@ router = APIRouter(prefix="/pairing", tags=["pairings"])
 @router.get("/", response_model=list[PairingRead])
 def list_pairings(
     latest: bool = Query(False),
+    limit: Optional[int] = Query(None, ge=1),
+    offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
 ):
     stmt = select(PairingTable).options(
@@ -23,6 +27,12 @@ def list_pairings(
     )
     if latest:
         stmt = stmt.where(PairingTable.latest.is_(True))
+    # Stable ordering so limit/offset pagination is deterministic.
+    stmt = stmt.order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
     return db.scalars(stmt).all()
 
 

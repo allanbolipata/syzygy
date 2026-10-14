@@ -11,6 +11,11 @@ from pairing_strategies import get_pairing_strategy, strategies
 from schemas import TumorOrNormal
 
 
+def _ensure_active(logic: PairingLogic) -> None:
+    if not logic.active:
+        raise HTTPException(status_code=400, detail=f"Pairing logic '{logic.name}' is not active")
+
+
 def resolve_pairing_logic(
     db: Session,
     pairing_logic_id: Optional[UUID] = None,
@@ -19,11 +24,13 @@ def resolve_pairing_logic(
     if pairing_logic_id is not None:
         logic = db.scalar(select(PairingLogic).where(PairingLogic.id == pairing_logic_id))
         if logic is not None:
+            _ensure_active(logic)
             return logic
 
     if pairing_logic_name is not None:
         logic = db.scalar(select(PairingLogic).where(PairingLogic.name == pairing_logic_name))
         if logic is not None:
+            _ensure_active(logic)
             return logic
 
     if pairing_logic_id is not None or pairing_logic_name is not None:
