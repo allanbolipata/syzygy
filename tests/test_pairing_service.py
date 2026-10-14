@@ -967,6 +967,83 @@ def test_list_pairings_unknown_pairing_logic_name_404(db):
 
 
 # ---------------------------------------------------------------------------
+# List endpoint sample-field filters
+# ---------------------------------------------------------------------------
+
+
+def _make_sample(db, primary_id, patient_id, tumor_or_normal, gene_panel="PANEL-A", bait_set="BAIT-1", sample_type="tissue"):
+    sample = Sample(
+        primary_id=primary_id,
+        cmo_sample_name=f"{primary_id} name",
+        patient_id=patient_id,
+        sample_type=sample_type,
+        gene_panel=gene_panel,
+        bait_set=bait_set,
+        tumor_or_normal=tumor_or_normal,
+    )
+    db.add(sample)
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_list_pairings_filter_by_sample_fields(db, tumor_sample, normal_sample, pairing_logic):
+    tumor_b = _make_sample(db, "TUMOR-002", "PATIENT-002", TumorOrNormal.TUMOR.value, gene_panel="PANEL-B", bait_set="BAIT-2", sample_type="blood")
+    normal_b = _make_sample(db, "NORMAL-002", "PATIENT-002", TumorOrNormal.NORMAL.value, gene_panel="PANEL-B", bait_set="BAIT-2", sample_type="blood")
+    p1 = _make_pairing(db, tumor_sample, normal_sample, pairing_logic)
+    p2 = _make_pairing(db, tumor_b, normal_b, pairing_logic)
+
+    # Each sample field matches on either side of the pairing.
+    assert [p.id for p in list_pairings(primary_id="TUMOR-001", limit=None, offset=None, db=db)] == [p1.id]
+    assert [p.id for p in list_pairings(primary_id="NORMAL-001", limit=None, offset=None, db=db)] == [p1.id]
+    assert [p.id for p in list_pairings(patient_id="PATIENT-001", limit=None, offset=None, db=db)] == [p1.id]
+    assert [p.id for p in list_pairings(patient_id="PATIENT-002", limit=None, offset=None, db=db)] == [p2.id]
+    assert [p.id for p in list_pairings(gene_panel="PANEL-B", limit=None, offset=None, db=db)] == [p2.id]
+    assert [p.id for p in list_pairings(bait_set="BAIT-2", limit=None, offset=None, db=db)] == [p2.id]
+    assert [p.id for p in list_pairings(sample_type="blood", limit=None, offset=None, db=db)] == [p2.id]
+    assert [p.id for p in list_pairings(cmo_sample_name="Normal Sample 1", limit=None, offset=None, db=db)] == [p1.id]
+
+
+def test_list_pairings_field_filters_match_same_side(db, tumor_sample, normal_sample, pairing_logic):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    tumor_b = _make_sample(db, "TUMOR-003", "PATIENT-003", TumorOrNormal.TUMOR.value)
+    p1 = _make_pairing(db, tumor_sample, normal_sample, pairing_logic, created_date=d1)
+    # p2 shares normal_sample (PATIENT-001) but its tumor belongs to PATIENT-003.
+    p2 = _make_pairing(db, tumor_b, normal_sample, pairing_logic, created_date=d2)
+
+    # Fields must all match one sample; TUMOR-003 is PATIENT-003.
+    assert list_pairings(primary_id="TUMOR-003", patient_id="PATIENT-001", limit=None, offset=None, db=db) == []
+    assert [p.id for p in list_pairings(primary_id="TUMOR-003", patient_id="PATIENT-003", limit=None, offset=None, db=db)] == [p2.id]
+    # Both fields match the normal side, so both pairings qualify.
+    assert [p.id for p in list_pairings(primary_id="NORMAL-001", patient_id="PATIENT-001", limit=None, offset=None, db=db)] == [p2.id, p1.id]
+    # Sample-field filters AND-combine with the logic filter.
+    assert [p.id for p in list_pairings(primary_id="TUMOR-003", pairing_logic_name="TEMPO", limit=None, offset=None, db=db)] == [p2.id]
+
+
+def test_list_pairings_filter_role_scoped(db, tumor_sample, normal_sample, pairing_logic):
+    p1 = _make_pairing(db, tumor_sample, normal_sample, pairing_logic)
+
+    assert [p.id for p in list_pairings(primary_id="TUMOR-001", tumor_or_normal=TumorOrNormal.TUMOR, limit=None, offset=None, db=db)] == [p1.id]
+    # TUMOR-001 sits on the tumor side only.
+    assert list_pairings(primary_id="TUMOR-001", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db) == []
+    assert [p.id for p in list_pairings(primary_id="NORMAL-001", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == [p1.id]
+
+
+def test_list_pairings_filter_created_date_range(db, tumor_sample, normal_sample, pairing_logic):
+    d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    p1 = _make_pairing(db, tumor_sample, normal_sample, pairing_logic, latest=True, created_date=d1)
+    p2 = _make_pairing(db, tumor_sample, normal_sample, pairing_logic, latest=False, created_date=d2)
+
+    # Bounds are inclusive.
+    assert [p.id for p in list_pairings(created_after=d1, limit=None, offset=None, db=db)] == [p2.id, p1.id]
+    assert [p.id for p in list_pairings(created_before=d1, limit=None, offset=None, db=db)] == [p1.id]
+    assert [p.id for p in list_pairings(created_after=d1, created_before=d1, limit=None, offset=None, db=db)] == [p1.id]
+    assert list_pairings(created_after=d2, created_before=d1, limit=None, offset=None, db=db) == []
+
+
+# ---------------------------------------------------------------------------
 # Sample creation with explicit / default pairing logic
 # ---------------------------------------------------------------------------
 

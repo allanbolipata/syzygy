@@ -77,8 +77,13 @@ existing tables. Schema changes are managed by Alembic (below).
 - `GET /v1/pairing` — list pairings, newest first. Optional filters
   (combined with AND): `latest=true` restricts to current pairings;
   `sample_id` matches pairings where the sample is tumor or normal;
+  sample fields `primary_id`, `cmo_sample_name`, `patient_id`,
+  `sample_type`, `gene_panel`, `bait_set` match a sample on either side
+  (when several are given, they must all match the same sample);
+  `tumor_or_normal` scopes that match to the tumor or normal role;
   `pairing_logic_id` / `pairing_logic_name` select the logic;
-  `limit` / `offset` paginate.
+  `created_after` / `created_before` (inclusive, ISO 8601) bound the
+  pairing creation date; `limit` / `offset` paginate.
 - `GET /v1/pairing-logic?limit=&offset=` — list pairing logics,
   newest first.
 - `POST /v1/pairing-logic` — register a pairing logic. `strategy_name`
