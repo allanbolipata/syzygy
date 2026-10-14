@@ -1036,3 +1036,35 @@ def test_trigger_pairing_endpoint_no_matching_normal(db, tumor_sample, pairing_l
     with pytest.raises(HTTPException) as exc:
         trigger_pairing_endpoint(payload, db=db)
     assert exc.value.status_code == 404
+
+
+def test_trigger_pairing_override_normal_id_missing_is_404(db, tumor_sample, pairing_logic):
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing(db, tumor_sample, pairing_logic, "override", uuid.uuid4())
+    assert exc.value.status_code == 404
+    assert "Normal sample not found" in exc.value.detail
+
+
+def test_trigger_pairing_manual_normal_id_missing_is_404(db, tumor_sample, pairing_logic):
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing(db, tumor_sample, pairing_logic, "manual", uuid.uuid4())
+    assert exc.value.status_code == 404
+
+
+def test_trigger_pairing_normal_id_is_tumor_is_404(db, tumor_sample, pairing_logic):
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing(db, tumor_sample, pairing_logic, "override", tumor_sample.id)
+    assert exc.value.status_code == 404
+    assert "Normal sample not found" in exc.value.detail
+
+
+def test_trigger_pairing_override_normal_not_found_endpoint(db, tumor_sample, pairing_logic):
+    payload = PairingTriggerCreate(
+        tumor_id=tumor_sample.id,
+        trigger_type="override",
+        pairing_logic_name="TEMPO",
+        normal_id=uuid.uuid4(),
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 404

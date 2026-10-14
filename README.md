@@ -43,6 +43,24 @@ existing tables. Schema changes are managed by Alembic (below).
   contains duplicate latest rows the migration will fail;
   deduplicate the data first.
 
+## API
+
+- `POST /v1/sample` — create a sample. Tumor samples are paired
+  automatically against the latest matching normal; normal samples are
+  paired against tumors that have no pairing yet. Optional
+  `pairing_logic_id` / `pairing_logic_name` select the logic; otherwise
+  the `DEFAULT_PAIRING_LOGIC_NAME` logic is used (inactive or missing
+  logic skips auto-pairing).
+- `GET /v1/sample?limit=&offset=` — list samples, newest first.
+- `POST /v1/pairing/trigger` — create or override a pairing for a
+  tumor. `trigger_type` is `manual` or `override`; optional `normal_id`
+  pins a specific normal sample.
+- `GET /v1/pairing?latest=&limit=&offset=` — list pairings, newest
+  first; `latest=true` restricts to current pairings.
+- `GET /v1/pairing-logic` — list pairing logics.
+- `POST /v1/pairing-logic` — register a pairing logic. `strategy_name`
+  must be a registered strategy (`default`, `IMPACT`, `TEMPO`, `ACCESS`).
+
 ## Tests
 
     pytest
