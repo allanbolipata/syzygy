@@ -96,7 +96,7 @@ def trigger_pairing(
     if normal_id is not None:
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
-            raise HTTPException(status_code=400, detail="Normal sample not found")
+            raise HTTPException(status_code=404, detail="Normal sample not found")
         if not strategy.matches(tumor, normal):
             raise HTTPException(status_code=400, detail="Normal sample does not match tumor")
     else:
