@@ -1,8 +1,11 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy import select
 
-from database import Base, engine
+from database import Base, SessionLocal, engine
+from models import PairingLogic
+from routers.pairing_logic import router as pairing_logic_router
 from routers.pairings import router as pairings_router
 from routers.samples import router as samples_router
 
@@ -10,6 +13,24 @@ from routers.samples import router as samples_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        for name, strategy in (
+            ("TEMPO", "tempo"),
+            ("CHRONOS", "tempo"),
+            ("IMPACT", "default"),
+            ("ACCESS", "default"),
+        ):
+            existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
+            if existing is None:
+                db.add(PairingLogic(name=name, strategy_name=strategy))
+            elif existing.strategy_name != strategy:
+                # Self-heal rows created before the beagle-aligned
+                # strategies existed (e.g. TEMPO seeded as "default").
+                existing.strategy_name = strategy
+        db.commit()
+    finally:
+        db.close()
     yield
     engine.dispose()
 
@@ -23,5 +44,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 app.include_router(samples_router, prefix="/v1")
 app.include_router(pairings_router, prefix="/v1")
+app.include_router(pairing_logic_router, prefix="/v1")
