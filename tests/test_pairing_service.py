@@ -20,7 +20,7 @@ from pairing_service import (
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from pairing_strategies import get_pairing_strategy, strategies
+from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
 from routers.samples import create_sample, list_samples
@@ -31,25 +31,36 @@ class CustomPairingStrategy:
     def matches(self, tumor: Sample, normal: Sample) -> bool:
         return tumor.patient_id == normal.patient_id and tumor.gene_panel == normal.gene_panel
 
-    def select_latest_normal(self, db: Session, tumor: Sample) -> Optional[Sample]:
+    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> list:
+        reasons = []
+        if tumor.patient_id != normal.patient_id:
+            reasons.append(f"patient_id mismatch ({tumor.patient_id} vs {normal.patient_id})")
+        if tumor.gene_panel != normal.gene_panel:
+            reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {normal.gene_panel})")
+        return reasons
+
+    def select_latest_normal(
+        self, db: Session, tumor: Sample, logic: Optional[PairingLogic] = None
+    ) -> NormalSelection:
         stmt = select(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
             Sample.patient_id == tumor.patient_id,
             Sample.gene_panel == tumor.gene_panel,
-        ).order_by(
-            Sample.sequencing_date.desc().nulls_last(),
-            Sample.created_date.desc(),
-            Sample.id.desc(),
         )
-        return db.scalar(stmt)
+        return NormalSelection(db.scalar(stmt))
 
-    def select_matching_tumors(self, db: Session, normal: Sample) -> list[Sample]:
+    def select_matching_tumors(
+        self, db: Session, normal: Sample, logic: Optional[PairingLogic] = None
+    ) -> list:
         stmt = select(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
             Sample.patient_id == normal.patient_id,
             Sample.gene_panel == normal.gene_panel,
         )
         return db.scalars(stmt).all()
+
+    def with_config(self, config: dict) -> "CustomPairingStrategy":
+        return self
 
 
 def _try_docker_engine():
@@ -261,16 +272,15 @@ def test_matches_false_different_bait_set(db, tumor_sample):
     db.refresh(normal)
     assert strategies["default"].matches(tumor_sample, normal) is False
 
-
 def test_select_latest_normal_returns_most_recent(db, tumor_sample, normal_sample, older_normal_sample):
-    result = strategies["default"].select_latest_normal(db, tumor_sample)
-    assert result is not None
-    assert result.id == normal_sample.id
+    assert (
+        strategies["default"].select_latest_normal(db, tumor_sample).normal.id
+        == normal_sample.id
+    )
 
 
-def test_select_latest_normal_no_match(db, tumor_sample):
-    result = strategies["default"].select_latest_normal(db, tumor_sample)
-    assert result is None
+def test_select_latest_normal_no_match(db, tumor_sample, non_matching_normal):
+    assert strategies["default"].select_latest_normal(db, tumor_sample).normal is None
 
 
 def test_select_matching_tumors_returns_matches(db, tumor_sample, normal_sample):
@@ -410,10 +420,26 @@ def test_trigger_pairing_override_with_normal_id(db, tumor_sample, normal_sample
     assert result.latest is True
 
 
-def test_trigger_pairing_override_normal_does_not_match(db, tumor_sample, non_matching_normal, pairing_logic):
+def test_trigger_pairing_override_strict_normal_does_not_match(
+    db, tumor_sample, non_matching_normal, pairing_logic
+):
+    """A strict override rejects a pinned normal with mismatched keys (400)."""
     with pytest.raises(HTTPException) as exc_info:
-        trigger_pairing(db, tumor_sample, pairing_logic, "override", non_matching_normal.id)
+        trigger_pairing(db, tumor_sample, pairing_logic, "override", non_matching_normal.id, strict=True)
     assert exc_info.value.status_code == 400
+    assert "patient_id mismatch" in exc_info.value.detail
+
+
+def test_trigger_pairing_override_force_records_mismatched_keys(
+    db, tumor_sample, non_matching_normal, pairing_logic
+):
+    """A non-strict override forces the pair and records the mismatches."""
+    result = trigger_pairing(db, tumor_sample, pairing_logic, "override", non_matching_normal.id)
+    assert result is not None
+    assert result.normal_id == non_matching_normal.id
+    assert result.latest is True
+    assert result.trigger_type == "override"
+    assert any("patient_id mismatch" in key for key in (result.mismatched_keys or []))
 
 
 def test_trigger_pairing_no_pairing_logic(db, tumor_sample, normal_sample):
@@ -424,6 +450,380 @@ def test_trigger_pairing_no_pairing_logic(db, tumor_sample, normal_sample):
 def test_trigger_pairing_no_matching_normal(db, tumor_sample, pairing_logic):
     result = trigger_pairing(db, tumor_sample, pairing_logic, "automatic")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Request-first cascade (default strategy)
+# ---------------------------------------------------------------------------
+
+
+def _sample(
+    db,
+    primary_id,
+    patient_id="PATIENT-001",
+    tumor_or_normal=TumorOrNormal.NORMAL.value,
+    request_id=None,
+    run_mode=None,
+    preservation=None,
+    sample_origin=None,
+    sample_type="tissue",
+    gene_panel="PANEL-A",
+    bait_set="BAIT-1",
+    sequencing_date=None,
+):
+    sample = Sample(
+        primary_id=primary_id,
+        cmo_sample_name=f"{primary_id} name",
+        patient_id=patient_id,
+        sample_type=sample_type,
+        gene_panel=gene_panel,
+        bait_set=bait_set,
+        tumor_or_normal=tumor_or_normal,
+        request_id=request_id,
+        run_mode=run_mode,
+        preservation=preservation,
+        sample_origin=sample_origin,
+        sequencing_date=sequencing_date,
+    )
+    db.add(sample)
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_default_prefers_same_request_normal(db):
+    tumor = _sample(
+        db, "TUMOR-REQ-1", tumor_or_normal=TumorOrNormal.TUMOR.value, request_id="REQ-1"
+    )
+    older_same = _sample(
+        db, "NORM-REQ-1", request_id="REQ-1",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    newer_other = _sample(
+        db, "NORM-REQ-2", request_id="REQ-2",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    selection = strategies["default"].select_latest_normal(db, tumor)
+    assert selection.normal.id == older_same.id
+    assert any("tier=same_request" in note for note in selection.notes)
+
+
+def test_default_falls_back_to_other_requests(db):
+    tumor = _sample(
+        db, "TUMOR-REQ-2", tumor_or_normal=TumorOrNormal.TUMOR.value, request_id="REQ-1"
+    )
+    other = _sample(db, "NORM-REQ-3", request_id="REQ-3")
+    selection = strategies["default"].select_latest_normal(db, tumor)
+    assert selection.normal.id == other.id
+    assert any("tier=other_requests" in note for note in selection.notes)
+
+
+def test_default_patient_wide_when_tumor_has_no_request(db, tumor_sample, normal_sample):
+    selection = strategies["default"].select_latest_normal(db, tumor_sample)
+    assert selection.normal.id == normal_sample.id
+    assert any("tier=patient-wide" in note for note in selection.notes)
+
+
+def test_default_cascade_notes_record_empty_tiers(db):
+    tumor = _sample(
+        db, "TUMOR-REQ-4", tumor_or_normal=TumorOrNormal.TUMOR.value, request_id="REQ-9"
+    )
+    # A blood-type normal under REQ-9 is not a candidate (base-key filter).
+    _sample(db, "NORM-REQ-4A", request_id="REQ-9", sample_type="blood")
+    other = _sample(db, "NORM-REQ-4B", request_id="REQ-8")
+    selection = strategies["default"].select_latest_normal(db, tumor)
+    assert selection.normal.id == other.id
+    notes = " | ".join(selection.notes)
+    assert "tier=same_request: no candidate normals" in notes
+    assert "tier=other_requests: 1 candidate(s), 1 matched" in notes
+
+
+# ---------------------------------------------------------------------------
+# Notes and trigger_type recording on pairings
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_pairing_records_trigger_type_and_notes(
+    db, tumor_sample, normal_sample, pairing_logic
+):
+    pairing = trigger_pairing(db, tumor_sample, pairing_logic, "manual")
+    assert pairing.trigger_type == "manual"
+    assert pairing.notes is not None
+    assert any("tier=patient-wide" in note for note in pairing.notes)
+
+
+def test_override_records_mismatched_keys_not_selection_notes(
+    db, tumor_sample, non_matching_normal, pairing_logic
+):
+    pairing = trigger_pairing(
+        db, tumor_sample, pairing_logic, "override", non_matching_normal.id
+    )
+    assert pairing.trigger_type == "override"
+    assert pairing.mismatched_keys
+    assert pairing.notes is None
+
+
+def test_trigger_pairing_endpoint_strict_override_rejects(
+    db, tumor_sample, non_matching_normal, pairing_logic
+):
+    payload = PairingTriggerCreate(
+        tumor_id=tumor_sample.id,
+        trigger_type="override",
+        pairing_logic_name="TEMPO",
+        normal_id=non_matching_normal.id,
+        strict=True,
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 400
+    assert "patient_id mismatch" in exc.value.detail
+
+
+def test_trigger_pairing_endpoint_404_includes_selection_notes(db):
+    tumor = _sample(
+        db, "TUMOR-404", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X",
+    )
+    # Hiseq normal fails the ARGOS run-mode gate, so no pairing results.
+    _sample(
+        db, "NORM-404-1", run_mode="Hiseq 3000",
+    )
+    logic = PairingLogic(name="ARGOS", strategy_name="argos")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    payload = PairingTriggerCreate(
+        tumor_id=tumor.id, trigger_type="manual", pairing_logic_name="ARGOS"
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 404
+    assert "run_mode mismatch" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# ARGOS strategy
+# ---------------------------------------------------------------------------
+
+
+def test_argos_matches_on_run_mode_bucket(db):
+    tumor = _sample(
+        db, "TUMOR-NSX", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X 1000", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    argos = strategies["argos"]
+    assert argos.matches(
+        tumor, _sample(db, "NORM-NSX-1", run_mode="novaSeq x 10",
+                       preservation=["FFPE"], sample_origin=["FFPE"])
+    )
+    assert not argos.matches(
+        tumor, _sample(db, "NORM-HS-1", run_mode="Hiseq 3000",
+                       preservation=["FFPE"], sample_origin=["FFPE"])
+    )
+    assert not argos.matches(
+        tumor, _sample(db, "NORM-NS-1", run_mode="NovaSeq 6000",
+                       preservation=["FFPE"], sample_origin=["FFPE"])
+    )
+    assert not argos.matches(
+        tumor, _sample(db, "NORM-UNK-1", run_mode="PromethION",
+                       preservation=["FFPE"], sample_origin=["FFPE"])
+    )
+    unknown_tumor = _sample(
+        db, "TUMOR-UNK", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="PromethION", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    assert argos.matches(
+        unknown_tumor, _sample(db, "NORM-UNK-2", run_mode="promethion",
+                              preservation=["FFPE"], sample_origin=["FFPE"])
+    )
+
+
+def test_argos_run_mode_gate_skips_newer_mismatching_candidate(db):
+    tumor = _sample(
+        db, "TUMOR-NSX-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    newer_hiseq = _sample(
+        db, "NORM-HS-2", run_mode="Hiseq 3000",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    older_novaseq = _sample(
+        db, "NORM-NSX-2", run_mode="NovaSeq X 1000",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == older_novaseq.id
+    assert any("run_mode mismatch" in note for note in selection.notes)
+
+
+def test_argos_ignores_sample_type(db):
+    """Beagle v2.3.0 never keys on specimen/sample type (a Resection tumor
+    pairs with a Blood normal); sample_type is not a hard key for argos."""
+    tumor = _sample(
+        db, "TUMOR-ST-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="resection", run_mode="NovaSeq X",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    normal = _sample(
+        db, "NORM-ST-1", sample_type="blood", run_mode="NovaSeq X",
+        preservation=["EDTA-Streck"], sample_origin=["Plasma"],
+    )
+    argos = strategies["argos"]
+    assert argos.matches(tumor, normal)
+    selection = argos.select_latest_normal(db, tumor)
+    assert selection.normal.id == normal.id
+
+
+def test_argos_preservation_is_not_a_gate(db):
+    """Beagle v2.3.0 does not gate on preservation: a differently-preserved
+    (even unresolvable) normal still pairs, latest run date wins."""
+    tumor = _sample(
+        db, "TUMOR-FROZEN", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["Fresh or Frozen"], sample_origin=["Fresh or Frozen"],
+        run_mode="NovaSeq X",
+    )
+    newer_ffpe = _sample(
+        db, "NORM-FFPE-2", preservation=["FFPE"], sample_origin=["FFPE"],
+        run_mode="NovaSeq X",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    older_frozen = _sample(
+        db, "NORM-FROZEN-2", preservation=["Fresh or Frozen"],
+        sample_origin=["Fresh or Frozen"], run_mode="NovaSeq X",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == newer_ffpe.id
+
+
+def test_argos_unresolvable_preservation_no_longer_blocks(db):
+    tumor = _sample(
+        db, "TUMOR-UNK-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["Frozen"],
+        run_mode="NovaSeq X",
+    )
+    normal = _sample(
+        db, "NORM-UNK-PRES-1", preservation=["FFPE"], sample_origin=["FFPE"],
+        run_mode="NovaSeq X",
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == normal.id
+
+
+def test_argos_pooled_normal_tier(db):
+    tumor = _sample(
+        db, "TUMOR-POOL-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    pooled = _sample(
+        db, "NORM-POOL-1", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == pooled.id
+    assert any("tier=pooled" in note for note in selection.notes)
+
+
+def test_argos_pooled_respects_keys_and_run_mode(db):
+    tumor = _sample(
+        db, "TUMOR-POOL-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    _sample(
+        db, "NORM-POOL-2A", patient_id=None, sample_type="Pooled Normal",
+        bait_set="BAIT-2", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    _sample(
+        db, "NORM-POOL-2B", patient_id=None, sample_type="Pooled Normal",
+        run_mode="Hiseq 3000", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any("run_mode mismatch" in note for note in selection.notes)
+
+
+def test_argos_pooled_no_preservation_gate(db):
+    """Pooled tier no longer requires resolvable preservation."""
+    tumor = _sample(db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    pooled = _sample(
+        db, "NORM-POOL-3", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == pooled.id
+    assert any("tier=pooled" in note for note in selection.notes)
+
+
+def test_argos_pooled_sample_types_configurable(db):
+    logic = PairingLogic(
+        name="ARGOS-CFG", strategy_name="argos",
+        config={"pooled_sample_types": ["PoolN"]},
+    )
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    strategy = get_pairing_strategy(logic)
+    tumor = _sample(
+        db, "TUMOR-POOL-4", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    pooled = _sample(
+        db, "NORM-POOLN-1", patient_id=None, sample_type="PoolN",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    selection = strategy.select_latest_normal(db, tumor)
+    assert selection.normal.id == pooled.id
+
+
+def test_get_pairing_strategy_applies_run_mode_map_config(db):
+    logic = PairingLogic(
+        name="ARGOS-CFG2", strategy_name="argos",
+        config={"run_mode_map": {"nova": "nova"}},
+    )
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    strategy = get_pairing_strategy(logic)
+    assert strategy is not strategies["argos"]
+    tumor = _sample(
+        db, "TUMOR-CFG-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="Nova 1234", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    normal = _sample(
+        db, "NORM-CFG-1", run_mode="nova",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    assert strategy.matches(tumor, normal)
+
+
+# ---------------------------------------------------------------------------
+# List endpoint: request_id / run_mode filters
+# ---------------------------------------------------------------------------
+
+
+def test_list_pairings_filter_by_request_id_and_run_mode(db, pairing_logic):
+    tumor = _sample(
+        db, "TUMOR-FILT-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        request_id="REQ-11", run_mode="Hiseq 3000",
+    )
+    _sample(db, "NORM-FILT-1", request_id="REQ-11", run_mode="Hiseq 3000")
+    pairing = trigger_pairing(db, tumor, pairing_logic, "manual")
+    assert pairing is not None
+
+    assert [
+        p.id for p in list_pairings(
+            latest=False, limit=None, offset=None, request_id="REQ-11", db=db
+        )
+    ] == [pairing.id]
+    assert [
+        p.id for p in list_pairings(
+            latest=False, limit=None, offset=None, run_mode="Hiseq 3000", db=db
+        )
+    ] == [pairing.id]
+    assert list_pairings(latest=False, limit=None, offset=None, request_id="REQ-99", db=db) == []
+    assert list_pairings(latest=False, limit=None, offset=None, run_mode="NovaSeq X", db=db) == []
 
 
 def test_trigger_pairing_for_normal_creates_pairing(db, tumor_sample, normal_sample, pairing_logic):
@@ -475,14 +875,19 @@ def test_get_pairing_strategy_default(db):
 
 
 def test_get_pairing_strategy_known_aliases(db):
-    for name in ("IMPACT", "TEMPO", "ACCESS"):
-        logic = PairingLogic(name=name)
+    for strategy_name, expected in (
+        ("IMPACT", "default"),
+        ("ACCESS", "default"),
+        ("TEMPO", "tempo"),
+        ("CHRONOS", "tempo"),
+    ):
+        logic = PairingLogic(name=f"ALIAS-{strategy_name}", strategy_name=strategy_name)
         db.add(logic)
         db.commit()
         db.refresh(logic)
 
         strategy = get_pairing_strategy(logic)
-        assert strategy is strategies["default"]
+        assert strategy is strategies[expected]
 
 
 def test_get_pairing_strategy_unknown(db):
@@ -1282,3 +1687,188 @@ def test_health_endpoint():
     from main import health
 
     assert health() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# tempo strategy (beagle TEMPO/CHRONOS alignment)
+# ---------------------------------------------------------------------------
+
+
+def _tempo_logic(db, name="TEMPO"):
+    logic = PairingLogic(name=name, strategy_name="tempo")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    return logic
+
+
+def _tempo_pair(db, tumor, normal, logic, trigger_type="historical"):
+    pairing = PairingTable(
+        tumor_id=tumor.id,
+        normal_id=normal.id,
+        pairing_logic_id=logic.id,
+        trigger_type=trigger_type,
+        latest=True,
+    )
+    db.add(pairing)
+    db.commit()
+    db.refresh(pairing)
+    return pairing
+
+
+def test_tempo_historical_pairing_bypasses_bait_run_mode_checks(db):
+    """beagle pre_pairing: the historical normal is returned by identity,
+    bait/run-mode checks skipped, and a newer fully-matching normal is
+    never considered."""
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-HIST-T", tumor_or_normal=TumorOrNormal.TUMOR.value, run_mode="HiSeq 3000"
+    )
+    # Historical normal: bait and run mode both mismatch on purpose.
+    old_normal = _sample(
+        db, "TMP-HIST-N-OLD",
+        bait_set="BAIT-X", run_mode="NovaSeq 6000",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    # Newer normal that matches everything.
+    new_normal = _sample(
+        db, "TMP-HIST-N-NEW",
+        run_mode="HiSeq 3000",
+        sequencing_date=datetime(2025, 6, 1, tzinfo=timezone.utc),
+    )
+    _tempo_pair(db, tumor, old_normal, logic)
+
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal is not None
+    assert selection.normal.id == old_normal.id
+    assert any("historical pairing retained" in note for note in selection.notes)
+    assert any("bypassed" in note for note in selection.notes)
+
+
+def test_tempo_historical_pairing_no_fallback_when_normal_missing(db):
+    """beagle: pre_pairing pointing at a missing normal -> tumor stays
+    unpaired; there is no patient-wide fallback."""
+    logic = _tempo_logic(db)
+    tumor = _sample(db, "TMP-GONE-T", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    normal = _sample(db, "TMP-GONE-N")
+    _tempo_pair(db, tumor, normal, logic)
+    db.delete(normal)
+    db.commit()
+
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal is None
+    assert any("missing" in note for note in selection.notes)
+
+
+def test_tempo_patient_wide_latest_run_date_wins(db):
+    logic = _tempo_logic(db)
+    tumor = _sample(db, "TMP-LATEST-T", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    older = _sample(
+        db, "TMP-LATEST-N1",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    newer = _sample(
+        db, "TMP-LATEST-N2",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal.id == newer.id
+
+
+def test_tempo_bait_and_run_mode_mismatch_leaves_tumor_unpaired(db):
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-GATE-T", tumor_or_normal=TumorOrNormal.TUMOR.value, run_mode="HiSeq 3000"
+    )
+    _sample(db, "TMP-GATE-N-BAD-BAIT", bait_set="BAIT-2")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal is None
+
+    _sample(db, "TMP-GATE-N-BAD-RM", run_mode="NovaSeq 6000")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal is None
+    assert any("bait_set mismatch" in note for note in selection.notes)
+    assert any("run_mode mismatch" in note for note in selection.notes)
+
+
+def test_tempo_bait_compared_case_insensitively(db):
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-CASE-T", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="Agilent"
+    )
+    normal = _sample(db, "TMP-CASE-N", bait_set="agilent")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal.id == normal.id
+
+
+def test_tempo_run_mode_buckets_novaseq_family(db):
+    """beagle buckets any 'novaseq' substring into one bucket, so
+    'NovaSeq X 1000' and 'NovaSeq 6000' pair (unlike the argos map)."""
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-BUCKET-T", tumor_or_normal=TumorOrNormal.TUMOR.value, run_mode="NovaSeq X 1000"
+    )
+    normal = _sample(db, "TMP-BUCKET-N", run_mode="NovaSeq 6000")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal.id == normal.id
+
+
+def test_tempo_gene_panel_is_not_a_key(db):
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-PANEL-T", tumor_or_normal=TumorOrNormal.TUMOR.value, gene_panel="PANEL-A"
+    )
+    normal = _sample(db, "TMP-PANEL-N", gene_panel="PANEL-B")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal.id == normal.id
+
+
+def test_tempo_sample_type_is_not_a_key(db):
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-TYPE-T", tumor_or_normal=TumorOrNormal.TUMOR.value, sample_type="Tumor"
+    )
+    normal = _sample(db, "TMP-TYPE-N", sample_type="Blood")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal.id == normal.id
+
+
+def test_tempo_scoped_to_patient(db):
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-SCOPE-T",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient_id="PATIENT-1",
+    )
+    _sample(db, "TMP-SCOPE-N", patient_id="PATIENT-2")
+    selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
+    assert selection.normal is None
+
+
+def test_tempo_select_matching_tumors_respects_soft_keys(db):
+    logic = _tempo_logic(db)
+    matching = _sample(
+        db, "TMP-MATCH-T1", tumor_or_normal=TumorOrNormal.TUMOR.value
+    )
+    wrong_bait = _sample(
+        db, "TMP-MATCH-T2", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-9"
+    )
+    normal = _sample(db, "TMP-MATCH-N")
+    tumors = strategies["tempo"].select_matching_tumors(db, normal, logic)
+    assert [t.id for t in tumors] == [matching.id]
+
+
+def test_tempo_trigger_pairing_automatic_keeps_historical(db):
+    """Service-level: an existing (historical) pairing is returned
+    unchanged on an automatic trigger."""
+    logic = _tempo_logic(db)
+    tumor = _sample(
+        db, "TMP-SVC-T", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-X"
+    )
+    normal = _sample(db, "TMP-SVC-N")
+    _tempo_pair(db, tumor, normal, logic)
+
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id == normal.id
+    assert result.trigger_type == "historical"

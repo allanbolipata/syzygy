@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import sqlalchemy as sa
 from sqlalchemy import Uuid
@@ -31,11 +31,21 @@ class Sample(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     primary_id: Mapped[str] = mapped_column(sa.String(255), index=True)
     cmo_sample_name: Mapped[str] = mapped_column(sa.String(255))
-    patient_id: Mapped[str] = mapped_column(sa.String(255), index=True)
+    # Nullable: shared (pooled) normals belong to no patient.
+    patient_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    request_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     sample_type: Mapped[str] = mapped_column(sa.String(255))
     gene_panel: Mapped[str] = mapped_column(sa.String(255))
     bait_set: Mapped[str] = mapped_column(sa.String(255))
     tumor_or_normal: Mapped[str] = mapped_column(sa.Enum("TUMOR", "NORMAL", name="tumor_or_normal"))
+    # Raw preservation data (e.g. ["FFPE"]) and sample origin (e.g.
+    # ["Fresh or Frozen"]); either a list or a scalar string. Resolved to
+    # ffpe/frozen at pairing time (see pairing_strategies.resolve_preservation).
+    preservation: Mapped[Optional[Any]] = mapped_column(sa.JSON, nullable=True)
+    sample_origin: Mapped[Optional[Any]] = mapped_column(sa.JSON, nullable=True)
+    # Raw run-mode / sequencer string (e.g. "NovaSeq X 1000"); normalized
+    # into a bucket at pairing time (see pairing_strategies.normalize_sequencer).
+    run_mode: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     additional_metadata: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     errors: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
     sequencing_date: Mapped[Optional[datetime]] = mapped_column(sa.DateTime(timezone=True), nullable=True)
@@ -53,6 +63,15 @@ class PairingTable(Base):
     tumor: Mapped[Sample] = relationship(foreign_keys=[tumor_id], lazy="joined")
     normal: Mapped[Sample] = relationship(foreign_keys=[normal_id], lazy="joined")
     pairing_logic_obj: Mapped[PairingLogic] = relationship(foreign_keys=[pairing_logic_id], lazy="joined")
+    # Keys that do not match on a forced (override) pairing; None/empty
+    # means the pair satisfies every matching key.
+    mismatched_keys: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
+    # Tier/selection notes from the strategy (which candidates were
+    # considered and why others were skipped); None when nothing notable.
+    notes: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
+    # How this pairing was created: "manual", "override", or
+    # "automatic"; legacy rows are None.
+    trigger_type: Mapped[Optional[str]] = mapped_column(sa.String(20), nullable=True)
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     latest: Mapped[bool] = mapped_column(sa.Boolean, default=True)

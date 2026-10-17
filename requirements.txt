@@ -4,6 +4,3 @@ SQLAlchemy==2.1.4
 pydantic==2.14.1
 pydantic-settings==2.15.0
 psycopg2-binary==2.9.13
-pytest==8.3.4
-testcontainers[postgres]==4.9.0
-alembic==1.20.0

@@ -15,10 +15,19 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        for name in ("TEMPO", "IMPACT", "ACCESS"):
+        for name, strategy in (
+            ("TEMPO", "tempo"),
+            ("CHRONOS", "tempo"),
+            ("IMPACT", "default"),
+            ("ACCESS", "default"),
+        ):
             existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
             if existing is None:
-                db.add(PairingLogic(name=name, strategy_name="default"))
+                db.add(PairingLogic(name=name, strategy_name=strategy))
+            elif existing.strategy_name != strategy:
+                # Self-heal rows created before the beagle-aligned
+                # strategies existed (e.g. TEMPO seeded as "default").
+                existing.strategy_name = strategy
         db.commit()
     finally:
         db.close()
@@ -34,6 +43,11 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
 
 app.include_router(samples_router, prefix="/v1")
 app.include_router(pairings_router, prefix="/v1")
