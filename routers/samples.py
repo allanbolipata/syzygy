@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from database import get_db, settings
-from models import PairingLogic, Sample
+from models import Sample
 from pairing_service import resolve_pairing_logic, trigger_pairing, trigger_pairing_for_normal
 from schemas import SampleCreate, SampleRead, TumorOrNormal
 
@@ -15,16 +15,12 @@ router = APIRouter(prefix="/sample", tags=["samples"])
 
 @router.post("/", response_model=SampleRead, status_code=201)
 def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
-    pairing_logic = resolve_pairing_logic(db, payload.pairing_logic_id, payload.pairing_logic_name)
-    if pairing_logic is None and settings.default_pairing_logic_name:
-        # An inactive default logic silently skips auto-pairing rather than
-        # failing sample creation.
-        pairing_logic = db.scalar(
-            select(PairingLogic).where(
-                PairingLogic.name == settings.default_pairing_logic_name,
-                PairingLogic.active.is_(True),
-            )
-        )
+    pairing_logic = resolve_pairing_logic(
+        db,
+        payload.pairing_logic_id,
+        payload.pairing_logic_name,
+        settings.default_pairing_logic_name,
+    )
 
     sample_data = payload.model_dump(exclude={"pairing_logic_id", "pairing_logic_name"})
     sample_data["tumor_or_normal"] = payload.tumor_or_normal.value

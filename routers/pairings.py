@@ -6,9 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from database import get_db
+from database import get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import resolve_pairing_logic, trigger_pairing
+from pairing_strategies import get_pairing_strategy
 from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal
 
 
@@ -20,10 +21,11 @@ SAMPLE_FILTER_FIELDS = (
     "primary_id",
     "cmo_sample_name",
     "patient_id",
+    "request_id",
     "sample_type",
     "gene_panel",
     "bait_set",
-    "tumor_or_normal",
+    "run_mode",
 )
 
 
@@ -36,9 +38,11 @@ def list_pairings(
     primary_id: Optional[str] = None,
     cmo_sample_name: Optional[str] = None,
     patient_id: Optional[str] = None,
+    request_id: Optional[str] = None,
     sample_type: Optional[str] = None,
     gene_panel: Optional[str] = None,
     bait_set: Optional[str] = None,
+    run_mode: Optional[str] = None,
     tumor_or_normal: Optional[TumorOrNormal] = None,
     created_after: Optional[datetime] = None,
     created_before: Optional[datetime] = None,
@@ -68,9 +72,11 @@ def list_pairings(
             ("primary_id", primary_id),
             ("cmo_sample_name", cmo_sample_name),
             ("patient_id", patient_id),
+            ("request_id", request_id),
             ("sample_type", sample_type),
             ("gene_panel", gene_panel),
             ("bait_set", bait_set),
+            ("run_mode", run_mode),
             ("tumor_or_normal", tumor_or_normal.value if tumor_or_normal is not None else None),
         )
         if value is not None
@@ -106,16 +112,40 @@ def list_pairings(
 
 
 @router.post("/trigger", response_model=PairingRead)
-def trigger_pairing_endpoint(payload: PairingTriggerCreate, db: Session = Depends(get_db)) -> PairingTable:
+def trigger_pairing_endpoint(
+    payload: PairingTriggerCreate,
+    db: Session = Depends(get_db),
+) -> PairingTable:
     tumor = db.get(Sample, payload.tumor_id)
     if tumor is None or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
         raise HTTPException(status_code=404, detail="Tumor sample not found")
 
-    pairing_logic = resolve_pairing_logic(db, payload.pairing_logic_id, payload.pairing_logic_name)
+    pairing_logic = resolve_pairing_logic(
+        db,
+        payload.pairing_logic_id,
+        payload.pairing_logic_name,
+        settings.default_pairing_logic_name,
+    )
     if pairing_logic is None:
-        raise HTTPException(status_code=400, detail="pairing_logic_id or pairing_logic_name is required")
+        raise HTTPException(
+            status_code=400,
+            detail="pairing_logic_id or pairing_logic_name is required",
+        )
 
-    pairing = trigger_pairing(db, tumor, pairing_logic, payload.trigger_type, payload.normal_id)
+    pairing = trigger_pairing(
+        db,
+        tumor,
+        pairing_logic,
+        payload.trigger_type,
+        payload.normal_id,
+        strict=payload.strict,
+    )
     if pairing is None:
-        raise HTTPException(status_code=404, detail="No valid pairing could be created")
+        detail = "No valid pairing could be created"
+        if payload.normal_id is None:
+            # Re-run the (read-only) selection to explain why, with tier notes.
+            selection = get_pairing_strategy(pairing_logic).select_latest_normal(db, tumor, pairing_logic)
+            if selection.notes:
+                detail += ": " + " | ".join(selection.notes)
+        raise HTTPException(status_code=404, detail=detail)
     return pairing

@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -13,8 +15,18 @@ router = APIRouter(prefix="/pairing-logic", tags=["pairing-logic"])
 
 
 @router.get("/", response_model=list[PairingLogicRead])
-def list_pairing_logic(db: Session = Depends(get_db)):
-    return db.scalars(select(PairingLogic)).all()
+def list_pairing_logic(
+    limit: Optional[int] = Query(None, ge=1),
+    offset: Optional[int] = Query(None, ge=0),
+    db: Session = Depends(get_db),
+):
+    # Stable ordering so limit/offset pagination is deterministic.
+    stmt = select(PairingLogic).order_by(PairingLogic.created_date.desc(), PairingLogic.id.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    return db.scalars(stmt).all()
 
 
 @router.post("/", response_model=PairingLogicRead, status_code=201)
