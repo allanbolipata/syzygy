@@ -2,9 +2,12 @@
 
 FastAPI + SQLAlchemy 2 service that pairs tumor and normal samples per
 patient using pluggable pairing logic. The default strategy (used by
-the seeded TEMPO, IMPACT, and ACCESS logics) pairs by request first,
-then within the patient; the `argos` strategy (WES) adds run-mode and
-preservation gating and a pooled-normal tier.
+the seeded IMPACT and ACCESS logics) pairs by request first, then
+within the patient; the `argos` strategy (WES) is aligned with
+beagle's ARGOS v2.3.0 pairing logic (run-mode buckets and a
+pooled-normal tier), and the `tempo` strategy (TEMPO_MPGEN / CHRONOS)
+is aligned with beagle's tempo_patient.py (historical-pairing tier
+first, then patient-wide bait/run-mode matching).
 
 ## Setup
 
@@ -70,8 +73,8 @@ builds it for new databases and never alters existing tables.
 - `GET /v1/pairing-logic?limit=&offset=` — list pairing logics,
   newest first.
 - `POST /v1/pairing-logic` — register a pairing logic. `strategy_name`
-  must be a registered strategy (`default`, `argos`; `IMPACT`,
-  `TEMPO`, and `ACCESS` are aliases of `default`). Payload fields:
+  must be a registered strategy (`default`, `argos`; `IMPACT`/`ACCESS`
+  alias `default`, `TEMPO`/`CHRONOS` alias `tempo`). Payload fields:
   `name`, `description` (optional), `active` (default `true`),
   `strategy_name`, and `config` (optional per-logic strategy settings,
   see Pairing strategies). Duplicate names are rejected with 409.
@@ -79,31 +82,44 @@ builds it for new databases and never alters existing tables.
 ## Pairing strategies
 
 Strategies are registered in `pairing_strategies.py` and selected per
-pairing logic via `PairingLogic.strategy_name`.
+pairing logic via `PairingLogic.strategy_name`; a logic's `config`
+dict customizes the strategy at use time.
 
-- `default` — request-first cascade: candidates are first restricted to
-  the tumor's own `request_id`, then widened to other requests of the
-  same patient. Matching requires the same `sample_type`, `gene_panel`,
-  and `bait_set`; the latest matching normal wins (tie-break on
-  `sequencing_date`, then `id`). `IMPACT`, `TEMPO`, and `ACCESS`
-  register as aliases of this strategy.
-- `argos` — extends `default` with:
+- `default` — patient-scoped matching on hard keys
+  (`patient_id`, `sample_type`, `gene_panel`, `bait_set`) with a
+  request-first cascade: normals ingested under the tumor's own
+  `request_id` are preferred, then all other normals of the same
+  patient; the latest matching `sequencing_date` wins (tie-break on
+  `created_date`, then `id`). `IMPACT` and `ACCESS` register as
+  aliases of this strategy.
+- `argos` — WES strategy aligned with beagle's ARGOS pairing logic
+  (v2.3.0). Hard keys are (`patient_id`, `gene_panel`, `bait_set`);
+  `sample_type` and preservation are not matching keys (beagle v2.3.0
+  never gates on them; both remain stored on the sample). Extends
+  `default` with:
   - **run-mode gating** — raw `run_mode` strings are normalized to
-    buckets (default map: "NovaSeq X" → `novaseq_x`, "Hiseq" →
-    `hiseq`, "NovaSeq 6000" → `novaseq_6000`) and must be equal on
-    both sides.
-  - **preservation gating** — `preservation`/`sample_origin` are
-    resolved to `ffpe`/`frozen` (fail-safe: unresolvable values make
-    the candidate ineligible, per the investigators' "both empty means
-    fail" rule), and must be equal on both sides.
+    buckets (default map: "novaseq x" → `novaseq_x`, "novaseq" →
+    `novaseq`, "hiseq" → `hiseq`) and must be equal on both sides.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,
     default `["Pooled Normal"]`) are considered across patients,
-    matched on `gene_panel` + `bait_set` + resolved preservation;
-    run mode is enforced only when the pooled sample carries one
-    (run/machine data is not tracked for pooled samples).
+    matched on `gene_panel` + `bait_set`; run mode is enforced only
+    when the pooled sample carries one (run/machine data is not
+    tracked for pooled samples).
   - Per-logic config keys: `run_mode_map` (raw substring → bucket,
     checked in order) and `pooled_sample_types`.
+- `tempo` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's
+  `tempo_patient.py`. A historical tier first: the tumor's existing
+  latest pairing for the logic (syzygy's equivalent of beagle's
+  `pre_pairing` / `pairing.tsv`) is retained by identity with
+  bait/run-mode checks bypassed, and there is no fallback when the
+  historical normal is missing. Then patient-wide matching on
+  `bait_set` (case-insensitive) and run-mode bucket (default map:
+  "novaseq" → `novaseq`, "hiseq" → `hiseq`; both "NovaSeq X 1000"
+  and "NovaSeq 6000" land in `novaseq`); the latest `sequencing_date`
+  wins. No request cascade, no pooled tier; `gene_panel` and
+  `sample_type` are not keys. `TEMPO` and `CHRONOS` register as
+  aliases of this strategy.
 
 ## Tests
 

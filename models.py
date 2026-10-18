@@ -44,7 +44,7 @@ class Sample(Base):
     preservation: Mapped[Optional[Any]] = mapped_column(sa.JSON, nullable=True)
     sample_origin: Mapped[Optional[Any]] = mapped_column(sa.JSON, nullable=True)
     # Raw run-mode / sequencer string (e.g. "NovaSeq X 1000"); normalized
-    # into a bucket at pairing time (see pairing_strategies.normalize_sequencer).
+    # into a bucket at pairing time (see pairing_strategies.normalize_run_mode).
     run_mode: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     additional_metadata: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     errors: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
