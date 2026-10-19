@@ -36,7 +36,8 @@ class Sample(Base):
     request_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     sample_type: Mapped[str] = mapped_column(sa.String(255))
     gene_panel: Mapped[str] = mapped_column(sa.String(255))
-    bait_set: Mapped[str] = mapped_column(sa.String(255))
+    # Nullable: DMP samples carry no bait-set key.
+    bait_set: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     tumor_or_normal: Mapped[str] = mapped_column(sa.Enum("TUMOR", "NORMAL", name="tumor_or_normal"))
     # Raw preservation data (e.g. ["FFPE"]) and sample origin (e.g.
     # ["Fresh or Frozen"]); either a list or a scalar string. Resolved to
