@@ -59,6 +59,34 @@ tempo
 both
     Loads both datasets and validates both.
 
+dmp
+    Loads beagle's DMP fixture (file_system/fixtures/DMP_data.json) and
+    translates the DMP-schema records into Sample rows via
+    dmp_translator.to_dmp_sample_kwargs:
+
+        sample          -> primary_id
+        external_id     -> cmo_sample_name
+        patient.cmo     -> patient_id ("C-" prefixed)
+        cmo_assay       -> gene_panel (fallback: ASSAY_MAPPING[assay])
+        type T/N        -> tumor_or_normal (TUMOR / NORMAL)
+        "DMP"           -> sample_type (provenance marker)
+        coverage and    -> additional_metadata (allowlisted only)
+        contamination
+
+    anon_id is never stored (security); patient.dmp, project_name, and
+    DMP's 1/0 metastasis flag are deferred to a later additional_metadata
+    change. The fixture holds four unique tumor records (type "T"; eight
+    file records, two per sample across two file groups -- duplicates are
+    merged): P-0001231/2 -> C-EXAMPLE4, P-0001234/5 -> C-EXAMPLE3, all
+    IMPACT468. There are no DMP normals in the fixture, so every DMP
+    tumor is expected to stay unpaired: DMP pairing is manual (the
+    operator pins a DMP normal via POST /pairing/trigger with an explicit
+    normal_id), and the automatic argos cascade does not select DMP
+    samples.
+
+all
+    Loads all three datasets and validates all.
+
 Field mapping (beagle filemetadata -> syzygy Sample, argos scenario)
 --------------------------------------------------------------------
     primaryId            -> primary_id
@@ -142,6 +170,11 @@ DEFAULT_BEAGLE_FIXTURES = (
     "beagle_checkout/fixtures/tests"
 )
 CANONICAL_FIXTURES = ["REQ_A", "REQ_A_2", "REQ_A_3", "REQ_A_4", "REQ_B"]
+DEFAULT_DMP_FIXTURE = (
+    "/path/to/"
+    "EXAMPLE-ORG/work/dev/"
+    "beagle_checkout/file_system/fixtures/DMP_data.json"
+)
 
 # Ground truth: beagle v2.3.0 test_pair_request.py, merged five-fixture DB.
 EXPECTED_PAIRS: dict[str, tuple[str, str]] = {
@@ -153,6 +186,15 @@ EXPECTED_PAIRS: dict[str, tuple[str, str]] = {
 }
 EXPECTED_UNPAIRED_NORMALS = {
     "REQ_A_2_3": "no tumor selects it in the merged dataset",
+}
+
+# DMP fixture: every record is a type "T" tumor; there are no DMP normals
+# in the fixture and DMP pairing is manual, so none of them pair.
+EXPECTED_DMP_UNPAIRED = {
+    "P-0001231-T01-IM6": "no normals in fixture; DMP pairing is manual",
+    "P-0001232-T01-IM6": "no normals in fixture; DMP pairing is manual",
+    "P-0001234-T01-IM6": "no normals in fixture; DMP pairing is manual",
+    "P-0001235-T01-IM6": "no normals in fixture; DMP pairing is manual",
 }
 
 # ---------------------------------------------------------------------------
@@ -300,6 +342,36 @@ def merge_samples(rows: list[dict]) -> tuple[dict[str, dict], int]:
     return samples, merged_anon
 
 
+def load_dmp_rows(path: str) -> tuple[list[dict], dict[str, dict], int]:
+    """Parse a beagle DMP dump into unique DMP records keyed by ``sample``.
+
+    Returns (all_records, samples, duplicate_count). Duplicate records
+    (the same ``sample`` id appearing in multiple file groups) are
+    merged, first non-null value wins.
+    """
+    with open(path) as f:
+        dump = json.load(f)
+    records = [
+        obj["fields"]["metadata"]
+        for obj in dump
+        if obj.get("model") == "file_system.filemetadata"
+    ]
+    samples: dict[str, dict] = {}
+    dupes = 0
+    for meta in records:
+        sid = meta.get("sample")
+        if not sid:
+            continue
+        if sid in samples:
+            dupes += 1
+            for k, v in meta.items():
+                if v not in (None, "") and samples[sid].get(k) in (None, ""):
+                    samples[sid][k] = v
+        else:
+            samples[sid] = dict(meta)
+    return records, samples, dupes
+
+
 def to_sample_kwargs(pid: str, m: dict) -> dict:
     gene_panel = m.get("genePanel") or (m.get("requestMetadata") or {}).get("genePanel")
     sample_type = m.get("sampleClass") or m.get("specimenType") or m.get("sampleType")
@@ -371,7 +443,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fixtures-dir", default=DEFAULT_BEAGLE_FIXTURES,
                     help="beagle fixtures/tests directory")
-    ap.add_argument("--scenario", choices=["argos", "tempo", "both"], default="argos",
+    ap.add_argument("--dmp-fixture", default=DEFAULT_DMP_FIXTURE,
+                    help="beagle DMP_data.json path")
+    ap.add_argument("--scenario", choices=["argos", "tempo", "dmp", "both", "all"],
+                    default="argos",
                     help="dataset(s) to load and validate")
     ap.add_argument("--skip-validate", action="store_true",
                     help="load data only; do not compare against expected pairs")
@@ -382,11 +457,13 @@ def main() -> int:
         sys.path.insert(0, repo)
 
     from database import Base, SessionLocal, engine
+    from dmp_translator import to_dmp_sample_kwargs
     from models import PairingLogic, PairingTable, Sample
     from pairing_service import trigger_pairing  # noqa: F811  (rebind global)
 
-    want_argos = args.scenario in ("argos", "both")
-    want_tempo = args.scenario in ("tempo", "both")
+    want_argos = args.scenario in ("argos", "both", "all")
+    want_tempo = args.scenario in ("tempo", "both", "all")
+    want_dmp = args.scenario in ("dmp", "all")
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -416,6 +493,7 @@ def main() -> int:
 
         argos_samples: list[Sample] = []
         tempo_samples: list[Sample] = []
+        dmp_samples: list[Sample] = []
 
         if want_argos:
             rows = load_fixture_rows(args.fixtures_dir, CANONICAL_FIXTURES)
@@ -454,6 +532,18 @@ def main() -> int:
                   f"(7 patients, 13 requests; cases A-G) + "
                   f"{len(TEMPO_HISTORICAL_PAIRINGS)} historical pairings")
 
+        if want_dmp:
+            dmp_records, dmp, dupes = load_dmp_rows(args.dmp_fixture)
+            print(f"[dmp] Parsed {len(dmp_records)} DMP records -> "
+                  f"{len(dmp)} unique samples ({dupes} duplicates merged)")
+            for sid in sorted(dmp):
+                kwargs = to_dmp_sample_kwargs(sid, dmp[sid])
+                s = Sample(**kwargs)
+                db.add(s)
+                db.commit()
+                db.refresh(s)
+                dmp_samples.append(s)
+
         if want_argos:
             pair_count = _trigger(db, argos_samples, logics["argos"], "argos")
             print(f"[argos] Loaded {len(argos_samples)} samples, created {pair_count} pairings.")
@@ -461,6 +551,9 @@ def main() -> int:
             pair_count = _trigger(db, tempo_samples, logics["TEMPO"], "tempo",
                                   trigger_type="manual")
             print(f"[tempo] Loaded {len(tempo_samples)} samples, created {pair_count} pairings.")
+        if want_dmp:
+            pair_count = _trigger(db, dmp_samples, logics["argos"], "dmp")
+            print(f"[dmp] Loaded {len(dmp_samples)} samples, created {pair_count} pairings.")
         db.commit()
 
         if args.skip_validate:
@@ -472,6 +565,8 @@ def main() -> int:
                 exit_code |= validate(db, argos_samples, logics["argos"])
             if want_tempo:
                 exit_code |= validate_tempo(db, tempo_samples, logics["TEMPO"])
+            if want_dmp:
+                exit_code |= validate_dmp(db, dmp_samples)
     finally:
         db.close()
         engine.dispose()
@@ -564,6 +659,73 @@ def validate_tempo(db, tempo_samples: list, tempo_logic) -> int:
 
     total = n_pass + n_fail
     print(f"\n{n_pass}/{total} expectations match beagle ground truth.")
+    return 0 if n_fail == 0 else 1
+
+
+def validate_dmp(db, dmp_samples: list) -> int:
+    """Validate the DMP ingestion scenario.
+
+    * Every DMP tumor stays unpaired: the fixture holds no DMP normals,
+      and DMP pairing is manual (operator pins a normal via
+      POST /pairing/trigger with an explicit normal_id).
+    * Security: no excluded DMP identifiers (anon_id, patient.dmp,
+      project_name, sample_type.dmp) are persisted anywhere.
+    * Translation spot-checks on the fixture's four tumor records.
+    """
+    from models import PairingTable, Sample
+
+    n_pass = n_fail = 0
+
+    for s in dmp_samples:
+        p = db.query(PairingTable).filter_by(tumor_id=s.id, latest=True).first()
+        if p is None:
+            n_pass += 1
+            print(f"  [PASS]    tumor {s.primary_id:>17} -> unpaired  # {EXPECTED_DMP_UNPAIRED[s.primary_id]}")
+        else:
+            n_fail += 1
+            print(f"  [FAIL]    tumor {s.primary_id:>17} -> {p.normal_id} (expected unpaired)")
+
+    excluded_keys = ("anon_id", "patient.dmp", "project_name", "sample_type.dmp")
+    violations = [
+        (s.primary_id, key)
+        for s in db.query(Sample).all()
+        for key in excluded_keys
+        if key in (s.additional_metadata or {})
+    ]
+    if violations:
+        for pid, key in violations:
+            n_fail += 1
+            print(f"  [FAIL]    sample {pid} stores excluded key {key!r}")
+    else:
+        n_pass += 1
+        print("  [PASS]    no excluded DMP identifiers persisted "
+              "(anon_id, patient.dmp, project_name, sample_type.dmp)")
+
+    checks = [
+        ("P-0001231-T01-IM6", "C-EXAMPLE4", "IMPACT468", "TUMOR"),
+        ("P-0001232-T01-IM6", "C-EXAMPLE4", "IMPACT468", "TUMOR"),
+        ("P-0001234-T01-IM6", "C-EXAMPLE3", "IMPACT468", "TUMOR"),
+        ("P-0001235-T01-IM6", "C-EXAMPLE3", "IMPACT468", "TUMOR"),
+    ]
+    by_pid = {s.primary_id: s for s in dmp_samples}
+    for pid, patient, panel, ton in checks:
+        s = by_pid.get(pid)
+        if s is None:
+            n_fail += 1
+            print(f"  [FAIL]    missing DMP sample {pid}")
+            continue
+        expected = (patient, panel, ton, "DMP")
+        got = (s.patient_id, s.gene_panel, s.tumor_or_normal, s.sample_type)
+        if got == expected:
+            n_pass += 1
+            print(f"  [PASS]    {pid:>17}: patient_id={s.patient_id} gene_panel={s.gene_panel} "
+                  f"tumor_or_normal={s.tumor_or_normal} sample_type={s.sample_type}")
+        else:
+            n_fail += 1
+            print(f"  [FAIL]    {pid:>17}: got {got} (expected {expected})")
+
+    total = n_pass + n_fail
+    print(f"\n{n_pass}/{total} DMP expectations met.")
     return 0 if n_fail == 0 else 1
 
 

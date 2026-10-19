@@ -19,7 +19,8 @@ class SampleCreate(BaseModel):
     request_id: Optional[str] = None
     sample_type: str
     gene_panel: str
-    bait_set: str
+    # Optional: DMP samples carry no bait-set key.
+    bait_set: Optional[str] = None
     tumor_or_normal: TumorOrNormal
     # Raw run-mode / sequencer string (e.g. "NovaSeq X 1000"); normalized
     # into a bucket at pairing time (argos strategy).
@@ -46,7 +47,7 @@ class SampleRead(BaseModel):
     request_id: Optional[str] = None
     sample_type: str
     gene_panel: str
-    bait_set: str
+    bait_set: Optional[str] = None
     tumor_or_normal: TumorOrNormal
     run_mode: Optional[str] = None
     preservation: Optional[Any] = None
