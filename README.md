@@ -48,6 +48,17 @@ builds it for new databases and never alters existing tables.
   `preservation` and `sample_origin` (raw preservation data, e.g.
   `["FFPE"]` or `"Fresh or Frozen"`), and `sequencing_date`.
 - `GET /v1/sample?limit=&offset=` — list samples, newest first.
+- `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
+  match (latest pairing for the selected logic) plus all potential
+  matches. Candidates are same-patient normals/tumors, plus pooled
+  normals for strategies with a pooled tier (`argos`). Each candidate
+  reports its cascade tier (`same_request`, `other_request`, `pooled`),
+  whether it passes every matching key (`matched`), and the reasons it
+  does not (`mismatched_keys`); for a tumor, `would_be_selected` marks
+  the candidate the strategy cascade would pick. Supports manual
+  pairing (e.g. pinning a DMP normal via `POST /v1/pairing/trigger`).
+  Optional `pairing_logic_id` / `pairing_logic_name` selects the logic;
+  otherwise the `DEFAULT_PAIRING_LOGIC_NAME` logic is used.
 - `POST /v1/pairing/trigger` — create or override a pairing for a
   tumor. `trigger_type` is `manual`, `automatic`, or `override`.
   `normal_id` pins a specific normal sample: with it, the normal is
