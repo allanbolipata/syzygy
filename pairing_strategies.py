@@ -144,6 +144,9 @@ class NormalSelection:
 
 
 class PairingStrategy(Protocol):
+    # Whether the strategy offers a pooled-normal tier (argos does).
+    HAS_POOLED_TIER: bool
+
     def matches(self, tumor: Sample, normal: Sample) -> bool:
         ...
 
@@ -167,6 +170,12 @@ class PairingStrategy(Protocol):
         ...
 
     def with_config(self, config: dict) -> "PairingStrategy":
+        ...
+
+    def _pooled_types(self) -> List[str]:
+        ...
+
+    def _is_pooled(self, sample: Sample) -> bool:
         ...
 
 
@@ -193,12 +202,21 @@ class DefaultPairingStrategy:
     # Sample attributes that must match on both sides of a pairing.
     # Overridden by strategies that align with other operators (argos).
     HARD_KEYS: tuple = ("patient_id", "sample_type", "gene_panel", "bait_set")
+    # Whether the strategy offers a pooled-normal tier (argos does).
+    HAS_POOLED_TIER: bool = False
 
     def __init__(self, config: Optional[dict] = None):
         self.config = dict(config or {})
 
     def with_config(self, config: dict) -> "PairingStrategy":
         return type(self)(config=dict(config or {}))
+
+    def _pooled_types(self) -> List[str]:
+        raw = self.config.get("pooled_sample_types") or DEFAULT_POOLED_SAMPLE_TYPES
+        return [str(t).lower() for t in raw]
+
+    def _is_pooled(self, sample: Sample) -> bool:
+        return False
 
     # -- matching -------------------------------------------------------
 
@@ -357,10 +375,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     """
 
     HARD_KEYS: tuple = ("patient_id", "gene_panel", "bait_set")
-
-    def _pooled_types(self) -> List[str]:
-        raw = self.config.get("pooled_sample_types") or DEFAULT_POOLED_SAMPLE_TYPES
-        return [str(t).lower() for t in raw]
+    HAS_POOLED_TIER: bool = True
 
     def _run_mode_map(self) -> Dict[str, str]:
         return self.config.get("run_mode_map") or DEFAULT_RUN_MODE_MAP

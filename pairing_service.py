@@ -1,8 +1,9 @@
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -202,3 +203,116 @@ def trigger_pairing_for_normal(
             trigger_type="automatic",
             notes=selection.notes or None,
         )
+
+
+def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
+    """The sample's current pairing and all potential matches.
+
+    Candidates are every opposite-type sample the strategy's keys can
+    reach: same-patient normals/tumors, plus pooled normals for
+    strategies with a pooled tier (argos). Each candidate is evaluated
+    with the strategy's ``mismatch_reasons``: ``matched`` is true when
+    it would pass every matching key; otherwise ``mismatched_keys``
+    lists the reasons it does not. For a tumor input,
+    ``would_be_selected`` marks the candidate the strategy's cascade
+    would pick. Used to support manual pairing (e.g. pinning a DMP
+    normal via POST /pairing/trigger).
+    """
+    strategy = get_pairing_strategy(logic)
+    is_tumor = sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+
+    # Current match: the latest pairing row with this sample on either
+    # side.
+    if is_tumor:
+        row = _get_latest_pairing(db, sample.id, logic.id)
+        counterpart = db.get(Sample, row.normal_id) if row else None
+    else:
+        row = db.scalar(
+            select(PairingTable).where(
+                PairingTable.normal_id == sample.id,
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest == True,
+            )
+        )
+        counterpart = db.get(Sample, row.tumor_id) if row else None
+
+    # Candidate scope: same-patient opposite-type samples, plus pooled
+    # normals (pooled-tier strategies) for a tumor.
+    if is_tumor:
+        conds = [Sample.tumor_or_normal == TumorOrNormal.NORMAL.value]
+        if sample.patient_id is not None:
+            conds.append(Sample.patient_id == sample.patient_id)
+        candidates = list(db.scalars(select(Sample).where(*conds)).all())
+        if strategy.HAS_POOLED_TIER:
+            candidates.extend(
+                db.scalars(
+                    select(Sample).where(
+                        Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
+                        Sample.patient_id.is_(None),
+                        func.lower(Sample.sample_type).in_(strategy._pooled_types()),
+                    )
+                ).all()
+            )
+    else:
+        if sample.patient_id is None and not strategy.HAS_POOLED_TIER:
+            candidates = []
+        else:
+            conds = [Sample.tumor_or_normal == TumorOrNormal.TUMOR.value]
+            if sample.patient_id is not None:
+                conds.append(Sample.patient_id == sample.patient_id)
+            candidates = list(db.scalars(select(Sample).where(*conds)).all())
+
+    winner = (
+        strategy.select_latest_normal(db, sample, logic).normal
+        if is_tumor
+        else None
+    )
+
+    tier_rank = {"same_request": 0, "other_request": 1, "pooled": 2}
+    others: list[dict] = []
+    for cand in candidates:
+        if counterpart is not None and cand.id == counterpart.id:
+            continue
+        tumor, normal = (sample, cand) if is_tumor else (cand, sample)
+        if strategy.HAS_POOLED_TIER and strategy._is_pooled(normal):
+            tier = "pooled"
+        elif normal.request_id is not None and normal.request_id == tumor.request_id:
+            tier = "same_request"
+        else:
+            tier = "other_request"
+        reasons = strategy.mismatch_reasons(tumor, normal)
+        others.append(
+            {
+                "sample": cand,
+                "tier": tier,
+                "matched": not reasons,
+                "mismatched_keys": reasons or None,
+                "would_be_selected": winner is not None and cand.id == winner.id,
+            }
+        )
+    others.sort(
+        key=lambda c: (
+            tier_rank[c["tier"]],
+            0 if c["matched"] else 1,
+            c["sample"].sequencing_date is None,
+            c["sample"].sequencing_date or datetime.min,
+            c["sample"].primary_id,
+        )
+    )
+
+    current_match = None
+    if row is not None and counterpart is not None:
+        current_match = {
+            "pairing_id": row.id,
+            "trigger_type": row.trigger_type,
+            "mismatched_keys": row.mismatched_keys,
+            "notes": row.notes,
+            "sample": counterpart,
+        }
+
+    return {
+        "sample": sample,
+        "pairing_logic": logic.name,
+        "current_match": current_match,
+        "other_matches": others,
+    }

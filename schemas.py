@@ -103,7 +103,7 @@ class PairingRead(BaseModel):
     normal_id: UUID
     tumor: SampleRead
     normal: SampleRead
-    # How the pairing was created: "manual", "override", or "automatic"
+    # How this pairing was created: "manual", "override" or "automatic"
     # (legacy rows: None).
     trigger_type: Optional[str] = None
     # Keys that did not match on a forced (override) pairing.
@@ -113,3 +113,38 @@ class PairingRead(BaseModel):
     created_date: datetime
     modified_date: datetime
     latest: bool
+
+
+class PossibleMatchCandidate(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    sample: SampleRead
+    # Cascade tier the candidate would be considered in: "same_request",
+    # "other_request", or "pooled".
+    tier: str
+    # True when the candidate passes every matching key of the strategy.
+    matched: bool
+    # Why the candidate does not match (empty when ``matched`` is true).
+    mismatched_keys: Optional[list[str]] = None
+    # For a tumor input: True when the strategy's cascade would pick this
+    # candidate (False for normal inputs).
+    would_be_selected: bool = False
+
+
+class CurrentMatchRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    pairing_id: UUID
+    trigger_type: Optional[str] = None
+    mismatched_keys: Optional[list[str]] = None
+    notes: Optional[list[str]] = None
+    sample: SampleRead
+
+
+class PossibleMatchesRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    sample: SampleRead
+    pairing_logic: str
+    current_match: Optional[CurrentMatchRead] = None
+    other_matches: list[PossibleMatchCandidate]
