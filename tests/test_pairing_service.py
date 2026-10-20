@@ -62,6 +62,14 @@ class CustomPairingStrategy:
     def with_config(self, config: dict) -> "CustomPairingStrategy":
         return self
 
+    HAS_POOLED_TIER = False
+
+    def _pooled_types(self) -> list:
+        return ["pooled normal"]
+
+    def _is_pooled(self, sample: Sample) -> bool:
+        return False
+
 
 def _try_docker_engine():
     """Attempt to create a PostgreSQL engine via testcontainers. Returns None on failure."""

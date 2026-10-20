@@ -1,13 +1,19 @@
 from typing import Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from database import get_db, settings
 from models import Sample
-from pairing_service import resolve_pairing_logic, trigger_pairing, trigger_pairing_for_normal
-from schemas import SampleCreate, SampleRead, TumorOrNormal
+from pairing_service import (
+    possible_matches,
+    resolve_pairing_logic,
+    trigger_pairing,
+    trigger_pairing_for_normal,
+)
+from schemas import PossibleMatchesRead, SampleCreate, SampleRead, TumorOrNormal
 
 
 router = APIRouter(prefix="/sample", tags=["samples"])
@@ -50,3 +56,35 @@ def list_samples(
     if offset is not None:
         stmt = stmt.offset(offset)
     return db.scalars(stmt).all()
+
+
+@router.get("/{sample_id}/possible-matches", response_model=PossibleMatchesRead)
+def possible_matches_endpoint(
+    sample_id: UUID,
+    pairing_logic_id: Optional[UUID] = None,
+    pairing_logic_name: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """The sample's current match and all potential matches.
+
+    Candidates are every opposite-type sample the strategy's keys can
+    reach (same-patient normals/tumors, plus pooled normals for
+    strategies with a pooled tier). Each candidate reports its cascade
+    tier, whether it passes every matching key (``matched``), and the
+    reasons it does not (``mismatched_keys``). For a tumor input,
+    ``would_be_selected`` marks the candidate the strategy's cascade
+    would pick. Supports manual pairing (e.g. pinning a DMP normal via
+    POST /pairing/trigger).
+    """
+    sample = db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    logic = resolve_pairing_logic(
+        db,
+        pairing_logic_id,
+        pairing_logic_name,
+        settings.default_pairing_logic_name,
+    )
+    if logic is None:
+        raise HTTPException(status_code=400, detail="No active pairing logic found")
+    return possible_matches(db, sample, logic)
