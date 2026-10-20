@@ -1,0 +1,12 @@
+.git
+.gitignore
+.python-version
+.aider*
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+tests/
+README.md
+requirements-dev.txt
