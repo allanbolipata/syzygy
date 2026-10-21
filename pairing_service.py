@@ -17,6 +17,26 @@ def _ensure_active(logic: PairingLogic) -> None:
         raise HTTPException(status_code=400, detail=f"Pairing logic '{logic.name}' is not active")
 
 
+# Pairing-logic names that alias a canonical row. IMPACT is the assay the
+# ARGOS pipeline sequences, so IMPACT data is paired by the ARGOS logic;
+# CHRONOS data is paired by the TEMPO logic. An exact-name match always
+# wins; the alias is only consulted when no row carries the given name.
+PAIRING_LOGIC_ALIASES: dict[str, str] = {
+    "IMPACT": "ARGOS",
+    "CHRONOS": "TEMPO",
+}
+
+
+def find_logic_by_name(db: Session, name: str) -> Optional[PairingLogic]:
+    """Exact pairing-logic name lookup with alias fallback."""
+    logic = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
+    if logic is None and name in PAIRING_LOGIC_ALIASES:
+        logic = db.scalar(
+            select(PairingLogic).where(PairingLogic.name == PAIRING_LOGIC_ALIASES[name])
+        )
+    return logic
+
+
 def resolve_pairing_logic(
     db: Session,
     pairing_logic_id: Optional[UUID] = None,
@@ -29,11 +49,11 @@ def resolve_pairing_logic(
         if logic is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
     elif pairing_logic_name is not None:
-        logic = db.scalar(select(PairingLogic).where(PairingLogic.name == pairing_logic_name))
+        logic = find_logic_by_name(db, pairing_logic_name)
         if logic is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
     elif default_name is not None:
-        logic = db.scalar(select(PairingLogic).where(PairingLogic.name == default_name))
+        logic = find_logic_by_name(db, default_name)
         if logic is None or not logic.active:
             return None
 

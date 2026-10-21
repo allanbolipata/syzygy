@@ -280,6 +280,25 @@ def test_matches_false_different_bait_set(db, tumor_sample):
     db.refresh(normal)
     assert strategies["default"].matches(tumor_sample, normal) is False
 
+
+def test_matches_ignores_sample_type(db, tumor_sample):
+    # sample_type is not a pairing key (aligned with beagle v2.3.0);
+    # a blood normal still matches a tissue tumor on the hard keys.
+    normal = Sample(
+        primary_id="NORMAL-BLOOD-1",
+        cmo_sample_name="Normal Blood 1",
+        patient_id="PATIENT-001",
+        sample_type="blood",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+    )
+    db.add(normal)
+    db.commit()
+    db.refresh(normal)
+    assert strategies["default"].matches(tumor_sample, normal) is True
+
+
 def test_select_latest_normal_returns_most_recent(db, tumor_sample, normal_sample, older_normal_sample):
     assert (
         strategies["default"].select_latest_normal(db, tumor_sample).normal.id
@@ -536,8 +555,9 @@ def test_default_cascade_notes_record_empty_tiers(db):
     tumor = _sample(
         db, "TUMOR-REQ-4", tumor_or_normal=TumorOrNormal.TUMOR.value, request_id="REQ-9"
     )
-    # A blood-type normal under REQ-9 is not a candidate (base-key filter).
-    _sample(db, "NORM-REQ-4A", request_id="REQ-9", sample_type="blood")
+    # A normal under REQ-9 with a different gene panel is not a candidate
+    # (base-key filter).
+    _sample(db, "NORM-REQ-4A", request_id="REQ-9", gene_panel="PANEL-B")
     other = _sample(db, "NORM-REQ-4B", request_id="REQ-8")
     selection = strategies["default"].select_latest_normal(db, tumor)
     assert selection.normal.id == other.id
@@ -884,7 +904,7 @@ def test_get_pairing_strategy_default(db):
 
 def test_get_pairing_strategy_known_aliases(db):
     for strategy_name, expected in (
-        ("IMPACT", "default"),
+        ("IMPACT", "argos"),
         ("ACCESS", "default"),
         ("TEMPO", "tempo"),
         ("CHRONOS", "tempo"),
@@ -1144,6 +1164,48 @@ def test_resolve_pairing_logic_inactive_by_id(db):
         resolve_pairing_logic(db, pairing_logic_id=logic.id)
     assert exc.value.status_code == 400
     assert "not active" in exc.value.detail
+
+
+def test_resolve_pairing_logic_alias_falls_back_to_canonical(db):
+    # No row named "IMPACT": the alias resolves to the ARGOS row.
+    argos = PairingLogic(name="ARGOS", strategy_name="argos")
+    db.add(argos)
+    db.commit()
+    db.refresh(argos)
+    logic = resolve_pairing_logic(db, pairing_logic_name="IMPACT")
+    assert logic is not None
+    assert logic.id == argos.id
+    assert logic.name == "ARGOS"
+
+
+def test_resolve_pairing_logic_chronos_alias(db):
+    tempo = PairingLogic(name="TEMPO", strategy_name="tempo")
+    db.add(tempo)
+    db.commit()
+    db.refresh(tempo)
+    logic = resolve_pairing_logic(db, pairing_logic_name="CHRONOS")
+    assert logic is not None
+    assert logic.id == tempo.id
+
+
+def test_resolve_pairing_logic_exact_name_wins_over_alias(db):
+    # A row literally named "IMPACT" (e.g. pre-migration data) wins over
+    # the alias: the canonical ARGOS row must not shadow it.
+    impact = PairingLogic(name="IMPACT", strategy_name="argos")
+    argos = PairingLogic(name="ARGOS", strategy_name="argos")
+    db.add_all([impact, argos])
+    db.commit()
+    db.refresh(impact)
+    logic = resolve_pairing_logic(db, pairing_logic_name="IMPACT")
+    assert logic is not None
+    assert logic.id == impact.id
+
+
+def test_resolve_pairing_logic_alias_unknown(db):
+    # Neither the alias nor the canonical row exists: 404.
+    with pytest.raises(HTTPException) as exc:
+        resolve_pairing_logic(db, pairing_logic_name="IMPACT")
+    assert exc.value.status_code == 404
 
 
 def test_trigger_pairing_endpoint_inactive_logic(db, tumor_sample):
