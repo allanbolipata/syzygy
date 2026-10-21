@@ -19,9 +19,8 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         for name, strategy in (
+            ("ARGOS", "argos"),
             ("TEMPO", "tempo"),
-            ("CHRONOS", "tempo"),
-            ("IMPACT", "default"),
             ("ACCESS", "default"),
         ):
             existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))

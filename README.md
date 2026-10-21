@@ -1,13 +1,14 @@
 # Syzygy — Sample Pairing Service
 
 FastAPI + SQLAlchemy 2 service that pairs tumor and normal samples per
-patient using pluggable pairing logic. The default strategy (used by
-the seeded IMPACT and ACCESS logics) pairs by request first, then
-within the patient; the `argos` strategy (WES) is aligned with
-beagle's ARGOS v2.3.0 pairing logic (run-mode buckets and a
-pooled-normal tier), and the `tempo` strategy (TEMPO_MPGEN / CHRONOS)
-is aligned with beagle's tempo_patient.py (historical-pairing tier
-first, then patient-wide bait/run-mode matching).
+patient using pluggable pairing logic. The `argos` strategy (used by
+the seeded ARGOS logic, which also serves IMPACT data via name alias)
+is aligned with beagle's ARGOS v2.3.0 pairing logic (run-mode buckets
+and a pooled-normal tier); the `tempo` strategy (seeded TEMPO logic,
+which also serves CHRONOS data via name alias) is aligned with
+beagle's tempo_patient.py (historical-pairing tier first, then
+patient-wide bait/run-mode matching); and the `default` strategy
+(seed: ACCESS) pairs by request first, then within the patient.
 
 ## Setup
 
@@ -32,8 +33,10 @@ Configuration comes from environment variables or a local `.env` file
     uvicorn main:app --reload
 
 At startup the app creates any missing tables and seeds the default
-pairing logics. `models.py` defines the complete schema; `create_all`
-builds it for new databases and never alters existing tables.
+pairing logics (`ARGOS` → `argos`, `TEMPO` → `tempo`, `ACCESS` →
+`default`; idempotent). `models.py` defines the complete schema;
+`create_all` builds it for new databases and never alters existing
+tables.
 
 ## API
 
@@ -90,8 +93,12 @@ builds it for new databases and never alters existing tables.
 - `GET /v1/pairing-logic?limit=&offset=` — list pairing logics,
   newest first.
 - `POST /v1/pairing-logic` — register a pairing logic. `strategy_name`
-  must be a registered strategy (`default`, `argos`; `IMPACT`/`ACCESS`
-  alias `default`, `TEMPO`/`CHRONOS` alias `tempo`). Payload fields:
+  must be a registered strategy (`default`, `argos`, `tempo`;
+  `ACCESS` aliases `default`, `IMPACT` aliases `argos`, and
+  `TEMPO`/`CHRONOS` alias `tempo`). Logic *names* also resolve with
+  aliases: `IMPACT` resolves to the `ARGOS` row and `CHRONOS` to the
+  `TEMPO` row when no row carries the given name (exact names always
+  win). Payload fields:
   `name`, `description` (optional), `active` (default `true`),
   `strategy_name`, and `config` (optional per-logic strategy settings,
   see Pairing strategies). Duplicate names are rejected with 409.
@@ -118,12 +125,13 @@ pairing logic via `PairingLogic.strategy_name`; a logic's `config`
 dict customizes the strategy at use time.
 
 - `default` — patient-scoped matching on hard keys
-  (`patient_id`, `sample_type`, `gene_panel`, `bait_set`) with a
+  (`patient_id`, `gene_panel`, `bait_set`) with a
   request-first cascade: normals ingested under the tumor's own
   `request_id` are preferred, then all other normals of the same
   patient; the latest matching `sequencing_date` wins (tie-break on
-  `created_date`, then `id`). `IMPACT` and `ACCESS` register as
-  aliases of this strategy.
+  `created_date`, then `id`). `sample_type` is not a matching key
+  (aligned with beagle v2.3.0). `ACCESS` registers as an alias of
+  this strategy.
 - `argos` — WES strategy aligned with beagle's ARGOS pairing logic
   (v2.3.0). Hard keys are (`patient_id`, `gene_panel`, `bait_set`);
   `sample_type` and preservation are not matching keys (beagle v2.3.0

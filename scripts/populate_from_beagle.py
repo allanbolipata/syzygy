@@ -152,7 +152,7 @@ shadowed by a native Homebrew postgres on this machine; 5433 is beagle's
 postgres). See docker-compose.yml.
 
 Idempotent: wipes samples/pairings/pairing_logic, re-seeds logics
-(argos -> argos strategy; TEMPO/CHRONOS -> tempo strategy; IMPACT/ACCESS
+(ARGOS/IMPACT -> argos strategy; TEMPO/CHRONOS -> tempo strategy; ACCESS
 -> default strategy, as main.py lifespan does), seeds the tempo
 historical pairings, loads the selected dataset(s), retriggers pairing.
 """
@@ -476,11 +476,9 @@ def main() -> int:
         db.commit()
 
         seed = {
-            "argos": ("argos", "ARGOS (WES) T/N pairing aligned with beagle v2.3.0"),
-            "TEMPO": ("tempo", "TEMPO_MPGEN T/N pairing aligned with beagle tempo logic"),
-            "CHRONOS": ("tempo", "CHRONOS T/N pairing aligned with beagle tempo logic"),
-            "IMPACT": ("default", None),
-            "ACCESS": ("default", None),
+            "ARGOS": ("argos", "ARGOS/IMPACT (WES) T/N pairing aligned with beagle v2.3.0"),
+            "TEMPO": ("tempo", "TEMPO/CHRONOS (WES) T/N pairing aligned with beagle tempo logic"),
+            "ACCESS": ("default", "ACCESS (cfDNA) T/N pairing; reference default strategy"),
         }
         logics: dict[str, PairingLogic] = {}
         for name, (strategy, desc) in seed.items():
@@ -545,14 +543,14 @@ def main() -> int:
                 dmp_samples.append(s)
 
         if want_argos:
-            pair_count = _trigger(db, argos_samples, logics["argos"], "argos")
+            pair_count = _trigger(db, argos_samples, logics["ARGOS"], "argos")
             print(f"[argos] Loaded {len(argos_samples)} samples, created {pair_count} pairings.")
         if want_tempo:
             pair_count = _trigger(db, tempo_samples, logics["TEMPO"], "tempo",
                                   trigger_type="manual")
             print(f"[tempo] Loaded {len(tempo_samples)} samples, created {pair_count} pairings.")
         if want_dmp:
-            pair_count = _trigger(db, dmp_samples, logics["argos"], "dmp")
+            pair_count = _trigger(db, dmp_samples, logics["ARGOS"], "dmp")
             print(f"[dmp] Loaded {len(dmp_samples)} samples, created {pair_count} pairings.")
         db.commit()
 
@@ -562,7 +560,7 @@ def main() -> int:
         else:
             exit_code = 0
             if want_argos:
-                exit_code |= validate(db, argos_samples, logics["argos"])
+                exit_code |= validate(db, argos_samples, logics["ARGOS"])
             if want_tempo:
                 exit_code |= validate_tempo(db, tempo_samples, logics["TEMPO"])
             if want_dmp:

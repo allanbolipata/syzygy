@@ -7,10 +7,10 @@ A logic's ``config`` dict customizes the strategy at use time (see
 ``get_pairing_strategy``).
 
 Registered strategies:
-  * ``default`` — patient-scoped matching on (patient_id, sample_type,
-    gene_panel, bait_set) with a request-first cascade: normals ingested
-    under the same ``request_id`` are preferred, then all other normals
-    for the patient.
+  * ``default`` — patient-scoped matching on (patient_id, gene_panel,
+    bait_set) with a request-first cascade: normals ingested under the
+    same ``request_id`` are preferred, then all other normals for the
+    patient.
   * ``argos`` — WES strategy aligned with beagle's argos pairing logic
     (v2_3.0). Matches on (patient_id, gene_panel, bait_set) with
     run-mode (sequencer) bucket matching, a request-first cascade, and a
@@ -23,7 +23,10 @@ Registered strategies:
     pairing.tsv) retained unconditionally, then patient-wide matching on
     bait_set (case-insensitive) and run-mode bucket. Gene panel and
     sample_type are not keys; there is no request cascade or pooled tier.
-  * ``IMPACT`` / ``ACCESS`` — aliases for ``default``.
+  * ``ACCESS`` — alias for ``default``.
+  * ``IMPACT`` — alias for ``argos`` (IMPACT is the assay the ARGOS
+    pipeline sequences; see ``PAIRING_LOGIC_ALIASES`` in
+    ``pairing_service`` for the logic-name side of the same grouping).
   * ``TEMPO`` / ``CHRONOS`` — aliases for ``tempo``.
 
 Every selection returns a ``NormalSelection`` whose ``notes`` record which
@@ -191,17 +194,17 @@ def register_pairing_strategy(name: str):
 
 @register_pairing_strategy("default")
 class DefaultPairingStrategy:
-    """Reference pairing strategy (used by IMPACT, ACCESS).
+    """Reference pairing strategy (used by ACCESS).
 
-    Base keys: see ``HARD_KEYS`` (patient_id, sample_type, gene_panel,
-    bait_set). Cascade:
+    Base keys: see ``HARD_KEYS`` (patient_id, gene_panel, bait_set).
+    Cascade:
     prefer normals ingested under the same request_id (when the tumor has
     one), then all other normals for the patient.
     """
 
     # Sample attributes that must match on both sides of a pairing.
     # Overridden by strategies that align with other operators (argos).
-    HARD_KEYS: tuple = ("patient_id", "sample_type", "gene_panel", "bait_set")
+    HARD_KEYS: tuple = ("patient_id", "gene_panel", "bait_set")
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool = False
 
@@ -340,7 +343,7 @@ class DefaultPairingStrategy:
         return list(db.scalars(stmt).all())
 
 
-for name in ("IMPACT", "ACCESS"):
+for name in ("ACCESS",):
     strategies[name] = strategies["default"]
 
 
@@ -570,6 +573,10 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         return [t for t in tumors if not self._soft_reasons(t, normal)]
 
 
+# Strategy-name aliases: a PairingLogic row may reference a strategy by
+# its pipeline name rather than its canonical name. IMPACT is the assay
+# the ARGOS pipeline sequences, so it pairs with the argos strategy.
+strategies["IMPACT"] = strategies["argos"]
 for name in ("TEMPO", "CHRONOS"):
     strategies[name] = strategies["tempo"]
 

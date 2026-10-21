@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db, settings
 from models import PairingLogic, PairingTable, Sample
-from pairing_service import resolve_pairing_logic, trigger_pairing
+from pairing_service import find_logic_by_name, resolve_pairing_logic, trigger_pairing
 from pairing_strategies import get_pairing_strategy
 from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal
 
@@ -94,7 +94,7 @@ def list_pairings(
             raise HTTPException(status_code=404, detail="Pairing logic not found")
         stmt = stmt.where(PairingTable.pairing_logic_id == pairing_logic_id)
     elif pairing_logic_name is not None:
-        logic = db.scalar(select(PairingLogic).where(PairingLogic.name == pairing_logic_name))
+        logic = find_logic_by_name(db, pairing_logic_name)
         if logic is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
         stmt = stmt.where(PairingTable.pairing_logic_id == logic.id)
