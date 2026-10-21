@@ -2,7 +2,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from database import get_db, settings
@@ -47,10 +47,50 @@ def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
 def list_samples(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
+    q: Optional[str] = None,
+    primary_id: Optional[str] = None,
+    cmo_sample_name: Optional[str] = None,
+    patient_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    sample_type: Optional[str] = None,
+    gene_panel: Optional[str] = None,
+    bait_set: Optional[str] = None,
+    run_mode: Optional[str] = None,
+    tumor_or_normal: Optional[TumorOrNormal] = None,
     db: Session = Depends(get_db),
 ):
-    # Stable ordering so limit/offset pagination is deterministic.
+    """List samples, newest first, with optional field filters.
+
+    ``q`` matches any of ``primary_id``, ``cmo_sample_name``,
+    ``patient_id``, or ``request_id``. The per-field filters are
+    case-insensitive substring matches; ``tumor_or_normal`` is exact.
+    All filters combine with AND.
+    """
     stmt = select(Sample).order_by(Sample.created_date.desc(), Sample.id.desc())
+    if q is not None:
+        like = f"%{q}%"
+        stmt = stmt.where(
+            or_(
+                Sample.primary_id.ilike(like),
+                Sample.cmo_sample_name.ilike(like),
+                Sample.patient_id.ilike(like),
+                Sample.request_id.ilike(like),
+            )
+        )
+    for field, value in {
+        "primary_id": primary_id,
+        "cmo_sample_name": cmo_sample_name,
+        "patient_id": patient_id,
+        "request_id": request_id,
+        "sample_type": sample_type,
+        "gene_panel": gene_panel,
+        "bait_set": bait_set,
+        "run_mode": run_mode,
+    }.items():
+        if value is not None:
+            stmt = stmt.where(getattr(Sample, field).ilike(f"%{value}%"))
+    if tumor_or_normal is not None:
+        stmt = stmt.where(Sample.tumor_or_normal == tumor_or_normal.value)
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:

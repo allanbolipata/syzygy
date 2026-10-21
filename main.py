@@ -1,6 +1,9 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
 from database import Base, SessionLocal, engine
@@ -52,3 +55,15 @@ def health() -> dict[str, str]:
 app.include_router(samples_router, prefix="/v1")
 app.include_router(pairings_router, prefix="/v1")
 app.include_router(pairing_logic_router, prefix="/v1")
+
+# Basic web front end (static, no build step).
+app.mount(
+    "/ui",
+    StaticFiles(directory=Path(__file__).resolve().parent / "static", html=True),
+    name="ui",
+)
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/ui")
