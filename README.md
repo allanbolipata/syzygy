@@ -19,8 +19,8 @@ first, then patient-wide bait/run-mode matching).
 tooling (pytest, testcontainers). The Docker image installs only
 `requirements.txt` (runtime deps).
 
-Configuration comes from environment variables (see `Settings` in
-`database.py`):
+Configuration comes from environment variables or a local `.env` file
+(gitignored; see `Settings` in `database.py`):
 
 - `DATABASE_URL` — SQLAlchemy database URL
   (default `postgresql+psycopg2://postgres:postgres@localhost:5432/postgres`)
