@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from database import Base
-from models import PairingLogic, Sample
+from models import PairingLogic, PairingTable, Sample
 from pairing_service import trigger_pairing
 from routers.samples import possible_matches_endpoint
 from schemas import TumorOrNormal
@@ -216,6 +216,38 @@ def test_pooled_normal_lists_cross_patient_tumors(db, argos):
     assert others["T2"]["matched"] is True
     assert others["T1"]["matched"] is False
     assert any("bait_set mismatch (agilent vs None)" in r for r in others["T1"]["mismatched_keys"])
+
+
+def test_normal_with_multiple_tumors_lists_all_current_matches(db, argos):
+    # A normal matches 1-to-many. Pair it to two different tumors and keep
+    # both rows latest (this is a state the auto-pair service never produces
+    # on its own, so the rows are inserted directly). possible_matches must
+    # surface both current tumors and must not repeat them as other matches.
+    n1 = _sample(db, "N1", request_id="R1", run_mode="NovaSeq X 1000")
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, request_id="R1",
+                 run_mode="NovaSeq X 1000")
+    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, request_id="R2",
+                 run_mode="NovaSeq X 1000")
+    for tumor in (t1, t2):
+        db.add(PairingTable(
+            pairing_logic_id=argos.id,
+            tumor_id=tumor.id,
+            normal_id=n1.id,
+            trigger_type="automatic",
+            latest=True,
+        ))
+    db.commit()
+
+    res = _endpoints(db, n1)
+    current_ids = sorted(c["sample"].primary_id for c in res["current_matches"])
+    assert current_ids == ["T1", "T2"]
+    # ``current_match`` mirrors the first current match (backward compat).
+    assert res["current_match"]["sample"].primary_id == \
+        res["current_matches"][0]["sample"].primary_id
+    # Neither current tumor is repeated among the other matches.
+    others = _others(res)
+    assert "T1" not in others
+    assert "T2" not in others
 
 
 # ---------------------------------------------------------------------------

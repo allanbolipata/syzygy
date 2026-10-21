@@ -13,6 +13,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="samples">Samples</button>
     <button class="tab" data-tab="patients">Patients</button>
+    <button class="tab" data-tab="requests">Requests</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
   </nav>
 </header>
@@ -143,6 +144,69 @@
   </section>
 </main>
 
+<main id="view-requests" class="view hidden">
+  <section class="panel">
+    <h2>Requests</h2>
+    <div class="actions">
+      <label>request_id
+        <input id="r-q" placeholder="partial match, e.g. R-2024-001">
+      </label>
+      <button id="r-search" class="primary">Search</button>
+      <button id="r-clear">Clear</button>
+    </div>
+    <div class="table-wrap">
+      <table id="requests-table">
+        <thead>
+          <tr>
+            <th>request_id</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th>patients</th><th>sample_types</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="r-empty" class="empty">No requests found.</p>
+    </div>
+    <p class="hint">Click a row to open the request's samples and patients.</p>
+  </section>
+
+  <section id="r-detail" class="panel hidden">
+    <div class="table-head">
+      <h3 id="r-detail-title">Request</h3>
+      <button id="r-close" class="small">Close</button>
+    </div>
+    <dl id="r-detail-meta" class="kv"></dl>
+
+    <h3>Samples</h3>
+    <div class="table-wrap">
+      <table id="r-samples">
+        <thead>
+          <tr>
+            <th>primary_id</th><th>cmo_sample_name</th><th>role</th><th>sample_type</th>
+            <th>patient_id</th><th>current match</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="r-samples-empty" class="empty">No samples in this request.</p>
+    </div>
+    <p class="hint">Click a sample row to open its matches &amp; overrides.</p>
+
+    <h3>Patients</h3>
+    <div class="table-wrap">
+      <table id="r-patients">
+        <thead>
+          <tr>
+            <th>patient_id</th><th>samples</th><th>tumors</th><th>normals</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="r-patients-empty" class="empty">No patients in this request.</p>
+    </div>
+    <p class="hint">Click a patient row to open the patient's view.</p>
+  </section>
+</main>
+
 <main id="view-matches" class="view hidden">
   <section class="panel">
     <h2>Pick a sample</h2>
@@ -168,8 +232,9 @@
   </section>
 
   <section id="m-current-panel" class="panel hidden">
-    <h3>Current match</h3>
+    <h3 id="m-current-title">Current match</h3>
     <div id="m-current"></div>
+    <p class="hint">Click the matched sample to open its matches &amp; overrides.</p>
   </section>
 
   <section id="m-others-panel" class="panel hidden">
@@ -185,6 +250,7 @@
     </div>
     <p class="hint">
       &#9733; marks the candidate the strategy's cascade would pick.
+      Click a candidate row to open its matches &amp; overrides.
       Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
     </p>
     <label class="check">

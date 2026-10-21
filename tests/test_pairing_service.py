@@ -24,6 +24,7 @@ from pairing_strategies import NormalSelection, get_pairing_strategy, register_p
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
 from routers.patients import list_patients
+from routers.requests import list_requests
 from routers.samples import create_sample, list_samples
 from schemas import PairingLogicCreate, PairingTriggerCreate, SampleCreate, TumorOrNormal
 
@@ -1425,6 +1426,57 @@ def test_list_patients_q_and_pagination(db):
     # Pagination slices the sorted, aggregated list.
     assert [p.patient_id for p in list_patients(q="PAT", limit=2, offset=0, db=db)] == ["PAT-A", "PAT-B"]
     assert [p.patient_id for p in list_patients(q="PAT", limit=2, offset=1, db=db)] == ["PAT-B", "PAT-C"]
+
+
+# ---------------------------------------------------------------------------
+# GET /request
+# ---------------------------------------------------------------------------
+
+
+def test_list_requests_aggregates_samples(db):
+    _make_sample2(
+        db, "TUMOR-101", "PAT-101", TumorOrNormal.TUMOR.value,
+        request_id="REQ-1",
+    )
+    _make_sample2(
+        db, "NORMAL-101", "PAT-101", TumorOrNormal.NORMAL.value,
+        request_id="REQ-1",
+    )
+    _make_sample2(
+        db, "TUMOR-303", "PAT-303", TumorOrNormal.TUMOR.value,
+        request_id="REQ-2", sample_type="blood", gene_panel="PANEL-B",
+    )
+    pooled = _make_sample2(db, "DMP-POOL", None, TumorOrNormal.NORMAL.value, request_id="REQ-2")
+
+    requests = list_requests(limit=None, offset=None, q=None, db=db)
+    assert [r.request_id for r in requests] == ["REQ-1", "REQ-2"]
+
+    r1 = requests[0]
+    assert r1.sample_count == 2 and r1.tumor_count == 1 and r1.normal_count == 1
+    assert r1.patients == ["PAT-101"]
+    assert r1.sample_types == ["tissue"]
+    assert r1.gene_panels == ["PANEL-A"]
+
+    r2 = requests[1]
+    assert r2.sample_count == 2 and r2.tumor_count == 1 and r2.normal_count == 1
+    # Pooled normals (no patient_id) do not appear in patients.
+    assert r2.patients == ["PAT-303"]
+    assert r2.sample_types == ["blood", "tissue"]
+    assert r2.gene_panels == ["PANEL-A", "PANEL-B"]
+    assert pooled.patient_id is None
+    assert all(r.request_id for r in requests)
+
+
+def test_list_requests_q_and_pagination(db):
+    for rid in ("REQ-A", "REQ-B", "REQ-C"):
+        _make_sample2(db, f"TUMOR-{rid}", "PAT-X", TumorOrNormal.TUMOR.value, request_id=rid)
+
+    # q is a case-insensitive partial match on request_id.
+    assert [r.request_id for r in list_requests(q="req-b", limit=None, offset=None, db=db)] == ["REQ-B"]
+    assert list_requests(q="nope", limit=None, offset=None, db=db) == []
+    # Pagination slices the sorted, aggregated list.
+    assert [r.request_id for r in list_requests(q="REQ", limit=2, offset=0, db=db)] == ["REQ-A", "REQ-B"]
+    assert [r.request_id for r in list_requests(q="REQ", limit=2, offset=1, db=db)] == ["REQ-B", "REQ-C"]
 
 
 def test_list_pairings_ordered_and_paginated(db, tumor_sample, normal_sample, pairing_logic):
