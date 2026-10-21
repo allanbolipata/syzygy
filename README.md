@@ -64,6 +64,12 @@ tables.
   derived from the samples' `additional_metadata` (first non-null value
   per key; tumor samples take priority). `q` is a case-insensitive
   partial match on `patient_id`; `limit` / `offset` paginate.
+- `GET /v1/request` — requests derived from samples (a request is a
+  distinct non-null `request_id`), sorted by `request_id`. Returns
+  sample/tumor/normal counts, the request's distinct `patient_id`s, and
+  the distinct `sample_type`s and `gene_panel`s carried by its samples.
+  `q` is a case-insensitive partial match on `request_id`; `limit` /
+  `offset` paginate.
 - `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
   match (latest pairing for the selected logic) plus all potential
   matches. Candidates are same-patient normals/tumors, plus pooled
@@ -120,12 +126,16 @@ at `/ui`; the root path `/` redirects there. It lets you:
 - browse patients: each patient's metadata, sample counts, and all
   their samples with their current match per pairing logic
   (`GET /v1/patient` + `GET /v1/pairing?latest=true`);
+- browse requests: each request's sample counts, distinct patients and
+  sample types, and all its samples and patients — clicking a sample
+  opens its matches & overrides and clicking a patient opens the
+  patient's view (`GET /v1/request` + `GET /v1/pairing?latest=true`);
 - view a sample's current match and all potential matches per pairing
   logic (via `possible-matches`), with cascade tier, match status,
   mismatch reasons, and the candidate the cascade would pick; clicking
-  a sample (from the samples or patients view) opens this view,
-  pre-selecting the logic the sample is currently paired under when
-  known;
+  a sample (from the samples, patients, or requests view) opens this
+  view, pre-selecting the logic the sample is currently paired under
+  when known;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the

@@ -73,6 +73,20 @@ class PatientRead(BaseModel):
     metadata: dict
 
 
+class RequestRead(BaseModel):
+    # Requests are derived from samples (``request_id`` non-null); there is
+    # no separate request table yet.
+    request_id: str
+    sample_count: int
+    tumor_count: int
+    normal_count: int
+    # Distinct patient_ids across the request's samples (non-null).
+    patients: list[str]
+    # Distinct sample_types / gene_panels across the request's samples.
+    sample_types: list[str]
+    gene_panels: list[str]
+
+
 class PairingLogicCreate(BaseModel):
     name: str
     description: Optional[str] = None
@@ -160,5 +174,9 @@ class PossibleMatchesRead(BaseModel):
 
     sample: SampleRead
     pairing_logic: str
+    # First/primary current match (backward compatibility). Prefer
+    # ``current_matches``: a tumor has at most one, a normal matches
+    # 1-to-many and lists every currently-paired tumor here.
     current_match: Optional[CurrentMatchRead] = None
+    current_matches: list[CurrentMatchRead] = []
     other_matches: list[PossibleMatchCandidate]

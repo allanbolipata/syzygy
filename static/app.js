@@ -96,6 +96,30 @@ document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => showView(btn.dataset.tab));
 });
 
+/* ---------- cross-view navigation (patient_id / request_id links) ---------- */
+
+function navigateToPatient(patientId) {
+  $("#p-q").value = patientId;
+  showView("patients");
+  loadPatients().then((results) => {
+    if (!results) return;
+    const row = results.find((p) => p.patient_id === patientId);
+    if (row) openPatient(row);
+    else banner("error", `No patient found with id ${esc(patientId)}.`, true);
+  });
+}
+
+function navigateToRequest(requestId) {
+  $("#r-q").value = requestId;
+  showView("requests");
+  loadRequests().then((results) => {
+    if (!results) return;
+    const row = results.find((r) => r.request_id === requestId);
+    if (row) openRequest(row);
+    else banner("error", `No request found with id ${esc(requestId)}.`, true);
+  });
+}
+
 /* ---------- samples view ---------- */
 
 const samplesState = { limit: 50, offset: 0, results: [] };
@@ -274,8 +298,8 @@ function renderMatches(data, logic) {
       <dt>id</dt><dd>${esc(s.id)}</dd>
       <dt>primary_id</dt><dd>${esc(s.primary_id)}</dd>
       <dt>cmo_sample_name</dt><dd>${esc(s.cmo_sample_name)}</dd>
-      <dt>patient_id</dt><dd>${esc(s.patient_id || "—")}</dd>
-      <dt>request_id</dt><dd>${esc(s.request_id || "—")}</dd>
+      <dt>patient_id</dt><dd>${s.patient_id ? `<span class="nav-link" data-nav-patient="${esc(s.patient_id)}" title="Go to the patient page">${esc(s.patient_id)}</span>` : "—"}</dd>
+      <dt>request_id</dt><dd>${s.request_id ? `<span class="nav-link" data-nav-request="${esc(s.request_id)}" title="Show the samples for this request">${esc(s.request_id)}</span>` : "—"}</dd>
       <dt>role</dt><dd><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></dd>
       <dt>sample_type</dt><dd>${esc(s.sample_type)}</dd>
       <dt>gene_panel</dt><dd>${esc(s.gene_panel)}</dd>
@@ -285,23 +309,30 @@ function renderMatches(data, logic) {
       <dt>sample_origin</dt><dd>${metaText(s.sample_origin)}</dd>
       <dt>sequencing_date</dt><dd>${fmtDate(s.sequencing_date)}</dd>
       <dt>errors</dt><dd>${s.errors && s.errors.length ? esc(s.errors.join("; ")) : "—"}</dd>
-    </dl>`;
+    </dl>
+    <p class="hint">Click patient_id / request_id to go to that patient's or request's page.</p>`;
 
-  // Current match.
+  // Current matches: a tumor has at most one; a normal matches 1-to-many
+  // and lists every currently-paired tumor here.
   $("#m-current-panel").classList.remove("hidden");
-  const cm = data.current_match;
-  if (!cm) {
-    $("#m-current").innerHTML = `<p class="empty">No current match for logic <strong>${esc(logic)}</strong>.</p>`;
+  const counterpartWord = s.tumor_or_normal === "TUMOR" ? "normal" : "tumor";
+  const cmList = data.current_matches || [];
+  $("#m-current-title").textContent = cmList.length > 1 ? "Current matches" : "Current match";
+  if (!cmList.length) {
+    $("#m-current").innerHTML = `<p class="empty">No current ${counterpartWord} match for logic <strong>${esc(logic)}</strong>.</p>`;
   } else {
-    const c = cm.sample;
-    $("#m-current").innerHTML = `
-      <dl class="kv">
-        <dt>matched ${s.tumor_or_normal === "TUMOR" ? "normal" : "tumor"}</dt>
-        <dd>${esc(c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient_id || "no patient")})</dd>
-        <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
-        <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
-      </dl>
-      ${noteList(cm.notes)}`;
+    $("#m-current").innerHTML = cmList.map((cm) => {
+      const c = cm.sample;
+      return `
+        <div class="current-match">
+          <dl class="kv">
+            <dt>matched ${counterpartWord}</dt>
+            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${esc(c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient_id || "no patient")})</span></dd>
+            <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
+            <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
+          </dl>
+          ${noteList(cm.notes)}</div>`;
+    }).join("");
   }
 
   // Other matches.
@@ -319,7 +350,7 @@ function renderMatches(data, logic) {
       : "";
     const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
     return `
-      <tr${c.would_be_selected ? ' class="current"' : ""}>
+      <tr class="${c.would_be_selected ? "current click" : "click"}" data-sample-id="${esc(cs.id)}" title="Open this sample's matches &amp; overrides">
         <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
         <td>${esc(cs.patient_id || "—")}</td>
         <td><span class="badge tier">${esc(c.tier)}</span></td>
@@ -345,6 +376,35 @@ $("#m-sample").addEventListener("change", (e) => {
   if (!picked) return;
   matchesState.sample = picked;
   showMatches();
+});
+
+/* Sample panel: click a patient_id / request_id value to go to its page. */
+$("#m-summary").addEventListener("click", (e) => {
+  const el = e.target.closest("[data-nav-patient],[data-nav-request]");
+  if (!el) return;
+  if (el.dataset.navPatient) navigateToPatient(el.dataset.navPatient);
+  else if (el.dataset.navRequest) navigateToRequest(el.dataset.navRequest);
+});
+
+/* Current match(es): click the matched sample to open its page. */
+$("#m-current").addEventListener("click", (e) => {
+  const el = e.target.closest("[data-sample-id]");
+  if (!el) return;
+  const cmList = (matchesState.data && matchesState.data.current_matches) || [];
+  const cm = cmList.find((c) => String(c.sample.id) === el.dataset.sampleId);
+  if (cm) openMatchesFor(cm.sample);
+});
+
+/* Other potential matches: click a candidate row to open its page
+   (but not the Override button). */
+$("#m-others").addEventListener("click", (e) => {
+  if (e.target.closest("button")) return;
+  const tr = e.target.closest("tr[data-sample-id]");
+  if (!tr) return;
+  const cand = ((matchesState.data && matchesState.data.other_matches) || []).find(
+    (c) => String(c.sample.id) === tr.dataset.sampleId
+  );
+  if (cand) openMatchesFor(cand.sample);
 });
 
 function submitOverride(normalId) {
@@ -373,7 +433,7 @@ function submitOverride(normalId) {
 
 const patientsState = {
   results: [],
-  pairings: null, // sample id -> {pairing logic name: matched sample}
+  pairings: null, // sample id -> {pairing logic name: [opposite samples]}
   patient: null,
   patientSamples: [],
 };
@@ -386,8 +446,10 @@ async function loadPatients() {
     if (q) params.set("q", q);
     patientsState.results = await api(`/patient/?${params}`);
     renderPatients();
+    return patientsState.results;
   } catch (e) {
     banner("error", `Failed to load patients: ${esc(e.message)}`, true);
+    return undefined;
   }
 }
 
@@ -416,14 +478,18 @@ function renderPatients() {
   });
 }
 
-/* Sample id -> {logic name: opposite sample}, from all latest pairings (one request). */
+/* Sample id -> {logic name: [opposite samples]}, from all latest pairings
+   (one request). A tumor lists its current normal(s) (at most one); a
+   normal lists every currently-paired tumor (1-to-many). */
 async function loadPairingMap() {
   if (!patientsState.pairings) {
     const rows = await api("/pairing/?latest=true&limit=500");
     const map = {};
     for (const r of rows) {
-      (map[r.tumor_id] = map[r.tumor_id] || {})[r.pairing_logic] = r.normal;
-      (map[r.normal_id] = map[r.normal_id] || {})[r.pairing_logic] = r.tumor;
+      const tSide = (map[r.tumor_id] = map[r.tumor_id] || {});
+      (tSide[r.pairing_logic] = tSide[r.pairing_logic] || []).push(r.normal);
+      const nSide = (map[r.normal_id] = map[r.normal_id] || {});
+      (nSide[r.pairing_logic] = nSide[r.pairing_logic] || []).push(r.tumor);
     }
     patientsState.pairings = map;
   }
@@ -433,8 +499,10 @@ async function loadPairingMap() {
 function currentMatchCell(sampleId) {
   const byLogic = (patientsState.pairings || {})[sampleId];
   if (!byLogic || !Object.keys(byLogic).length) return "—";
-  return Object.entries(byLogic).map(([logic, s]) =>
-    `<div>${esc(logic)}: ${esc(s.primary_id)} <span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></div>`
+  return Object.entries(byLogic).flatMap(([logic, samples]) =>
+    (samples || []).map((s) =>
+      `<div>${esc(logic)}: ${esc(s.primary_id)} <span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></div>`
+    )
   ).join("");
 }
 
@@ -491,10 +559,155 @@ $("#p-close").addEventListener("click", () => {
   $("#p-detail").classList.add("hidden");
 });
 
+/* ---------- requests view ---------- */
+
+const requestsState = {
+  results: [],
+  request: null,
+  requestSamples: [],
+  requestPatients: [],
+};
+
+async function loadRequests() {
+  try {
+    const q = $("#r-q").value.trim();
+    const params = new URLSearchParams();
+    params.set("limit", 100);
+    if (q) params.set("q", q);
+    requestsState.results = await api(`/request/?${params}`);
+    renderRequests();
+    return requestsState.results;
+  } catch (e) {
+    banner("error", `Failed to load requests: ${esc(e.message)}`, true);
+    return undefined;
+  }
+}
+
+function renderRequests() {
+  const rows = requestsState.results;
+  const tbody = $("#requests-table tbody");
+  tbody.innerHTML = rows.map((r) => `
+    <tr class="click" data-rid="${esc(r.request_id)}">
+      <td>${esc(r.request_id)}</td>
+      <td>${r.sample_count}</td>
+      <td>${r.tumor_count}</td>
+      <td>${r.normal_count}</td>
+      <td>${esc((r.patients || []).join(", "))}</td>
+      <td>${esc((r.sample_types || []).join(", "))}</td>
+    </tr>`).join("");
+  $("#r-empty").classList.toggle("hidden", rows.length > 0);
+  tbody.querySelectorAll("tr[data-rid]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const row = rows.find((r) => r.request_id === tr.dataset.rid);
+      if (row) openRequest(row);
+    });
+  });
+}
+
+async function openRequest(row) {
+  requestsState.request = row;
+  $("#r-detail").classList.remove("hidden");
+  $("#r-detail-title").textContent = `Request ${row.request_id}`;
+  $("#r-detail-meta").innerHTML =
+    `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
+    `<dt>patients</dt><dd>${esc((row.patients || []).join(", ") || "—")}</dd>` +
+    `<dt>sample_types</dt><dd>${esc((row.sample_types || []).join(", ") || "—")}</dd>` +
+    `<dt>gene_panels</dt><dd>${esc((row.gene_panels || []).join(", ") || "—")}</dd>`;
+
+  const sbody = $("#r-samples tbody");
+  const pbody = $("#r-patients tbody");
+  sbody.innerHTML = "";
+  pbody.innerHTML = "";
+  $("#r-samples-empty").classList.remove("hidden");
+  $("#r-patients-empty").classList.remove("hidden");
+  try {
+    const [fetchedSamples] = await Promise.all([
+      api(`/sample/?request_id=${encodeURIComponent(row.request_id)}&limit=200`),
+      loadPairingMap(),
+    ]);
+    // /sample/ filters request_id as a substring match; keep only the
+    // samples belonging to this exact request.
+    const samples = (requestsState.requestSamples =
+      fetchedSamples.filter((s) => s.request_id === row.request_id));
+
+    // Per-patient counts within this request (non-null patient_id only).
+    const byPatient = {};
+    for (const s of samples) {
+      if (!s.patient_id) continue;
+      const g = (byPatient[s.patient_id] =
+        byPatient[s.patient_id] || { patient_id: s.patient_id, count: 0, tumor: 0, normal: 0 });
+      g.count += 1;
+      if (s.tumor_or_normal === "TUMOR") g.tumor += 1;
+      else if (s.tumor_or_normal === "NORMAL") g.normal += 1;
+    }
+    requestsState.requestPatients = Object.keys(byPatient).sort().map((pid) => byPatient[pid]);
+
+    sbody.innerHTML = samples.map((s) => `
+      <tr class="click" data-id="${s.id}">
+        <td>${esc(s.primary_id)}</td>
+        <td>${esc(s.cmo_sample_name)}</td>
+        <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
+        <td>${esc(s.sample_type)}</td>
+        <td>${esc(s.patient_id || "")}</td>
+        <td>${currentMatchCell(s.id)}</td>
+      </tr>`).join("");
+    $("#r-samples-empty").classList.toggle("hidden", samples.length > 0);
+    sbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const sample = requestsState.requestSamples.find((s) => s.id === tr.dataset.id);
+        if (sample) openMatchesFor(sample);
+      });
+    });
+
+    pbody.innerHTML = requestsState.requestPatients.map((p) => `
+      <tr class="click" data-pid="${esc(p.patient_id)}">
+        <td>${esc(p.patient_id)}</td>
+        <td>${p.count}</td>
+        <td>${p.tumor}</td>
+        <td>${p.normal}</td>
+      </tr>`).join("");
+    $("#r-patients-empty").classList.toggle("hidden", requestsState.requestPatients.length > 0);
+    pbody.querySelectorAll("tr[data-pid]").forEach((tr) => {
+      tr.addEventListener("click", () => openPatientFromRequest(tr.dataset.pid));
+    });
+
+    $("#r-detail").scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    banner("error", `Failed to load request samples: ${esc(e.message)}`, true);
+  }
+}
+
+/* Switch to the Patients tab and open the given patient's detail. */
+async function openPatientFromRequest(patientId) {
+  showView("patients");
+  try {
+    const rows = await api(`/patient/?q=${encodeURIComponent(patientId)}&limit=200`);
+    const row = rows.find((p) => p.patient_id === patientId);
+    if (row) openPatient(row);
+    else banner("error", `Patient ${esc(patientId)} not found.`, true);
+  } catch (e) {
+    banner("error", `Failed to open patient: ${esc(e.message)}`, true);
+  }
+}
+
+$("#r-search").addEventListener("click", loadRequests);
+$("#r-q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") loadRequests();
+});
+$("#r-clear").addEventListener("click", () => {
+  $("#r-q").value = "";
+  loadRequests();
+});
+$("#r-close").addEventListener("click", () => {
+  requestsState.request = null;
+  $("#r-detail").classList.add("hidden");
+});
+
 /* ---------- init ---------- */
 
 (async function init() {
   await loadLogics();
   loadSamples(0);
   loadPatients();
+  loadRequests();
 })();

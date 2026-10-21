@@ -226,35 +226,63 @@ def trigger_pairing_for_normal(
 
 
 def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
-    """The sample's current pairing and all potential matches.
+    """The sample's current matches and all potential matches.
+
+    ``current_matches`` is the list of every latest pairing for the
+    selected logic on the sample's side: a tumor has at most one, but a
+    normal matches 1-to-many and can list several tumors. (``current_match``
+    mirrors ``current_matches[0]`` for backward compatibility.)
 
     Candidates are every opposite-type sample the strategy's keys can
     reach: same-patient normals/tumors, plus pooled normals for
-    strategies with a pooled tier (argos). Each candidate is evaluated
-    with the strategy's ``mismatch_reasons``: ``matched`` is true when
-    it would pass every matching key; otherwise ``mismatched_keys``
-    lists the reasons it does not. For a tumor input,
-    ``would_be_selected`` marks the candidate the strategy's cascade
-    would pick. Used to support manual pairing (e.g. pinning a DMP
-    normal via POST /pairing/trigger).
+    strategies with a pooled tier (argos). Each candidate that is not
+    already a current match is evaluated with the strategy's
+    ``mismatch_reasons``: ``matched`` is true when it would pass every
+    matching key; otherwise ``mismatched_keys`` lists the reasons it does
+    not. For a tumor input, ``would_be_selected`` marks the candidate the
+    strategy's cascade would pick. Used to support manual pairing (e.g.
+    pinning a DMP normal via POST /pairing/trigger).
     """
     strategy = get_pairing_strategy(logic)
     is_tumor = sample.tumor_or_normal == TumorOrNormal.TUMOR.value
 
-    # Current match: the latest pairing row with this sample on either
-    # side.
+    # Current matches: every latest pairing row with this sample on its
+    # side. A tumor has at most one (unique per tumor + logic); a normal
+    # matches 1-to-many, so it can carry several latest rows — one per
+    # distinct tumor currently paired to it.
     if is_tumor:
         row = _get_latest_pairing(db, sample.id, logic.id)
-        counterpart = db.get(Sample, row.normal_id) if row else None
+        current_rows = [row] if row is not None else []
     else:
-        row = db.scalar(
-            select(PairingTable).where(
-                PairingTable.normal_id == sample.id,
-                PairingTable.pairing_logic_id == logic.id,
-                PairingTable.latest == True,
-            )
+        current_rows = list(
+            db.scalars(
+                select(PairingTable)
+                .where(
+                    PairingTable.normal_id == sample.id,
+                    PairingTable.pairing_logic_id == logic.id,
+                    PairingTable.latest == True,  # noqa: E712
+                )
+                .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+            ).all()
         )
-        counterpart = db.get(Sample, row.tumor_id) if row else None
+
+    current_matches: list[dict] = []
+    for row in current_rows:
+        counterpart = (
+            db.get(Sample, row.normal_id) if is_tumor else db.get(Sample, row.tumor_id)
+        )
+        if counterpart is None:
+            continue
+        current_matches.append(
+            {
+                "pairing_id": row.id,
+                "trigger_type": row.trigger_type,
+                "mismatched_keys": row.mismatched_keys,
+                "notes": row.notes,
+                "sample": counterpart,
+            }
+        )
+    current_ids = {m["sample"].id for m in current_matches}
 
     # Candidate scope: same-patient opposite-type samples, plus pooled
     # normals (pooled-tier strategies) for a tumor.
@@ -291,7 +319,7 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
     tier_rank = {"same_request": 0, "other_request": 1, "pooled": 2}
     others: list[dict] = []
     for cand in candidates:
-        if counterpart is not None and cand.id == counterpart.id:
+        if cand.id in current_ids:
             continue
         tumor, normal = (sample, cand) if is_tumor else (cand, sample)
         if strategy.HAS_POOLED_TIER and strategy._is_pooled(normal):
@@ -320,19 +348,14 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
         )
     )
 
-    current_match = None
-    if row is not None and counterpart is not None:
-        current_match = {
-            "pairing_id": row.id,
-            "trigger_type": row.trigger_type,
-            "mismatched_keys": row.mismatched_keys,
-            "notes": row.notes,
-            "sample": counterpart,
-        }
+    # ``current_match`` is kept for backward compatibility as the first
+    # current match; ``current_matches`` is the authoritative full list.
+    current_match = current_matches[0] if current_matches else None
 
     return {
         "sample": sample,
         "pairing_logic": logic.name,
         "current_match": current_match,
+        "current_matches": current_matches,
         "other_matches": others,
     }
