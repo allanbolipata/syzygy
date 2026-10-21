@@ -47,7 +47,13 @@ builds it for new databases and never alters existing tables.
   `run_mode` (raw sequencer string, e.g. "NovaSeq X 1000"),
   `preservation` and `sample_origin` (raw preservation data, e.g.
   `["FFPE"]` or `"Fresh or Frozen"`), and `sequencing_date`.
-- `GET /v1/sample?limit=&offset=` — list samples, newest first.
+- `GET /v1/sample` — list samples, newest first. Optional filters
+  (combined with AND): `q` matches any of `primary_id`,
+  `cmo_sample_name`, `patient_id`, `request_id`; `primary_id`,
+  `cmo_sample_name`, `patient_id`, `request_id`, `sample_type`,
+  `gene_panel`, `bait_set`, `run_mode` are case-insensitive partial
+  matches; `tumor_or_normal` is exact (`TUMOR`/`NORMAL`); `limit` /
+  `offset` paginate.
 - `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
   match (latest pairing for the selected logic) plus all potential
   matches. Candidates are same-patient normals/tumors, plus pooled
@@ -89,6 +95,21 @@ builds it for new databases and never alters existing tables.
   `name`, `description` (optional), `active` (default `true`),
   `strategy_name`, and `config` (optional per-logic strategy settings,
   see Pairing strategies). Duplicate names are rejected with 409.
+
+## Front end
+
+A basic static web UI (no build step, no extra dependencies) is served
+at `/ui`; the root path `/` redirects there. It lets you:
+
+- query and filter samples by the matching fields (patient, request,
+  panel, bait set, run mode, sample type, role) with pagination;
+- view a sample's current match and all potential matches per pairing
+  logic (via `possible-matches`), with cascade tier, match status,
+  mismatch reasons, and the candidate the cascade would pick;
+- submit overrides: pin a candidate normal as the tumor's current
+  pairing for the selected logic (`POST /v1/pairing/trigger` with
+  `trigger_type=override`), optionally in strict mode, with the
+  recorded mismatches shown afterwards.
 
 ## Pairing strategies
 

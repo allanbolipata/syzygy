@@ -1249,6 +1249,73 @@ def test_list_samples_ties_broken_by_id(db):
     assert [s.id for s in result] == sorted([s1.id, s2.id], reverse=True)
 
 
+# ---------------------------------------------------------------------------
+# GET /sample field filters
+# ---------------------------------------------------------------------------
+
+
+def _make_sample2(db, primary_id, patient_id, tumor_or_normal, **kw):
+    sample = Sample(
+        primary_id=primary_id,
+        cmo_sample_name=f"{primary_id} name",
+        patient_id=patient_id,
+        sample_type=kw.pop("sample_type", "tissue"),
+        gene_panel=kw.pop("gene_panel", "PANEL-A"),
+        bait_set=kw.pop("bait_set", "BAIT-1"),
+        tumor_or_normal=tumor_or_normal,
+        **kw,
+    )
+    db.add(sample)
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_list_samples_field_filters(db):
+    t1 = _make_sample2(db, "TUMOR-101", "PAT-101", TumorOrNormal.TUMOR.value)
+    n1 = _make_sample2(db, "NORMAL-101", "PAT-101", TumorOrNormal.NORMAL.value)
+    t2 = _make_sample2(
+        db, "TUMOR-202", "PAT-202", TumorOrNormal.TUMOR.value,
+        gene_panel="PANEL-B", bait_set="BAIT-2", sample_type="blood",
+        run_mode="NovaSeq X 1000", request_id="REQ-77",
+    )
+
+    assert {s.id for s in list_samples(limit=None, offset=None, db=db)} == {t1.id, n1.id, t2.id}
+    assert [s.id for s in list_samples(primary_id="TUMOR-101", limit=None, offset=None, db=db)] == [t1.id]
+    assert [s.id for s in list_samples(cmo_sample_name="normal-101", limit=None, offset=None, db=db)] == [n1.id]
+    assert [s.id for s in list_samples(patient_id="PAT-202", limit=None, offset=None, db=db)] == [t2.id]
+    assert [s.id for s in list_samples(request_id="REQ-77", limit=None, offset=None, db=db)] == [t2.id]
+    assert {s.id for s in list_samples(gene_panel="PANEL-A", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert [s.id for s in list_samples(bait_set="BAIT-2", limit=None, offset=None, db=db)] == [t2.id]
+    assert [s.id for s in list_samples(sample_type="blood", limit=None, offset=None, db=db)] == [t2.id]
+    # Text filters are case-insensitive substring matches.
+    assert [s.id for s in list_samples(run_mode="ovaseq x 100", limit=None, offset=None, db=db)] == [t2.id]
+    assert [s.id for s in list_samples(tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == [n1.id]
+    # Filters combine with AND; no match returns empty.
+    assert [s.id for s in list_samples(primary_id="TUMOR-101", tumor_or_normal=TumorOrNormal.TUMOR, limit=None, offset=None, db=db)] == [t1.id]
+    assert list_samples(primary_id="TUMOR-101", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db) == []
+    # Filters combine with pagination.
+    assert [s.id for s in list_samples(gene_panel="PANEL-A", limit=1, offset=1, db=db)] in [[t1.id], [n1.id]]
+
+
+def test_list_samples_q_search(db):
+    t1 = _make_sample2(db, "TUMOR-101", "PAT-101", TumorOrNormal.TUMOR.value)
+    n1 = _make_sample2(db, "NORMAL-101", "PAT-101", TumorOrNormal.NORMAL.value)
+    t2 = _make_sample2(
+        db, "TUMOR-202", "PAT-202", TumorOrNormal.TUMOR.value,
+        gene_panel="PANEL-B", request_id="REQ-77",
+    )
+
+    # q searches primary_id, cmo_sample_name, patient_id, request_id (OR).
+    assert {s.id for s in list_samples(q="tum", limit=None, offset=None, db=db)} == {t1.id, t2.id}
+    assert [s.id for s in list_samples(q="REQ-77", limit=None, offset=None, db=db)] == [t2.id]
+    assert {s.id for s in list_samples(q="pat-101", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert list_samples(q="nope", limit=None, offset=None, db=db) == []
+    # q AND-combines with field filters.
+    assert [s.id for s in list_samples(q="tum", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == []
+    assert [s.id for s in list_samples(q="pat-101", tumor_or_normal=TumorOrNormal.TUMOR, limit=None, offset=None, db=db)] == [t1.id]
+
+
 def test_list_pairings_ordered_and_paginated(db, tumor_sample, normal_sample, pairing_logic):
     d1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
     d2 = datetime(2024, 1, 2, tzinfo=timezone.utc)
