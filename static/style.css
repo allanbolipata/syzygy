@@ -30,6 +30,7 @@ header {
 }
 header h1 { font-size: 1.15rem; margin: 0; }
 header .sub { color: var(--muted); font-weight: 400; font-size: 0.9rem; }
+nav.tabs { margin-left: auto; }
 
 nav { display: flex; gap: 0.4rem; }
 .tab {

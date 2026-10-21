@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from database import Base, SessionLocal, engine
 from models import PairingLogic
+from routers.patients import router as patients_router
 from routers.pairing_logic import router as pairing_logic_router
 from routers.pairings import router as pairings_router
 from routers.samples import router as samples_router
@@ -52,6 +53,7 @@ def health() -> dict[str, str]:
 
 
 app.include_router(samples_router, prefix="/v1")
+app.include_router(patients_router, prefix="/v1")
 app.include_router(pairings_router, prefix="/v1")
 app.include_router(pairing_logic_router, prefix="/v1")
 

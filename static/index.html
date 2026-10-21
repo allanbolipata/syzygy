@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -7,89 +7,155 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header>
-  <h1>Syzygy <span class="sub">Sample Pairing Service</span></h1>
-  <nav>
-    <button id="tab-samples" class="tab active" data-tab="samples">Samples</button>
-    <button id="tab-matches" class="tab" data-tab="matches">Matches &amp; Overrides</button>
-    <a class="tab link" href="/docs" target="_blank" rel="noopener">API docs</a>
+<header class="topbar">
+  <h1>Syzygy <span class="sub">sample pairing</span></h1>
+  <button id="btn-back" disabled title="Return to the previous screen">&larr; Back</button>
+  <nav class="tabs">
+    <button class="tab active" data-tab="samples">Samples</button>
+    <button class="tab" data-tab="patients">Patients</button>
+    <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
   </nav>
 </header>
 
 <div id="banner"></div>
 
-<!-- ============ Samples view ============ -->
 <main id="view-samples" class="view">
   <section class="panel">
     <h2>Query &amp; filter samples</h2>
-    <p class="hint">Filters are case-insensitive partial matches, combined with AND.
-    The matching keys used by the pairing strategies are included: patient, panel,
-    bait set, run mode, request, sample type and role.</p>
-    <div class="filters">
-      <label>primary_id <input id="f-primary_id" placeholder="TUMOR-001"></label>
-      <label>cmo_sample_name <input id="f-cmo_sample_name"></label>
-      <label>patient_id <input id="f-patient_id" placeholder="PATIENT-001"></label>
-      <label>request_id <input id="f-request_id"></label>
-      <label>sample_type <input id="f-sample_type"></label>
-      <label>gene_panel <input id="f-gene_panel"></label>
-      <label>bait_set <input id="f-bait_set"></label>
-      <label>run_mode <input id="f-run_mode" placeholder="novaseq"></label>
-      <label>role
-        <select id="f-tumor_or_normal">
+    <div class="filters" id="s-filters">
+      <label>search
+        <input id="f-q" name="q" placeholder="any of primary_id, cmo name, patient, request">
+      </label>
+      <label>primary_id
+        <input id="f-primary_id" name="primary_id">
+      </label>
+      <label>cmo_sample_name
+        <input id="f-cmo_sample_name" name="cmo_sample_name">
+      </label>
+      <label>patient_id
+        <input id="f-patient_id" name="patient_id">
+      </label>
+      <label>request_id
+        <input id="f-request_id" name="request_id">
+      </label>
+      <label>sample_type
+        <input id="f-sample_type" name="sample_type">
+      </label>
+      <label>gene_panel
+        <input id="f-gene_panel" name="gene_panel">
+      </label>
+      <label>bait_set
+        <input id="f-bait_set" name="bait_set">
+      </label>
+      <label>run_mode
+        <input id="f-run_mode" name="run_mode">
+      </label>
+      <label>tumor_or_normal
+        <select id="f-tumor_or_normal" name="tumor_or_normal">
           <option value="">any</option>
           <option value="TUMOR">TUMOR</option>
           <option value="NORMAL">NORMAL</option>
         </select>
       </label>
-    </div>
-    <div class="actions">
-      <button id="btn-search" class="primary">Search</button>
-      <button id="btn-clear">Clear</button>
-      <span class="spacer"></span>
-      <label>rows
+      <label>limit
         <select id="f-limit">
-          <option>25</option><option selected>50</option><option>100</option>
+          <option>25</option>
+          <option selected>50</option>
+          <option>100</option>
         </select>
       </label>
+      <button type="button" class="primary" id="btn-search">Search</button>
+      <button type="button" id="btn-clear">Clear</button>
     </div>
+    <p class="hint">Field filters are case-insensitive partial matches combined with AND.</p>
   </section>
 
   <section class="panel">
     <div class="table-head">
-      <h2>Samples <span id="s-count" class="count"></span></h2>
-      <div class="pager">
-        <button id="s-prev">« Prev</button>
-        <button id="s-next">Next »</button>
-      </div>
+      <h3>Results</h3>
+      <span id="s-count"></span>
     </div>
     <div class="table-wrap">
       <table id="samples-table">
         <thead>
           <tr>
-            <th>primary_id</th><th>cmo_sample_name</th><th>patient_id</th>
-            <th>request_id</th><th>role</th><th>sample_type</th>
-            <th>gene_panel</th><th>bait_set</th><th>run_mode</th>
-            <th>preservation</th><th>sample_origin</th><th>sequencing_date</th>
+            <th>primary_id</th><th>cmo_sample_name</th><th>patient_id</th><th>request_id</th>
+            <th>role</th><th>sample_type</th><th>gene_panel</th><th>bait_set</th>
+            <th>run_mode</th><th>preservation</th><th>sample_origin</th><th>sequencing_date</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
-      <p id="s-empty" class="empty">No samples found.</p>
+      <p id="s-empty" class="empty">No samples match.</p>
     </div>
-    <p class="hint">Click a row to open its matches view.</p>
+    <div class="pager">
+      <button id="s-prev">Prev</button>
+      <button id="s-next">Next</button>
+    </div>
+    <p class="hint">Click a row to open its matches &amp; overrides.</p>
   </section>
 </main>
 
-<!-- ============ Matches & overrides view ============ -->
+<main id="view-patients" class="view hidden">
+  <section class="panel">
+    <h2>Patients</h2>
+    <div class="actions">
+      <label>patient_id
+        <input id="p-q" placeholder="partial match, e.g. C-DRKHP7">
+      </label>
+      <button id="p-search" class="primary">Search</button>
+      <button id="p-clear">Clear</button>
+    </div>
+    <div class="table-wrap">
+      <table id="patients-table">
+        <thead>
+          <tr>
+            <th>patient_id</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th>requests</th><th>metadata</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="p-empty" class="empty">No patients found.</p>
+    </div>
+    <p class="hint">Click a row to open the patient's samples.</p>
+  </section>
+
+  <section id="p-detail" class="panel hidden">
+    <div class="table-head">
+      <h3 id="p-detail-title">Patient</h3>
+      <button id="p-close" class="small">Close</button>
+    </div>
+    <dl id="p-detail-meta" class="kv"></dl>
+    <div class="table-wrap">
+      <table id="p-samples">
+        <thead>
+          <tr>
+            <th>primary_id</th><th>cmo_sample_name</th><th>role</th><th>sample_type</th>
+            <th>request_id</th><th>current match</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="p-samples-empty" class="empty">No samples for this patient.</p>
+    </div>
+    <p class="hint">Click a sample row to open its matches &amp; overrides.</p>
+  </section>
+</main>
+
 <main id="view-matches" class="view hidden">
   <section class="panel">
-    <h2>Pairing matches</h2>
+    <h2>Pick a sample</h2>
     <div class="actions">
-      <label>find sample
-        <input id="m-q" placeholder="primary_id, name, patient or request…" style="min-width:22rem">
+      <label>search
+        <input id="m-q" placeholder="partial match on primary_id / cmo name / patient / request">
       </label>
-      <button id="m-search">Find</button>
-      <select id="m-sample" disabled></select>
+      <button id="m-search" class="primary">Search</button>
+    </div>
+    <div class="actions">
+      <label>sample
+        <select id="m-sample" disabled></select>
+      </label>
       <label>pairing logic
         <select id="m-logic"></select>
       </label>
@@ -97,42 +163,38 @@
     </div>
   </section>
 
-  <section id="m-summary" class="panel hidden"></section>
+  <section id="m-summary" class="panel hidden">
+    <!-- filled by JS -->
+  </section>
 
-  <section class="panel hidden" id="m-current-panel">
-    <h2>Current match</h2>
+  <section id="m-current-panel" class="panel hidden">
+    <h3>Current match</h3>
     <div id="m-current"></div>
   </section>
 
-  <section class="panel hidden" id="m-others-panel">
-    <div class="table-head">
-      <h2>Other matches</h2>
-      <label class="chk"><input type="checkbox" id="m-strict">
-        strict: reject the override if any matching key differs</label>
-    </div>
+  <section id="m-others-panel" class="panel hidden">
+    <h3>Other potential matches</h3>
     <div class="table-wrap">
       <table id="m-others">
         <thead>
-          <tr>
-            <th>candidate</th><th>patient</th><th>tier</th>
-            <th>status</th><th>mismatched keys</th><th>sequencing_date</th>
-            <th></th>
-          </tr>
+          <tr><th>candidate</th><th>patient_id</th><th>tier</th><th>keys</th><th>mismatched keys</th><th>sequencing_date</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
       <p id="m-others-empty" class="empty">No other candidates.</p>
     </div>
-    <p class="hint">For a tumor sample, <em>Override</em> pins the candidate as the
-    tumor's current pairing for the selected logic (recorded with
-    <code>mismatched_keys</code> when keys differ); <em>Re-pair</em> re-runs the
-    strategy cascade.</p>
+    <p class="hint">
+      &#9733; marks the candidate the strategy's cascade would pick.
+      Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
+    </p>
+    <label class="check">
+      <input type="checkbox" id="m-strict">
+      reject if any matching key differs (strict override)
+    </label>
   </section>
 </main>
 
-<footer>
-  <span id="footer-note"></span>
-</footer>
+<footer class="foot">Syzygy dev UI &mdash; no-build static front end served by FastAPI at <code>/ui</code></footer>
 <script src="app.js"></script>
 </body>
 </html>
