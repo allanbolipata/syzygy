@@ -23,6 +23,7 @@ from pairing_service import (
 from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
+from routers.patients import list_patients
 from routers.samples import create_sample, list_samples
 from schemas import PairingLogicCreate, PairingTriggerCreate, SampleCreate, TumorOrNormal
 
@@ -1376,6 +1377,54 @@ def test_list_samples_q_search(db):
     # q AND-combines with field filters.
     assert [s.id for s in list_samples(q="tum", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == []
     assert [s.id for s in list_samples(q="pat-101", tumor_or_normal=TumorOrNormal.TUMOR, limit=None, offset=None, db=db)] == [t1.id]
+
+
+# ---------------------------------------------------------------------------
+# GET /patient
+# ---------------------------------------------------------------------------
+
+
+def test_list_patients_aggregates_samples(db):
+    _make_sample2(
+        db, "TUMOR-101", "PAT-101", TumorOrNormal.TUMOR.value,
+        request_id="REQ-1",
+        additional_metadata={"species": "Mouse", "sex": "M", "oncotreeCode": "GLI"},
+    )
+    _make_sample2(
+        db, "NORMAL-101", "PAT-101", TumorOrNormal.NORMAL.value,
+        request_id="REQ-2",
+        additional_metadata={"sex": "M"},
+    )
+    pooled = _make_sample2(db, "DMP-POOL", None, TumorOrNormal.NORMAL.value)
+    _make_sample2(db, "TUMOR-202", "PAT-202", TumorOrNormal.TUMOR.value)
+
+    patients = list_patients(limit=None, offset=None, q=None, db=db)
+    assert [p.patient_id for p in patients] == ["PAT-101", "PAT-202"]
+
+    p1 = patients[0]
+    assert p1.sample_count == 2 and p1.tumor_count == 1 and p1.normal_count == 1
+    assert p1.requests == ["REQ-1", "REQ-2"]
+    # Patient-level fields come from sample metadata (tumor samples first).
+    assert p1.metadata == {"species": "Mouse", "sex": "M", "oncotreeCode": "GLI"}
+
+    p2 = patients[1]
+    assert p2.sample_count == 1 and p2.metadata == {}
+
+    # Samples without a patient_id (pooled normals) do not create patients.
+    assert pooled.patient_id is None
+    assert all(p.patient_id for p in patients)
+
+
+def test_list_patients_q_and_pagination(db):
+    for pid in ("PAT-A", "PAT-B", "PAT-C"):
+        _make_sample2(db, f"TUMOR-{pid}", pid, TumorOrNormal.TUMOR.value)
+
+    # q is a case-insensitive partial match on patient_id.
+    assert [p.patient_id for p in list_patients(q="pat-b", limit=None, offset=None, db=db)] == ["PAT-B"]
+    assert list_patients(q="nope", limit=None, offset=None, db=db) == []
+    # Pagination slices the sorted, aggregated list.
+    assert [p.patient_id for p in list_patients(q="PAT", limit=2, offset=0, db=db)] == ["PAT-A", "PAT-B"]
+    assert [p.patient_id for p in list_patients(q="PAT", limit=2, offset=1, db=db)] == ["PAT-B", "PAT-C"]
 
 
 def test_list_pairings_ordered_and_paginated(db, tumor_sample, normal_sample, pairing_logic):

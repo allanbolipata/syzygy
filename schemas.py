@@ -59,6 +59,20 @@ class SampleRead(BaseModel):
     modified_date: datetime
 
 
+class PatientRead(BaseModel):
+    # Patients are derived from samples (``patient_id`` non-null); there is
+    # no separate patient table yet.
+    patient_id: str
+    sample_count: int
+    tumor_count: int
+    normal_count: int
+    # Distinct request_ids across the patient's samples.
+    requests: list[str]
+    # Patient-level fields derived from the samples' additional_metadata
+    # (first non-null value per key; tumor samples take priority).
+    metadata: dict
+
+
 class PairingLogicCreate(BaseModel):
     name: str
     description: Optional[str] = None

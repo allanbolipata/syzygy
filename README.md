@@ -57,6 +57,13 @@ tables.
   `gene_panel`, `bait_set`, `run_mode` are case-insensitive partial
   matches; `tumor_or_normal` is exact (`TUMOR`/`NORMAL`); `limit` /
   `offset` paginate.
+- `GET /v1/patient` — patients derived from samples (a patient is a
+  distinct non-null `patient_id`), sorted by `patient_id`. Returns
+  sample/tumor/normal counts, the patient's distinct `request_id`s, and
+  patient-level `metadata` (species, sex, oncotreeCode, diagnosisDate)
+  derived from the samples' `additional_metadata` (first non-null value
+  per key; tumor samples take priority). `q` is a case-insensitive
+  partial match on `patient_id`; `limit` / `offset` paginate.
 - `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
   match (latest pairing for the selected logic) plus all potential
   matches. Candidates are same-patient normals/tumors, plus pooled
@@ -110,13 +117,22 @@ at `/ui`; the root path `/` redirects there. It lets you:
 
 - query and filter samples by the matching fields (patient, request,
   panel, bait set, run mode, sample type, role) with pagination;
+- browse patients: each patient's metadata, sample counts, and all
+  their samples with their current match per pairing logic
+  (`GET /v1/patient` + `GET /v1/pairing?latest=true`);
 - view a sample's current match and all potential matches per pairing
   logic (via `possible-matches`), with cascade tier, match status,
-  mismatch reasons, and the candidate the cascade would pick;
+  mismatch reasons, and the candidate the cascade would pick; clicking
+  a sample (from the samples or patients view) opens this view,
+  pre-selecting the logic the sample is currently paired under when
+  known;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the
   recorded mismatches shown afterwards.
+
+A back button returns to the previous screen (in-app navigation
+history; disabled at the start of a session).
 
 ## Pairing strategies
 

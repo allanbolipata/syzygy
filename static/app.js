@@ -62,15 +62,38 @@ async function api(path, opts) {
   return body;
 }
 
-/* ---------- tabs ---------- */
+/* ---------- view navigation (tabs + back button) ---------- */
+
+const viewHistory = [];
+
+function currentViewName() {
+  const el = document.querySelector("main.view:not(.hidden)");
+  return el ? el.id.replace("view-", "") : null;
+}
+
+function showView(name, push = true) {
+  const current = currentViewName();
+  if (push && current && current !== name) viewHistory.push(current);
+  document.querySelectorAll(".tab[data-tab]").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === name)
+  );
+  document.querySelectorAll("main.view").forEach((v) =>
+    v.classList.toggle("hidden", v.id !== `view-${name}`)
+  );
+  updateBackButton();
+}
+
+function updateBackButton() {
+  $("#btn-back").disabled = viewHistory.length === 0;
+}
+
+$("#btn-back").addEventListener("click", () => {
+  const prev = viewHistory.pop();
+  if (prev) showView(prev, false);
+});
 
 document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab[data-tab]").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    document.querySelectorAll("main.view").forEach((v) => v.classList.add("hidden"));
-    $(`#view-${btn.dataset.tab}`).classList.remove("hidden");
-  });
+  btn.addEventListener("click", () => showView(btn.dataset.tab));
 });
 
 /* ---------- samples view ---------- */
@@ -175,7 +198,15 @@ function openMatchesFor(sample) {
   sel.innerHTML = `<option value="${sample.id}" selected>${esc(sampleLabel(sample))}</option>`;
   sel.disabled = false;
   $("#m-show").disabled = false;
-  document.querySelector('.tab[data-tab="matches"]').click();
+  // Prefer the logic this sample is currently paired under, when known.
+  const byLogic = patientsState.pairings ? patientsState.pairings[sample.id] : null;
+  if (byLogic) {
+    const logicSel = $("#m-logic");
+    const known = Object.keys(byLogic)[0];
+    const opt = [...logicSel.options].find((o) => o.value === known && !o.disabled);
+    if (opt) logicSel.value = opt.value;
+  }
+  showView("matches");
   showMatches();
 }
 
@@ -338,9 +369,132 @@ function submitOverride(normalId) {
     .catch((e) => banner("error", `Override failed: ${esc(e.message)}`, true));
 }
 
+/* ---------- patients view ---------- */
+
+const patientsState = {
+  results: [],
+  pairings: null, // sample id -> {pairing logic name: matched sample}
+  patient: null,
+  patientSamples: [],
+};
+
+async function loadPatients() {
+  try {
+    const q = $("#p-q").value.trim();
+    const params = new URLSearchParams();
+    params.set("limit", 100);
+    if (q) params.set("q", q);
+    patientsState.results = await api(`/patient/?${params}`);
+    renderPatients();
+  } catch (e) {
+    banner("error", `Failed to load patients: ${esc(e.message)}`, true);
+  }
+}
+
+function renderPatients() {
+  const rows = patientsState.results;
+  const tbody = $("#patients-table tbody");
+  tbody.innerHTML = rows.map((p) => {
+    const meta = Object.entries(p.metadata)
+      .map(([k, v]) => `${esc(k)}: ${metaText(v)}`).join(", ");
+    return `
+      <tr class="click" data-pid="${esc(p.patient_id)}">
+        <td>${esc(p.patient_id)}</td>
+        <td>${p.sample_count}</td>
+        <td>${p.tumor_count}</td>
+        <td>${p.normal_count}</td>
+        <td>${esc((p.requests || []).join(", "))}</td>
+        <td>${meta || "—"}</td>
+      </tr>`;
+  }).join("");
+  $("#p-empty").classList.toggle("hidden", rows.length > 0);
+  tbody.querySelectorAll("tr[data-pid]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const row = rows.find((p) => p.patient_id === tr.dataset.pid);
+      if (row) openPatient(row);
+    });
+  });
+}
+
+/* Sample id -> {logic name: opposite sample}, from all latest pairings (one request). */
+async function loadPairingMap() {
+  if (!patientsState.pairings) {
+    const rows = await api("/pairing/?latest=true&limit=500");
+    const map = {};
+    for (const r of rows) {
+      (map[r.tumor_id] = map[r.tumor_id] || {})[r.pairing_logic] = r.normal;
+      (map[r.normal_id] = map[r.normal_id] || {})[r.pairing_logic] = r.tumor;
+    }
+    patientsState.pairings = map;
+  }
+  return patientsState.pairings;
+}
+
+function currentMatchCell(sampleId) {
+  const byLogic = (patientsState.pairings || {})[sampleId];
+  if (!byLogic || !Object.keys(byLogic).length) return "—";
+  return Object.entries(byLogic).map(([logic, s]) =>
+    `<div>${esc(logic)}: ${esc(s.primary_id)} <span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></div>`
+  ).join("");
+}
+
+async function openPatient(row) {
+  patientsState.patient = row;
+  $("#p-detail").classList.remove("hidden");
+  $("#p-detail-title").textContent = `Patient ${row.patient_id}`;
+  $("#p-detail-meta").innerHTML =
+    `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
+    `<dt>requests</dt><dd>${esc((row.requests || []).join(", ") || "—")}</dd>` +
+    Object.entries(row.metadata).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${metaText(v)}</dd>`).join("");
+
+  const tbody = $("#p-samples tbody");
+  tbody.innerHTML = "";
+  $("#p-samples-empty").classList.remove("hidden");
+  try {
+    const [samples] = await Promise.all([
+      api(`/sample/?patient_id=${encodeURIComponent(row.patient_id)}&limit=200`),
+      loadPairingMap(),
+    ]);
+    patientsState.patientSamples = samples;
+    tbody.innerHTML = samples.map((s) => `
+      <tr class="click" data-id="${s.id}">
+        <td>${esc(s.primary_id)}</td>
+        <td>${esc(s.cmo_sample_name)}</td>
+        <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
+        <td>${esc(s.sample_type)}</td>
+        <td>${esc(s.request_id || "")}</td>
+        <td>${currentMatchCell(s.id)}</td>
+      </tr>`).join("");
+    $("#p-samples-empty").classList.toggle("hidden", samples.length > 0);
+    tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const sample = patientsState.patientSamples.find((s) => s.id === tr.dataset.id);
+        if (sample) openMatchesFor(sample);
+      });
+    });
+    $("#p-detail").scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    banner("error", `Failed to load patient samples: ${esc(e.message)}`, true);
+  }
+}
+
+$("#p-search").addEventListener("click", loadPatients);
+$("#p-q").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") loadPatients();
+});
+$("#p-clear").addEventListener("click", () => {
+  $("#p-q").value = "";
+  loadPatients();
+});
+$("#p-close").addEventListener("click", () => {
+  patientsState.patient = null;
+  $("#p-detail").classList.add("hidden");
+});
+
 /* ---------- init ---------- */
 
 (async function init() {
   await loadLogics();
   loadSamples(0);
+  loadPatients();
 })();
