@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
@@ -58,6 +58,17 @@ app.include_router(patients_router, prefix="/v1")
 app.include_router(requests_router, prefix="/v1")
 app.include_router(pairings_router, prefix="/v1")
 app.include_router(pairing_logic_router, prefix="/v1")
+
+
+# Local dev UI: never serve stale cached assets (no build step, no
+# versioned filenames — always refetch from disk).
+@app.middleware("http")
+async def no_cache_ui(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/ui"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 # Basic web front end (static, no build step).
 app.mount(

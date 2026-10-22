@@ -50,6 +50,10 @@ class Sample(Base):
     additional_metadata: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     errors: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
     sequencing_date: Mapped[Optional[datetime]] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    # Provenance: the beagle file group this record came from (e.g. "LIMS",
+    # "DMP BAMs", "Pooled Normals"); None for rows created outside a beagle
+    # import (dashboard fixtures, manual API creates).
+    file_group: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

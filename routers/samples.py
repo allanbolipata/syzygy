@@ -56,6 +56,7 @@ def list_samples(
     gene_panel: Optional[str] = None,
     bait_set: Optional[str] = None,
     run_mode: Optional[str] = None,
+    file_group: Optional[str] = None,
     tumor_or_normal: Optional[TumorOrNormal] = None,
     db: Session = Depends(get_db),
 ):
@@ -86,6 +87,7 @@ def list_samples(
         "gene_panel": gene_panel,
         "bait_set": bait_set,
         "run_mode": run_mode,
+        "file_group": file_group,
     }.items():
         if value is not None:
             stmt = stmt.where(getattr(Sample, field).ilike(f"%{value}%"))
