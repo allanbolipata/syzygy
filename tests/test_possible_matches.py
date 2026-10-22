@@ -101,7 +101,7 @@ def test_tumor_current_and_other_matches(db, argos):
                  sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc))
     n1 = _sample(db, "N1", request_id="R1", run_mode="NovaSeq X 1000",
                  sequencing_date=datetime(2024, 1, 2, tzinfo=timezone.utc))
-    n2 = _sample(db, "N2", request_id="R2", run_mode="NovaSeq X 1000",
+    n2 = _sample(db, "N2", request_id="R2", run_mode="HiSeq 4000",
                  sequencing_date=datetime(2023, 1, 1, tzinfo=timezone.utc))
     n3 = _sample(db, "N3", request_id="R1", bait_set="idt",
                  run_mode="NovaSeq X 1000")
@@ -125,27 +125,31 @@ def test_tumor_current_and_other_matches(db, argos):
     others = _others(res)
     # The current match is not repeated among the other matches.
     assert "N1" not in others
-    # Different-patient normals are out of scope.
+    # Out-of-scope candidates: different patient (N4), different bait set
+    # (N3), different pooled panel (P2) — no cascade tier can reach them.
     assert "N4" not in others
+    assert "N3" not in others
+    assert "P2" not in others
 
     assert others["N2"]["tier"] == "other_request"
-    assert others["N2"]["matched"] is True
-    assert others["N2"]["mismatched_keys"] is None
+    assert others["N2"]["matched"] is False
+    assert any("run_mode mismatch" in r for r in others["N2"]["mismatched_keys"])
     assert others["N2"]["would_be_selected"] is False
-
-    assert others["N3"]["tier"] == "same_request"
-    assert others["N3"]["matched"] is False
-    assert any("bait_set mismatch (agilent vs idt)" in r for r in others["N3"]["mismatched_keys"])
 
     assert others["P1"]["tier"] == "pooled"
     assert others["P1"]["matched"] is True
-    assert others["P2"]["tier"] == "pooled"
-    assert others["P2"]["matched"] is False
-    assert any("gene_panel mismatch (IMPACT468 vs IMPACT505)" in r for r in others["P2"]["mismatched_keys"])
 
-    # Ordered by tier (same_request, other_request, pooled), matched first.
+    # Ordered by tier (other_request before pooled), matched first.
     assert [c["sample"].primary_id for c in res["other_matches"]] == [
-        "N3", "N2", "P1", "P2",
+        "N2", "P1",
+    ]
+
+    # Whole-scope summary, independent of the page.
+    assert res["other_matches_total"] == 2
+    assert res["other_matches_matched"] == 1
+    assert res["other_matches_tiers"] == {"other_request": 1, "pooled": 1}
+    assert res["other_matches_breakdown"] == [
+        {"mismatched_keys": ["run_mode mismatch"], "count": 1},
     ]
 
 
@@ -161,8 +165,9 @@ def test_tumor_without_current_match_marks_cascade_winner(db, argos):
     assert res["current_match"] is None
 
     others = _others(res)
-    assert others["P1"]["matched"] is False
-    assert any("bait_set mismatch (None vs agilent)" in r for r in others["P1"]["mismatched_keys"])
+    # P1's bait set differs from the tumor's (null), so the pooled tier
+    # can never reach T2 via P1: it is out of scope.
+    assert "P1" not in others
     assert others["P3"]["matched"] is True
     assert others["P3"]["would_be_selected"] is True
 
@@ -214,8 +219,9 @@ def test_pooled_normal_lists_cross_patient_tumors(db, argos):
     others = _others(res)
     assert others["T2"]["tier"] == "pooled"
     assert others["T2"]["matched"] is True
-    assert others["T1"]["matched"] is False
-    assert any("bait_set mismatch (agilent vs None)" in r for r in others["T1"]["mismatched_keys"])
+    # T1's bait set differs from the pooled normal's, so no tier can
+    # reach it: it is out of the candidate scope.
+    assert "T1" not in others
 
 
 def test_normal_with_multiple_tumors_lists_all_current_matches(db, argos):
@@ -266,3 +272,94 @@ def test_unknown_logic_404(db):
     with pytest.raises(HTTPException) as exc_info:
         possible_matches_endpoint(t1.id, pairing_logic_name="NOPE", db=db)
     assert exc_info.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+
+
+def test_other_matches_paging(db, argos):
+    # Six same-patient normals: three on the tumor's request, three on
+    # another. No pairing is triggered, so all six are candidates.
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, request_id="R1",
+                 run_mode="NovaSeq X 1000")
+    for i in range(1, 4):
+        _sample(db, f"N{i}", request_id="R1", run_mode="NovaSeq X 1000")
+    for i in range(4, 7):
+        _sample(db, f"N{i}", request_id="R2", run_mode="NovaSeq X 1000")
+
+    first = possible_matches_endpoint(
+        t1.id, pairing_logic_name="argos", limit=2, offset=0, db=db
+    )
+    second = possible_matches_endpoint(
+        t1.id, pairing_logic_name="argos", limit=2, offset=2, db=db
+    )
+    # The page is a bounded slice; the totals describe the whole scope,
+    # not the page, so they are identical for both pages.
+    assert first["other_matches_total"] == second["other_matches_total"] == 6
+    assert first["other_matches_matched"] == second["other_matches_matched"] == 6
+    assert first["other_matches_tiers"] == second["other_matches_tiers"] == {
+        "same_request": 3, "other_request": 3,
+    }
+    assert first["other_matches_breakdown"] == []
+    assert len(first["other_matches"]) == 2
+    assert len(second["other_matches"]) == 2
+    pids_first = {c["sample"].primary_id for c in first["other_matches"]}
+    pids_second = {c["sample"].primary_id for c in second["other_matches"]}
+    assert not pids_first & pids_second
+
+    # A page past the end is empty, but the scope totals are unchanged.
+    beyond = possible_matches_endpoint(
+        t1.id, pairing_logic_name="argos", limit=2, offset=100, db=db
+    )
+    assert beyond["other_matches"] == []
+    assert beyond["other_matches_total"] == 6
+
+
+def test_limit_validation(db, argos):
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value)
+    for bad in (0, 5001):
+        with pytest.raises(HTTPException) as exc_info:
+            possible_matches_endpoint(
+                t1.id, pairing_logic_name="argos", limit=bad, db=db
+            )
+        assert exc_info.value.status_code == 400
+    with pytest.raises(HTTPException) as exc_info:
+        possible_matches_endpoint(t1.id, pairing_logic_name="argos", offset=-1, db=db)
+    assert exc_info.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive hard keys
+# ---------------------------------------------------------------------------
+
+
+def test_hard_keys_compared_case_insensitively(db, argos):
+    # Production data stores the same values in different cases across
+    # sample types; matching keys must compare case-insensitively.
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient_id="C-1",
+                 gene_panel="IMPACT468", bait_set="Agilent",
+                 run_mode="NovaSeq X 1000")
+    n1 = _sample(db, "N1", patient_id="c-1", gene_panel="impact468",
+                 bait_set="AGILENT", run_mode="NovaSeq X 1000")
+
+    res = _endpoints(db, t1)
+    others = _others(res)
+    assert "N1" in others
+    assert others["N1"]["matched"] is True
+    assert others["N1"]["mismatched_keys"] is None
+
+
+def test_pooled_tier_matches_across_case(db, argos):
+    # The pooled tier was dead in production data: pooled normals store
+    # e.g. "impact505" while tumors store "IMPACT505".
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient_id="C-1",
+                 gene_panel="IMPACT468", bait_set="agilent")
+    p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal",
+                 gene_panel="impact468", bait_set="agilent")
+
+    res = _endpoints(db, t1)
+    others = _others(res)
+    assert others["P1"]["tier"] == "pooled"
+    assert others["P1"]["matched"] is True

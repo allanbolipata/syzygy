@@ -182,4 +182,11 @@ class PossibleMatchesRead(BaseModel):
     # 1-to-many and lists every currently-paired tumor here.
     current_match: Optional[CurrentMatchRead] = None
     current_matches: list[CurrentMatchRead] = []
-    other_matches: list[PossibleMatchCandidate]
+    # ``other_matches`` is a bounded page (default 500) of the
+    # strategy's candidate scope; the fields below describe the full
+    # scope regardless of the page.
+    other_matches: list[PossibleMatchCandidate] = []
+    other_matches_total: int = 0
+    other_matches_matched: int = 0
+    other_matches_tiers: dict[str, int] = {}
+    other_matches_breakdown: list[dict] = []

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from database import get_db, settings
 from models import Sample
 from pairing_service import (
+    MAX_OTHER_MATCHES_LIMIT,
     possible_matches,
     resolve_pairing_logic,
     trigger_pairing,
@@ -105,18 +106,26 @@ def possible_matches_endpoint(
     sample_id: UUID,
     pairing_logic_id: Optional[UUID] = None,
     pairing_logic_name: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """The sample's current match and all potential matches.
 
-    Candidates are every opposite-type sample the strategy's keys can
-    reach (same-patient normals/tumors, plus pooled normals for
-    strategies with a pooled tier). Each candidate reports its cascade
-    tier, whether it passes every matching key (``matched``), and the
-    reasons it does not (``mismatched_keys``). For a tumor input,
+    Candidates are exactly the opposite-type samples this strategy's
+    cascade can reach (its hard keys, compared case-insensitively, plus
+    extra tiers such as argos's pooled normals). Each candidate reports
+    its cascade tier, whether it passes every matching key (``matched``),
+    and the reasons it does not (``mismatched_keys``). For a tumor input,
     ``would_be_selected`` marks the candidate the strategy's cascade
-    would pick. Supports manual pairing (e.g. pinning a DMP normal via
-    POST /pairing/trigger).
+    would pick.
+
+    ``other_matches`` is a bounded page (``limit``/``offset``; default
+    ``limit`` is 500, max 5000) of that candidate scope; the response's
+    ``other_matches_total`` / ``other_matches_matched`` /
+    ``other_matches_tiers`` / ``other_matches_breakdown`` fields describe
+    the full scope regardless of the page. Supports manual pairing (e.g.
+    pinning a DMP normal via POST /pairing/trigger).
     """
     sample = db.get(Sample, sample_id)
     if sample is None:
@@ -129,4 +138,11 @@ def possible_matches_endpoint(
     )
     if logic is None:
         raise HTTPException(status_code=400, detail="No active pairing logic found")
-    return possible_matches(db, sample, logic)
+    if limit is not None and (limit < 1 or limit > MAX_OTHER_MATCHES_LIMIT):
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit must be between 1 and {MAX_OTHER_MATCHES_LIMIT}",
+        )
+    if offset is not None and offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    return possible_matches(db, sample, logic, limit=limit, offset=offset)

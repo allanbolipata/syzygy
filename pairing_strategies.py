@@ -146,6 +146,23 @@ class NormalSelection:
     notes: List[str] = field(default_factory=list)
 
 
+def _norm_key(value) -> Optional[str]:
+    """Case-insensitive comparison form of a key value (None stays None)."""
+    return None if value is None else str(value).lower()
+
+
+def _key_condition(column, value):
+    """Case-insensitive hard-key equality for candidate queries.
+
+    ``None`` values match only NULL columns: SQLAlchemy renders
+    ``column == None`` as ``IS NULL``, which is the pre-existing
+    behavior for null keys.
+    """
+    if value is None:
+        return column.is_(None)
+    return func.lower(column) == str(value).lower()
+
+
 class PairingStrategy(Protocol):
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool
@@ -162,6 +179,20 @@ class PairingStrategy(Protocol):
         tumor: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> NormalSelection:
+        ...
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        """Every opposite-type sample this strategy's cascade can reach.
+
+        Powers the Matches & Overrides view: the candidate list mirrors
+        what the strategy can actually select, so it stays bounded
+        instead of returning the whole opposite-type table.
+        """
         ...
 
     def select_matching_tumors(
@@ -224,11 +255,12 @@ class DefaultPairingStrategy:
     # -- matching -------------------------------------------------------
 
     def _base_mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+        # Hard keys compare case-insensitively; None matches only NULL.
         reasons: List[str] = []
         for label in self.HARD_KEYS:
             t_val = getattr(tumor, label)
             n_val = getattr(normal, label)
-            if t_val != n_val:
+            if _norm_key(t_val) != _norm_key(n_val):
                 reasons.append(f"{label} mismatch ({t_val} vs {n_val})")
         return reasons
 
@@ -248,7 +280,8 @@ class DefaultPairingStrategy:
     ):
         conds = [Sample.tumor_or_normal == TumorOrNormal.NORMAL.value]
         conds.extend(
-            getattr(Sample, key) == getattr(tumor, key) for key in self.HARD_KEYS
+            _key_condition(getattr(Sample, key), getattr(tumor, key))
+            for key in self.HARD_KEYS
         )
         stmt = select(Sample).where(*conds)
         if request_id is not None:
@@ -329,6 +362,24 @@ class DefaultPairingStrategy:
         notes.extend(tier_notes)
         return NormalSelection(picked, notes)
 
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        conds = [Sample.tumor_or_normal == role]
+        conds.extend(
+            _key_condition(getattr(Sample, key), getattr(sample, key))
+            for key in self.HARD_KEYS
+        )
+        return list(db.scalars(select(Sample).where(*conds)).all())
+
     def select_matching_tumors(
         self,
         db: Session,
@@ -337,7 +388,8 @@ class DefaultPairingStrategy:
     ) -> List[Sample]:
         conds = [Sample.tumor_or_normal == TumorOrNormal.TUMOR.value]
         conds.extend(
-            getattr(Sample, key) == getattr(normal, key) for key in self.HARD_KEYS
+            _key_condition(getattr(Sample, key), getattr(normal, key))
+            for key in self.HARD_KEYS
         )
         stmt = select(Sample).where(*conds)
         return list(db.scalars(stmt).all())
@@ -401,9 +453,9 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
 
     def _pooled_reasons(self, tumor: Sample, pooled: Sample) -> List[str]:
         reasons: List[str] = []
-        if tumor.gene_panel != pooled.gene_panel:
+        if _norm_key(tumor.gene_panel) != _norm_key(pooled.gene_panel):
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
-        if tumor.bait_set != pooled.bait_set:
+        if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
             reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
         if pooled.run_mode:
             t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
@@ -428,8 +480,8 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return select(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
             func.lower(Sample.sample_type).in_(self._pooled_types()),
-            Sample.gene_panel == tumor.gene_panel,
-            Sample.bait_set == tumor.bait_set,
+            _key_condition(Sample.gene_panel, tumor.gene_panel),
+            _key_condition(Sample.bait_set, tumor.bait_set),
         )
 
     def select_latest_normal(
@@ -448,6 +500,33 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         )
         notes.extend(tier_notes)
         return NormalSelection(picked, notes)
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        if sample.tumor_or_normal == TumorOrNormal.TUMOR.value:
+            candidates = super().candidate_scope(db, sample, logic)
+            if sample.patient_id is None:
+                # Patient-null hard-key scope already includes every
+                # matching pooled normal; nothing extra to add.
+                return candidates
+            pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+            known = {c.id for c in candidates}
+            candidates.extend(p for p in pooled if p.id not in known)
+            return candidates
+        if self._is_pooled(sample):
+            # Only the pooled tier can pick a pooled normal: any tumor
+            # sharing its gene_panel + bait_set, regardless of patient.
+            conds = [
+                Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+                _key_condition(Sample.gene_panel, sample.gene_panel),
+                _key_condition(Sample.bait_set, sample.bait_set),
+            ]
+            return list(db.scalars(select(Sample).where(*conds)).all())
+        return super().candidate_scope(db, sample, logic)
 
 
 @register_pairing_strategy("tempo")
@@ -548,7 +627,7 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         candidates = db.scalars(
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
-                Sample.patient_id == tumor.patient_id,
+                _key_condition(Sample.patient_id, tumor.patient_id),
             )
         ).all()
         picked, tier_notes = self._select_in_candidates(
@@ -567,10 +646,31 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         tumors = db.scalars(
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
-                Sample.patient_id == normal.patient_id,
+                _key_condition(Sample.patient_id, normal.patient_id),
             )
         ).all()
         return [t for t in tumors if not self._soft_reasons(t, normal)]
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        # Tempo is patient-scoped (no pooled tier): everything the
+        # patient-wide tier can reach is one same-patient query away.
+        if sample.patient_id is None:
+            return []
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        conds = [
+            Sample.tumor_or_normal == role,
+            _key_condition(Sample.patient_id, sample.patient_id),
+        ]
+        return list(db.scalars(select(Sample).where(*conds)).all())
 
 
 # Strategy-name aliases: a PairingLogic row may reference a strategy by
