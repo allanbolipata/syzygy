@@ -251,8 +251,16 @@
       </table>
       <p id="m-others-empty" class="empty">No other candidates.</p>
     </div>
+    <p id="m-others-summary" class="hint"></p>
+    <div class="pager">
+      <button id="m-others-prev">Prev</button>
+      <button id="m-others-next">Next</button>
+    </div>
     <p class="hint">
       &#9733; marks the candidate the strategy's cascade would pick.
+      Candidates are the opposite-type samples this strategy can actually
+      reach (hard keys compared case-insensitively); the page is bounded
+      to 500 per page &mdash; use Prev/Next to page the full scope.
       Click a candidate row to open its matches &amp; overrides.
       Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
     </p>

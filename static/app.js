@@ -207,7 +207,18 @@ for (const el of ["#f-q", ...SAMPLE_FILTER_IDS.map((id) => `#f-${id}`)]) {
 
 /* ---------- matches & overrides view ---------- */
 
-const matchesState = { sample: null, data: null, busy: false, candidates: [] };
+// Candidates are a bounded page of the strategy's candidate scope:
+// the API returns at most OTHERS_PAGE_SIZE rows per request, with
+// whole-scope totals alongside (matches DEFAULT_OTHER_MATCHES_LIMIT).
+const OTHERS_PAGE_SIZE = 500;
+const matchesState = {
+  sample: null,
+  data: null,
+  busy: false,
+  candidates: [],
+  othersOffset: 0,
+  othersTotal: 0,
+};
 
 async function loadLogics() {
   try {
@@ -235,7 +246,8 @@ function openMatchesFor(sample) {
     if (opt) logicSel.value = opt.value;
   }
   showView("matches");
-  showMatches();
+  matchesState.othersOffset = 0;
+  showMatches(0);
 }
 
 function sampleLabel(s) {
@@ -267,18 +279,23 @@ async function searchMatchesSamples() {
   }
 }
 
-async function showMatches() {
+async function showMatches(offset) {
   const sample = matchesState.sample;
   const logic = $("#m-logic").value;
   if (!sample || !logic) return;
   if (matchesState.busy) return;
+  if (offset === undefined || typeof offset !== "number") offset = matchesState.othersOffset;
   matchesState.busy = true;
   $("#m-show").disabled = true;
+  const params = new URLSearchParams();
+  params.set("pairing_logic_name", logic);
+  params.set("limit", OTHERS_PAGE_SIZE);
+  params.set("offset", offset);
   try {
-    const data = await api(
-      `/sample/${sample.id}/possible-matches?pairing_logic_name=${encodeURIComponent(logic)}`
-    );
+    const data = await api(`/sample/${sample.id}/possible-matches?${params}`);
     matchesState.data = data;
+    matchesState.othersOffset = offset;
+    matchesState.othersTotal = data.other_matches_total ?? data.other_matches.length;
     renderMatches(data, logic);
   } catch (e) {
     banner("error", `Failed to load matches: ${esc(e.message)}`, true);
@@ -366,6 +383,31 @@ function renderMatches(data, logic) {
       </tr>`;
   }).join("");
   $("#m-others-empty").classList.toggle("hidden", rows.length > 0);
+  $("#m-others-empty").textContent =
+    rows.length === 0 && matchesState.othersTotal > 0
+      ? "No candidates on this page."
+      : "No other candidates.";
+
+  // Bounded candidate page: whole-scope summary + pager controls.
+  const total = matchesState.othersTotal;
+  const offset = matchesState.othersOffset;
+  const parts = [];
+  if (total > 0) parts.push(rows.length > 0
+    ? `showing ${offset + 1}\u2013${offset + rows.length} of ${total} candidates`
+    : `${total} candidates in scope, none on this page`);
+  if (typeof data.other_matches_matched === "number") parts.push(`${data.other_matches_matched} pass every key`);
+  const tierBits = Object.entries(data.other_matches_tiers || {})
+    .map(([t, n]) => `${n} ${t.replace(/_/g, " ")}`)
+    .join(", ");
+  if (tierBits) parts.push(`tiers: ${tierBits}`);
+  const breakdownBits = (data.other_matches_breakdown || [])
+    .slice(0, 3)
+    .map((b) => `${b.count} on ${b.mismatched_keys.join(" + ")}`)
+    .join(", ");
+  if (breakdownBits) parts.push(`mismatches: ${breakdownBits}`);
+  $("#m-others-summary").textContent = parts.join(" \u00b7 ");
+  $("#m-others-prev").disabled = offset <= 0;
+  $("#m-others-next").disabled = offset + rows.length >= total;
   tbody.querySelectorAll("button[data-override]").forEach((btn) => {
     btn.addEventListener("click", () => submitOverride(btn.dataset.override));
   });
@@ -375,12 +417,22 @@ $("#m-search").addEventListener("click", searchMatchesSamples);
 $("#m-q").addEventListener("keydown", (e) => {
   if (e.key === "Enter") searchMatchesSamples();
 });
-$("#m-show").addEventListener("click", showMatches);
+$("#m-show").addEventListener("click", () => showMatches());
 $("#m-sample").addEventListener("change", (e) => {
   const picked = matchesState.candidates.find((s) => s.id === e.target.value);
   if (!picked) return;
   matchesState.sample = picked;
-  showMatches();
+  matchesState.othersOffset = 0;
+  showMatches(0);
+});
+$("#m-others-prev").addEventListener("click", () => {
+  if (!matchesState.data) return;
+  showMatches(Math.max(0, matchesState.othersOffset - OTHERS_PAGE_SIZE));
+});
+$("#m-others-next").addEventListener("click", () => {
+  if (!matchesState.data) return;
+  const next = matchesState.othersOffset + OTHERS_PAGE_SIZE;
+  if (next < matchesState.othersTotal) showMatches(next);
 });
 
 /* Sample panel: click a patient_id / request_id value to go to its page. */
