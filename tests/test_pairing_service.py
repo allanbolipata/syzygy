@@ -768,7 +768,10 @@ def test_argos_pooled_normal_tier(db):
     assert any("tier=pooled" in note for note in selection.notes)
 
 
-def test_argos_pooled_respects_keys_and_run_mode(db):
+def test_argos_pooled_ignores_run_mode(db):
+    """Pooled tier ignores run mode: a pool sequenced on a different
+    machine still matches when keys and preservation agree; a key
+    mismatch still blocks."""
     tumor = _sample(
         db, "TUMOR-POOL-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
@@ -777,13 +780,12 @@ def test_argos_pooled_respects_keys_and_run_mode(db):
         db, "NORM-POOL-2A", patient_id=None, sample_type="Pooled Normal",
         bait_set="BAIT-2", preservation=["FFPE"], sample_origin=["FFPE"],
     )
-    _sample(
+    other_machine_pool = _sample(
         db, "NORM-POOL-2B", patient_id=None, sample_type="Pooled Normal",
         run_mode="Hiseq 3000", preservation=["FFPE"], sample_origin=["FFPE"],
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal is None
-    assert any("run_mode mismatch" in note for note in selection.notes)
+    assert selection.normal.id == other_machine_pool.id
 
 
 def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
