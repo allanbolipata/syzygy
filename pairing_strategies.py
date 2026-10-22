@@ -527,7 +527,15 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     def _resolved_preservation(sample: Sample) -> str:
         return resolve_preservation(sample.preservation, sample.sample_origin)
 
+    @staticmethod
+    def _is_dmp(sample: Sample) -> bool:
+        return str(sample.sample_type or "").strip().upper() == "DMP"
+
     def _soft_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
+        # DMP records carry no run_mode/preservation/sample_origin, so
+        # those gates do not apply when either side is DMP.
+        if self._is_dmp(tumor) or self._is_dmp(candidate):
+            return []
         reasons: List[str] = []
         t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
         n_bucket = normalize_run_mode(candidate.run_mode, self._run_mode_map())

@@ -122,3 +122,20 @@ class PooledMachine(Base):
     machine_type: Mapped[Optional[str]] = mapped_column(sa.String(100), nullable=True)
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BaitSet(Base):
+    """Bait set -> primary pairing logic assignment. Seeded at startup by
+    ``bait_sets.seed_bait_sets``; maintainable via ``/v1/bait-sets``."""
+    __tablename__ = "bait_sets"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bait_set: Mapped[str] = mapped_column(sa.String(255), unique=True, index=True)
+    pairing_logic_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), sa.ForeignKey("pairing_logic.id"), index=True)
+    pairing_logic_obj: Mapped[PairingLogic] = relationship(foreign_keys=[pairing_logic_id], lazy="joined")
+    created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
+    modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    @property
+    def pairing_logic(self) -> str:
+        return self.pairing_logic_obj.name if self.pairing_logic_obj is not None else ""

@@ -1495,6 +1495,29 @@ def test_list_samples_file_group_filter(db):
     assert [s.id for s in list_samples(file_group="LIMS", limit=1, offset=1, db=db)] in [[t1.id], [n1.id]]
 
 
+def test_list_samples_no_patient_filter(db):
+    pn1 = _make_sample2(
+        db, "PN-NF-001", None, TumorOrNormal.NORMAL.value,
+        sample_type="Pooled Normal", file_group="Pooled Normals",
+    )
+    n1 = _make_sample2(db, "NF-302", "PAT-NF-302", TumorOrNormal.NORMAL.value)
+    t1 = _make_sample2(db, "NF-301", "PAT-NF-301", TumorOrNormal.TUMOR.value)
+
+    # Selects exactly the null-patient rows (scoped via q: other tests
+    # in this module may have created other patient-less samples).
+    assert [s.id for s in list_samples(no_patient=True, q="PN-NF", limit=None, offset=None, db=db)] == [pn1.id]
+    assert [s.id for s in list_samples(no_patient=True, q="NF-30", limit=None, offset=None, db=db)] == []
+    # no_patient=False / None are no-ops.
+    assert {s.id for s in list_samples(no_patient=False, q="NF-30", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert {s.id for s in list_samples(q="NF-30", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    # AND-combines with other filters (case-insensitive sample_type).
+    assert [s.id for s in list_samples(no_patient=True, tumor_or_normal=TumorOrNormal.NORMAL, sample_type="pooled", q="PN-NF", limit=None, offset=None, db=db)] == [pn1.id]
+    assert list_samples(no_patient=True, tumor_or_normal=TumorOrNormal.TUMOR, q="PN-NF", limit=None, offset=None, db=db) == []
+    # Combines with pagination.
+    assert [s.id for s in list_samples(no_patient=True, q="PN-NF", limit=1, offset=0, db=db)] == [pn1.id]
+    assert list_samples(no_patient=True, q="PN-NF", limit=1, offset=1, db=db) == []
+
+
 # ---------------------------------------------------------------------------
 # GET /patient
 # ---------------------------------------------------------------------------

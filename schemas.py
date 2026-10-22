@@ -207,3 +207,19 @@ class PooledMachineRead(BaseModel):
     machine_type: Optional[str] = None
     created_date: datetime
     modified_date: datetime
+
+
+class BaitSetUpsert(BaseModel):
+    bait_set: str
+    pairing_logic_name: str
+
+
+class BaitSetRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    bait_set: str
+    pairing_logic_id: UUID
+    pairing_logic: str
+    created_date: datetime
+    modified_date: datetime

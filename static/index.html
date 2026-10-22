@@ -14,6 +14,7 @@
     <button class="tab active" data-tab="samples">Samples</button>
     <button class="tab" data-tab="patients">Patients</button>
     <button class="tab" data-tab="requests">Requests</button>
+    <button class="tab" data-tab="pooled">Pooled Normals</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
   </nav>
 </header>
@@ -207,6 +208,103 @@
       <p id="r-patients-empty" class="empty">No patients in this request.</p>
     </div>
     <p class="hint">Click a patient row to open the patient's view.</p>
+  </section>
+</main>
+
+<main id="view-pooled" class="view hidden">
+  <section class="panel">
+    <h2>Pooled normals</h2>
+    <p class="hint">Shared normals (sample_type <code>Pooled Normal</code>, no patient) &mdash; the ARGOS cascade's last-resort tier.</p>
+    <div class="filters">
+      <label>search
+        <input id="pn-q" placeholder="any of primary_id, cmo name, request">
+      </label>
+      <label>gene_panel
+        <input id="pn-gene_panel">
+      </label>
+      <label>bait_set
+        <input id="pn-bait_set">
+      </label>
+      <label>run_mode
+        <input id="pn-run_mode">
+      </label>
+      <label>file_group
+        <input id="pn-file_group">
+      </label>
+      <label>limit
+        <select id="pn-limit">
+          <option>25</option>
+          <option selected>50</option>
+          <option>100</option>
+        </select>
+      </label>
+      <button type="button" class="primary" id="pn-search">Search</button>
+      <button type="button" id="pn-clear">Clear</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="table-head">
+      <h3>Shared normal samples</h3>
+      <span id="pn-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="pooled-table">
+        <thead>
+          <tr>
+            <th>cmo_sample_name</th><th>primary_id</th><th>request_id</th>
+            <th>sample_type</th><th>gene_panel</th><th>bait_set</th>
+            <th>run_mode</th><th>file_group</th><th>preservation</th><th>sequencing_date</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="pn-empty" class="empty">No pooled normals found.</p>
+    </div>
+    <div class="pager">
+      <button id="pn-prev">Prev</button>
+      <button id="pn-next">Next</button>
+    </div>
+    <p class="hint">Click a row to open its matches &amp; overrides.</p>
+  </section>
+
+  <section class="panel">
+    <h2>Pooled machines</h2>
+    <p class="hint">
+      Reference table for ARGOS pooled-tier run-mode matching: a pooled normal's
+      <code>run_mode</code> (the machine name) maps through <code>machine_class</code>
+      to a sequencer family (<code>novaseq</code>/<code>hiseq</code>) and must agree
+      with the tumor's run-mode family. <code>machine_type</code> is display-only.
+    </p>
+    <div class="actions">
+      <label>machine_name
+        <input id="pm-name">
+      </label>
+      <label>machine_class
+        <input id="pm-class" list="pm-class-options">
+      </label>
+      <label>machine_type
+        <input id="pm-type" placeholder="display only, e.g. NovaSeq 6000">
+      </label>
+      <datalist id="pm-class-options">
+        <option value="novaseq"></option>
+        <option value="hiseq"></option>
+      </datalist>
+      <button id="pm-add" class="primary">Add</button>
+    </div>
+    <div class="table-wrap">
+      <table id="pm-table">
+        <thead>
+          <tr>
+            <th>machine_name</th><th>machine_class</th><th>machine_type</th>
+            <th>modified</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="pm-empty" class="empty">No machines.</p>
+    </div>
+    <p class="hint">Save upserts on machine name (case-insensitive); edit changes class and type (the name stays the key).</p>
   </section>
 </main>
 

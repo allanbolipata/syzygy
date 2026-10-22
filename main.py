@@ -9,6 +9,8 @@ from sqlalchemy import select
 from database import Base, SessionLocal, engine
 from models import PairingLogic
 from pairing_strategies import seed_pooled_machines
+from bait_sets import seed_bait_sets
+from routers.bait_sets import router as bait_sets_router
 from routers.machines import router as machines_router
 from routers.patients import router as patients_router
 from routers.pairing_logic import router as pairing_logic_router
@@ -38,6 +40,7 @@ async def lifespan(app: FastAPI):
                 # strategies existed (e.g. TEMPO seeded as "default").
                 existing.strategy_name = strategy
         db.commit()
+        seed_bait_sets(db)
     finally:
         db.close()
     yield
@@ -64,6 +67,7 @@ app.include_router(requests_router, prefix="/v1")
 app.include_router(pairings_router, prefix="/v1")
 app.include_router(pairing_logic_router, prefix="/v1")
 app.include_router(machines_router, prefix="/v1")
+app.include_router(bait_sets_router, prefix="/v1")
 
 
 # Local dev UI: never serve stale cached assets (no build step, no
