@@ -126,7 +126,7 @@ const samplesState = { limit: 50, offset: 0, results: [] };
 
 const SAMPLE_FILTER_IDS = [
   "primary_id", "cmo_sample_name", "patient_id", "request_id",
-  "sample_type", "gene_panel", "bait_set", "run_mode",
+  "sample_type", "gene_panel", "bait_set", "run_mode", "file_group",
 ];
 
 function samplesParams(offset) {
@@ -169,6 +169,7 @@ function renderSamples() {
       <td>${esc(s.gene_panel)}</td>
       <td>${esc(s.bait_set || "")}</td>
       <td>${esc(s.run_mode || "")}</td>
+      <td>${esc(s.file_group || "")}</td>
       <td>${metaText(s.preservation)}</td>
       <td>${metaText(s.sample_origin)}</td>
       <td>${fmtDate(s.sequencing_date)}</td>
@@ -308,6 +309,7 @@ function renderMatches(data, logic) {
       <dt>gene_panel</dt><dd>${esc(s.gene_panel)}</dd>
       <dt>bait_set</dt><dd>${esc(s.bait_set || "—")}</dd>
       <dt>run_mode</dt><dd>${esc(s.run_mode || "—")}</dd>
+      <dt>file_group</dt><dd>${esc(s.file_group || "—")}</dd>
       <dt>preservation</dt><dd>${metaText(s.preservation)}</dd>
       <dt>sample_origin</dt><dd>${metaText(s.sample_origin)}</dd>
       <dt>sequencing_date</dt><dd>${fmtDate(s.sequencing_date)}</dd>

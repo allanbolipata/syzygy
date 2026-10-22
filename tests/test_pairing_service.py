@@ -1380,6 +1380,25 @@ def test_list_samples_q_search(db):
     assert [s.id for s in list_samples(q="pat-101", tumor_or_normal=TumorOrNormal.TUMOR, limit=None, offset=None, db=db)] == [t1.id]
 
 
+def test_list_samples_file_group_filter(db):
+    t1 = _make_sample2(db, "TUMOR-101", "PAT-101", TumorOrNormal.TUMOR.value, file_group="LIMS")
+    n1 = _make_sample2(db, "NORMAL-101", "PAT-101", TumorOrNormal.NORMAL.value, file_group="LIMS")
+    d1 = _make_sample2(db, "DMP-001", None, TumorOrNormal.NORMAL.value, file_group="Pooled Normals")
+    t2 = _make_sample2(db, "TUMOR-202", "PAT-202", TumorOrNormal.TUMOR.value)  # no file group
+
+    # Filter alone.
+    assert {s.id for s in list_samples(file_group="LIMS", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert [s.id for s in list_samples(file_group="Pooled Normals", limit=None, offset=None, db=db)] == [d1.id]
+    # Case-insensitive substring match.
+    assert {s.id for s in list_samples(file_group="lims", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert [s.id for s in list_samples(file_group="poole", limit=None, offset=None, db=db)] == [d1.id]
+    # AND-combines with other filters; no match returns empty.
+    assert [s.id for s in list_samples(file_group="LIMS", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == [n1.id]
+    assert list_samples(file_group="LIMS", patient_id="PAT-202", limit=None, offset=None, db=db) == []
+    # Combines with pagination.
+    assert [s.id for s in list_samples(file_group="LIMS", limit=1, offset=1, db=db)] in [[t1.id], [n1.id]]
+
+
 # ---------------------------------------------------------------------------
 # GET /patient
 # ---------------------------------------------------------------------------

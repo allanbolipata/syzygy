@@ -33,6 +33,8 @@ class SampleCreate(BaseModel):
     additional_metadata: Optional[dict[str, Any]] = None
     errors: Optional[list[str]] = None
     sequencing_date: Optional[datetime] = None
+    # Provenance: source beagle file group (beagle imports only).
+    file_group: Optional[str] = None
     pairing_logic_id: Optional[UUID] = None
     pairing_logic_name: Optional[str] = None
 
@@ -55,6 +57,7 @@ class SampleRead(BaseModel):
     additional_metadata: Optional[dict[str, Any]] = None
     errors: Optional[list[str]] = None
     sequencing_date: Optional[datetime] = None
+    file_group: Optional[str] = None
     created_date: datetime
     modified_date: datetime
 
