@@ -133,6 +133,8 @@ function samplesParams(offset) {
   const p = new URLSearchParams();
   p.set("limit", samplesState.limit);
   p.set("offset", offset);
+  const q = $("#f-q").value.trim();
+  if (q) p.set("q", q);
   for (const id of SAMPLE_FILTER_IDS) {
     const v = $(`#f-${id}`).value.trim();
     if (v) p.set(id, v);
@@ -185,6 +187,7 @@ function renderSamples() {
 
 $("#btn-search").addEventListener("click", () => loadSamples(0));
 $("#btn-clear").addEventListener("click", () => {
+  $("#f-q").value = "";
   for (const id of SAMPLE_FILTER_IDS) $(`#f-${id}`).value = "";
   $("#f-tumor_or_normal").value = "";
   loadSamples(0);
@@ -195,8 +198,8 @@ $("#f-limit").addEventListener("change", (e) => {
 });
 $("#s-prev").addEventListener("click", () => loadSamples(Math.max(0, samplesState.offset - samplesState.limit)));
 $("#s-next").addEventListener("click", () => loadSamples(samplesState.offset + samplesState.limit));
-for (const id of SAMPLE_FILTER_IDS) {
-  $(`#f-${id}`).addEventListener("keydown", (e) => {
+for (const el of ["#f-q", ...SAMPLE_FILTER_IDS.map((id) => `#f-${id}`)]) {
+  $(el).addEventListener("keydown", (e) => {
     if (e.key === "Enter") loadSamples(0);
   });
 }
