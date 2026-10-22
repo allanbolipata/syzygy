@@ -14,10 +14,12 @@ Registered strategies:
   * ``argos`` — WES strategy aligned with beagle's argos pairing logic
     (v2_3.0). Matches on (patient_id, gene_panel, bait_set) with
     run-mode (sequencer) bucket matching, a request-first cascade, and a
-    pooled normal tier (shared across patients). Beagle's v2_3.0 logic
-    does not key on specimen/sample type and does not gate on
-    preservation, so neither is a matching key here (both are still
-    stored on the sample).
+    pooled normal tier (shared across patients). Beagle's v2.3.0 logic
+    does not key on specimen/sample type, so it is not a matching key
+    here (still stored on the sample). Preservation is a gate on every
+    tier, pooled included: both sides' (preservation, sample_origin)
+    must resolve to the same category ("ffpe"/"frozen"; see
+    ``resolve_preservation``), and an unresolvable side blocks the pair.
   * ``tempo`` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's
     tempo_patient.py: a historical-pairing tier (beagle's pre_pairing /
     pairing.tsv) retained unconditionally, then patient-wide matching on
@@ -77,18 +79,40 @@ TEMPO_RUN_MODE_MAP: Dict[str, str] = {
 DEFAULT_POOLED_SAMPLE_TYPES: tuple = ("Pooled Normal",)
 
 
-def _as_text(value) -> str:
-    """Normalize a possibly list-valued metadata field to a single string.
+# Sample-origin entries (lower-cased) that resolve to the "frozen"
+# category. "ffpe" resolves to "ffpe"; any other sample-origin entry is
+# unresolvable.
+_FROZEN_ORIGIN_VALUES = frozenset({"fresh or frozen", "frozen"})
+
+
+def _value_set(value) -> set:
+    """Lower-cased, stripped, non-empty entries of a JSON metadata field.
 
     preservation / sample_origin are JSON columns that may hold a list
-    (mirroring beagle's list-valued metadata) or a scalar; lists use
-    their first entry.
+    (mirroring beagle's list-valued metadata) or a scalar; every entry
+    is considered, so any entry matching a category token qualifies.
     """
     if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else ""
-    return str(value).strip().lower()
+        return set()
+    items = value if isinstance(value, (list, tuple)) else (value,)
+    return {str(v).strip().lower() for v in items if str(v).strip()}
+
+
+def _origin_category(origin: set) -> Optional[str]:
+    """Category of a sample-origin value set: "ffpe", "frozen", or None.
+
+    Case-insensitive exact token match: "ffpe" -> "ffpe"; "fresh or
+    frozen" or "frozen" -> "frozen". Any other value — or a set mixing
+    both categories — is unresolvable (None).
+    """
+    cats = set()
+    if "ffpe" in origin:
+        cats.add("ffpe")
+    if _FROZEN_ORIGIN_VALUES & origin:
+        cats.add("frozen")
+    if len(cats) != 1:
+        return None
+    return cats.pop()
 
 
 def normalize_run_mode(value: Optional[str], mapping: Optional[Dict[str, str]] = None) -> str:
@@ -109,28 +133,29 @@ def normalize_run_mode(value: Optional[str], mapping: Optional[Dict[str, str]] =
 def resolve_preservation(preservation, sample_origin) -> str:
     """Resolve (preservation, sample_origin) to "ffpe", "frozen", or "".
 
-    Ported from beagle's get_preservation_type (argos_operator v2_2_0):
-    both sides agree on FFPE -> "ffpe"; both consistent with fresh/frozen
-    -> "frozen"; anything else (missing or unrecognizable included) -> ""
-    (unresolvable).
+    Fuzzy, case-insensitive category resolution (ARGOS preservation
+    gate):
+      * preservation non-empty -> "ffpe" if any entry is "ffpe",
+        otherwise "frozen" (anything else);
+      * preservation empty, sample_origin non-empty -> the origin's
+        category: "ffpe" for "ffpe"; "frozen" for "fresh or frozen" or
+        "frozen"; any other origin value is unresolvable;
+      * both non-empty -> the two categories must agree (e.g.
+        preservation "Frozen" == sample_origin "Fresh or Frozen");
+        disagreement — or a present-but-unresolvable origin — is
+        unresolvable.
+    The empty string means unresolvable; the ARGOS gate blocks a pair
+    when either side is unresolvable.
     """
-    p = _as_text(preservation)
-    o = _as_text(sample_origin)
-    if p and o:
-        if p == "ffpe" and o == "ffpe":
-            return "ffpe"
-        if "fresh or frozen" in o and p != "ffpe":
-            return "frozen"
-        return ""
-    if p:
-        return "ffpe" if p == "ffpe" else "frozen"
-    if o:
-        if o == "ffpe":
-            return "ffpe"
-        if "fresh or frozen" in o:
-            return "frozen"
-        return ""
-    return ""
+    p = _value_set(preservation)
+    o = _value_set(sample_origin)
+    p_cat = "ffpe" if "ffpe" in p else "frozen" if p else None
+    o_cat = _origin_category(o) if o else None
+    if p_cat is None:
+        return o_cat or ""
+    if o_cat is None:
+        return "" if o else p_cat
+    return p_cat if p_cat == o_cat else ""
 
 
 @dataclass
@@ -405,10 +430,15 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     logic (v2_3.0).
 
     Matching keys (hard): patient_id, gene_panel, bait_set. Beagle's
-    v2_3.0 logic never keys on specimen/sample type and does not gate on
-    preservation, so ``sample_type`` is dropped from the hard keys and
-    the preservation gate is removed; both attributes remain stored on
-    the sample and are surfaced in pairing notes/reads.
+    v2.3.0 logic never keys on specimen/sample type, so ``sample_type``
+    is dropped from the hard keys; it remains stored on the sample and
+    is surfaced in pairing notes/reads.
+
+    Preservation is a soft gate on every tier, pooled included: each
+    side's (preservation, sample_origin) must resolve to the same
+    category via ``resolve_preservation`` (fuzzy, case-insensitive:
+    "ffpe"/"frozen"). A side that is unresolvable, or whose category
+    disagrees with the other side, blocks the pair.
 
     Extends the default strategy with:
       * run-mode (sequencer) matching — the raw ``run_mode`` strings are
@@ -443,12 +473,27 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return resolve_preservation(sample.preservation, sample.sample_origin)
 
     def _soft_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
+        reasons: List[str] = []
         t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
         n_bucket = normalize_run_mode(candidate.run_mode, self._run_mode_map())
         if t_bucket != n_bucket:
-            return [
+            reasons.append(
                 f"run_mode mismatch ({t_bucket or 'unknown'} vs {n_bucket or 'unknown'})"
-            ]
+            )
+        reasons.extend(self._preservation_reasons(tumor, candidate))
+        return reasons
+
+    def _preservation_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
+        """Preservation agreement gate: both sides must resolve to the
+        same category; unresolvable on either side blocks the pair."""
+        t_cat = self._resolved_preservation(tumor)
+        n_cat = self._resolved_preservation(candidate)
+        if not t_cat:
+            return ["preservation unresolvable on tumor"]
+        if not n_cat:
+            return ["preservation unresolvable on normal"]
+        if t_cat != n_cat:
+            return [f"preservation mismatch ({t_cat} vs {n_cat})"]
         return []
 
     def _pooled_reasons(self, tumor: Sample, pooled: Sample) -> List[str]:
@@ -464,6 +509,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
                 reasons.append(
                     f"run_mode mismatch ({t_bucket or 'unknown'} vs {p_bucket or 'unknown'})"
                 )
+        reasons.extend(self._preservation_reasons(tumor, pooled))
         return reasons
 
     def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:

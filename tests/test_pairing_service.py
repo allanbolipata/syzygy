@@ -698,7 +698,7 @@ def test_argos_ignores_sample_type(db):
     )
     normal = _sample(
         db, "NORM-ST-1", sample_type="blood", run_mode="NovaSeq X",
-        preservation=["EDTA-Streck"], sample_origin=["Plasma"],
+        preservation=["FFPE"], sample_origin=["FFPE"],
     )
     argos = strategies["argos"]
     assert argos.matches(tumor, normal)
@@ -706,9 +706,9 @@ def test_argos_ignores_sample_type(db):
     assert selection.normal.id == normal.id
 
 
-def test_argos_preservation_is_not_a_gate(db):
-    """Beagle v2.3.0 does not gate on preservation: a differently-preserved
-    (even unresolvable) normal still pairs, latest run date wins."""
+def test_argos_preservation_gate_skips_disagreement(db):
+    """A differently-preserved normal is skipped even when it has the
+    newer run date; the latest preservation-matching normal wins."""
     tumor = _sample(
         db, "TUMOR-FROZEN", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["Fresh or Frozen"], sample_origin=["Fresh or Frozen"],
@@ -725,10 +725,15 @@ def test_argos_preservation_is_not_a_gate(db):
         sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == newer_ffpe.id
+    assert selection.normal.id == older_frozen.id
+    assert any("preservation mismatch" in note for note in selection.notes)
 
 
-def test_argos_unresolvable_preservation_no_longer_blocks(db):
+def test_argos_unresolvable_preservation_blocks(db):
+    """Unresolvable preservation blocks pairing: fields disagreeing
+    within one sample (preservation FFPE + origin Frozen), and missing
+    data on either side."""
+    argos = strategies["argos"]
     tumor = _sample(
         db, "TUMOR-UNK-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["Frozen"],
@@ -738,8 +743,15 @@ def test_argos_unresolvable_preservation_no_longer_blocks(db):
         db, "NORM-UNK-PRES-1", preservation=["FFPE"], sample_origin=["FFPE"],
         run_mode="NovaSeq X",
     )
-    selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == normal.id
+    selection = argos.select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any("unresolvable" in note for note in selection.notes)
+
+    bare = _sample(
+        db, "TUMOR-NO-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X",
+    )
+    assert any("unresolvable" in r for r in argos.mismatch_reasons(bare, normal))
 
 
 def test_argos_pooled_normal_tier(db):
@@ -774,16 +786,37 @@ def test_argos_pooled_respects_keys_and_run_mode(db):
     assert any("run_mode mismatch" in note for note in selection.notes)
 
 
-def test_argos_pooled_no_preservation_gate(db):
-    """Pooled tier no longer requires resolvable preservation."""
+def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
+    """An FFPE pooled normal does not match a tumor with no preservation
+    data (unresolvable blocks the pooled tier)."""
     tumor = _sample(db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value)
     pooled = _sample(
         db, "NORM-POOL-3", patient_id=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"],
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == pooled.id
-    assert any("tier=pooled" in note for note in selection.notes)
+    assert selection.normal is None
+    assert any("unresolvable" in note for note in selection.notes)
+
+
+def test_argos_pooled_preservation_gate_matches_category(db):
+    """Pooled tier matches on resolved category: a frozen tumor takes the
+    FROZEN pool, not the FFPE pool."""
+    tumor = _sample(
+        db, "TUMOR-POOL-F", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["Frozen"], sample_origin=["Fresh or Frozen"],
+    )
+    _sample(
+        db, "NORM-POOL-F-FFPE", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    frozen_pool = _sample(
+        db, "NORM-POOL-F-FROZEN", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FROZEN"], sample_origin=["FROZEN"],
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == frozen_pool.id
+    assert any("preservation mismatch" in note for note in selection.notes)
 
 
 def test_argos_pooled_sample_types_configurable(db):
