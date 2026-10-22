@@ -20,7 +20,7 @@ from pairing_service import (
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, strategies
+from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
 from routers.patients import list_patients
@@ -30,10 +30,14 @@ from schemas import PairingLogicCreate, PairingTriggerCreate, SampleCreate, Tumo
 
 
 class CustomPairingStrategy:
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
         return tumor.patient_id == normal.patient_id and tumor.gene_panel == normal.gene_panel
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> list:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> list:
         reasons = []
         if tumor.patient_id != normal.patient_id:
             reasons.append(f"patient_id mismatch ({tumor.patient_id} vs {normal.patient_id})")
@@ -755,37 +759,91 @@ def test_argos_unresolvable_preservation_blocks(db):
 
 
 def test_argos_pooled_normal_tier(db):
+    seed_pooled_machines(db)
     tumor = _sample(
         db, "TUMOR-POOL-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
         db, "NORM-POOL-1", patient_id=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal.id == pooled.id
     assert any("tier=pooled" in note for note in selection.notes)
 
 
-def test_argos_pooled_ignores_run_mode(db):
-    """Pooled tier ignores run mode: a pool sequenced on a different
-    machine still matches when keys and preservation agree; a key
-    mismatch still blocks."""
-    tumor = _sample(
+def test_argos_pooled_run_mode_resolved_via_machines(db):
+    """Pooled tier run mode resolves through pooled_machines: the pool's
+    machine name (its raw run_mode, e.g. "diana") maps to a machine
+    class; the tumor's run_mode maps to a novaseq/hiseq family; they
+    must agree. A key mismatch still blocks."""
+    seed_pooled_machines(db)
+    argos = strategies["argos"]
+    tumor_nova = _sample(
         db, "TUMOR-POOL-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     _sample(
         db, "NORM-POOL-2A", patient_id=None, sample_type="Pooled Normal",
         bait_set="BAIT-2", preservation=["FFPE"], sample_origin=["FFPE"],
+        run_mode="diana",
     )
-    other_machine_pool = _sample(
+    pool_nova = _sample(
         db, "NORM-POOL-2B", patient_id=None, sample_type="Pooled Normal",
-        run_mode="Hiseq 3000", preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+    )
+    selection = argos.select_latest_normal(db, tumor_nova)
+    assert selection.normal.id == pool_nova.id
+
+    tumor_hiseq = _sample(
+        db, "TUMOR-POOL-2C", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient_id="PATIENT-002",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="HiSeq 3000",
+    )
+    pool_hiseq = _sample(
+        db, "NORM-POOL-2D", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="pitt",
+    )
+    assert any("run_mode mismatch" in r
+               for r in argos.mismatch_reasons(tumor_hiseq, pool_nova, db))
+    selection2 = argos.select_latest_normal(db, tumor_hiseq)
+    assert selection2.normal.id == pool_hiseq.id
+
+
+def test_argos_pooled_unknown_machine_blocks(db):
+    """A pool whose machine isn't in pooled_machines can't pair."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-U", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    pooled = _sample(
+        db, "NORM-POOL-U", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="bono",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == other_machine_pool.id
+    assert selection.normal is None
+    assert any("pooled machine not in table" in note for note in selection.notes)
+
+
+def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
+    """Tumor run_mode missing or unmappable (e.g. NextSeq) blocks the
+    pooled tier."""
+    seed_pooled_machines(db)
+    for rm in (None, "NextSeq 2000"):
+        tumor = _sample(
+            db, f"TUMOR-POOL-{rm}", tumor_or_normal=TumorOrNormal.TUMOR.value,
+            preservation=["FFPE"], sample_origin=["FFPE"], run_mode=rm,
+        )
+        _sample(
+            db, f"NORM-POOL-{rm}", patient_id=None, sample_type="Pooled Normal",
+            preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+        )
+        selection = strategies["argos"].select_latest_normal(db, tumor)
+        assert selection.normal is None
+        assert any("tumor run_mode unresolvable" in note
+                   for note in selection.notes)
 
 
 def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
@@ -803,18 +861,20 @@ def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
 
 def test_argos_pooled_preservation_gate_matches_category(db):
     """Pooled tier matches on resolved category: a frozen tumor takes the
-    FROZEN pool, not the FFPE pool."""
+    FROZEN pool, not the FFPE pool (machine families agree)."""
+    seed_pooled_machines(db)
     tumor = _sample(
         db, "TUMOR-POOL-F", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["Frozen"], sample_origin=["Fresh or Frozen"],
+        run_mode="NovaSeq X",
     )
     _sample(
         db, "NORM-POOL-F-FFPE", patient_id=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     frozen_pool = _sample(
         db, "NORM-POOL-F-FROZEN", patient_id=None, sample_type="Pooled Normal",
-        preservation=["FROZEN"], sample_origin=["FROZEN"],
+        preservation=["FROZEN"], sample_origin=["FROZEN"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal.id == frozen_pool.id
@@ -830,13 +890,14 @@ def test_argos_pooled_sample_types_configurable(db):
     db.commit()
     db.refresh(logic)
     strategy = get_pairing_strategy(logic)
+    seed_pooled_machines(db)
     tumor = _sample(
         db, "TUMOR-POOL-4", tumor_or_normal=TumorOrNormal.TUMOR.value,
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
         db, "NORM-POOLN-1", patient_id=None, sample_type="PoolN",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategy.select_latest_normal(db, tumor)
     assert selection.normal.id == pooled.id

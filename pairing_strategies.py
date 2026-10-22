@@ -20,6 +20,9 @@ Registered strategies:
     tier, pooled included: both sides' (preservation, sample_origin)
     must resolve to the same category ("ffpe"/"frozen"; see
     ``resolve_preservation``), and an unresolvable side blocks the pair.
+    The pooled tier also resolves run mode through the pooled_machines
+    table (pool machine name -> machine class; tumor run_mode ->
+    novaseq/hiseq family).
   * ``tempo`` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's
     tempo_patient.py: a historical-pairing tier (beagle's pre_pairing /
     pairing.tsv) retained unconditionally, then patient-wide matching on
@@ -44,7 +47,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import PairingLogic, PairingTable, Sample
+from models import PairingLogic, PairingTable, PooledMachine, Sample
 from schemas import TumorOrNormal
 
 # Sentinel used to sort rows without a sequencing_date to the end. It is
@@ -77,6 +80,44 @@ TEMPO_RUN_MODE_MAP: Dict[str, str] = {
 # resort by the argos strategy. Configurable per pairing logic via the
 # ``pooled_sample_types`` config key.
 DEFAULT_POOLED_SAMPLE_TYPES: tuple = ("Pooled Normal",)
+
+# Default machine reference rows for the pooled_machines table (used by
+# seed_pooled_machines at startup and by tests). machine_class is the
+# family used for pooled run-mode matching; machine_type is display-only.
+DEFAULT_POOLED_MACHINES: tuple = (
+    ("diana", "novaseq", "NovaSeq 6000"),
+    ("jax", "hiseq", "HiSeq 4000"),
+    ("kim", "hiseq", "HiSeq 2500"),
+    ("liz", "hiseq", "HiSeq 2500"),
+    ("michelle", "novaseq", "NovaSeq 6000"),
+    ("momo", "hiseq", "HiSeq 2500"),
+    ("pitt", "hiseq", "HiSeq 4000"),
+    ("ruth", "novaseq", "NovaSeq 6000"),
+)
+
+
+def seed_pooled_machines(db: Session) -> None:
+    """Idempotently insert DEFAULT_POOLED_MACHINES (missing rows only).
+
+    Called from app startup so a fresh database gets the machine table;
+    safe to call again (existing rows are left untouched).
+    """
+    for name, machine_class, machine_type in DEFAULT_POOLED_MACHINES:
+        existing = db.scalar(
+            select(PooledMachine).where(
+                func.lower(PooledMachine.machine_name) == name.lower()
+            )
+        )
+        if existing is None:
+            db.add(
+                PooledMachine(
+                    machine_name=name,
+                    machine_class=machine_class,
+                    machine_type=machine_type,
+                )
+            )
+    db.commit()
+
 
 
 # Sample-origin entries (lower-cased) that resolve to the "frozen"
@@ -192,10 +233,14 @@ class PairingStrategy(Protocol):
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool
 
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
         ...
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         ...
 
     def select_latest_normal(
@@ -289,11 +334,17 @@ class DefaultPairingStrategy:
                 reasons.append(f"{label} mismatch ({t_val} vs {n_val})")
         return reasons
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
+        # ``db`` is accepted for protocol compatibility; the default
+        # strategy has no pooled tier, so it never needs it.
         return self._base_mismatch_reasons(tumor, normal)
 
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
-        return not self.mismatch_reasons(tumor, normal)
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
+        return not self.mismatch_reasons(tumor, normal, db)
 
     # -- candidate selection ---------------------------------------------
 
@@ -449,9 +500,12 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         tier (mirrors beagle's compare_dates "most recent" selection);
       * a pooled-normal tier — shared pooled normals (``sample_type`` in
         ``pooled_sample_types``, patient_id null), matched across patients
-        on gene_panel + bait_set; run mode is ignored for pooled matches
-        (run/machine data is not tracked), but the preservation gate
-        still applies.
+        on gene_panel + bait_set. Run mode is resolved through the
+        pooled_machines table: the pool's machine name (its raw run_mode)
+        maps to a machine class, the tumor's run_mode maps to a
+        novaseq/hiseq family, and the pair matches only when both resolve
+        to the same family (unresolvable on either side blocks it). The
+        preservation gate still applies.
 
     Per-logic config keys:
       * ``run_mode_map`` — dict of raw substring -> bucket, checked in
@@ -497,27 +551,74 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             return [f"preservation mismatch ({t_cat} vs {n_cat})"]
         return []
 
-    def _pooled_reasons(self, tumor: Sample, pooled: Sample) -> List[str]:
-        # Run mode is intentionally ignored in the pooled tier: pooled
-        # normals are shared across patients/machines and carry no
-        # reliable run/machine data. Preservation is still enforced.
+    @staticmethod
+    def _tumor_machine_family(run_mode: Optional[str]) -> str:
+        """Machine family of a tumor's raw run_mode string,
+        case-insensitive: 'novaseq', 'hiseq', or '' when missing or
+        unresolvable (e.g. 'NextSeq')."""
+        s = (run_mode or "").strip().lower()
+        if "novaseq" in s:
+            return "novaseq"
+        if "hiseq" in s:
+            return "hiseq"
+        return ""
+
+    def _pooled_machine_class(self, db: Optional[Session], pooled: Sample) -> str:
+        """Machine class for a pooled normal, looked up in the
+        pooled_machines table by its machine name (the pooled normal's
+        raw run_mode value): 'novaseq'/'hiseq', or '' when the pooled
+        normal has no run_mode or its machine is not in the table."""
+        name = (pooled.run_mode or "").strip().lower()
+        if not name or db is None:
+            return ""
+        row = db.scalar(
+            select(PooledMachine).where(
+                func.lower(PooledMachine.machine_name) == name
+            )
+        )
+        return row.machine_class if row is not None else ""
+
+    def _pooled_reasons(
+        self, db: Optional[Session], tumor: Sample, pooled: Sample
+    ) -> List[str]:
+        # Pooled run-mode check: the pool's machine name resolves to a
+        # class via the pooled_machines table; the tumor's run_mode
+        # resolves to a novaseq/hiseq family. Both must resolve and
+        # agree. The preservation gate still applies too.
         reasons: List[str] = []
         if _norm_key(tumor.gene_panel) != _norm_key(pooled.gene_panel):
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
         if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
             reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
+        t_family = self._tumor_machine_family(tumor.run_mode)
+        p_class = self._pooled_machine_class(db, pooled)
+        if not t_family:
+            reasons.append("tumor run_mode unresolvable")
+        elif not p_class:
+            reasons.append(
+                "pooled machine not in table "
+                f"({(pooled.run_mode or '').strip() or 'missing'})"
+            )
+        elif t_family != p_class:
+            reasons.append(f"run_mode mismatch ({t_family} vs {p_class})")
         reasons.extend(self._preservation_reasons(tumor, pooled))
         return reasons
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         if self._is_pooled(normal):
-            return self._pooled_reasons(tumor, normal)
+            # Pooled tier has its own relaxed key set (the machine-table
+            # run-mode check needs the session).
+            return self._pooled_reasons(db, tumor, normal)
         reasons = self._base_mismatch_reasons(tumor, normal)
         reasons.extend(self._soft_reasons(tumor, normal))
         return reasons
 
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
-        return not self.mismatch_reasons(tumor, normal)
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
+        return not self.mismatch_reasons(tumor, normal, db)
 
     def _pooled_candidate_stmt(self, tumor: Sample):
         return select(Sample).where(
@@ -539,7 +640,10 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         notes = list(selection.notes)
         candidates = db.scalars(self._pooled_candidate_stmt(tumor)).all()
         picked, tier_notes = self._select_in_candidates(
-            tumor, candidates, "pooled", self._pooled_reasons
+            tumor,
+            candidates,
+            "pooled",
+            lambda t, c: self._pooled_reasons(db, t, c),
         )
         notes.extend(tier_notes)
         return NormalSelection(picked, notes)
@@ -624,7 +728,9 @@ class TempoPairingStrategy(DefaultPairingStrategy):
             )
         return reasons
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         # patient_id is the only hard key; bait_set + run_mode are soft.
         reasons = self._base_mismatch_reasons(tumor, normal)
         reasons.extend(self._soft_reasons(tumor, normal))

@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from database import Base
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import trigger_pairing
+from pairing_strategies import seed_pooled_machines
 from routers.samples import possible_matches_endpoint
 from schemas import TumorOrNormal
 
@@ -32,6 +33,7 @@ def engine():
 def db(engine):
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
     session = SessionLocal()
+    seed_pooled_machines(session)
     try:
         yield session
     finally:
@@ -114,7 +116,7 @@ def test_tumor_current_and_other_matches(db, argos):
                  run_mode="NovaSeq X 1000")
     n4 = _sample(db, "N4", patient_id="C-2", request_id="R1")
     p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal",
-                 run_mode=None,
+                 run_mode="diana",
                  sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc))
     p2 = _sample(db, "P2", patient_id=None, sample_type="Pooled Normal",
                  gene_panel="IMPACT505")
@@ -161,12 +163,13 @@ def test_tumor_current_and_other_matches(db, argos):
 
 
 def test_tumor_without_current_match_marks_cascade_winner(db, argos):
-    # DMP-style tumor: no patient normals, unknown bait set and run mode.
+    # DMP-style tumor: no patient normals, unknown bait set; run mode
+    # resolves to the pool's machine family.
     t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
-                 sample_type="DMP", bait_set=None, run_mode=None)
+                 sample_type="DMP", bait_set=None, run_mode="NovaSeq X 1000")
     p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal")
     p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
-                 bait_set=None)
+                 bait_set=None, run_mode="diana")
 
     res = _endpoints(db, t2)
     assert res["current_match"] is None
@@ -216,9 +219,9 @@ def test_pooled_normal_lists_cross_patient_tumors(db, argos):
     t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, request_id="R1",
                  run_mode="NovaSeq X 1000")
     t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
-                 sample_type="DMP", bait_set=None, run_mode=None)
+                 sample_type="DMP", bait_set=None, run_mode="NovaSeq X 1000")
     p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
-                 bait_set=None)
+                 bait_set=None, run_mode="diana")
 
     res = _endpoints(db, p3)
     assert res["current_match"] is None
@@ -362,9 +365,11 @@ def test_pooled_tier_matches_across_case(db, argos):
     # The pooled tier was dead in production data: pooled normals store
     # e.g. "impact505" while tumors store "IMPACT505".
     t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient_id="C-1",
-                 gene_panel="IMPACT468", bait_set="agilent")
+                 gene_panel="IMPACT468", bait_set="agilent",
+                 run_mode="NovaSeq X 1000")
     p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal",
-                 gene_panel="impact468", bait_set="agilent")
+                 gene_panel="impact468", bait_set="agilent",
+                 run_mode="diana")
 
     res = _endpoints(db, t1)
     others = _others(res)

@@ -104,3 +104,21 @@ class PairingTable(Base):
             sqlite_where=sa.text("latest"),
         ),
     )
+
+
+class PooledMachine(Base):
+    """Machine reference data for ARGOS pooled-normal run-mode
+    resolution: the machine name (a pooled normal's raw ``run_mode``
+    value, e.g. "diana") maps to a machine class (``novaseq``/
+    ``hiseq``) and a display type. Seeded at startup by
+    ``pairing_strategies.seed_pooled_machines`` and maintainable via
+    the ``/v1/machines`` API. Used by ``ArgosPairingStrategy`` for
+    pooled-tier run-mode matching."""
+    __tablename__ = "pooled_machines"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    machine_name: Mapped[str] = mapped_column(sa.String(100), unique=True, index=True)
+    machine_class: Mapped[str] = mapped_column(sa.String(50), index=True)
+    machine_type: Mapped[Optional[str]] = mapped_column(sa.String(100), nullable=True)
+    created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
+    modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)

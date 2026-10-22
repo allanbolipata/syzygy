@@ -190,3 +190,20 @@ class PossibleMatchesRead(BaseModel):
     other_matches_matched: int = 0
     other_matches_tiers: dict[str, int] = {}
     other_matches_breakdown: list[dict] = []
+
+
+class PooledMachineUpsert(BaseModel):
+    machine_name: str
+    machine_class: str
+    machine_type: Optional[str] = None
+
+
+class PooledMachineRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    machine_name: str
+    machine_class: str
+    machine_type: Optional[str] = None
+    created_date: datetime
+    modified_date: datetime
