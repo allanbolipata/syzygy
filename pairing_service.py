@@ -143,7 +143,7 @@ def trigger_pairing(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=404, detail="Normal sample not found")
-        reasons = strategy.mismatch_reasons(tumor, normal)
+        reasons = strategy.mismatch_reasons(tumor, normal, db)
         if strict and reasons:
             raise HTTPException(
                 status_code=400,
@@ -329,7 +329,7 @@ def possible_matches(
             tier = "same_request"
         else:
             tier = "other_request"
-        reasons = strategy.mismatch_reasons(tumor, normal)
+        reasons = strategy.mismatch_reasons(tumor, normal, db)
         others.append(
             {
                 "sample": cand,

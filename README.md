@@ -164,7 +164,11 @@ dict customizes the strategy at use time.
   it; it remains stored on the sample). Extends `default` with:
   - **run-mode gating** — raw `run_mode` strings are normalized to
     buckets (default map: "novaseq x" → `novaseq_x`, "novaseq" →
-    `novaseq`, "hiseq" → `hiseq`) and must be equal on both sides.
+    `novaseq`, "hiseq" → `hiseq`) and must be equal on both sides; in
+    the pooled tier the pool's machine name resolves through
+    `pooled_machines` (machine class `novaseq`/`hiseq`), which must
+    match the tumor's run-mode family (a NovaSeq X run is a NovaSeq
+    machine).
   - **preservation gating** — each side's `preservation` /
     `sample_origin` must resolve to the same category, fuzzily
     (case-insensitive): preservation `FFPE` → ffpe, anything else →
