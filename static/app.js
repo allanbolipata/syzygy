@@ -231,15 +231,35 @@ async function loadLogics() {
   }
 }
 
-function openMatchesFor(sample) {
+/* Select the pairing logic assigned to the sample's bait set (server-side
+   bait_sets table), so the page doesn't default to the first logic. */
+async function applyBaitSetLogic(sample) {
+  if (!sample || !sample.bait_set) return false;
+  try {
+    const row = await api(`/bait-sets/lookup?name=${encodeURIComponent(sample.bait_set)}`);
+    if (!row) return false;
+    const logicSel = $("#m-logic");
+    const opt = [...logicSel.options].find((o) => o.value === row.pairing_logic && !o.disabled);
+    if (!opt) return false;
+    logicSel.value = opt.value;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function openMatchesFor(sample) {
   matchesState.sample = sample;
   const sel = $("#m-sample");
   sel.innerHTML = `<option value="${sample.id}" selected>${esc(sampleLabel(sample))}</option>`;
   sel.disabled = false;
   $("#m-show").disabled = false;
-  // Prefer the logic this sample is currently paired under, when known.
+  // Prefer the bait set's assigned logic, then the logic this sample is
+  // currently paired under, when known.
   const byLogic = patientsState.pairings ? patientsState.pairings[sample.id] : null;
-  if (byLogic) {
+  if (await applyBaitSetLogic(sample)) {
+    // bait-set logic selected
+  } else if (byLogic) {
     const logicSel = $("#m-logic");
     const known = Object.keys(byLogic)[0];
     const opt = [...logicSel.options].find((o) => o.value === known && !o.disabled);
@@ -274,6 +294,7 @@ async function searchMatchesSamples() {
     $("#m-show").disabled = false;
     matchesState.candidates = results;
     matchesState.sample = results[0];
+    await applyBaitSetLogic(results[0]);
   } catch (e) {
     banner("error", `Search failed: ${esc(e.message)}`, true);
   }
@@ -418,11 +439,12 @@ $("#m-q").addEventListener("keydown", (e) => {
   if (e.key === "Enter") searchMatchesSamples();
 });
 $("#m-show").addEventListener("click", () => showMatches());
-$("#m-sample").addEventListener("change", (e) => {
+$("#m-sample").addEventListener("change", async (e) => {
   const picked = matchesState.candidates.find((s) => s.id === e.target.value);
   if (!picked) return;
   matchesState.sample = picked;
   matchesState.othersOffset = 0;
+  await applyBaitSetLogic(picked);
   showMatches(0);
 });
 $("#m-others-prev").addEventListener("click", () => {
@@ -760,6 +782,188 @@ $("#r-close").addEventListener("click", () => {
   $("#r-detail").classList.add("hidden");
 });
 
+/* ---------- pooled normals view ---------- */
+
+const POOLED_SAMPLE_TYPE = "Pooled Normal";
+const pooledState = { limit: 50, offset: 0, results: [] };
+
+const POOLED_FILTER_IDS = ["gene_panel", "bait_set", "run_mode", "file_group"];
+
+function pooledParams(offset) {
+  const p = new URLSearchParams();
+  p.set("limit", pooledState.limit);
+  p.set("offset", offset);
+  p.set("tumor_or_normal", "NORMAL");
+  p.set("sample_type", POOLED_SAMPLE_TYPE);
+  p.set("no_patient", "true");
+  const q = $("#pn-q").value.trim();
+  if (q) p.set("q", q);
+  for (const id of POOLED_FILTER_IDS) {
+    const v = $(`#pn-${id}`).value.trim();
+    if (v) p.set(id, v);
+  }
+  return p.toString();
+}
+
+async function loadPooled(offset) {
+  try {
+    const results = await api(`/sample/?${pooledParams(offset)}`);
+    pooledState.results = results;
+    pooledState.offset = offset;
+    renderPooled();
+  } catch (e) {
+    banner("error", `Failed to load pooled normals: ${esc(e.message)}`, true);
+  }
+}
+
+function renderPooled() {
+  const rows = pooledState.results;
+  const tbody = $("#pooled-table tbody");
+  tbody.innerHTML = rows.map((s) => `
+    <tr class="click" data-id="${s.id}">
+      <td>${esc(s.cmo_sample_name)}</td>
+      <td>${esc(s.primary_id)}</td>
+      <td>${esc(s.request_id || "")}</td>
+      <td>${esc(s.sample_type)}</td>
+      <td>${esc(s.gene_panel)}</td>
+      <td>${esc(s.bait_set || "")}</td>
+      <td>${esc(s.run_mode || "")}</td>
+      <td>${esc(s.file_group || "")}</td>
+      <td>${metaText(s.preservation)}</td>
+      <td>${fmtDate(s.sequencing_date)}</td>
+    </tr>`).join("");
+  $("#pn-empty").classList.toggle("hidden", rows.length > 0);
+  $("#pn-count").textContent = rows.length ? `${rows.length} on this page` : "";
+  $("#pn-prev").disabled = pooledState.offset === 0;
+  $("#pn-next").disabled = rows.length < pooledState.limit;
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const sample = rows.find((s) => s.id === tr.dataset.id);
+      if (sample) openMatchesFor(sample);
+    });
+  });
+}
+
+$("#pn-search").addEventListener("click", () => loadPooled(0));
+$("#pn-clear").addEventListener("click", () => {
+  $("#pn-q").value = "";
+  for (const id of POOLED_FILTER_IDS) $(`#pn-${id}`).value = "";
+  loadPooled(0);
+});
+$("#pn-limit").addEventListener("change", (e) => {
+  pooledState.limit = Number(e.target.value);
+  loadPooled(0);
+});
+$("#pn-prev").addEventListener("click", () => loadPooled(Math.max(0, pooledState.offset - pooledState.limit)));
+$("#pn-next").addEventListener("click", () => loadPooled(pooledState.offset + pooledState.limit));
+for (const el of ["#pn-q", ...POOLED_FILTER_IDS.map((id) => `#pn-${id}`)]) {
+  $(el).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadPooled(0);
+  });
+}
+
+/* ---------- pooled machines view ---------- */
+
+const machinesState = { results: [], editing: null };
+
+async function loadMachines() {
+  try {
+    machinesState.results = await api("/machines/");
+    renderMachines();
+  } catch (e) {
+    banner("error", `Failed to load machines: ${esc(e.message)}`, true);
+  }
+}
+
+function renderMachines() {
+  const rows = machinesState.results;
+  const tbody = $("#pm-table tbody");
+  tbody.innerHTML = rows.map((m) => {
+    if (machinesState.editing === m.id) {
+      return `
+        <tr>
+          <td>${esc(m.machine_name)}</td>
+          <td><input id="pme-class" value="${esc(m.machine_class || "")}"></td>
+          <td><input id="pme-type" value="${esc(m.machine_type || "")}"></td>
+          <td>${fmtDate(m.modified_date)}</td>
+          <td>
+            <button class="small primary" data-save-machine="${esc(m.id)}">Save</button>
+            <button class="small" data-cancel-machine="${esc(m.id)}">Cancel</button>
+          </td>
+        </tr>`;
+    }
+    return `
+      <tr>
+        <td>${esc(m.machine_name)}</td>
+        <td>${esc(m.machine_class)}</td>
+        <td>${esc(m.machine_type || "")}</td>
+        <td>${fmtDate(m.modified_date)}</td>
+        <td><button class="small" data-edit-machine="${esc(m.id)}">Edit</button></td>
+      </tr>`;
+  }).join("");
+  $("#pm-empty").classList.toggle("hidden", rows.length > 0);
+  tbody.querySelectorAll("button[data-edit-machine]").forEach((b) =>
+    b.addEventListener("click", () => {
+      machinesState.editing = b.dataset.editMachine;
+      renderMachines();
+    })
+  );
+  tbody.querySelectorAll("button[data-cancel-machine]").forEach((b) =>
+    b.addEventListener("click", () => {
+      machinesState.editing = null;
+      renderMachines();
+    })
+  );
+  tbody.querySelectorAll("button[data-save-machine]").forEach((b) =>
+    b.addEventListener("click", () => saveMachine(b.dataset.saveMachine))
+  );
+}
+
+function saveMachine(id) {
+  const row = machinesState.results.find((m) => m.id === id);
+  if (!row) return;
+  const payload = {
+    machine_name: row.machine_name,
+    machine_class: $("#pme-class").value.trim(),
+    machine_type: $("#pme-type").value.trim() || null,
+  };
+  api("/machines/", { method: "POST", body: JSON.stringify(payload) })
+    .then(() => {
+      machinesState.editing = null;
+      banner("ok", `Machine ${esc(payload.machine_name)} saved.`);
+      return loadMachines();
+    })
+    .catch((e) => banner("error", `Save failed: ${esc(e.message)}`, true));
+}
+
+function addMachine() {
+  const payload = {
+    machine_name: $("#pm-name").value.trim(),
+    machine_class: $("#pm-class").value.trim(),
+    machine_type: $("#pm-type").value.trim() || null,
+  };
+  if (!payload.machine_name || !payload.machine_class) {
+    banner("error", "machine_name and machine_class are required.", true);
+    return;
+  }
+  api("/machines/", { method: "POST", body: JSON.stringify(payload) })
+    .then((m) => {
+      $("#pm-name").value = "";
+      $("#pm-class").value = "";
+      $("#pm-type").value = "";
+      banner("ok", `Machine ${esc(m.machine_name)} saved.`);
+      loadMachines();
+    })
+    .catch((e) => banner("error", `Add failed: ${esc(e.message)}`, true));
+}
+
+$("#pm-add").addEventListener("click", addMachine);
+for (const id of ["#pm-name", "#pm-class", "#pm-type"]) {
+  $(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addMachine();
+  });
+}
+
 /* ---------- init ---------- */
 
 (async function init() {
@@ -767,4 +971,6 @@ $("#r-close").addEventListener("click", () => {
   loadSamples(0);
   loadPatients();
   loadRequests();
+  loadPooled(0);
+  loadMachines();
 })();

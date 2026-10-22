@@ -22,11 +22,11 @@ Deliberately NOT stored:
     patient.dmp, project_name, sample_type (DMP's 1/0 metastasis flag)
                        -- deferred; move to additional_metadata later.
 
-DMP records carry no IGO/LIMS keys, so request_id, bait_set, run_mode,
-preservation, sample_origin, and sequencing_date are all None. DMP
-pairings are manual (the operator pins a DMP normal via
-POST /pairing/trigger with an explicit normal_id); the automatic
-cascade does not select DMP samples.
+DMP records carry no IGO/LIMS keys, so request_id, run_mode,
+preservation, sample_origin, and sequencing_date are None; bait_set is set
+to the gene_panel (beagle logic). The ARGOS strategy skips the run_mode and
+preservation gates when either side is a DMP sample, so DMP samples are
+candidates for matching with regular LIMS data.
 """
 from __future__ import annotations
 
@@ -90,7 +90,9 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
         request_id=None,
         sample_type="DMP",
         gene_panel=resolve_gene_panel(meta),
-        bait_set=None,
+        # Beagle logic: DMP has no bait set; its gene panel stands in so the
+        # sample can match LIMS data on the (gene_panel, bait_set) keys.
+        bait_set=resolve_gene_panel(meta),
         tumor_or_normal="TUMOR" if tumor_type == "T" else "NORMAL",
         run_mode=None,
         preservation=None,

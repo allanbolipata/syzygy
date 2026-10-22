@@ -124,6 +124,17 @@ th { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-
 tbody tr.click { cursor: pointer; }
 tbody tr.click:hover { background: #f0f4fc; }
 
+/* Inline edit inputs in the machines grid. */
+td input {
+  font: inherit;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  width: 100%;
+  min-width: 7.5rem;
+}
+
 .nav-link { color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .nav-link:hover { color: #173c8a; }
 tbody tr.current { background: #f3f8ef; }

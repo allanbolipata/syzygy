@@ -32,7 +32,7 @@ def test_core_mapping():
     assert kw["gene_panel"] == "IMPACT468"
     assert kw["tumor_or_normal"] == "NORMAL"
     assert kw["sample_type"] == "DMP"
-    assert kw["bait_set"] is None
+    assert kw["bait_set"] == kw["gene_panel"]
     assert kw["run_mode"] is None
     assert kw["request_id"] is None
     assert kw["preservation"] is None
@@ -76,3 +76,24 @@ def test_tumor_type_t_and_fallbacks():
 def test_unknown_type_rejected():
     with pytest.raises(ValueError):
         to_dmp_sample_kwargs("P-1-X01-IM6", _meta(type="X"))
+
+
+def test_argos_skips_run_mode_and_preservation_for_dmp():
+    from models import Sample
+    from pairing_strategies import strategies
+
+    def mk(**kw):
+        base = dict(patient_id="C-1", gene_panel="IMPACT468", bait_set="IMPACT468")
+        base.update(kw)
+        return Sample(**base)
+
+    lims = mk(sample_type="Tumor", tumor_or_normal="TUMOR", run_mode="NovaSeq",
+              preservation="FFPE")
+    dmp = mk(sample_type="DMP", tumor_or_normal="NORMAL")
+    argos = strategies["argos"]
+    assert argos.matches(lims, dmp) is True
+    # Non-DMP normal with missing run_mode/preservation is still rejected.
+    lims_n = mk(sample_type="Normal", tumor_or_normal="NORMAL")
+    assert argos.matches(lims, lims_n) is False
+    # bait_set remains a hard key.
+    assert argos.matches(lims, mk(sample_type="DMP", bait_set="OTHER")) is False
