@@ -62,7 +62,12 @@ def _sample(
     bait_set: Optional[str] = "agilent",
     run_mode: Optional[str] = None,
     sequencing_date: Optional[datetime] = None,
+    preservation: Optional[list] = None,
+    sample_origin: Optional[list] = None,
 ):
+    # Real samples carry preservation data; the ARGOS gate requires
+    # resolvable, agreeing categories, so fixtures default to FFPE
+    # (callers can override to test the gate itself).
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
@@ -73,6 +78,8 @@ def _sample(
         tumor_or_normal=tumor_or_normal,
         request_id=request_id,
         run_mode=run_mode,
+        preservation=preservation if preservation is not None else ["FFPE"],
+        sample_origin=sample_origin if sample_origin is not None else ["FFPE"],
         sequencing_date=sequencing_date,
     )
     db.add(sample)

@@ -160,12 +160,19 @@ dict customizes the strategy at use time.
   this strategy.
 - `argos` — WES strategy aligned with beagle's ARGOS pairing logic
   (v2.3.0). Hard keys are (`patient_id`, `gene_panel`, `bait_set`);
-  `sample_type` and preservation are not matching keys (beagle v2.3.0
-  never gates on them; both remain stored on the sample). Extends
-  `default` with:
+  `sample_type` is not a matching key (beagle v2.3.0 never gates on
+  it; it remains stored on the sample). Extends `default` with:
   - **run-mode gating** — raw `run_mode` strings are normalized to
     buckets (default map: "novaseq x" → `novaseq_x`, "novaseq" →
     `novaseq`, "hiseq" → `hiseq`) and must be equal on both sides.
+  - **preservation gating** — each side's `preservation` /
+    `sample_origin` must resolve to the same category, fuzzily
+    (case-insensitive): preservation `FFPE` → ffpe, anything else →
+    frozen; `sample_origin` (checked when preservation is empty)
+    resolves `FFPE` → ffpe and `Fresh or Frozen` / `frozen` →
+    frozen. When both fields are present they must agree; a sample
+    that is unresolvable, or that disagrees with the other side,
+    blocks the pair — including in the pooled tier.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,
     default `["Pooled Normal"]`) are considered across patients,
