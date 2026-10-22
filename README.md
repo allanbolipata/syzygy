@@ -176,9 +176,9 @@ dict customizes the strategy at use time.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,
     default `["Pooled Normal"]`) are considered across patients,
-    matched on `gene_panel` + `bait_set`; run mode is enforced only
-    when the pooled sample carries one (run/machine data is not
-    tracked for pooled samples).
+    matched on `gene_panel` + `bait_set`; run mode is ignored for
+    pooled matches (run/machine data is not tracked), while the
+    preservation gate still applies.
   - Per-logic config keys: `run_mode_map` (raw substring → bucket,
     checked in order) and `pooled_sample_types`.
 - `tempo` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's

@@ -449,8 +449,9 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         tier (mirrors beagle's compare_dates "most recent" selection);
       * a pooled-normal tier — shared pooled normals (``sample_type`` in
         ``pooled_sample_types``, patient_id null), matched across patients
-        on gene_panel + bait_set. Run mode is enforced only when the
-        pooled sample carries one (run/machine data is not tracked).
+        on gene_panel + bait_set; run mode is ignored for pooled matches
+        (run/machine data is not tracked), but the preservation gate
+        still applies.
 
     Per-logic config keys:
       * ``run_mode_map`` — dict of raw substring -> bucket, checked in
@@ -497,18 +498,14 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return []
 
     def _pooled_reasons(self, tumor: Sample, pooled: Sample) -> List[str]:
+        # Run mode is intentionally ignored in the pooled tier: pooled
+        # normals are shared across patients/machines and carry no
+        # reliable run/machine data. Preservation is still enforced.
         reasons: List[str] = []
         if _norm_key(tumor.gene_panel) != _norm_key(pooled.gene_panel):
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
         if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
             reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
-        if pooled.run_mode:
-            t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
-            p_bucket = normalize_run_mode(pooled.run_mode, self._run_mode_map())
-            if t_bucket != p_bucket:
-                reasons.append(
-                    f"run_mode mismatch ({t_bucket or 'unknown'} vs {p_bucket or 'unknown'})"
-                )
         reasons.extend(self._preservation_reasons(tumor, pooled))
         return reasons
 
