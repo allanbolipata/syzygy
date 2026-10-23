@@ -14,6 +14,7 @@
     <button class="tab" data-tab="patients">Patients</button>
     <button class="tab" data-tab="requests">Requests</button>
     <button class="tab" data-tab="pooled">Pooled Normals</button>
+    <button class="tab" data-tab="pairs">Pairs by Logic</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
   </nav>
 </header>
@@ -207,6 +208,33 @@
       <p id="r-patients-empty" class="empty">No patients in this request.</p>
     </div>
     <p class="hint">Click a patient row to open the patient's view.</p>
+  </section>
+</main>
+
+<main id="view-pairs" class="view hidden">
+  <section class="panel">
+    <h2>Pairs by pairing logic</h2>
+    <p class="hint">Current (latest) pairings under the selected logic. Download uses <code>primary_id</code> for samples and the tumor's bait set.</p>
+    <div class="filters">
+      <label>pairing logic
+        <select id="pr-logic"></select>
+      </label>
+      <label>format
+        <select id="pr-format">
+          <option value="csv">CSV</option>
+          <option value="tsv">TSV</option>
+        </select>
+      </label>
+      <button id="pr-download" disabled>Download</button>
+      <span id="pr-count" class="hint"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="pairs-table">
+        <thead><tr><th>TUMOR_SAMPLE</th><th>NORMAL_SAMPLE</th><th>BAIT_SET</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="pr-empty" class="empty hidden">No current pairs for this logic.</p>
   </section>
 </main>
 

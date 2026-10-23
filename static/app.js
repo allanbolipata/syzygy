@@ -71,7 +71,7 @@ async function api(path, opts) {
  * Every navigation (tab switch, opening/closing a detail panel, opening
  * matches for a sample) pushes a history entry. */
 
-const VIEWS = ["samples", "patients", "requests", "pooled", "matches"];
+const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches"];
 let restoringNav = false;
 
 function currentViewName() {
@@ -289,6 +289,10 @@ async function loadLogics() {
     const logics = await api("/pairing-logic/?limit=100");
     $("#m-logic").innerHTML = logics.map((l) =>
       `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
+    ).join("");
+    // Pairs page lists every logic (inactive ones can still own pairings).
+    $("#pr-logic").innerHTML = logics.map((l) =>
+      `<option value="${esc(l.name)}">${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
@@ -1033,10 +1037,51 @@ for (const id of ["#pm-name", "#pm-class", "#pm-type"]) {
   });
 }
 
+/* ---------- pairs-by-logic view ---------- */
+
+const pairsState = { rows: [], logic: null };
+const PAIR_HEADER = ["TUMOR_SAMPLE", "NORMAL_SAMPLE", "BAIT_SET"];
+
+async function loadPairs() {
+  const logic = $("#pr-logic").value;
+  if (!logic) return;
+  try {
+    const rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
+    pairsState.rows = rows.map((r) => [r.tumor.primary_id, r.normal.primary_id, r.tumor.bait_set || ""]);
+    pairsState.logic = logic;
+    $("#pairs-table tbody").innerHTML = pairsState.rows.map((r) =>
+      `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("");
+    $("#pr-empty").classList.toggle("hidden", rows.length > 0);
+    $("#pr-count").textContent = `${rows.length} pair${rows.length === 1 ? "" : "s"}`;
+    $("#pr-download").disabled = rows.length === 0;
+  } catch (e) {
+    banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+  }
+}
+
+function downloadPairs() {
+  const tsv = $("#pr-format").value === "tsv";
+  const sep = tsv ? "\t" : ",";
+  const cell = (v) => (!tsv && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v.replace(/[\t\r\n]/g, " "));
+  const text = [PAIR_HEADER, ...pairsState.rows].map((r) => r.map(cell).join(sep)).join("\n") + "\n";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: tsv ? "text/tab-separated-values" : "text/csv" }));
+  a.download = `pairs_${pairsState.logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+$("#pr-logic").addEventListener("change", loadPairs);
+$("#pr-download").addEventListener("click", downloadPairs);
+document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
+
 /* ---------- init ---------- */
 
 (async function init() {
   await loadLogics();
+  loadPairs();
   loadSamples(0);
   loadPatients();
   loadRequests();
