@@ -64,33 +64,97 @@ async function api(path, opts) {
 
 /* ---------- view navigation (tabs + back button) ---------- */
 
-const viewHistory = [];
+/* Navigation state lives in the URL hash, so browser Back/Forward, reloads
+ * and shared links all work:
+ *   #/samples   #/patients[/<patient_id>]   #/requests[/<request_id>]
+ *   #/matches[/<sample primary_id>]
+ * Every navigation (tab switch, opening/closing a detail panel, opening
+ * matches for a sample) pushes a history entry. */
+
+const VIEWS = ["samples", "patients", "requests", "pooled", "matches"];
+let restoringNav = false;
 
 function currentViewName() {
   const el = document.querySelector("main.view:not(.hidden)");
   return el ? el.id.replace("view-", "") : null;
 }
 
-function showView(name, push = true) {
-  const current = currentViewName();
-  if (push && current && current !== name) viewHistory.push(current);
+function currentHash() {
+  const view = currentViewName() || "samples";
+  let id = null;
+  if (view === "patients" && patientsState.patient) id = patientsState.patient.patient_id;
+  else if (view === "requests" && requestsState.request) id = requestsState.request.request_id;
+  else if (view === "matches" && matchesState.sample) id = matchesState.sample.primary_id;
+  return `#/${view}` + (id ? `/${encodeURIComponent(id)}` : "");
+}
+
+/* Push a history entry for the current UI state (no-op while restoring or unchanged). */
+function pushNav() {
+  if (restoringNav) return;
+  const h = currentHash();
+  if (h !== location.hash) history.pushState(null, "", h);
+}
+
+function showView(name) {
   document.querySelectorAll(".tab[data-tab]").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === name)
   );
   document.querySelectorAll("main.view").forEach((v) =>
     v.classList.toggle("hidden", v.id !== `view-${name}`)
   );
-  updateBackButton();
+  pushNav();
 }
 
-function updateBackButton() {
-  $("#btn-back").disabled = viewHistory.length === 0;
+function closePatientDetail() {
+  patientsState.patient = null;
+  $("#p-detail").classList.add("hidden");
 }
 
-$("#btn-back").addEventListener("click", () => {
-  const prev = viewHistory.pop();
-  if (prev) showView(prev, false);
-});
+function closeRequestDetail() {
+  requestsState.request = null;
+  $("#r-detail").classList.add("hidden");
+}
+
+/* Make the UI match location.hash (used on popstate and initial load). */
+async function restoreFromHash() {
+  const m = location.hash.match(/^#\/([a-z]+)(?:\/(.+))?$/);
+  const view = m && VIEWS.includes(m[1]) ? m[1] : "samples";
+  const id = m && m[2] ? decodeURIComponent(m[2]) : null;
+  restoringNav = true;
+  try {
+    showView(view);
+    if (view === "patients") {
+      if (!id) closePatientDetail();
+      else if (!patientsState.patient || patientsState.patient.patient_id !== id) {
+        const rows = await api(`/patient/?q=${encodeURIComponent(id)}&limit=200`);
+        const row = rows.find((p) => p.patient_id === id);
+        if (row) await openPatient(row);
+        else banner("error", `Patient ${esc(id)} not found.`, true);
+      }
+    } else if (view === "requests") {
+      if (!id) closeRequestDetail();
+      else if (!requestsState.request || requestsState.request.request_id !== id) {
+        const rows = await api(`/request/?q=${encodeURIComponent(id)}&limit=200`);
+        const row = rows.find((r) => r.request_id === id);
+        if (row) await openRequest(row);
+        else banner("error", `Request ${esc(id)} not found.`, true);
+      }
+    } else if (view === "matches" && id) {
+      if (!matchesState.sample || matchesState.sample.primary_id !== id) {
+        const rows = await api(`/sample/?primary_id=${encodeURIComponent(id)}&limit=50`);
+        const row = rows.find((x) => x.primary_id === id);
+        if (row) await openMatchesFor(row);
+        else banner("error", `Sample ${esc(id)} not found.`, true);
+      }
+    }
+  } catch (e) {
+    banner("error", `Failed to restore view: ${esc(e.message)}`, true);
+  } finally {
+    restoringNav = false;
+  }
+}
+
+window.addEventListener("popstate", restoreFromHash);
 
 document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => showView(btn.dataset.tab));
@@ -588,6 +652,7 @@ function currentMatchCell(sampleId) {
 async function openPatient(row) {
   patientsState.patient = row;
   $("#p-detail").classList.remove("hidden");
+  pushNav();
   $("#p-detail-title").textContent = `Patient ${row.patient_id}`;
   $("#p-detail-meta").innerHTML =
     `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
@@ -634,8 +699,8 @@ $("#p-clear").addEventListener("click", () => {
   loadPatients();
 });
 $("#p-close").addEventListener("click", () => {
-  patientsState.patient = null;
-  $("#p-detail").classList.add("hidden");
+  closePatientDetail();
+  pushNav();
 });
 
 /* ---------- requests view ---------- */
@@ -686,6 +751,7 @@ function renderRequests() {
 async function openRequest(row) {
   requestsState.request = row;
   $("#r-detail").classList.remove("hidden");
+  pushNav();
   $("#r-detail-title").textContent = `Request ${row.request_id}`;
   $("#r-detail-meta").innerHTML =
     `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
@@ -778,8 +844,8 @@ $("#r-clear").addEventListener("click", () => {
   loadRequests();
 });
 $("#r-close").addEventListener("click", () => {
-  requestsState.request = null;
-  $("#r-detail").classList.add("hidden");
+  closeRequestDetail();
+  pushNav();
 });
 
 /* ---------- pooled normals view ---------- */
@@ -973,4 +1039,6 @@ for (const id of ["#pm-name", "#pm-class", "#pm-type"]) {
   loadRequests();
   loadPooled(0);
   loadMachines();
+  if (location.hash) restoreFromHash();
+  else history.replaceState(null, "", "#/samples");
 })();
