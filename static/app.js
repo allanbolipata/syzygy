@@ -624,9 +624,12 @@ function renderPatients() {
 /* Sample id -> {logic name: [opposite samples]}, from all latest pairings
    (one request). A tumor lists its current normal(s) (at most one); a
    normal lists every currently-paired tumor (1-to-many). */
-async function loadPairingMap() {
-  if (!patientsState.pairings) {
-    const rows = await api("/pairing/?latest=true&limit=500");
+async function loadPairingMap(filter = {}) {
+  {
+    // Scoped to the patient/request on screen and uncapped, so every
+    // current match is returned (a global limit dropped older pairings).
+    const params = new URLSearchParams({ latest: "true", ...filter });
+    const rows = await api(`/pairing/?${params}`);
     const map = {};
     for (const r of rows) {
       const tSide = (map[r.tumor_id] = map[r.tumor_id] || {});
@@ -665,7 +668,7 @@ async function openPatient(row) {
   try {
     const [samples] = await Promise.all([
       api(`/sample/?patient_id=${encodeURIComponent(row.patient_id)}&limit=200`),
-      loadPairingMap(),
+      loadPairingMap({ patient_id: row.patient_id }),
     ]);
     patientsState.patientSamples = samples;
     tbody.innerHTML = samples.map((s) => `
@@ -768,7 +771,7 @@ async function openRequest(row) {
   try {
     const [fetchedSamples] = await Promise.all([
       api(`/sample/?request_id=${encodeURIComponent(row.request_id)}&limit=200`),
-      loadPairingMap(),
+      loadPairingMap({ request_id: row.request_id }),
     ]);
     // /sample/ filters request_id as a substring match; keep only the
     // samples belonging to this exact request.
