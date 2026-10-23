@@ -22,7 +22,14 @@ Registered strategies:
     ``resolve_preservation``), and an unresolvable side blocks the pair.
     The pooled tier also resolves run mode through the pooled_machines
     table (pool machine name -> machine class; tumor run_mode ->
-    novaseq/hiseq family).
+    novaseq/hiseq family). DMP samples (``sample_type`` == "DMP") are
+    manual-pairing only: the automatic cascade never selects them, and
+    any pair involving a DMP sample always carries a "DMP: manual
+    pairing only" mismatch reason, so they surface in the Sample
+    Pairing view as overridable candidates. The candidate scope lists
+    them by patient only: a non-DMP sample lists every same-patient
+    opposite-type DMP sample, and a DMP sample lists every same-patient
+    opposite-type sample.
   * ``tempo`` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's
     tempo_patient.py: a historical-pairing tier (beagle's pre_pairing /
     pairing.tsv) retained unconditionally, then patient-wide matching on
@@ -282,6 +289,9 @@ class PairingStrategy(Protocol):
     def _is_pooled(self, sample: Sample) -> bool:
         ...
 
+    def _is_dmp(self, sample: Sample) -> bool:
+        ...
+
 
 strategies: Dict[str, PairingStrategy] = {}
 
@@ -320,6 +330,12 @@ class DefaultPairingStrategy:
         return [str(t).lower() for t in raw]
 
     def _is_pooled(self, sample: Sample) -> bool:
+        return False
+
+    @staticmethod
+    def _is_dmp(sample: Sample) -> bool:
+        # DMP is an argos-strategy concept; other strategies treat
+        # sample_type "DMP" as an ordinary sample type.
         return False
 
     # -- matching -------------------------------------------------------
@@ -505,7 +521,19 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         maps to a machine class, the tumor's run_mode maps to a
         novaseq/hiseq family, and the pair matches only when both resolve
         to the same family (unresolvable on either side blocks it). The
-        preservation gate still applies.
+        preservation gate still applies;
+      * DMP samples (``sample_type`` == "DMP") are manual-pairing only:
+        the automatic cascade never selects them (``select_latest_normal``
+        returns no selection for a DMP tumor, and ``select_matching_tumors``
+        returns nothing for a DMP normal), and any pair involving a DMP
+        sample always carries the "DMP: manual pairing only" mismatch
+        reason, so the Sample Pairing view shows them as overridable
+        candidates. The candidate scope lists them by patient only: a
+        non-DMP sample lists every same-patient opposite-type DMP sample,
+        and a DMP sample lists every same-patient opposite-type sample
+        (LIMS and DMP alike). The run-mode and preservation gates are
+        skipped when either side is DMP (the manual-only reason stands in
+        for them).
 
     Per-logic config keys:
       * ``run_mode_map`` — dict of raw substring -> bucket, checked in
@@ -532,10 +560,15 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return str(sample.sample_type or "").strip().upper() == "DMP"
 
     def _soft_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
-        # DMP records carry no run_mode/preservation/sample_origin, so
-        # those gates do not apply when either side is DMP.
+        # DMP samples are manual-pairing only: they are never
+        # auto-selected, and any pair involving a DMP sample carries the
+        # manual-only mismatch reason (so the Sample Pairing view shows
+        # it as an overridable candidate). DMP records carry no
+        # run_mode/preservation/sample_origin, so those gates do not
+        # apply when either side is DMP; the manual-only reason stands
+        # in for them.
         if self._is_dmp(tumor) or self._is_dmp(candidate):
-            return []
+            return ["DMP: manual pairing only"]
         reasons: List[str] = []
         t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
         n_bucket = normalize_run_mode(candidate.run_mode, self._run_mode_map())
@@ -618,7 +651,13 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         if self._is_pooled(normal):
             # Pooled tier has its own relaxed key set (the machine-table
             # run-mode check needs the session).
-            return self._pooled_reasons(db, tumor, normal)
+            reasons = list(self._pooled_reasons(db, tumor, normal))
+            # The pooled tier does not go through _soft_reasons, so the
+            # DMP manual-only reason is added here (the non-pooled path
+            # picks it up from _soft_reasons).
+            if self._is_dmp(tumor) or self._is_dmp(normal):
+                reasons.append("DMP: manual pairing only")
+            return reasons
         reasons = self._base_mismatch_reasons(tumor, normal)
         reasons.extend(self._soft_reasons(tumor, normal))
         return reasons
@@ -636,12 +675,52 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             _key_condition(Sample.bait_set, tumor.bait_set),
         )
 
+    def select_matching_tumors(
+        self,
+        db: Session,
+        normal: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        # DMP normals are manual-pairing only: ingesting one never
+        # auto-pairs it to a tumor.
+        if self._is_dmp(normal):
+            return []
+        return super().select_matching_tumors(db, normal, logic)
+
+    def _dmp_candidates(self, db: Session, sample: Sample) -> List[Sample]:
+        """Every opposite-type DMP sample for the sample's patient."""
+        if sample.patient_id is None:
+            # A patient-less DMP sample has no "same patient" to share.
+            return []
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        return list(
+            db.scalars(
+                select(Sample).where(
+                    Sample.tumor_or_normal == role,
+                    _key_condition(Sample.patient_id, sample.patient_id),
+                    func.trim(func.upper(Sample.sample_type)) == "DMP",
+                )
+            ).all()
+        )
+
     def select_latest_normal(
         self,
         db: Session,
         tumor: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> NormalSelection:
+        # DMP tumors are manual-pairing only: no automatic selection.
+        # (The default cascade below also skips DMP normals via
+        # _soft_reasons.)
+        if self._is_dmp(tumor):
+            return NormalSelection(
+                None,
+                ["tumor is DMP: manual pairing only (no automatic selection)"],
+            )
         selection = super().select_latest_normal(db, tumor, logic)
         if selection.normal is not None:
             return selection
@@ -662,6 +741,28 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         sample: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> List[Sample]:
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        if self._is_dmp(sample):
+            # A DMP sample: every same-patient opposite-type sample (LIMS
+            # and DMP alike) is a potential override candidate.
+            candidates = list(
+                db.scalars(
+                    select(Sample).where(
+                        Sample.tumor_or_normal == role,
+                        _key_condition(Sample.patient_id, sample.patient_id),
+                    )
+                ).all()
+            )
+            if role == TumorOrNormal.NORMAL.value:
+                # The pooled tier still applies for a DMP tumor.
+                pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+                known = {c.id for c in candidates}
+                candidates.extend(p for p in pooled if p.id not in known)
+            return candidates
         if sample.tumor_or_normal == TumorOrNormal.TUMOR.value:
             candidates = super().candidate_scope(db, sample, logic)
             if sample.patient_id is None:
@@ -669,8 +770,9 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
                 # matching pooled normal; nothing extra to add.
                 return candidates
             pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+            dmp = self._dmp_candidates(db, sample)
             known = {c.id for c in candidates}
-            candidates.extend(p for p in pooled if p.id not in known)
+            candidates.extend(c for c in pooled + dmp if c.id not in known)
             return candidates
         if self._is_pooled(sample):
             # Only the pooled tier can pick a pooled normal: any tumor
@@ -681,7 +783,13 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
                 _key_condition(Sample.bait_set, sample.bait_set),
             ]
             return list(db.scalars(select(Sample).where(*conds)).all())
-        return super().candidate_scope(db, sample, logic)
+        # Non-pooled normal: base scope plus same-patient DMP tumors.
+        candidates = super().candidate_scope(db, sample, logic)
+        if sample.patient_id is not None:
+            dmp = self._dmp_candidates(db, sample)
+            known = {c.id for c in candidates}
+            candidates.extend(c for c in dmp if c.id not in known)
+        return candidates
 
 
 @register_pairing_strategy("tempo")

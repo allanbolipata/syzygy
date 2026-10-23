@@ -250,8 +250,11 @@ def possible_matches(
     Candidates are exactly the opposite-type samples this strategy's
     cascade can reach (``strategy.candidate_scope``): its hard keys,
     compared case-insensitively, plus the strategy's extra tiers (e.g.
-    argos's pooled-normal tier). This mirrors pairing, so the list stays
-    bounded instead of returning the whole opposite-type table.
+    argos's pooled-normal tier and same-patient DMP samples). This
+    mirrors pairing, so the list stays bounded instead of returning the
+    whole opposite-type table. DMP candidates (tier "dmp", argos only)
+    are always mismatches: DMP samples are manual-pairing only and are
+    never auto-selected, so they are listed purely as override targets.
 
     ``other_matches`` is a bounded page of that scope (``limit``/``offset``,
     default ``DEFAULT_OTHER_MATCHES_LIMIT``); ``other_matches_total``
@@ -317,7 +320,7 @@ def possible_matches(
         else None
     )
 
-    tier_rank = {"same_request": 0, "other_request": 1, "pooled": 2}
+    tier_rank = {"same_request": 0, "other_request": 1, "dmp": 2, "pooled": 3}
     others: list[dict] = []
     for cand in candidates:
         if cand.id in current_ids:
@@ -325,6 +328,10 @@ def possible_matches(
         tumor, normal = (sample, cand) if is_tumor else (cand, sample)
         if strategy.HAS_POOLED_TIER and strategy._is_pooled(normal):
             tier = "pooled"
+        elif strategy._is_dmp(cand):
+            # The candidate itself is a DMP sample: manual-pairing tier
+            # (argos only). Non-DMP candidates keep their natural tier.
+            tier = "dmp"
         elif normal.request_id is not None and normal.request_id == tumor.request_id:
             tier = "same_request"
         else:

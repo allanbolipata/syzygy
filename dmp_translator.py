@@ -24,9 +24,12 @@ Deliberately NOT stored:
 
 DMP records carry no IGO/LIMS keys, so request_id, run_mode,
 preservation, sample_origin, and sequencing_date are None; bait_set is set
-to the gene_panel (beagle logic). The ARGOS strategy skips the run_mode and
-preservation gates when either side is a DMP sample, so DMP samples are
-candidates for matching with regular LIMS data.
+to the gene_panel (beagle logic). In the ARGOS strategy DMP samples are
+manual-pairing only: the automatic cascade never selects them, and any
+pair involving a DMP sample reports a permanent "DMP: manual pairing only"
+mismatch reason. Same-patient DMP samples are listed as potential matches
+on the Sample Pairing page (candidate scope, tier "dmp") so an operator
+can pin them via an override.
 """
 from __future__ import annotations
 
