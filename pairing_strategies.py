@@ -14,10 +14,22 @@ Registered strategies:
   * ``argos`` — WES strategy aligned with beagle's argos pairing logic
     (v2_3.0). Matches on (patient_id, gene_panel, bait_set) with
     run-mode (sequencer) bucket matching, a request-first cascade, and a
-    pooled normal tier (shared across patients). Beagle's v2_3.0 logic
-    does not key on specimen/sample type and does not gate on
-    preservation, so neither is a matching key here (both are still
-    stored on the sample).
+    pooled normal tier (shared across patients). Beagle's v2.3.0 logic
+    does not key on specimen/sample type, so it is not a matching key
+    here (still stored on the sample). Preservation is a gate on every
+    tier, pooled included: both sides' (preservation, sample_origin)
+    must resolve to the same category ("ffpe"/"frozen"; see
+    ``resolve_preservation``), and an unresolvable side blocks the pair.
+    The pooled tier also resolves run mode through the pooled_machines
+    table (pool machine name -> machine class; tumor run_mode ->
+    novaseq/hiseq family). DMP samples (``sample_type`` == "DMP") are
+    manual-pairing only: the automatic cascade never selects them, and
+    any pair involving a DMP sample always carries a "DMP: manual
+    pairing only" mismatch reason, so they surface in the Sample
+    Pairing view as overridable candidates. The candidate scope lists
+    them by patient only: a non-DMP sample lists every same-patient
+    opposite-type DMP sample, and a DMP sample lists every same-patient
+    opposite-type sample.
   * ``tempo`` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's
     tempo_patient.py: a historical-pairing tier (beagle's pre_pairing /
     pairing.tsv) retained unconditionally, then patient-wide matching on
@@ -42,7 +54,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import PairingLogic, PairingTable, Sample
+from models import PairingLogic, PairingTable, PooledMachine, Sample
 from schemas import TumorOrNormal
 
 # Sentinel used to sort rows without a sequencing_date to the end. It is
@@ -76,19 +88,79 @@ TEMPO_RUN_MODE_MAP: Dict[str, str] = {
 # ``pooled_sample_types`` config key.
 DEFAULT_POOLED_SAMPLE_TYPES: tuple = ("Pooled Normal",)
 
+# Default machine reference rows for the pooled_machines table (used by
+# seed_pooled_machines at startup and by tests). machine_class is the
+# family used for pooled run-mode matching; machine_type is display-only.
+DEFAULT_POOLED_MACHINES: tuple = (
+    ("diana", "novaseq", "NovaSeq 6000"),
+    ("jax", "hiseq", "HiSeq 4000"),
+    ("kim", "hiseq", "HiSeq 2500"),
+    ("liz", "hiseq", "HiSeq 2500"),
+    ("michelle", "novaseq", "NovaSeq 6000"),
+    ("momo", "hiseq", "HiSeq 2500"),
+    ("pitt", "hiseq", "HiSeq 4000"),
+    ("ruth", "novaseq", "NovaSeq 6000"),
+)
 
-def _as_text(value) -> str:
-    """Normalize a possibly list-valued metadata field to a single string.
+
+def seed_pooled_machines(db: Session) -> None:
+    """Idempotently insert DEFAULT_POOLED_MACHINES (missing rows only).
+
+    Called from app startup so a fresh database gets the machine table;
+    safe to call again (existing rows are left untouched).
+    """
+    for name, machine_class, machine_type in DEFAULT_POOLED_MACHINES:
+        existing = db.scalar(
+            select(PooledMachine).where(
+                func.lower(PooledMachine.machine_name) == name.lower()
+            )
+        )
+        if existing is None:
+            db.add(
+                PooledMachine(
+                    machine_name=name,
+                    machine_class=machine_class,
+                    machine_type=machine_type,
+                )
+            )
+    db.commit()
+
+
+
+# Sample-origin entries (lower-cased) that resolve to the "frozen"
+# category. "ffpe" resolves to "ffpe"; any other sample-origin entry is
+# unresolvable.
+_FROZEN_ORIGIN_VALUES = frozenset({"fresh or frozen", "frozen"})
+
+
+def _value_set(value) -> set:
+    """Lower-cased, stripped, non-empty entries of a JSON metadata field.
 
     preservation / sample_origin are JSON columns that may hold a list
-    (mirroring beagle's list-valued metadata) or a scalar; lists use
-    their first entry.
+    (mirroring beagle's list-valued metadata) or a scalar; every entry
+    is considered, so any entry matching a category token qualifies.
     """
     if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else ""
-    return str(value).strip().lower()
+        return set()
+    items = value if isinstance(value, (list, tuple)) else (value,)
+    return {str(v).strip().lower() for v in items if str(v).strip()}
+
+
+def _origin_category(origin: set) -> Optional[str]:
+    """Category of a sample-origin value set: "ffpe", "frozen", or None.
+
+    Case-insensitive exact token match: "ffpe" -> "ffpe"; "fresh or
+    frozen" or "frozen" -> "frozen". Any other value — or a set mixing
+    both categories — is unresolvable (None).
+    """
+    cats = set()
+    if "ffpe" in origin:
+        cats.add("ffpe")
+    if _FROZEN_ORIGIN_VALUES & origin:
+        cats.add("frozen")
+    if len(cats) != 1:
+        return None
+    return cats.pop()
 
 
 def normalize_run_mode(value: Optional[str], mapping: Optional[Dict[str, str]] = None) -> str:
@@ -109,28 +181,29 @@ def normalize_run_mode(value: Optional[str], mapping: Optional[Dict[str, str]] =
 def resolve_preservation(preservation, sample_origin) -> str:
     """Resolve (preservation, sample_origin) to "ffpe", "frozen", or "".
 
-    Ported from beagle's get_preservation_type (argos_operator v2_2_0):
-    both sides agree on FFPE -> "ffpe"; both consistent with fresh/frozen
-    -> "frozen"; anything else (missing or unrecognizable included) -> ""
-    (unresolvable).
+    Fuzzy, case-insensitive category resolution (ARGOS preservation
+    gate):
+      * preservation non-empty -> "ffpe" if any entry is "ffpe",
+        otherwise "frozen" (anything else);
+      * preservation empty, sample_origin non-empty -> the origin's
+        category: "ffpe" for "ffpe"; "frozen" for "fresh or frozen" or
+        "frozen"; any other origin value is unresolvable;
+      * both non-empty -> the two categories must agree (e.g.
+        preservation "Frozen" == sample_origin "Fresh or Frozen");
+        disagreement — or a present-but-unresolvable origin — is
+        unresolvable.
+    The empty string means unresolvable; the ARGOS gate blocks a pair
+    when either side is unresolvable.
     """
-    p = _as_text(preservation)
-    o = _as_text(sample_origin)
-    if p and o:
-        if p == "ffpe" and o == "ffpe":
-            return "ffpe"
-        if "fresh or frozen" in o and p != "ffpe":
-            return "frozen"
-        return ""
-    if p:
-        return "ffpe" if p == "ffpe" else "frozen"
-    if o:
-        if o == "ffpe":
-            return "ffpe"
-        if "fresh or frozen" in o:
-            return "frozen"
-        return ""
-    return ""
+    p = _value_set(preservation)
+    o = _value_set(sample_origin)
+    p_cat = "ffpe" if "ffpe" in p else "frozen" if p else None
+    o_cat = _origin_category(o) if o else None
+    if p_cat is None:
+        return o_cat or ""
+    if o_cat is None:
+        return "" if o else p_cat
+    return p_cat if p_cat == o_cat else ""
 
 
 @dataclass
@@ -146,14 +219,35 @@ class NormalSelection:
     notes: List[str] = field(default_factory=list)
 
 
+def _norm_key(value) -> Optional[str]:
+    """Case-insensitive comparison form of a key value (None stays None)."""
+    return None if value is None else str(value).lower()
+
+
+def _key_condition(column, value):
+    """Case-insensitive hard-key equality for candidate queries.
+
+    ``None`` values match only NULL columns: SQLAlchemy renders
+    ``column == None`` as ``IS NULL``, which is the pre-existing
+    behavior for null keys.
+    """
+    if value is None:
+        return column.is_(None)
+    return func.lower(column) == str(value).lower()
+
+
 class PairingStrategy(Protocol):
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool
 
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
         ...
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         ...
 
     def select_latest_normal(
@@ -162,6 +256,20 @@ class PairingStrategy(Protocol):
         tumor: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> NormalSelection:
+        ...
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        """Every opposite-type sample this strategy's cascade can reach.
+
+        Powers the Matches & Overrides view: the candidate list mirrors
+        what the strategy can actually select, so it stays bounded
+        instead of returning the whole opposite-type table.
+        """
         ...
 
     def select_matching_tumors(
@@ -179,6 +287,9 @@ class PairingStrategy(Protocol):
         ...
 
     def _is_pooled(self, sample: Sample) -> bool:
+        ...
+
+    def _is_dmp(self, sample: Sample) -> bool:
         ...
 
 
@@ -221,22 +332,35 @@ class DefaultPairingStrategy:
     def _is_pooled(self, sample: Sample) -> bool:
         return False
 
+    @staticmethod
+    def _is_dmp(sample: Sample) -> bool:
+        # DMP is an argos-strategy concept; other strategies treat
+        # sample_type "DMP" as an ordinary sample type.
+        return False
+
     # -- matching -------------------------------------------------------
 
     def _base_mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+        # Hard keys compare case-insensitively; None matches only NULL.
         reasons: List[str] = []
         for label in self.HARD_KEYS:
             t_val = getattr(tumor, label)
             n_val = getattr(normal, label)
-            if t_val != n_val:
+            if _norm_key(t_val) != _norm_key(n_val):
                 reasons.append(f"{label} mismatch ({t_val} vs {n_val})")
         return reasons
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
+        # ``db`` is accepted for protocol compatibility; the default
+        # strategy has no pooled tier, so it never needs it.
         return self._base_mismatch_reasons(tumor, normal)
 
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
-        return not self.mismatch_reasons(tumor, normal)
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
+        return not self.mismatch_reasons(tumor, normal, db)
 
     # -- candidate selection ---------------------------------------------
 
@@ -248,7 +372,8 @@ class DefaultPairingStrategy:
     ):
         conds = [Sample.tumor_or_normal == TumorOrNormal.NORMAL.value]
         conds.extend(
-            getattr(Sample, key) == getattr(tumor, key) for key in self.HARD_KEYS
+            _key_condition(getattr(Sample, key), getattr(tumor, key))
+            for key in self.HARD_KEYS
         )
         stmt = select(Sample).where(*conds)
         if request_id is not None:
@@ -329,6 +454,24 @@ class DefaultPairingStrategy:
         notes.extend(tier_notes)
         return NormalSelection(picked, notes)
 
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        conds = [Sample.tumor_or_normal == role]
+        conds.extend(
+            _key_condition(getattr(Sample, key), getattr(sample, key))
+            for key in self.HARD_KEYS
+        )
+        return list(db.scalars(select(Sample).where(*conds)).all())
+
     def select_matching_tumors(
         self,
         db: Session,
@@ -337,7 +480,8 @@ class DefaultPairingStrategy:
     ) -> List[Sample]:
         conds = [Sample.tumor_or_normal == TumorOrNormal.TUMOR.value]
         conds.extend(
-            getattr(Sample, key) == getattr(normal, key) for key in self.HARD_KEYS
+            _key_condition(getattr(Sample, key), getattr(normal, key))
+            for key in self.HARD_KEYS
         )
         stmt = select(Sample).where(*conds)
         return list(db.scalars(stmt).all())
@@ -353,10 +497,15 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     logic (v2_3.0).
 
     Matching keys (hard): patient_id, gene_panel, bait_set. Beagle's
-    v2_3.0 logic never keys on specimen/sample type and does not gate on
-    preservation, so ``sample_type`` is dropped from the hard keys and
-    the preservation gate is removed; both attributes remain stored on
-    the sample and are surfaced in pairing notes/reads.
+    v2.3.0 logic never keys on specimen/sample type, so ``sample_type``
+    is dropped from the hard keys; it remains stored on the sample and
+    is surfaced in pairing notes/reads.
+
+    Preservation is a soft gate on every tier, pooled included: each
+    side's (preservation, sample_origin) must resolve to the same
+    category via ``resolve_preservation`` (fuzzy, case-insensitive:
+    "ffpe"/"frozen"). A side that is unresolvable, or whose category
+    disagrees with the other side, blocks the pair.
 
     Extends the default strategy with:
       * run-mode (sequencer) matching — the raw ``run_mode`` strings are
@@ -367,8 +516,24 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         tier (mirrors beagle's compare_dates "most recent" selection);
       * a pooled-normal tier — shared pooled normals (``sample_type`` in
         ``pooled_sample_types``, patient_id null), matched across patients
-        on gene_panel + bait_set. Run mode is enforced only when the
-        pooled sample carries one (run/machine data is not tracked).
+        on gene_panel + bait_set. Run mode is resolved through the
+        pooled_machines table: the pool's machine name (its raw run_mode)
+        maps to a machine class, the tumor's run_mode maps to a
+        novaseq/hiseq family, and the pair matches only when both resolve
+        to the same family (unresolvable on either side blocks it). The
+        preservation gate still applies;
+      * DMP samples (``sample_type`` == "DMP") are manual-pairing only:
+        the automatic cascade never selects them (``select_latest_normal``
+        returns no selection for a DMP tumor, and ``select_matching_tumors``
+        returns nothing for a DMP normal), and any pair involving a DMP
+        sample always carries the "DMP: manual pairing only" mismatch
+        reason, so the Sample Pairing view shows them as overridable
+        candidates. The candidate scope lists them by patient only: a
+        non-DMP sample lists every same-patient opposite-type DMP sample,
+        and a DMP sample lists every same-patient opposite-type sample
+        (LIMS and DMP alike). The run-mode and preservation gates are
+        skipped when either side is DMP (the manual-only reason stands in
+        for them).
 
     Per-logic config keys:
       * ``run_mode_map`` — dict of raw substring -> bucket, checked in
@@ -390,46 +555,156 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     def _resolved_preservation(sample: Sample) -> str:
         return resolve_preservation(sample.preservation, sample.sample_origin)
 
+    @staticmethod
+    def _is_dmp(sample: Sample) -> bool:
+        return str(sample.sample_type or "").strip().upper() == "DMP"
+
     def _soft_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
+        # DMP samples are manual-pairing only: they are never
+        # auto-selected, and any pair involving a DMP sample carries the
+        # manual-only mismatch reason (so the Sample Pairing view shows
+        # it as an overridable candidate). DMP records carry no
+        # run_mode/preservation/sample_origin, so those gates do not
+        # apply when either side is DMP; the manual-only reason stands
+        # in for them.
+        if self._is_dmp(tumor) or self._is_dmp(candidate):
+            return ["DMP: manual pairing only"]
+        reasons: List[str] = []
         t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
         n_bucket = normalize_run_mode(candidate.run_mode, self._run_mode_map())
         if t_bucket != n_bucket:
-            return [
+            reasons.append(
                 f"run_mode mismatch ({t_bucket or 'unknown'} vs {n_bucket or 'unknown'})"
-            ]
-        return []
-
-    def _pooled_reasons(self, tumor: Sample, pooled: Sample) -> List[str]:
-        reasons: List[str] = []
-        if tumor.gene_panel != pooled.gene_panel:
-            reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
-        if tumor.bait_set != pooled.bait_set:
-            reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
-        if pooled.run_mode:
-            t_bucket = normalize_run_mode(tumor.run_mode, self._run_mode_map())
-            p_bucket = normalize_run_mode(pooled.run_mode, self._run_mode_map())
-            if t_bucket != p_bucket:
-                reasons.append(
-                    f"run_mode mismatch ({t_bucket or 'unknown'} vs {p_bucket or 'unknown'})"
-                )
+            )
+        reasons.extend(self._preservation_reasons(tumor, candidate))
         return reasons
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def _preservation_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
+        """Preservation agreement gate: both sides must resolve to the
+        same category; unresolvable on either side blocks the pair."""
+        t_cat = self._resolved_preservation(tumor)
+        n_cat = self._resolved_preservation(candidate)
+        if not t_cat:
+            return ["preservation unresolvable on tumor"]
+        if not n_cat:
+            return ["preservation unresolvable on normal"]
+        if t_cat != n_cat:
+            return [f"preservation mismatch ({t_cat} vs {n_cat})"]
+        return []
+
+    @staticmethod
+    def _tumor_machine_family(run_mode: Optional[str]) -> str:
+        """Machine family of a tumor's raw run_mode string,
+        case-insensitive: 'novaseq', 'hiseq', or '' when missing or
+        unresolvable (e.g. 'NextSeq')."""
+        s = (run_mode or "").strip().lower()
+        if "novaseq" in s:
+            return "novaseq"
+        if "hiseq" in s:
+            return "hiseq"
+        return ""
+
+    def _pooled_machine_class(self, db: Optional[Session], pooled: Sample) -> str:
+        """Machine class for a pooled normal, looked up in the
+        pooled_machines table by its machine name (the pooled normal's
+        raw run_mode value): 'novaseq'/'hiseq', or '' when the pooled
+        normal has no run_mode or its machine is not in the table."""
+        name = (pooled.run_mode or "").strip().lower()
+        if not name or db is None:
+            return ""
+        row = db.scalar(
+            select(PooledMachine).where(
+                func.lower(PooledMachine.machine_name) == name
+            )
+        )
+        return row.machine_class if row is not None else ""
+
+    def _pooled_reasons(
+        self, db: Optional[Session], tumor: Sample, pooled: Sample
+    ) -> List[str]:
+        # Pooled run-mode check: the pool's machine name resolves to a
+        # class via the pooled_machines table; the tumor's run_mode
+        # resolves to a novaseq/hiseq family. Both must resolve and
+        # agree. The preservation gate still applies too.
+        reasons: List[str] = []
+        if _norm_key(tumor.gene_panel) != _norm_key(pooled.gene_panel):
+            reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
+        if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
+            reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
+        t_family = self._tumor_machine_family(tumor.run_mode)
+        p_class = self._pooled_machine_class(db, pooled)
+        if not t_family:
+            reasons.append("tumor run_mode unresolvable")
+        elif not p_class:
+            reasons.append(
+                "pooled machine not in table "
+                f"({(pooled.run_mode or '').strip() or 'missing'})"
+            )
+        elif t_family != p_class:
+            reasons.append(f"run_mode mismatch ({t_family} vs {p_class})")
+        reasons.extend(self._preservation_reasons(tumor, pooled))
+        return reasons
+
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         if self._is_pooled(normal):
-            return self._pooled_reasons(tumor, normal)
+            # Pooled tier has its own relaxed key set (the machine-table
+            # run-mode check needs the session).
+            reasons = list(self._pooled_reasons(db, tumor, normal))
+            # The pooled tier does not go through _soft_reasons, so the
+            # DMP manual-only reason is added here (the non-pooled path
+            # picks it up from _soft_reasons).
+            if self._is_dmp(tumor) or self._is_dmp(normal):
+                reasons.append("DMP: manual pairing only")
+            return reasons
         reasons = self._base_mismatch_reasons(tumor, normal)
         reasons.extend(self._soft_reasons(tumor, normal))
         return reasons
 
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
-        return not self.mismatch_reasons(tumor, normal)
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
+        return not self.mismatch_reasons(tumor, normal, db)
 
     def _pooled_candidate_stmt(self, tumor: Sample):
         return select(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
             func.lower(Sample.sample_type).in_(self._pooled_types()),
-            Sample.gene_panel == tumor.gene_panel,
-            Sample.bait_set == tumor.bait_set,
+            _key_condition(Sample.gene_panel, tumor.gene_panel),
+            _key_condition(Sample.bait_set, tumor.bait_set),
+        )
+
+    def select_matching_tumors(
+        self,
+        db: Session,
+        normal: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        # DMP normals are manual-pairing only: ingesting one never
+        # auto-pairs it to a tumor.
+        if self._is_dmp(normal):
+            return []
+        return super().select_matching_tumors(db, normal, logic)
+
+    def _dmp_candidates(self, db: Session, sample: Sample) -> List[Sample]:
+        """Every opposite-type DMP sample for the sample's patient."""
+        if sample.patient_id is None:
+            # A patient-less DMP sample has no "same patient" to share.
+            return []
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        return list(
+            db.scalars(
+                select(Sample).where(
+                    Sample.tumor_or_normal == role,
+                    _key_condition(Sample.patient_id, sample.patient_id),
+                    func.trim(func.upper(Sample.sample_type)) == "DMP",
+                )
+            ).all()
         )
 
     def select_latest_normal(
@@ -438,16 +713,83 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         tumor: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> NormalSelection:
+        # DMP tumors are manual-pairing only: no automatic selection.
+        # (The default cascade below also skips DMP normals via
+        # _soft_reasons.)
+        if self._is_dmp(tumor):
+            return NormalSelection(
+                None,
+                ["tumor is DMP: manual pairing only (no automatic selection)"],
+            )
         selection = super().select_latest_normal(db, tumor, logic)
         if selection.normal is not None:
             return selection
         notes = list(selection.notes)
         candidates = db.scalars(self._pooled_candidate_stmt(tumor)).all()
         picked, tier_notes = self._select_in_candidates(
-            tumor, candidates, "pooled", self._pooled_reasons
+            tumor,
+            candidates,
+            "pooled",
+            lambda t, c: self._pooled_reasons(db, t, c),
         )
         notes.extend(tier_notes)
         return NormalSelection(picked, notes)
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        if self._is_dmp(sample):
+            # A DMP sample: every same-patient opposite-type sample (LIMS
+            # and DMP alike) is a potential override candidate.
+            candidates = list(
+                db.scalars(
+                    select(Sample).where(
+                        Sample.tumor_or_normal == role,
+                        _key_condition(Sample.patient_id, sample.patient_id),
+                    )
+                ).all()
+            )
+            if role == TumorOrNormal.NORMAL.value:
+                # The pooled tier still applies for a DMP tumor.
+                pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+                known = {c.id for c in candidates}
+                candidates.extend(p for p in pooled if p.id not in known)
+            return candidates
+        if sample.tumor_or_normal == TumorOrNormal.TUMOR.value:
+            candidates = super().candidate_scope(db, sample, logic)
+            if sample.patient_id is None:
+                # Patient-null hard-key scope already includes every
+                # matching pooled normal; nothing extra to add.
+                return candidates
+            pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+            dmp = self._dmp_candidates(db, sample)
+            known = {c.id for c in candidates}
+            candidates.extend(c for c in pooled + dmp if c.id not in known)
+            return candidates
+        if self._is_pooled(sample):
+            # Only the pooled tier can pick a pooled normal: any tumor
+            # sharing its gene_panel + bait_set, regardless of patient.
+            conds = [
+                Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+                _key_condition(Sample.gene_panel, sample.gene_panel),
+                _key_condition(Sample.bait_set, sample.bait_set),
+            ]
+            return list(db.scalars(select(Sample).where(*conds)).all())
+        # Non-pooled normal: base scope plus same-patient DMP tumors.
+        candidates = super().candidate_scope(db, sample, logic)
+        if sample.patient_id is not None:
+            dmp = self._dmp_candidates(db, sample)
+            known = {c.id for c in candidates}
+            candidates.extend(c for c in dmp if c.id not in known)
+        return candidates
 
 
 @register_pairing_strategy("tempo")
@@ -502,7 +844,9 @@ class TempoPairingStrategy(DefaultPairingStrategy):
             )
         return reasons
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         # patient_id is the only hard key; bait_set + run_mode are soft.
         reasons = self._base_mismatch_reasons(tumor, normal)
         reasons.extend(self._soft_reasons(tumor, normal))
@@ -548,7 +892,7 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         candidates = db.scalars(
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
-                Sample.patient_id == tumor.patient_id,
+                _key_condition(Sample.patient_id, tumor.patient_id),
             )
         ).all()
         picked, tier_notes = self._select_in_candidates(
@@ -567,10 +911,31 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         tumors = db.scalars(
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
-                Sample.patient_id == normal.patient_id,
+                _key_condition(Sample.patient_id, normal.patient_id),
             )
         ).all()
         return [t for t in tumors if not self._soft_reasons(t, normal)]
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        # Tempo is patient-scoped (no pooled tier): everything the
+        # patient-wide tier can reach is one same-patient query away.
+        if sample.patient_id is None:
+            return []
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        conds = [
+            Sample.tumor_or_normal == role,
+            _key_condition(Sample.patient_id, sample.patient_id),
+        ]
+        return list(db.scalars(select(Sample).where(*conds)).all())
 
 
 # Strategy-name aliases: a PairingLogic row may reference a strategy by

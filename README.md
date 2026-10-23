@@ -73,8 +73,12 @@ tables.
 - `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
   match (latest pairing for the selected logic) plus all potential
   matches. Candidates are same-patient normals/tumors, plus pooled
-  normals for strategies with a pooled tier (`argos`). Each candidate
-  reports its cascade tier (`same_request`, `other_request`, `pooled`),
+  normals for strategies with a pooled tier (`argos`); the `argos`
+  strategy additionally lists same-patient DMP samples (tier `dmp`) —
+  DMP pairing is manual, so they are always reported as mismatches and
+  exist purely as override targets. Each candidate
+  reports its cascade tier (`same_request`, `other_request`, `dmp`,
+  `pooled`),
   whether it passes every matching key (`matched`), and the reasons it
   does not (`mismatched_keys`); for a tumor, `would_be_selected` marks
   the candidate the strategy cascade would pick. Supports manual
@@ -160,18 +164,29 @@ dict customizes the strategy at use time.
   this strategy.
 - `argos` — WES strategy aligned with beagle's ARGOS pairing logic
   (v2.3.0). Hard keys are (`patient_id`, `gene_panel`, `bait_set`);
-  `sample_type` and preservation are not matching keys (beagle v2.3.0
-  never gates on them; both remain stored on the sample). Extends
-  `default` with:
+  `sample_type` is not a matching key (beagle v2.3.0 never gates on
+  it; it remains stored on the sample). Extends `default` with:
   - **run-mode gating** — raw `run_mode` strings are normalized to
     buckets (default map: "novaseq x" → `novaseq_x`, "novaseq" →
-    `novaseq`, "hiseq" → `hiseq`) and must be equal on both sides.
+    `novaseq`, "hiseq" → `hiseq`) and must be equal on both sides; in
+    the pooled tier the pool's machine name resolves through
+    `pooled_machines` (machine class `novaseq`/`hiseq`), which must
+    match the tumor's run-mode family (a NovaSeq X run is a NovaSeq
+    machine).
+  - **preservation gating** — each side's `preservation` /
+    `sample_origin` must resolve to the same category, fuzzily
+    (case-insensitive): preservation `FFPE` → ffpe, anything else →
+    frozen; `sample_origin` (checked when preservation is empty)
+    resolves `FFPE` → ffpe and `Fresh or Frozen` / `frozen` →
+    frozen. When both fields are present they must agree; a sample
+    that is unresolvable, or that disagrees with the other side,
+    blocks the pair — including in the pooled tier.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,
     default `["Pooled Normal"]`) are considered across patients,
-    matched on `gene_panel` + `bait_set`; run mode is enforced only
-    when the pooled sample carries one (run/machine data is not
-    tracked for pooled samples).
+    matched on `gene_panel` + `bait_set`; run mode is ignored for
+    pooled matches (run/machine data is not tracked), while the
+    preservation gate still applies.
   - Per-logic config keys: `run_mode_map` (raw substring → bucket,
     checked in order) and `pooled_sample_types`.
 - `tempo` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's

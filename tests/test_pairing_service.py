@@ -20,7 +20,7 @@ from pairing_service import (
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, strategies
+from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
 from routers.patients import list_patients
@@ -30,10 +30,14 @@ from schemas import PairingLogicCreate, PairingTriggerCreate, SampleCreate, Tumo
 
 
 class CustomPairingStrategy:
-    def matches(self, tumor: Sample, normal: Sample) -> bool:
+    def matches(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> bool:
         return tumor.patient_id == normal.patient_id and tumor.gene_panel == normal.gene_panel
 
-    def mismatch_reasons(self, tumor: Sample, normal: Sample) -> list:
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> list:
         reasons = []
         if tumor.patient_id != normal.patient_id:
             reasons.append(f"patient_id mismatch ({tumor.patient_id} vs {normal.patient_id})")
@@ -698,7 +702,7 @@ def test_argos_ignores_sample_type(db):
     )
     normal = _sample(
         db, "NORM-ST-1", sample_type="blood", run_mode="NovaSeq X",
-        preservation=["EDTA-Streck"], sample_origin=["Plasma"],
+        preservation=["FFPE"], sample_origin=["FFPE"],
     )
     argos = strategies["argos"]
     assert argos.matches(tumor, normal)
@@ -706,9 +710,9 @@ def test_argos_ignores_sample_type(db):
     assert selection.normal.id == normal.id
 
 
-def test_argos_preservation_is_not_a_gate(db):
-    """Beagle v2.3.0 does not gate on preservation: a differently-preserved
-    (even unresolvable) normal still pairs, latest run date wins."""
+def test_argos_preservation_gate_skips_disagreement(db):
+    """A differently-preserved normal is skipped even when it has the
+    newer run date; the latest preservation-matching normal wins."""
     tumor = _sample(
         db, "TUMOR-FROZEN", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["Fresh or Frozen"], sample_origin=["Fresh or Frozen"],
@@ -725,10 +729,15 @@ def test_argos_preservation_is_not_a_gate(db):
         sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == newer_ffpe.id
+    assert selection.normal.id == older_frozen.id
+    assert any("preservation mismatch" in note for note in selection.notes)
 
 
-def test_argos_unresolvable_preservation_no_longer_blocks(db):
+def test_argos_unresolvable_preservation_blocks(db):
+    """Unresolvable preservation blocks pairing: fields disagreeing
+    within one sample (preservation FFPE + origin Frozen), and missing
+    data on either side."""
+    argos = strategies["argos"]
     tumor = _sample(
         db, "TUMOR-UNK-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["Frozen"],
@@ -738,52 +747,138 @@ def test_argos_unresolvable_preservation_no_longer_blocks(db):
         db, "NORM-UNK-PRES-1", preservation=["FFPE"], sample_origin=["FFPE"],
         run_mode="NovaSeq X",
     )
-    selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == normal.id
+    selection = argos.select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any("unresolvable" in note for note in selection.notes)
+
+    bare = _sample(
+        db, "TUMOR-NO-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X",
+    )
+    assert any("unresolvable" in r for r in argos.mismatch_reasons(bare, normal))
 
 
 def test_argos_pooled_normal_tier(db):
+    seed_pooled_machines(db)
     tumor = _sample(
         db, "TUMOR-POOL-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
         db, "NORM-POOL-1", patient_id=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal.id == pooled.id
     assert any("tier=pooled" in note for note in selection.notes)
 
 
-def test_argos_pooled_respects_keys_and_run_mode(db):
-    tumor = _sample(
+def test_argos_pooled_run_mode_resolved_via_machines(db):
+    """Pooled tier run mode resolves through pooled_machines: the pool's
+    machine name (its raw run_mode, e.g. "diana") maps to a machine
+    class; the tumor's run_mode maps to a novaseq/hiseq family; they
+    must agree. A key mismatch still blocks."""
+    seed_pooled_machines(db)
+    argos = strategies["argos"]
+    tumor_nova = _sample(
         db, "TUMOR-POOL-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     _sample(
         db, "NORM-POOL-2A", patient_id=None, sample_type="Pooled Normal",
         bait_set="BAIT-2", preservation=["FFPE"], sample_origin=["FFPE"],
+        run_mode="diana",
     )
-    _sample(
+    pool_nova = _sample(
         db, "NORM-POOL-2B", patient_id=None, sample_type="Pooled Normal",
-        run_mode="Hiseq 3000", preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+    )
+    selection = argos.select_latest_normal(db, tumor_nova)
+    assert selection.normal.id == pool_nova.id
+
+    tumor_hiseq = _sample(
+        db, "TUMOR-POOL-2C", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient_id="PATIENT-002",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="HiSeq 3000",
+    )
+    pool_hiseq = _sample(
+        db, "NORM-POOL-2D", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="pitt",
+    )
+    assert any("run_mode mismatch" in r
+               for r in argos.mismatch_reasons(tumor_hiseq, pool_nova, db))
+    selection2 = argos.select_latest_normal(db, tumor_hiseq)
+    assert selection2.normal.id == pool_hiseq.id
+
+
+def test_argos_pooled_unknown_machine_blocks(db):
+    """A pool whose machine isn't in pooled_machines can't pair."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-U", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    pooled = _sample(
+        db, "NORM-POOL-U", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="bono",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal is None
-    assert any("run_mode mismatch" in note for note in selection.notes)
+    assert any("pooled machine not in table" in note for note in selection.notes)
 
 
-def test_argos_pooled_no_preservation_gate(db):
-    """Pooled tier no longer requires resolvable preservation."""
+def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
+    """Tumor run_mode missing or unmappable (e.g. NextSeq) blocks the
+    pooled tier."""
+    seed_pooled_machines(db)
+    for rm in (None, "NextSeq 2000"):
+        tumor = _sample(
+            db, f"TUMOR-POOL-{rm}", tumor_or_normal=TumorOrNormal.TUMOR.value,
+            preservation=["FFPE"], sample_origin=["FFPE"], run_mode=rm,
+        )
+        _sample(
+            db, f"NORM-POOL-{rm}", patient_id=None, sample_type="Pooled Normal",
+            preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+        )
+        selection = strategies["argos"].select_latest_normal(db, tumor)
+        assert selection.normal is None
+        assert any("tumor run_mode unresolvable" in note
+                   for note in selection.notes)
+
+
+def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
+    """An FFPE pooled normal does not match a tumor with no preservation
+    data (unresolvable blocks the pooled tier)."""
     tumor = _sample(db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value)
     pooled = _sample(
         db, "NORM-POOL-3", patient_id=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"],
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal.id == pooled.id
-    assert any("tier=pooled" in note for note in selection.notes)
+    assert selection.normal is None
+    assert any("unresolvable" in note for note in selection.notes)
+
+
+def test_argos_pooled_preservation_gate_matches_category(db):
+    """Pooled tier matches on resolved category: a frozen tumor takes the
+    FROZEN pool, not the FFPE pool (machine families agree)."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-F", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["Frozen"], sample_origin=["Fresh or Frozen"],
+        run_mode="NovaSeq X",
+    )
+    _sample(
+        db, "NORM-POOL-F-FFPE", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+    )
+    frozen_pool = _sample(
+        db, "NORM-POOL-F-FROZEN", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FROZEN"], sample_origin=["FROZEN"], run_mode="diana",
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == frozen_pool.id
+    assert any("preservation mismatch" in note for note in selection.notes)
 
 
 def test_argos_pooled_sample_types_configurable(db):
@@ -795,13 +890,14 @@ def test_argos_pooled_sample_types_configurable(db):
     db.commit()
     db.refresh(logic)
     strategy = get_pairing_strategy(logic)
+    seed_pooled_machines(db)
     tumor = _sample(
         db, "TUMOR-POOL-4", tumor_or_normal=TumorOrNormal.TUMOR.value,
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
         db, "NORM-POOLN-1", patient_id=None, sample_type="PoolN",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategy.select_latest_normal(db, tumor)
     assert selection.normal.id == pooled.id
@@ -1378,6 +1474,48 @@ def test_list_samples_q_search(db):
     # q AND-combines with field filters.
     assert [s.id for s in list_samples(q="tum", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == []
     assert [s.id for s in list_samples(q="pat-101", tumor_or_normal=TumorOrNormal.TUMOR, limit=None, offset=None, db=db)] == [t1.id]
+
+
+def test_list_samples_file_group_filter(db):
+    t1 = _make_sample2(db, "TUMOR-101", "PAT-101", TumorOrNormal.TUMOR.value, file_group="LIMS")
+    n1 = _make_sample2(db, "NORMAL-101", "PAT-101", TumorOrNormal.NORMAL.value, file_group="LIMS")
+    d1 = _make_sample2(db, "DMP-001", None, TumorOrNormal.NORMAL.value, file_group="Pooled Normals")
+    t2 = _make_sample2(db, "TUMOR-202", "PAT-202", TumorOrNormal.TUMOR.value)  # no file group
+
+    # Filter alone.
+    assert {s.id for s in list_samples(file_group="LIMS", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert [s.id for s in list_samples(file_group="Pooled Normals", limit=None, offset=None, db=db)] == [d1.id]
+    # Case-insensitive substring match.
+    assert {s.id for s in list_samples(file_group="lims", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert [s.id for s in list_samples(file_group="poole", limit=None, offset=None, db=db)] == [d1.id]
+    # AND-combines with other filters; no match returns empty.
+    assert [s.id for s in list_samples(file_group="LIMS", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == [n1.id]
+    assert list_samples(file_group="LIMS", patient_id="PAT-202", limit=None, offset=None, db=db) == []
+    # Combines with pagination.
+    assert [s.id for s in list_samples(file_group="LIMS", limit=1, offset=1, db=db)] in [[t1.id], [n1.id]]
+
+
+def test_list_samples_no_patient_filter(db):
+    pn1 = _make_sample2(
+        db, "PN-NF-001", None, TumorOrNormal.NORMAL.value,
+        sample_type="Pooled Normal", file_group="Pooled Normals",
+    )
+    n1 = _make_sample2(db, "NF-302", "PAT-NF-302", TumorOrNormal.NORMAL.value)
+    t1 = _make_sample2(db, "NF-301", "PAT-NF-301", TumorOrNormal.TUMOR.value)
+
+    # Selects exactly the null-patient rows (scoped via q: other tests
+    # in this module may have created other patient-less samples).
+    assert [s.id for s in list_samples(no_patient=True, q="PN-NF", limit=None, offset=None, db=db)] == [pn1.id]
+    assert [s.id for s in list_samples(no_patient=True, q="NF-30", limit=None, offset=None, db=db)] == []
+    # no_patient=False / None are no-ops.
+    assert {s.id for s in list_samples(no_patient=False, q="NF-30", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    assert {s.id for s in list_samples(q="NF-30", limit=None, offset=None, db=db)} == {t1.id, n1.id}
+    # AND-combines with other filters (case-insensitive sample_type).
+    assert [s.id for s in list_samples(no_patient=True, tumor_or_normal=TumorOrNormal.NORMAL, sample_type="pooled", q="PN-NF", limit=None, offset=None, db=db)] == [pn1.id]
+    assert list_samples(no_patient=True, tumor_or_normal=TumorOrNormal.TUMOR, q="PN-NF", limit=None, offset=None, db=db) == []
+    # Combines with pagination.
+    assert [s.id for s in list_samples(no_patient=True, q="PN-NF", limit=1, offset=0, db=db)] == [pn1.id]
+    assert list_samples(no_patient=True, q="PN-NF", limit=1, offset=1, db=db) == []
 
 
 # ---------------------------------------------------------------------------
@@ -2110,3 +2248,97 @@ def test_tempo_trigger_pairing_automatic_keeps_historical(db):
     assert result is not None
     assert result.normal_id == normal.id
     assert result.trigger_type == "historical"
+
+
+# ---------------------------------------------------------------------------
+# DMP samples (argos): manual pairing only
+# ---------------------------------------------------------------------------
+
+
+def _argos_logic(db):
+    logic = PairingLogic(name="ARGOS", strategy_name="argos")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    return logic
+
+
+def test_argos_dmp_pair_never_matches(db):
+    """Any pair involving a DMP sample is a mismatch (manual pairing
+    only), even when all hard keys agree."""
+    tumor = _sample(
+        db, "DMP-TUMOR-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    dmp = _sample(db, "DMP-NORM-1", sample_type="DMP")
+    argos = strategies["argos"]
+    assert argos.matches(tumor, dmp) is False
+    assert argos.mismatch_reasons(tumor, dmp) == ["DMP: manual pairing only"]
+
+
+def test_argos_dmp_tumor_never_auto_selected(db):
+    """A DMP tumor gets no automatic selection, even with a perfect
+    LIMS normal available."""
+    tumor = _sample(
+        db, "DMP-TUMOR-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP",
+    )
+    _sample(
+        db, "LIMS-NORM-2", run_mode="NovaSeq X",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any("DMP" in note for note in selection.notes)
+
+
+def test_argos_cascade_skips_dmp_normal(db):
+    """The cascade skips a DMP normal (even with all hard keys matching)
+    and picks a qualifying LIMS normal instead."""
+    tumor = _sample(
+        db, "TUMOR-DMP-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    _sample(
+        db, "DMP-NORM-3", sample_type="DMP",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    lims = _sample(
+        db, "LIMS-NORM-3", run_mode="NovaSeq X",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == lims.id
+    assert any("DMP" in note for note in selection.notes)
+
+
+def test_argos_dmp_normal_does_not_trigger_cascade(db):
+    """Ingesting a DMP normal never auto-pairs unpaired tumors."""
+    tumor = _sample(
+        db, "TUMOR-DMP-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    dmp = _sample(db, "DMP-NORM-4", sample_type="DMP")
+    assert strategies["argos"].select_matching_tumors(db, dmp) == []
+    result = trigger_pairing(db, tumor, _argos_logic(db), "automatic")
+    assert result is None
+
+
+def test_argos_dmp_override_pin_records_manual_reason(db):
+    """A non-strict override can pin a DMP normal (the pairing row
+    records the manual-only reason); a strict override rejects it (400)."""
+    tumor = _sample(
+        db, "TUMOR-DMP-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    dmp = _sample(db, "DMP-NORM-5", sample_type="DMP")
+    logic = _argos_logic(db)
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing(db, tumor, logic, "override", dmp.id, strict=True)
+    assert exc.value.status_code == 400
+    result = trigger_pairing(db, tumor, logic, "override", dmp.id)
+    assert result is not None
+    assert result.normal_id == dmp.id
+    assert result.trigger_type == "override"
+    assert "DMP: manual pairing only" in result.mismatched_keys

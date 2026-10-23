@@ -33,6 +33,8 @@ class SampleCreate(BaseModel):
     additional_metadata: Optional[dict[str, Any]] = None
     errors: Optional[list[str]] = None
     sequencing_date: Optional[datetime] = None
+    # Provenance: source beagle file group (beagle imports only).
+    file_group: Optional[str] = None
     pairing_logic_id: Optional[UUID] = None
     pairing_logic_name: Optional[str] = None
 
@@ -55,6 +57,7 @@ class SampleRead(BaseModel):
     additional_metadata: Optional[dict[str, Any]] = None
     errors: Optional[list[str]] = None
     sequencing_date: Optional[datetime] = None
+    file_group: Optional[str] = None
     created_date: datetime
     modified_date: datetime
 
@@ -179,4 +182,44 @@ class PossibleMatchesRead(BaseModel):
     # 1-to-many and lists every currently-paired tumor here.
     current_match: Optional[CurrentMatchRead] = None
     current_matches: list[CurrentMatchRead] = []
-    other_matches: list[PossibleMatchCandidate]
+    # ``other_matches`` is a bounded page (default 500) of the
+    # strategy's candidate scope; the fields below describe the full
+    # scope regardless of the page.
+    other_matches: list[PossibleMatchCandidate] = []
+    other_matches_total: int = 0
+    other_matches_matched: int = 0
+    other_matches_tiers: dict[str, int] = {}
+    other_matches_breakdown: list[dict] = []
+
+
+class PooledMachineUpsert(BaseModel):
+    machine_name: str
+    machine_class: str
+    machine_type: Optional[str] = None
+
+
+class PooledMachineRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    machine_name: str
+    machine_class: str
+    machine_type: Optional[str] = None
+    created_date: datetime
+    modified_date: datetime
+
+
+class BaitSetUpsert(BaseModel):
+    bait_set: str
+    pairing_logic_name: str
+
+
+class BaitSetRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    bait_set: str
+    pairing_logic_id: UUID
+    pairing_logic: str
+    created_date: datetime
+    modified_date: datetime

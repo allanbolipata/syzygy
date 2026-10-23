@@ -143,7 +143,7 @@ def trigger_pairing(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=404, detail="Normal sample not found")
-        reasons = strategy.mismatch_reasons(tumor, normal)
+        reasons = strategy.mismatch_reasons(tumor, normal, db)
         if strict and reasons:
             raise HTTPException(
                 status_code=400,
@@ -225,7 +225,21 @@ def trigger_pairing_for_normal(
         )
 
 
-def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
+# Default page size for the bounded ``other_matches`` slice. The strategy
+# candidate scope is bounded by design, but patientless samples can still
+# reach tens of thousands of candidates, so the endpoint returns a page
+# by default and reports the full-scope totals alongside it.
+DEFAULT_OTHER_MATCHES_LIMIT = 500
+MAX_OTHER_MATCHES_LIMIT = 5000
+
+
+def possible_matches(
+    db: Session,
+    sample: Sample,
+    logic: PairingLogic,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> dict:
     """The sample's current matches and all potential matches.
 
     ``current_matches`` is the list of every latest pairing for the
@@ -233,15 +247,26 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
     normal matches 1-to-many and can list several tumors. (``current_match``
     mirrors ``current_matches[0]`` for backward compatibility.)
 
-    Candidates are every opposite-type sample the strategy's keys can
-    reach: same-patient normals/tumors, plus pooled normals for
-    strategies with a pooled tier (argos). Each candidate that is not
-    already a current match is evaluated with the strategy's
-    ``mismatch_reasons``: ``matched`` is true when it would pass every
-    matching key; otherwise ``mismatched_keys`` lists the reasons it does
-    not. For a tumor input, ``would_be_selected`` marks the candidate the
-    strategy's cascade would pick. Used to support manual pairing (e.g.
-    pinning a DMP normal via POST /pairing/trigger).
+    Candidates are exactly the opposite-type samples this strategy's
+    cascade can reach (``strategy.candidate_scope``): its hard keys,
+    compared case-insensitively, plus the strategy's extra tiers (e.g.
+    argos's pooled-normal tier and same-patient DMP samples). This
+    mirrors pairing, so the list stays bounded instead of returning the
+    whole opposite-type table. DMP candidates (tier "dmp", argos only)
+    are always mismatches: DMP samples are manual-pairing only and are
+    never auto-selected, so they are listed purely as override targets.
+
+    ``other_matches`` is a bounded page of that scope (``limit``/``offset``,
+    default ``DEFAULT_OTHER_MATCHES_LIMIT``); ``other_matches_total``
+    counts the whole scope, and ``other_matches_matched`` /
+    ``other_matches_tiers`` / ``other_matches_breakdown`` summarize it
+    without depending on the page. Each candidate that is not already a
+    current match is evaluated with the strategy's ``mismatch_reasons``:
+    ``matched`` is true when it would pass every matching key; otherwise
+    ``mismatched_keys`` lists the reasons it does not. For a tumor input,
+    ``would_be_selected`` marks the candidate the strategy's cascade would
+    pick. Used to support manual pairing (e.g. pinning a DMP normal via
+    POST /pairing/trigger).
     """
     strategy = get_pairing_strategy(logic)
     is_tumor = sample.tumor_or_normal == TumorOrNormal.TUMOR.value
@@ -284,31 +309,10 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
         )
     current_ids = {m["sample"].id for m in current_matches}
 
-    # Candidate scope: same-patient opposite-type samples, plus pooled
-    # normals (pooled-tier strategies) for a tumor.
-    if is_tumor:
-        conds = [Sample.tumor_or_normal == TumorOrNormal.NORMAL.value]
-        if sample.patient_id is not None:
-            conds.append(Sample.patient_id == sample.patient_id)
-        candidates = list(db.scalars(select(Sample).where(*conds)).all())
-        if strategy.HAS_POOLED_TIER:
-            candidates.extend(
-                db.scalars(
-                    select(Sample).where(
-                        Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
-                        Sample.patient_id.is_(None),
-                        func.lower(Sample.sample_type).in_(strategy._pooled_types()),
-                    )
-                ).all()
-            )
-    else:
-        if sample.patient_id is None and not strategy.HAS_POOLED_TIER:
-            candidates = []
-        else:
-            conds = [Sample.tumor_or_normal == TumorOrNormal.TUMOR.value]
-            if sample.patient_id is not None:
-                conds.append(Sample.patient_id == sample.patient_id)
-            candidates = list(db.scalars(select(Sample).where(*conds)).all())
+    # Candidate scope: every opposite-type sample this strategy's cascade
+    # can actually reach (its hard keys, case-insensitive, plus extra
+    # tiers such as argos's pooled normals) — bounded by design.
+    candidates = strategy.candidate_scope(db, sample, logic)
 
     winner = (
         strategy.select_latest_normal(db, sample, logic).normal
@@ -316,7 +320,7 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
         else None
     )
 
-    tier_rank = {"same_request": 0, "other_request": 1, "pooled": 2}
+    tier_rank = {"same_request": 0, "other_request": 1, "dmp": 2, "pooled": 3}
     others: list[dict] = []
     for cand in candidates:
         if cand.id in current_ids:
@@ -324,11 +328,15 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
         tumor, normal = (sample, cand) if is_tumor else (cand, sample)
         if strategy.HAS_POOLED_TIER and strategy._is_pooled(normal):
             tier = "pooled"
+        elif strategy._is_dmp(cand):
+            # The candidate itself is a DMP sample: manual-pairing tier
+            # (argos only). Non-DMP candidates keep their natural tier.
+            tier = "dmp"
         elif normal.request_id is not None and normal.request_id == tumor.request_id:
             tier = "same_request"
         else:
             tier = "other_request"
-        reasons = strategy.mismatch_reasons(tumor, normal)
+        reasons = strategy.mismatch_reasons(tumor, normal, db)
         others.append(
             {
                 "sample": cand,
@@ -348,6 +356,32 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
         )
     )
 
+    # Whole-scope summary (independent of the page) + the bounded slice.
+    total = len(others)
+    matched_count = sum(1 for c in others if c["matched"])
+    tiers: dict[str, int] = {}
+    for c in others:
+        tiers[c["tier"]] = tiers.get(c["tier"], 0) + 1
+    # Mismatch profile: how many candidates fail on exactly which set of
+    # keys (key labels only, so e.g. "bait_set" groups regardless of which
+    # bait it differs on).
+    groups: dict[tuple, int] = {}
+    for c in others:
+        if c["matched"]:
+            continue
+        keys = tuple(sorted(r.split(" (")[0] for r in c["mismatched_keys"]))
+        groups[keys] = groups.get(keys, 0) + 1
+    breakdown = [
+        {"mismatched_keys": list(keys), "count": count}
+        for keys, count in sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    page_limit = (
+        DEFAULT_OTHER_MATCHES_LIMIT
+        if limit is None
+        else max(1, min(int(limit), MAX_OTHER_MATCHES_LIMIT))
+    )
+    page_offset = 0 if offset is None else max(0, int(offset))
+
     # ``current_match`` is kept for backward compatibility as the first
     # current match; ``current_matches`` is the authoritative full list.
     current_match = current_matches[0] if current_matches else None
@@ -357,5 +391,9 @@ def possible_matches(db: Session, sample: Sample, logic: PairingLogic) -> dict:
         "pairing_logic": logic.name,
         "current_match": current_match,
         "current_matches": current_matches,
-        "other_matches": others,
+        "other_matches": others[page_offset:page_offset + page_limit],
+        "other_matches_total": total,
+        "other_matches_matched": matched_count,
+        "other_matches_tiers": tiers,
+        "other_matches_breakdown": breakdown,
     }

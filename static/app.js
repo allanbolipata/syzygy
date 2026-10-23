@@ -64,33 +64,97 @@ async function api(path, opts) {
 
 /* ---------- view navigation (tabs + back button) ---------- */
 
-const viewHistory = [];
+/* Navigation state lives in the URL hash, so browser Back/Forward, reloads
+ * and shared links all work:
+ *   #/samples   #/patients[/<patient_id>]   #/requests[/<request_id>]
+ *   #/matches[/<sample primary_id>]
+ * Every navigation (tab switch, opening/closing a detail panel, opening
+ * matches for a sample) pushes a history entry. */
+
+const VIEWS = ["samples", "patients", "requests", "pooled", "matches"];
+let restoringNav = false;
 
 function currentViewName() {
   const el = document.querySelector("main.view:not(.hidden)");
   return el ? el.id.replace("view-", "") : null;
 }
 
-function showView(name, push = true) {
-  const current = currentViewName();
-  if (push && current && current !== name) viewHistory.push(current);
+function currentHash() {
+  const view = currentViewName() || "samples";
+  let id = null;
+  if (view === "patients" && patientsState.patient) id = patientsState.patient.patient_id;
+  else if (view === "requests" && requestsState.request) id = requestsState.request.request_id;
+  else if (view === "matches" && matchesState.sample) id = matchesState.sample.primary_id;
+  return `#/${view}` + (id ? `/${encodeURIComponent(id)}` : "");
+}
+
+/* Push a history entry for the current UI state (no-op while restoring or unchanged). */
+function pushNav() {
+  if (restoringNav) return;
+  const h = currentHash();
+  if (h !== location.hash) history.pushState(null, "", h);
+}
+
+function showView(name) {
   document.querySelectorAll(".tab[data-tab]").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === name)
   );
   document.querySelectorAll("main.view").forEach((v) =>
     v.classList.toggle("hidden", v.id !== `view-${name}`)
   );
-  updateBackButton();
+  pushNav();
 }
 
-function updateBackButton() {
-  $("#btn-back").disabled = viewHistory.length === 0;
+function closePatientDetail() {
+  patientsState.patient = null;
+  $("#p-detail").classList.add("hidden");
 }
 
-$("#btn-back").addEventListener("click", () => {
-  const prev = viewHistory.pop();
-  if (prev) showView(prev, false);
-});
+function closeRequestDetail() {
+  requestsState.request = null;
+  $("#r-detail").classList.add("hidden");
+}
+
+/* Make the UI match location.hash (used on popstate and initial load). */
+async function restoreFromHash() {
+  const m = location.hash.match(/^#\/([a-z]+)(?:\/(.+))?$/);
+  const view = m && VIEWS.includes(m[1]) ? m[1] : "samples";
+  const id = m && m[2] ? decodeURIComponent(m[2]) : null;
+  restoringNav = true;
+  try {
+    showView(view);
+    if (view === "patients") {
+      if (!id) closePatientDetail();
+      else if (!patientsState.patient || patientsState.patient.patient_id !== id) {
+        const rows = await api(`/patient/?q=${encodeURIComponent(id)}&limit=200`);
+        const row = rows.find((p) => p.patient_id === id);
+        if (row) await openPatient(row);
+        else banner("error", `Patient ${esc(id)} not found.`, true);
+      }
+    } else if (view === "requests") {
+      if (!id) closeRequestDetail();
+      else if (!requestsState.request || requestsState.request.request_id !== id) {
+        const rows = await api(`/request/?q=${encodeURIComponent(id)}&limit=200`);
+        const row = rows.find((r) => r.request_id === id);
+        if (row) await openRequest(row);
+        else banner("error", `Request ${esc(id)} not found.`, true);
+      }
+    } else if (view === "matches" && id) {
+      if (!matchesState.sample || matchesState.sample.primary_id !== id) {
+        const rows = await api(`/sample/?primary_id=${encodeURIComponent(id)}&limit=50`);
+        const row = rows.find((x) => x.primary_id === id);
+        if (row) await openMatchesFor(row);
+        else banner("error", `Sample ${esc(id)} not found.`, true);
+      }
+    }
+  } catch (e) {
+    banner("error", `Failed to restore view: ${esc(e.message)}`, true);
+  } finally {
+    restoringNav = false;
+  }
+}
+
+window.addEventListener("popstate", restoreFromHash);
 
 document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => showView(btn.dataset.tab));
@@ -126,7 +190,7 @@ const samplesState = { limit: 50, offset: 0, results: [] };
 
 const SAMPLE_FILTER_IDS = [
   "primary_id", "cmo_sample_name", "patient_id", "request_id",
-  "sample_type", "gene_panel", "bait_set", "run_mode",
+  "sample_type", "gene_panel", "bait_set", "run_mode", "file_group",
 ];
 
 function samplesParams(offset) {
@@ -169,6 +233,7 @@ function renderSamples() {
       <td>${esc(s.gene_panel)}</td>
       <td>${esc(s.bait_set || "")}</td>
       <td>${esc(s.run_mode || "")}</td>
+      <td>${esc(s.file_group || "")}</td>
       <td>${metaText(s.preservation)}</td>
       <td>${metaText(s.sample_origin)}</td>
       <td>${fmtDate(s.sequencing_date)}</td>
@@ -206,7 +271,18 @@ for (const el of ["#f-q", ...SAMPLE_FILTER_IDS.map((id) => `#f-${id}`)]) {
 
 /* ---------- matches & overrides view ---------- */
 
-const matchesState = { sample: null, data: null, busy: false, candidates: [] };
+// Candidates are a bounded page of the strategy's candidate scope:
+// the API returns at most OTHERS_PAGE_SIZE rows per request, with
+// whole-scope totals alongside (matches DEFAULT_OTHER_MATCHES_LIMIT).
+const OTHERS_PAGE_SIZE = 500;
+const matchesState = {
+  sample: null,
+  data: null,
+  busy: false,
+  candidates: [],
+  othersOffset: 0,
+  othersTotal: 0,
+};
 
 async function loadLogics() {
   try {
@@ -219,22 +295,43 @@ async function loadLogics() {
   }
 }
 
-function openMatchesFor(sample) {
+/* Select the pairing logic assigned to the sample's bait set (server-side
+   bait_sets table), so the page doesn't default to the first logic. */
+async function applyBaitSetLogic(sample) {
+  if (!sample || !sample.bait_set) return false;
+  try {
+    const row = await api(`/bait-sets/lookup?name=${encodeURIComponent(sample.bait_set)}`);
+    if (!row) return false;
+    const logicSel = $("#m-logic");
+    const opt = [...logicSel.options].find((o) => o.value === row.pairing_logic && !o.disabled);
+    if (!opt) return false;
+    logicSel.value = opt.value;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function openMatchesFor(sample) {
   matchesState.sample = sample;
   const sel = $("#m-sample");
   sel.innerHTML = `<option value="${sample.id}" selected>${esc(sampleLabel(sample))}</option>`;
   sel.disabled = false;
   $("#m-show").disabled = false;
-  // Prefer the logic this sample is currently paired under, when known.
+  // Prefer the bait set's assigned logic, then the logic this sample is
+  // currently paired under, when known.
   const byLogic = patientsState.pairings ? patientsState.pairings[sample.id] : null;
-  if (byLogic) {
+  if (await applyBaitSetLogic(sample)) {
+    // bait-set logic selected
+  } else if (byLogic) {
     const logicSel = $("#m-logic");
     const known = Object.keys(byLogic)[0];
     const opt = [...logicSel.options].find((o) => o.value === known && !o.disabled);
     if (opt) logicSel.value = opt.value;
   }
   showView("matches");
-  showMatches();
+  matchesState.othersOffset = 0;
+  showMatches(0);
 }
 
 function sampleLabel(s) {
@@ -261,23 +358,29 @@ async function searchMatchesSamples() {
     $("#m-show").disabled = false;
     matchesState.candidates = results;
     matchesState.sample = results[0];
+    await applyBaitSetLogic(results[0]);
   } catch (e) {
     banner("error", `Search failed: ${esc(e.message)}`, true);
   }
 }
 
-async function showMatches() {
+async function showMatches(offset) {
   const sample = matchesState.sample;
   const logic = $("#m-logic").value;
   if (!sample || !logic) return;
   if (matchesState.busy) return;
+  if (offset === undefined || typeof offset !== "number") offset = matchesState.othersOffset;
   matchesState.busy = true;
   $("#m-show").disabled = true;
+  const params = new URLSearchParams();
+  params.set("pairing_logic_name", logic);
+  params.set("limit", OTHERS_PAGE_SIZE);
+  params.set("offset", offset);
   try {
-    const data = await api(
-      `/sample/${sample.id}/possible-matches?pairing_logic_name=${encodeURIComponent(logic)}`
-    );
+    const data = await api(`/sample/${sample.id}/possible-matches?${params}`);
     matchesState.data = data;
+    matchesState.othersOffset = offset;
+    matchesState.othersTotal = data.other_matches_total ?? data.other_matches.length;
     renderMatches(data, logic);
   } catch (e) {
     banner("error", `Failed to load matches: ${esc(e.message)}`, true);
@@ -308,6 +411,7 @@ function renderMatches(data, logic) {
       <dt>gene_panel</dt><dd>${esc(s.gene_panel)}</dd>
       <dt>bait_set</dt><dd>${esc(s.bait_set || "—")}</dd>
       <dt>run_mode</dt><dd>${esc(s.run_mode || "—")}</dd>
+      <dt>file_group</dt><dd>${esc(s.file_group || "—")}</dd>
       <dt>preservation</dt><dd>${metaText(s.preservation)}</dd>
       <dt>sample_origin</dt><dd>${metaText(s.sample_origin)}</dd>
       <dt>sequencing_date</dt><dd>${fmtDate(s.sequencing_date)}</dd>
@@ -364,6 +468,31 @@ function renderMatches(data, logic) {
       </tr>`;
   }).join("");
   $("#m-others-empty").classList.toggle("hidden", rows.length > 0);
+  $("#m-others-empty").textContent =
+    rows.length === 0 && matchesState.othersTotal > 0
+      ? "No candidates on this page."
+      : "No other candidates.";
+
+  // Bounded candidate page: whole-scope summary + pager controls.
+  const total = matchesState.othersTotal;
+  const offset = matchesState.othersOffset;
+  const parts = [];
+  if (total > 0) parts.push(rows.length > 0
+    ? `showing ${offset + 1}\u2013${offset + rows.length} of ${total} candidates`
+    : `${total} candidates in scope, none on this page`);
+  if (typeof data.other_matches_matched === "number") parts.push(`${data.other_matches_matched} pass every key`);
+  const tierBits = Object.entries(data.other_matches_tiers || {})
+    .map(([t, n]) => `${n} ${t.replace(/_/g, " ")}`)
+    .join(", ");
+  if (tierBits) parts.push(`tiers: ${tierBits}`);
+  const breakdownBits = (data.other_matches_breakdown || [])
+    .slice(0, 3)
+    .map((b) => `${b.count} on ${b.mismatched_keys.join(" + ")}`)
+    .join(", ");
+  if (breakdownBits) parts.push(`mismatches: ${breakdownBits}`);
+  $("#m-others-summary").textContent = parts.join(" \u00b7 ");
+  $("#m-others-prev").disabled = offset <= 0;
+  $("#m-others-next").disabled = offset + rows.length >= total;
   tbody.querySelectorAll("button[data-override]").forEach((btn) => {
     btn.addEventListener("click", () => submitOverride(btn.dataset.override));
   });
@@ -373,12 +502,23 @@ $("#m-search").addEventListener("click", searchMatchesSamples);
 $("#m-q").addEventListener("keydown", (e) => {
   if (e.key === "Enter") searchMatchesSamples();
 });
-$("#m-show").addEventListener("click", showMatches);
-$("#m-sample").addEventListener("change", (e) => {
+$("#m-show").addEventListener("click", () => showMatches());
+$("#m-sample").addEventListener("change", async (e) => {
   const picked = matchesState.candidates.find((s) => s.id === e.target.value);
   if (!picked) return;
   matchesState.sample = picked;
-  showMatches();
+  matchesState.othersOffset = 0;
+  await applyBaitSetLogic(picked);
+  showMatches(0);
+});
+$("#m-others-prev").addEventListener("click", () => {
+  if (!matchesState.data) return;
+  showMatches(Math.max(0, matchesState.othersOffset - OTHERS_PAGE_SIZE));
+});
+$("#m-others-next").addEventListener("click", () => {
+  if (!matchesState.data) return;
+  const next = matchesState.othersOffset + OTHERS_PAGE_SIZE;
+  if (next < matchesState.othersTotal) showMatches(next);
 });
 
 /* Sample panel: click a patient_id / request_id value to go to its page. */
@@ -484,9 +624,12 @@ function renderPatients() {
 /* Sample id -> {logic name: [opposite samples]}, from all latest pairings
    (one request). A tumor lists its current normal(s) (at most one); a
    normal lists every currently-paired tumor (1-to-many). */
-async function loadPairingMap() {
-  if (!patientsState.pairings) {
-    const rows = await api("/pairing/?latest=true&limit=500");
+async function loadPairingMap(filter = {}) {
+  {
+    // Scoped to the patient/request on screen and uncapped, so every
+    // current match is returned (a global limit dropped older pairings).
+    const params = new URLSearchParams({ latest: "true", ...filter });
+    const rows = await api(`/pairing/?${params}`);
     const map = {};
     for (const r of rows) {
       const tSide = (map[r.tumor_id] = map[r.tumor_id] || {});
@@ -512,6 +655,7 @@ function currentMatchCell(sampleId) {
 async function openPatient(row) {
   patientsState.patient = row;
   $("#p-detail").classList.remove("hidden");
+  pushNav();
   $("#p-detail-title").textContent = `Patient ${row.patient_id}`;
   $("#p-detail-meta").innerHTML =
     `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
@@ -524,7 +668,7 @@ async function openPatient(row) {
   try {
     const [samples] = await Promise.all([
       api(`/sample/?patient_id=${encodeURIComponent(row.patient_id)}&limit=200`),
-      loadPairingMap(),
+      loadPairingMap({ patient_id: row.patient_id }),
     ]);
     patientsState.patientSamples = samples;
     tbody.innerHTML = samples.map((s) => `
@@ -558,8 +702,8 @@ $("#p-clear").addEventListener("click", () => {
   loadPatients();
 });
 $("#p-close").addEventListener("click", () => {
-  patientsState.patient = null;
-  $("#p-detail").classList.add("hidden");
+  closePatientDetail();
+  pushNav();
 });
 
 /* ---------- requests view ---------- */
@@ -610,6 +754,7 @@ function renderRequests() {
 async function openRequest(row) {
   requestsState.request = row;
   $("#r-detail").classList.remove("hidden");
+  pushNav();
   $("#r-detail-title").textContent = `Request ${row.request_id}`;
   $("#r-detail-meta").innerHTML =
     `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
@@ -626,7 +771,7 @@ async function openRequest(row) {
   try {
     const [fetchedSamples] = await Promise.all([
       api(`/sample/?request_id=${encodeURIComponent(row.request_id)}&limit=200`),
-      loadPairingMap(),
+      loadPairingMap({ request_id: row.request_id }),
     ]);
     // /sample/ filters request_id as a substring match; keep only the
     // samples belonging to this exact request.
@@ -702,9 +847,191 @@ $("#r-clear").addEventListener("click", () => {
   loadRequests();
 });
 $("#r-close").addEventListener("click", () => {
-  requestsState.request = null;
-  $("#r-detail").classList.add("hidden");
+  closeRequestDetail();
+  pushNav();
 });
+
+/* ---------- pooled normals view ---------- */
+
+const POOLED_SAMPLE_TYPE = "Pooled Normal";
+const pooledState = { limit: 50, offset: 0, results: [] };
+
+const POOLED_FILTER_IDS = ["gene_panel", "bait_set", "run_mode", "file_group"];
+
+function pooledParams(offset) {
+  const p = new URLSearchParams();
+  p.set("limit", pooledState.limit);
+  p.set("offset", offset);
+  p.set("tumor_or_normal", "NORMAL");
+  p.set("sample_type", POOLED_SAMPLE_TYPE);
+  p.set("no_patient", "true");
+  const q = $("#pn-q").value.trim();
+  if (q) p.set("q", q);
+  for (const id of POOLED_FILTER_IDS) {
+    const v = $(`#pn-${id}`).value.trim();
+    if (v) p.set(id, v);
+  }
+  return p.toString();
+}
+
+async function loadPooled(offset) {
+  try {
+    const results = await api(`/sample/?${pooledParams(offset)}`);
+    pooledState.results = results;
+    pooledState.offset = offset;
+    renderPooled();
+  } catch (e) {
+    banner("error", `Failed to load pooled normals: ${esc(e.message)}`, true);
+  }
+}
+
+function renderPooled() {
+  const rows = pooledState.results;
+  const tbody = $("#pooled-table tbody");
+  tbody.innerHTML = rows.map((s) => `
+    <tr class="click" data-id="${s.id}">
+      <td>${esc(s.cmo_sample_name)}</td>
+      <td>${esc(s.primary_id)}</td>
+      <td>${esc(s.request_id || "")}</td>
+      <td>${esc(s.sample_type)}</td>
+      <td>${esc(s.gene_panel)}</td>
+      <td>${esc(s.bait_set || "")}</td>
+      <td>${esc(s.run_mode || "")}</td>
+      <td>${esc(s.file_group || "")}</td>
+      <td>${metaText(s.preservation)}</td>
+      <td>${fmtDate(s.sequencing_date)}</td>
+    </tr>`).join("");
+  $("#pn-empty").classList.toggle("hidden", rows.length > 0);
+  $("#pn-count").textContent = rows.length ? `${rows.length} on this page` : "";
+  $("#pn-prev").disabled = pooledState.offset === 0;
+  $("#pn-next").disabled = rows.length < pooledState.limit;
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const sample = rows.find((s) => s.id === tr.dataset.id);
+      if (sample) openMatchesFor(sample);
+    });
+  });
+}
+
+$("#pn-search").addEventListener("click", () => loadPooled(0));
+$("#pn-clear").addEventListener("click", () => {
+  $("#pn-q").value = "";
+  for (const id of POOLED_FILTER_IDS) $(`#pn-${id}`).value = "";
+  loadPooled(0);
+});
+$("#pn-limit").addEventListener("change", (e) => {
+  pooledState.limit = Number(e.target.value);
+  loadPooled(0);
+});
+$("#pn-prev").addEventListener("click", () => loadPooled(Math.max(0, pooledState.offset - pooledState.limit)));
+$("#pn-next").addEventListener("click", () => loadPooled(pooledState.offset + pooledState.limit));
+for (const el of ["#pn-q", ...POOLED_FILTER_IDS.map((id) => `#pn-${id}`)]) {
+  $(el).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadPooled(0);
+  });
+}
+
+/* ---------- pooled machines view ---------- */
+
+const machinesState = { results: [], editing: null };
+
+async function loadMachines() {
+  try {
+    machinesState.results = await api("/machines/");
+    renderMachines();
+  } catch (e) {
+    banner("error", `Failed to load machines: ${esc(e.message)}`, true);
+  }
+}
+
+function renderMachines() {
+  const rows = machinesState.results;
+  const tbody = $("#pm-table tbody");
+  tbody.innerHTML = rows.map((m) => {
+    if (machinesState.editing === m.id) {
+      return `
+        <tr>
+          <td>${esc(m.machine_name)}</td>
+          <td><input id="pme-class" value="${esc(m.machine_class || "")}"></td>
+          <td><input id="pme-type" value="${esc(m.machine_type || "")}"></td>
+          <td>${fmtDate(m.modified_date)}</td>
+          <td>
+            <button class="small primary" data-save-machine="${esc(m.id)}">Save</button>
+            <button class="small" data-cancel-machine="${esc(m.id)}">Cancel</button>
+          </td>
+        </tr>`;
+    }
+    return `
+      <tr>
+        <td>${esc(m.machine_name)}</td>
+        <td>${esc(m.machine_class)}</td>
+        <td>${esc(m.machine_type || "")}</td>
+        <td>${fmtDate(m.modified_date)}</td>
+        <td><button class="small" data-edit-machine="${esc(m.id)}">Edit</button></td>
+      </tr>`;
+  }).join("");
+  $("#pm-empty").classList.toggle("hidden", rows.length > 0);
+  tbody.querySelectorAll("button[data-edit-machine]").forEach((b) =>
+    b.addEventListener("click", () => {
+      machinesState.editing = b.dataset.editMachine;
+      renderMachines();
+    })
+  );
+  tbody.querySelectorAll("button[data-cancel-machine]").forEach((b) =>
+    b.addEventListener("click", () => {
+      machinesState.editing = null;
+      renderMachines();
+    })
+  );
+  tbody.querySelectorAll("button[data-save-machine]").forEach((b) =>
+    b.addEventListener("click", () => saveMachine(b.dataset.saveMachine))
+  );
+}
+
+function saveMachine(id) {
+  const row = machinesState.results.find((m) => m.id === id);
+  if (!row) return;
+  const payload = {
+    machine_name: row.machine_name,
+    machine_class: $("#pme-class").value.trim(),
+    machine_type: $("#pme-type").value.trim() || null,
+  };
+  api("/machines/", { method: "POST", body: JSON.stringify(payload) })
+    .then(() => {
+      machinesState.editing = null;
+      banner("ok", `Machine ${esc(payload.machine_name)} saved.`);
+      return loadMachines();
+    })
+    .catch((e) => banner("error", `Save failed: ${esc(e.message)}`, true));
+}
+
+function addMachine() {
+  const payload = {
+    machine_name: $("#pm-name").value.trim(),
+    machine_class: $("#pm-class").value.trim(),
+    machine_type: $("#pm-type").value.trim() || null,
+  };
+  if (!payload.machine_name || !payload.machine_class) {
+    banner("error", "machine_name and machine_class are required.", true);
+    return;
+  }
+  api("/machines/", { method: "POST", body: JSON.stringify(payload) })
+    .then((m) => {
+      $("#pm-name").value = "";
+      $("#pm-class").value = "";
+      $("#pm-type").value = "";
+      banner("ok", `Machine ${esc(m.machine_name)} saved.`);
+      loadMachines();
+    })
+    .catch((e) => banner("error", `Add failed: ${esc(e.message)}`, true));
+}
+
+$("#pm-add").addEventListener("click", addMachine);
+for (const id of ["#pm-name", "#pm-class", "#pm-type"]) {
+  $(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addMachine();
+  });
+}
 
 /* ---------- init ---------- */
 
@@ -713,4 +1040,8 @@ $("#r-close").addEventListener("click", () => {
   loadSamples(0);
   loadPatients();
   loadRequests();
+  loadPooled(0);
+  loadMachines();
+  if (location.hash) restoreFromHash();
+  else history.replaceState(null, "", "#/samples");
 })();
