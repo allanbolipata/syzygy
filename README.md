@@ -73,8 +73,12 @@ tables.
 - `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
   match (latest pairing for the selected logic) plus all potential
   matches. Candidates are same-patient normals/tumors, plus pooled
-  normals for strategies with a pooled tier (`argos`). Each candidate
-  reports its cascade tier (`same_request`, `other_request`, `pooled`),
+  normals for strategies with a pooled tier (`argos`); the `argos`
+  strategy additionally lists same-patient DMP samples (tier `dmp`) —
+  DMP pairing is manual, so they are always reported as mismatches and
+  exist purely as override targets. Each candidate
+  reports its cascade tier (`same_request`, `other_request`, `dmp`,
+  `pooled`),
   whether it passes every matching key (`matched`), and the reasons it
   does not (`mismatched_keys`); for a tumor, `would_be_selected` marks
   the candidate the strategy cascade would pick. Supports manual

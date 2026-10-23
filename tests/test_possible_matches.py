@@ -163,10 +163,10 @@ def test_tumor_current_and_other_matches(db, argos):
 
 
 def test_tumor_without_current_match_marks_cascade_winner(db, argos):
-    # DMP-style tumor: no patient normals, unknown bait set; run mode
+    # Tumor with no patient normals and unknown bait set; run mode
     # resolves to the pool's machine family.
     t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
-                 sample_type="DMP", bait_set=None, run_mode="NovaSeq X 1000")
+                 bait_set=None, run_mode="NovaSeq X 1000")
     p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal")
     p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
                  bait_set=None, run_mode="diana")
@@ -180,6 +180,29 @@ def test_tumor_without_current_match_marks_cascade_winner(db, argos):
     assert "P1" not in others
     assert others["P3"]["matched"] is True
     assert others["P3"]["would_be_selected"] is True
+
+
+def test_dmp_tumor_never_auto_selected(db, argos):
+    # A DMP tumor lists its same-patient and pooled candidates but is
+    # never auto-paired: every candidate involving the DMP tumor carries
+    # the manual-only reason, and nothing is marked for selection.
+    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
+                 sample_type="DMP", bait_set=None, run_mode="NovaSeq X 1000")
+    p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
+                 bait_set=None, run_mode="diana")
+    n1 = _sample(db, "N1", patient_id="C-9", bait_set="agilent")
+
+    res = _endpoints(db, t2)
+    assert res["current_match"] is None
+
+    others = _others(res)
+    assert others["P3"]["tier"] == "pooled"
+    assert others["P3"]["matched"] is False
+    assert "DMP: manual pairing only" in others["P3"]["mismatched_keys"]
+    assert others["N1"]["tier"] == "other_request"
+    assert others["N1"]["matched"] is False
+    assert "DMP: manual pairing only" in others["N1"]["mismatched_keys"]
+    assert not any(c["would_be_selected"] for c in others.values())
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +251,10 @@ def test_pooled_normal_lists_cross_patient_tumors(db, argos):
 
     others = _others(res)
     assert others["T2"]["tier"] == "pooled"
-    assert others["T2"]["matched"] is True
+    # T2 is a DMP tumor: listed as a potential match, but the manual-
+    # pairing reason keeps it an overridable mismatch.
+    assert others["T2"]["matched"] is False
+    assert "DMP: manual pairing only" in others["T2"]["mismatched_keys"]
     # T1's bait set differs from the pooled normal's, so no tier can
     # reach it: it is out of the candidate scope.
     assert "T1" not in others
@@ -375,3 +401,66 @@ def test_pooled_tier_matches_across_case(db, argos):
     others = _others(res)
     assert others["P1"]["tier"] == "pooled"
     assert others["P1"]["matched"] is True
+
+
+# ---------------------------------------------------------------------------
+# DMP: same-patient visibility (manual pairing only)
+# ---------------------------------------------------------------------------
+
+
+def test_tumor_lists_same_patient_dmp_normals(db, argos):
+    # A DMP normal is a potential match for the same patient even when
+    # its panel/bait differ: listed in the "dmp" tier, never a match,
+    # never selected.
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, request_id="R1",
+                 run_mode="NovaSeq X 1000")
+    d1 = _sample(db, "D1", sample_type="DMP", gene_panel="IMPACT341",
+                 bait_set="IMPACT341")
+    d2 = _sample(db, "D2", patient_id="C-2", sample_type="DMP",
+                 gene_panel="IMPACT341", bait_set="IMPACT341")
+
+    res = _endpoints(db, t1)
+    others = _others(res)
+    assert others["D1"]["tier"] == "dmp"
+    assert others["D1"]["matched"] is False
+    assert "DMP: manual pairing only" in others["D1"]["mismatched_keys"]
+    assert others["D1"]["would_be_selected"] is False
+    # Different-patient DMP normals stay out of scope.
+    assert "D2" not in others
+
+
+def test_dmp_sample_lists_all_same_patient_opposite_type(db, argos):
+    # For a DMP sample, every same-patient opposite-type sample (LIMS
+    # and DMP alike) is a potential override candidate.
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, sample_type="DMP",
+                 gene_panel="IMPACT341", bait_set="IMPACT341")
+    n1 = _sample(db, "N1", bait_set="agilent")
+    n2 = _sample(db, "N2", sample_type="DMP")
+    _sample(db, "N3", patient_id="C-2")
+
+    res = _endpoints(db, t1)
+    others = _others(res)
+    assert set(others) == {"N1", "N2"}
+    assert all(not c["matched"] for c in others.values())
+    assert all(not c["would_be_selected"] for c in others.values())
+    assert all("DMP: manual pairing only" in c["mismatched_keys"]
+               for c in others.values())
+
+
+def test_normal_lists_same_patient_dmp_tumors(db, argos):
+    # DMP tumors show up under a normal too, so the operator can pin the
+    # override from either side of the page.
+    n1 = _sample(db, "N1", request_id="R1", run_mode="NovaSeq X 1000")
+    d1 = _sample(db, "D1", TumorOrNormal.TUMOR.value, sample_type="DMP",
+                 gene_panel="IMPACT341", bait_set="IMPACT341")
+    d2 = _sample(db, "D2", TumorOrNormal.TUMOR.value, sample_type="DMP",
+                 patient_id="C-2", gene_panel="IMPACT341",
+                 bait_set="IMPACT341")
+
+    res = _endpoints(db, n1)
+    others = _others(res)
+    assert others["D1"]["tier"] == "dmp"
+    assert others["D1"]["matched"] is False
+    assert "DMP: manual pairing only" in others["D1"]["mismatched_keys"]
+    # Different-patient DMP tumors stay out of scope.
+    assert "D2" not in others

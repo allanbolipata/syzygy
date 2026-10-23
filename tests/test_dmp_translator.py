@@ -78,7 +78,7 @@ def test_unknown_type_rejected():
         to_dmp_sample_kwargs("P-1-X01-IM6", _meta(type="X"))
 
 
-def test_argos_skips_run_mode_and_preservation_for_dmp():
+def test_argos_dmp_pairs_are_manual_pairing_only():
     from models import Sample
     from pairing_strategies import strategies
 
@@ -91,9 +91,18 @@ def test_argos_skips_run_mode_and_preservation_for_dmp():
               preservation="FFPE")
     dmp = mk(sample_type="DMP", tumor_or_normal="NORMAL")
     argos = strategies["argos"]
-    assert argos.matches(lims, dmp) is True
-    # Non-DMP normal with missing run_mode/preservation is still rejected.
+    # A DMP pair never matches, even when every other key agrees: the
+    # permanent manual-only reason applies, and the run_mode/preservation
+    # gates are skipped for DMP (no reasons from them).
+    reasons = argos.mismatch_reasons(lims, dmp)
+    assert argos.matches(lims, dmp) is False
+    assert reasons == ["DMP: manual pairing only"]
+    # Non-DMP normal with missing run_mode/preservation is still rejected
+    # by the regular gates.
     lims_n = mk(sample_type="Normal", tumor_or_normal="NORMAL")
     assert argos.matches(lims, lims_n) is False
-    # bait_set remains a hard key.
+    # bait_set is still a hard key, reported alongside the manual reason.
+    reasons = argos.mismatch_reasons(lims, mk(sample_type="DMP", bait_set="OTHER"))
     assert argos.matches(lims, mk(sample_type="DMP", bait_set="OTHER")) is False
+    assert any("bait_set" in r for r in reasons)
+    assert "DMP: manual pairing only" in reasons

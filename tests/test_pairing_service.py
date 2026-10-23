@@ -2248,3 +2248,97 @@ def test_tempo_trigger_pairing_automatic_keeps_historical(db):
     assert result is not None
     assert result.normal_id == normal.id
     assert result.trigger_type == "historical"
+
+
+# ---------------------------------------------------------------------------
+# DMP samples (argos): manual pairing only
+# ---------------------------------------------------------------------------
+
+
+def _argos_logic(db):
+    logic = PairingLogic(name="ARGOS", strategy_name="argos")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    return logic
+
+
+def test_argos_dmp_pair_never_matches(db):
+    """Any pair involving a DMP sample is a mismatch (manual pairing
+    only), even when all hard keys agree."""
+    tumor = _sample(
+        db, "DMP-TUMOR-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    dmp = _sample(db, "DMP-NORM-1", sample_type="DMP")
+    argos = strategies["argos"]
+    assert argos.matches(tumor, dmp) is False
+    assert argos.mismatch_reasons(tumor, dmp) == ["DMP: manual pairing only"]
+
+
+def test_argos_dmp_tumor_never_auto_selected(db):
+    """A DMP tumor gets no automatic selection, even with a perfect
+    LIMS normal available."""
+    tumor = _sample(
+        db, "DMP-TUMOR-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP",
+    )
+    _sample(
+        db, "LIMS-NORM-2", run_mode="NovaSeq X",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any("DMP" in note for note in selection.notes)
+
+
+def test_argos_cascade_skips_dmp_normal(db):
+    """The cascade skips a DMP normal (even with all hard keys matching)
+    and picks a qualifying LIMS normal instead."""
+    tumor = _sample(
+        db, "TUMOR-DMP-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    _sample(
+        db, "DMP-NORM-3", sample_type="DMP",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    lims = _sample(
+        db, "LIMS-NORM-3", run_mode="NovaSeq X",
+        preservation=["FFPE"], sample_origin=["FFPE"],
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == lims.id
+    assert any("DMP" in note for note in selection.notes)
+
+
+def test_argos_dmp_normal_does_not_trigger_cascade(db):
+    """Ingesting a DMP normal never auto-pairs unpaired tumors."""
+    tumor = _sample(
+        db, "TUMOR-DMP-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    dmp = _sample(db, "DMP-NORM-4", sample_type="DMP")
+    assert strategies["argos"].select_matching_tumors(db, dmp) == []
+    result = trigger_pairing(db, tumor, _argos_logic(db), "automatic")
+    assert result is None
+
+
+def test_argos_dmp_override_pin_records_manual_reason(db):
+    """A non-strict override can pin a DMP normal (the pairing row
+    records the manual-only reason); a strict override rejects it (400)."""
+    tumor = _sample(
+        db, "TUMOR-DMP-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X", preservation=["FFPE"], sample_origin=["FFPE"],
+    )
+    dmp = _sample(db, "DMP-NORM-5", sample_type="DMP")
+    logic = _argos_logic(db)
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing(db, tumor, logic, "override", dmp.id, strict=True)
+    assert exc.value.status_code == 400
+    result = trigger_pairing(db, tumor, logic, "override", dmp.id)
+    assert result is not None
+    assert result.normal_id == dmp.id
+    assert result.trigger_type == "override"
+    assert "DMP: manual pairing only" in result.mismatched_keys
