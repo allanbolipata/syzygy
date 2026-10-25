@@ -54,6 +54,7 @@ async function api(path, opts) {
   let body = null;
   try { body = await res.json(); } catch (_) { /* non-JSON */ }
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) location.href = "/login";
     const detail = body && body.detail
       ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail))
       : res.statusText;
@@ -1077,9 +1078,39 @@ $("#pr-logic").addEventListener("change", loadPairs);
 $("#pr-download").addEventListener("click", downloadPairs);
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
 
+/* ---------- auth: current user + sign-out ---------- */
+
+/* The browser sends the auth_token cookie automatically (same origin),
+ * so /auth/me needs no Authorization header. */
+let currentUser = null;
+
+function userDisplay(user) {
+  return user.display_name || user.preferred_username || user.email || "";
+}
+
+function renderCurrentUser() {
+  $("#current-user").textContent = currentUser ? userDisplay(currentUser) : "";
+}
+
+async function loadCurrentUser() {
+  try {
+    currentUser = await api("/auth/me");
+    renderCurrentUser();
+  } catch (_) {
+    /* 401/403 already handled by api(): the user is being sent to /login. */
+  }
+}
+
+function signOut() {
+  window.location = "/auth/logout";
+}
+
+$("#logout-btn").addEventListener("click", signOut);
+
 /* ---------- init ---------- */
 
 (async function init() {
+  loadCurrentUser();
   await loadLogics();
   loadPairs();
   loadSamples(0);

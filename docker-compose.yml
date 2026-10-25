@@ -4,9 +4,20 @@ services:
       context: .
       dockerfile: Dockerfile
     image: sample-pairing-app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: uvicorn main:app --host 0.0.0.0 --port 8100
     environment:
       DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      # KEYCLOAK_URL must be the same URL the BROWSER uses: the token's
+      # issuer claim is stamped from the browser-side authorize request,
+      # so this must match or every login 401s. Inside the app container,
+      # localhost:8081 does NOT reach the keycloak service (the code
+      # exchange would fail), so for local dev run the app on the host
+      # instead (see README "Local development"). In production this
+      # points at the externally managed org Keycloak.
+      KEYCLOAK_URL: http://localhost:8081
+      KEYCLOAK_REALM: master
+      KEYCLOAK_CLIENT_ID: syzygy
+      KEYCLOAK_CLIENT_SECRET: ""
     ports:
       - "8000:8000"
     depends_on:
@@ -18,6 +29,34 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
+
+  # Dev-only Keycloak: in production KEYCLOAK_URL points at an
+  # externally managed Keycloak and this service is not used.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Keycloak 26 serves /health/ready on the management interface
+      # (port 9000) by default; these keep health enabled on the main
+      # HTTP interface (8080) so the in-container healthcheck below works.
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_MANAGEMENT_HEALTH_ENABLED: "false"
+    # 8081, not 8080: 8080 is used by other local services (llama-server).
+    ports:
+      - "8081:8080"
+    healthcheck:
+      # The image has no curl/wget/nc, and its bash (RHEL build) lacks
+      # /dev/tcp, so the probe is a tiny JEP 330 Java program run by the
+      # JRE keycloak ships (java.net.http is in the JDK).
+      test: ["CMD-SHELL", 'printf "public class Probe { public static void main(String[] a) throws Exception { var r = java.net.http.HttpClient.newHttpClient().send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(\042http://localhost:8080/health/ready\042)).build(), java.net.http.HttpResponse.BodyHandlers.discarding()); System.exit(r.statusCode() == 200 ? 0 : 1); } }" > /tmp/kc_probe.java && java /tmp/kc_probe.java']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     restart: unless-stopped
 
   db:
@@ -32,7 +71,8 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5434:5432"
+      # 5435, not 5434: 5434 is used by other local dev databases.
+      - "5435:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     restart: unless-stopped

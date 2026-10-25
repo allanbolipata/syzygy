@@ -139,3 +139,17 @@ class BaitSet(Base):
     @property
     def pairing_logic(self) -> str:
         return self.pairing_logic_obj.name if self.pairing_logic_obj is not None else ""
+
+
+class AllowedUser(Base):
+    """Keycloak users allowed to log in (allow-list for auth, maintained
+    ahead of the Keycloak integration)."""
+
+    __tablename__ = "allowed_users"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(sa.String(255), unique=True, index=True)
+    display_name: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
+    active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
+    modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)

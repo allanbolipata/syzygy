@@ -148,6 +148,70 @@ at `/ui`; the root path `/` redirects there. It lets you:
 A back button returns to the previous screen (in-app navigation
 history; disabled at the start of a session).
 
+## Authentication (Keycloak)
+
+All `/v1` API endpoints require a Keycloak token. The app reads
+`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID` and
+`KEYCLOAK_CLIENT_SECRET` (see `Settings` in `database.py`); in
+production `KEYCLOAK_URL` points at an externally managed Keycloak.
+The `keycloak` service in `docker-compose.yml` is strictly for local
+development.
+
+**Flow (browser):** a browser without a session lands on the `/login`
+page, which redirects through `/auth/redirect` (adds a `state`
+parameter) to Keycloak's authorize endpoint. After authenticating,
+Keycloak returns to `/auth/callback`, which exchanges the
+authorization code for a token, stores it in an `HttpOnly`
+`auth_token` cookie, and sends the browser to `/ui`. API clients skip
+the browser dance and send `Authorization: Bearer <token>` instead.
+`GET /auth/logout` clears the cookie and returns to `/login`.
+
+**Allow-list:** only emails that have an *active* row in
+`allowed_users` may log in; a valid Keycloak token for anyone else
+gets `403`. Provision users with:
+
+    python scripts/manage_allowed_users.py add --email name@example.com
+
+**Local development:**
+
+1. `docker compose up -d db keycloak` — starts the dev-only Keycloak
+   on **8081** (admin credentials `admin`/`admin`) and Postgres on
+   **5435** (ports chosen to avoid local clashes).
+
+2. One-time setup at <http://localhost:8081>, in the **master** realm:
+   - **Clients** → create client `syzygy`: Client authentication
+     **ON** (confidential), Standard flow **ON**, Valid redirect URI
+     `http://localhost:8000/auth/callback`, Web Origins
+     `http://localhost:8000`; then copy the client secret.
+   - **Users** → create a user with a real email (e.g.
+     `you@example.com`) and set a password.
+
+   Keycloak runs in `start-dev` (in-memory) mode: a full
+   `docker compose down` wipes the client, users, and secret, so
+   repeat this step after a teardown.
+
+3. Configure and run the app **on the host**, not in the compose
+   `app` container — the token's `iss` claim is stamped from the
+   URL the *browser* uses to reach Keycloak, so the app's
+   `KEYCLOAK_URL` must equal that browser-side URL, which is
+   unreachable from inside the app container and the code exchange
+   would fail:
+
+       cp .env.example .env   # then set KEYCLOAK_CLIENT_SECRET
+       source .venv/bin/activate
+       uvicorn main:app --reload
+
+   The `.env.example` defaults already match the compose ports.
+
+4. Allow-list the user:
+
+       python scripts/manage_allowed_users.py add --email you@example.com
+
+5. Open <http://localhost:8000/ui> and log in. In production, point
+   `KEYCLOAK_URL` at the externally managed org Keycloak instead.
+
+`/health`, `/`, `/ui`, `/docs` and `/openapi.json` stay public.
+
 ## Pairing strategies
 
 Strategies are registered in `pairing_strategies.py` and selected per

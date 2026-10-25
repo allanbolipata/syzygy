@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
@@ -10,6 +10,7 @@ from database import Base, SessionLocal, engine
 from models import PairingLogic
 from pairing_strategies import seed_pooled_machines
 from bait_sets import seed_bait_sets
+from auth import get_current_user, router as auth_router
 from routers.bait_sets import router as bait_sets_router
 from routers.machines import router as machines_router
 from routers.patients import router as patients_router
@@ -61,13 +62,31 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-app.include_router(samples_router, prefix="/v1")
-app.include_router(patients_router, prefix="/v1")
-app.include_router(requests_router, prefix="/v1")
-app.include_router(pairings_router, prefix="/v1")
-app.include_router(pairing_logic_router, prefix="/v1")
-app.include_router(machines_router, prefix="/v1")
-app.include_router(bait_sets_router, prefix="/v1")
+app.include_router(auth_router, prefix="/v1")
+# Public OAuth dance paths at the root (/auth/redirect, later
+# /auth/callback) — not behind the /v1 API prefix.
+app.include_router(auth_router)
+app.include_router(
+    samples_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    patients_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    requests_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    pairings_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    pairing_logic_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    machines_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    bait_sets_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
 
 
 # Local dev UI: never serve stale cached assets (no build step, no
@@ -75,7 +94,7 @@ app.include_router(bait_sets_router, prefix="/v1")
 @app.middleware("http")
 async def no_cache_ui(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/ui"):
+    if request.url.path.startswith("/ui") or request.url.path == "/login":
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -91,3 +110,13 @@ app.mount(
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse(url="/ui")
+
+
+@app.get("/login", include_in_schema=False)
+def login() -> HTMLResponse:
+    return HTMLResponse(
+        (Path(__file__).resolve().parent / "static" / "login.html").read_text(
+            encoding="utf-8"
+        ),
+        media_type="text/html",
+    )
