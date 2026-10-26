@@ -41,6 +41,74 @@ lists of known TEMPO and ACCESS bait sets). `models.py` defines the
 complete schema; `create_all` builds it for new databases and never
 alters existing tables.
 
+## Setting up on a new machine
+
+Self-contained walkthrough from a fresh checkout to a working app.
+Prerequisites: Docker (engine + Compose plugin v2 — Docker Desktop on
+macOS/Windows, or the CLI on Linux) and Python 3.11+.
+
+### Full local environment (app + database + Keycloak)
+
+1. Clone and configure:
+
+       git clone git@github.com:allanbolipata/syzygy.git
+       cd syzygy
+       cp .env.example .env
+
+2. Start the dev stack (app on **8000**, syzygy Postgres on
+   **5435** — the default 5432 is commonly owned by the host's own
+   Postgres — and dev Keycloak on **8080** with its own Postgres):
+
+       docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+   The first run builds the app image and creates the shared
+   `syzygy-dev` network plus two named volumes (`syzygy_db_data`,
+   `syzygy_keycloak_db_data`). **That is where all local data
+   persists** — `down`/`up` cycles keep it; only `down -v` wipes it.
+
+3. One-time Keycloak setup at <http://localhost:8080> (**master**
+   realm, `admin`/`admin`): create the confidential client `syzygy`
+   with redirect URI `http://localhost:8000/auth/callback` and web
+   origin `http://localhost:8000`; copy its client secret into
+   `.env` (`KEYCLOAK_CLIENT_SECRET`); create your user.
+
+4. Run the app **on the host**, not in the compose `app` container
+   (the token's `iss` claim must equal the browser-side Keycloak
+   URL, which the container cannot use — see Authentication below):
+
+       python3 -m venv .venv && source .venv/bin/activate
+       pip install -r requirements.txt
+       docker compose -f docker-compose.yml -f docker-compose.dev.yml stop app
+       uvicorn main:app --reload
+
+5. Allow-list your user and log in:
+
+       python scripts/manage_allowed_users.py add --email you@example.com
+       # then open http://localhost:8000/ui
+
+   To run the test suite: `pip install -r requirements-dev.txt` then
+   `pytest tests/` (it spins up its own Postgres via testcontainers,
+   independent of the compose DB).
+
+### Against an existing Postgres (no local database)
+
+Per the Running section, the app builds the schema on startup
+(`create_all`) and seeds idempotently — **an empty database is fine,
+no migration step is needed on this branch** (alembic lives on a
+separate branch). The connecting role just needs `CREATE` privilege
+on the database. Point `DATABASE_URL` at it:
+
+    DATABASE_URL=postgresql+psycopg2://user:pass@db-host:5432/dbname \
+    KEYCLOAK_URL=... KEYCLOAK_CLIENT_SECRET=*** \
+    docker compose -f docker-compose.yml up -d
+
+The production base file bundles no Postgres and no Keycloak, so this
+is also the production deployment shape. For *local development*
+against an existing database, drop the `db` service (and the `app`'s
+`depends_on` on it) from `docker-compose.dev.yml` and set
+`DATABASE_URL` there instead — the dev Keycloak still comes from the
+override file.
+
 ## Docker compose
 
 The deployment is split into a base file and a local-development
