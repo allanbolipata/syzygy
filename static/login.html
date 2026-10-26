@@ -12,6 +12,7 @@
 </header>
 
 <main class="view">
+  <div id="login-error" class="login-error hidden"></div>
   <section class="panel">
     <h2>Sign in</h2>
     <p>Sign in with your Keycloak account</p>
@@ -26,13 +27,31 @@
   document.getElementById("btn-signin").addEventListener("click", function () {
     location.href = "/auth/redirect";
   });
-  // Redirect straight to the UI when a session is already valid;
-  // otherwise (401/403/404 or network error) leave the sign-in button visible.
+  var errEl = document.getElementById("login-error");
+  function showError(msg) {
+    if (!msg) return;
+    errEl.textContent = msg;
+    errEl.classList.remove("hidden");
+  }
+  // Explanation passed along by the UI after a 403 (e.g. "User not
+  // allowed: ... has no email address").
+  showError(new URLSearchParams(location.search).get("error"));
+  // Redirect straight to the UI when a session is already valid; if the
+  // session is valid but NOT allow-listed (403), show the reason and stay
+  // here instead of bouncing back to the UI in a loop; otherwise
+  // (401/404 or network error) leave the sign-in button visible.
   fetch("/v1/auth/me")
     .then(function (r) {
       if (r.ok) {
         location.href = "/ui";
+        return null;
       }
+      if (r.status === 403) {
+        return r.json().then(function (b) {
+          showError(b.detail || "Your account is not allowed to use Syzygy");
+        });
+      }
+      return null;
     })
     .catch(function () {
       /* no session: stay on this page */

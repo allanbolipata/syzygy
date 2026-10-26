@@ -96,32 +96,34 @@ def _extract_token(request: Request) -> Optional[str]:
     return request.cookies.get("auth_token") or None
 
 
-def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict]]:
+def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], Optional[dict]]:
     """Resolve the request's token to an allow-listed user.
 
-    Returns (status, user) where status is:
-    - "none"            no token presented at all
+    Returns (status, user, claims) where status is:
+    - "none"            no token presented at all (claims None)
     - "unauthenticated" token present but not a valid Keycloak token
+                        (claims None)
     - "forbidden"       valid token, but the email is not in allowed_users
-                        or the row is not active
+                        or the row is not active (claims included so the
+                        caller can explain why)
     - "ok"              valid token for an active allowed user; user is
                         {"sub", "email", "preferred_username",
-                        "display_name" (from the AllowedUser row)}
+                         "display_name" (from the AllowedUser row)}
     """
     token = _extract_token(request)
     if token is None:
-        return ("none", None)
+        return ("none", None, None)
     try:
         claims = verify_token(token)
     except TokenError:
-        return ("unauthenticated", None)
+        return ("unauthenticated", None, None)
 
     email = (claims.get("email") or "").lower()
     user = db.scalar(
         select(AllowedUser).where(func.lower(AllowedUser.email) == email)
     )
     if user is None or not user.active:
-        return ("forbidden", None)
+        return ("forbidden", None, claims)
     return (
         "ok",
         {
@@ -130,17 +132,33 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict]]:
             "preferred_username": claims.get("preferred_username"),
             "display_name": user.display_name,
         },
+        claims,
     )
 
 
 def get_current_user(request: Request, db: Session = Depends(get_db)) -> dict:
     """FastAPI dependency: require a valid Keycloak token whose email is
-    an active row in allowed_users. Raises 401/403 otherwise."""
-    status, user = _resolve_user(request, db)
+    an active row in allowed_users. Raises 401/403 otherwise; the 403
+    detail explains *why* (e.g. the account has no email address)."""
+    status, user, claims = _resolve_user(request, db)
     if status == "ok" and user is not None:
         return user
     if status == "forbidden":
-        raise HTTPException(status_code=403, detail="User not allowed")
+        assert claims is not None  # "forbidden" always carries claims
+        email = (claims.get("email") or "").strip()
+        username = claims.get("preferred_username") or "unknown"
+        if email:
+            detail = (
+                f"User not allowed: {email} is not in the allow-list"
+                " (or is inactive)"
+            )
+        else:
+            detail = (
+                f"User not allowed: '{username}' has no email address — "
+                "the allow-list is per-email; ask an admin to provision "
+                "your account"
+            )
+        raise HTTPException(status_code=403, detail=detail)
     raise HTTPException(status_code=401, detail="Authentication required")
 
 

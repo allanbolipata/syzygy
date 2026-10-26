@@ -401,7 +401,10 @@ gets `403`. Provision users with:
      console, or <http://localhost:8080/realms/master/account>). The
      browser keeps the `admin` session, and app logins silently
      re-authenticate as admin (no email → `403 User not allowed`)
-     without ever showing the login form.
+     without ever showing the login form. If it happens anyway, the
+     login page shows the reason (e.g. *"'admin' has no email
+     address — the allow-list is per-email"*); log out of Keycloak
+     and sign in again.
 
    Keycloak stores this setup in its own Postgres (volume
    `keycloak_db_data`), so it survives `docker compose down`; only

@@ -63,6 +63,16 @@ nav { display: flex; gap: 0.4rem; }
 main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
 .hidden { display: none !important; }
 
+.login-error {
+  margin: 1rem auto 0;
+  padding: 0.6rem 1rem;
+  max-width: 720px;
+  color: var(--bad);
+  border: 1px solid #e6b7b2;
+  background: #fbeeec;
+  border-radius: 6px;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);

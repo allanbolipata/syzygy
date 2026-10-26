@@ -54,10 +54,16 @@ async function api(path, opts) {
   let body = null;
   try { body = await res.json(); } catch (_) { /* non-JSON */ }
   if (!res.ok) {
-    if (res.status === 401 || res.status === 403) location.href = "/login";
     const detail = body && body.detail
       ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail))
       : res.statusText;
+    if (res.status === 403) {
+      // 403 = authenticated but not allow-listed: send the browser to the
+      // login page WITH the explanation (a plain /login shows nothing).
+      location.href = "/login?error=" + encodeURIComponent(detail);
+    } else if (res.status === 401) {
+      location.href = "/login";
+    }
     throw new Error(detail);
   }
   return body;
