@@ -70,7 +70,11 @@ macOS/Windows, or the CLI on Linux) and Python 3.11+.
    realm, `admin`/`admin`): create the confidential client `syzygy`
    with redirect URI `http://localhost:8000/auth/callback` and web
    origin `http://localhost:8000`; copy its client secret into
-   `.env` (`KEYCLOAK_CLIENT_SECRET`); create your user.
+   `.env` (`KEYCLOAK_CLIENT_SECRET`); create your user. Then
+   **log out of Keycloak** (http://localhost:8080/realms/master/account)
+   — the browser otherwise keeps the `admin` session, and app logins
+   silently re-authenticate as admin (no email → `403 User not
+   allowed`) without ever showing the login form.
 
 4. Run the app **on the host**, not in the compose `app` container
    (the token's `iss` claim must equal the browser-side Keycloak
@@ -393,6 +397,11 @@ gets `403`. Provision users with:
      `http://localhost:8000`; then copy the client secret.
    - **Users** → create a user with a real email (e.g.
      `you@example.com`) and set a password.
+   - **Log out of Keycloak** afterwards (top-right of the admin
+     console, or <http://localhost:8080/realms/master/account>). The
+     browser keeps the `admin` session, and app logins silently
+     re-authenticate as admin (no email → `403 User not allowed`)
+     without ever showing the login form.
 
    Keycloak stores this setup in its own Postgres (volume
    `keycloak_db_data`), so it survives `docker compose down`; only
