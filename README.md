@@ -32,11 +32,92 @@ Configuration comes from environment variables or a local `.env` file
 
     uvicorn main:app --reload
 
-At startup the app creates any missing tables and seeds the default
-pairing logics (`ARGOS` → `argos`, `TEMPO` → `tempo`, `ACCESS` →
-`default`; idempotent). `models.py` defines the complete schema;
-`create_all` builds it for new databases and never alters existing
-tables.
+At startup the app creates any missing tables and seeds, idempotently:
+the default pairing logics (`ARGOS` → `argos`, `TEMPO` → `tempo`,
+`ACCESS` → `default`), pooled-machine reference rows for the `argos`
+pooled tier (`pairing_strategies.seed_pooled_machines`), and bait-set →
+primary pairing logic assignments (`bait_sets.seed_bait_sets`; explicit
+lists of known TEMPO and ACCESS bait sets). `models.py` defines the
+complete schema; `create_all` builds it for new databases and never
+alters existing tables.
+
+## Docker compose
+
+The deployment is split into a base file and a local-development
+override:
+
+| File | Services | Role |
+|------|----------|------|
+| `docker-compose.yml` | `app` (**8000**) only | **Production base.** Wires the app to an external database (`DATABASE_URL`, required) and an external Keycloak (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`). It bundles neither. |
+| `docker-compose.dev.yml` | adds `db` (syzygy Postgres, published on **5435**), `keycloak` (**8080**) and `keycloak-db` (Keycloak's own Postgres, not published on the host) | **Local development override.** Layered on the base: adds the two services the app needs locally and overrides the app's env with dev values. |
+
+Both files declare the project name `syzygy` and share one network,
+`syzygy-dev`, so every command passes both files.
+
+**Local development:**
+
+    docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+Tear down (add `-v` to also delete the dev Postgres data volumes):
+
+    docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+
+**Production:** run the base file alone, with the required variables
+set on the command line (shell environment wins over any `.env` in
+this directory):
+
+    DATABASE_URL=postgresql+psycopg2://user:pass@db-host:5432/app \
+    KEYCLOAK_URL=https://keycloak.example.org \
+    KEYCLOAK_CLIENT_SECRET=*** \
+    docker compose -f docker-compose.yml up -d
+
+Point `KEYCLOAK_URL` at the externally managed org Keycloak and
+`DATABASE_URL` at the deployment's Postgres. Every value in the base
+file's `app` environment is overridable, so deployment-specific
+values can be injected the same way without editing the compose
+files.
+
+### Pointing Postgres at a database
+
+The dev Postgres services (`db` and `keycloak-db`) store their data
+in `/var/lib/postgresql/data`. Three ways to point that at a
+database:
+
+1. **Named volume (the default).** The dev override declares
+   top-level volumes (`db_data`, `keycloak_db_data`) and mounts them,
+   e.g. `- db_data:/var/lib/postgresql/data`. Docker/Podman keeps the
+   volume outside the repo and it survives container recreation;
+   `docker compose down -v` deletes it.
+2. **An existing directory on the host (bind mount).** Replace the
+   named volume with a host path:
+
+       volumes:
+         - ./pgdata:/var/lib/postgresql/data
+         # or an absolute path:
+         # - /var/lib/postgres/syzygy/app:/var/lib/postgresql/data
+
+   Relative paths resolve against the compose file's directory. The
+   directory may be empty (Postgres initializes it on first start) or
+   already hold a cluster built by a compatible PostgreSQL (the
+   container adopts it as-is). The cluster data is written as the
+   `postgres` user (uid 999): on a Linux host, chown the directory
+   first (`chown -R 999:999 <dir>` as root) so the container's
+   entrypoint does not have to re-chown it. On macOS (Docker
+   Desktop), bind mounts to the data directory do not work: the VM
+   mount rejects `chown` and macOS will not chown to uid 999 without
+   root, so the entrypoint aborts with `chown: Permission denied` —
+   use the named volume instead. Point at most one stack at a given
+   directory.
+3. **An existing database, no compose Postgres.** The production base
+   file does exactly this: `docker-compose.yml` declares no `db`
+   service at all — set `DATABASE_URL` on the command line (or in the
+   `app` service's `environment` block) to point anywhere: a host
+   Postgres, a managed cluster, or another container. To run the dev
+   stack against an existing database instead, drop the `db` service
+   (and the `app` service's `depends_on` on it) from
+   `docker-compose.dev.yml` and set `DATABASE_URL` there instead. If
+   that database's container sits on `syzygy-dev`, reference it by
+   its service or container name in the URL.
 
 ## API
 
@@ -49,14 +130,18 @@ tables.
   logic skips auto-pairing). Sample fields include `request_id`,
   `run_mode` (raw sequencer string, e.g. "NovaSeq X 1000"),
   `preservation` and `sample_origin` (raw preservation data, e.g.
-  `["FFPE"]` or `"Fresh or Frozen"`), and `sequencing_date`.
+  `["FFPE"]` or `"Fresh or Frozen"`), `sequencing_date`, and
+  `file_group` (provenance: the source beagle file group for imported
+  rows).
 - `GET /v1/sample` — list samples, newest first. Optional filters
   (combined with AND): `q` matches any of `primary_id`,
   `cmo_sample_name`, `patient_id`, `request_id`; `primary_id`,
   `cmo_sample_name`, `patient_id`, `request_id`, `sample_type`,
-  `gene_panel`, `bait_set`, `run_mode` are case-insensitive partial
-  matches; `tumor_or_normal` is exact (`TUMOR`/`NORMAL`); `limit` /
-  `offset` paginate.
+  `gene_panel`, `bait_set`, `run_mode`, `file_group` are
+  case-insensitive partial matches; `tumor_or_normal` is exact
+  (`TUMOR`/`NORMAL`); `no_patient=true` restricts to samples with a
+  null `patient_id` (e.g. pooled normals); `limit` / `offset`
+  paginate.
 - `GET /v1/patient` — patients derived from samples (a patient is a
   distinct non-null `patient_id`), sorted by `patient_id`. Returns
   sample/tumor/normal counts, the patient's distinct `request_id`s, and
@@ -71,29 +156,38 @@ tables.
   `q` is a case-insensitive partial match on `request_id`; `limit` /
   `offset` paginate.
 - `GET /v1/sample/{sample_id}/possible-matches` — the sample's current
-  match (latest pairing for the selected logic) plus all potential
-  matches. Candidates are same-patient normals/tumors, plus pooled
-  normals for strategies with a pooled tier (`argos`); the `argos`
-  strategy additionally lists same-patient DMP samples (tier `dmp`) —
-  DMP pairing is manual, so they are always reported as mismatches and
-  exist purely as override targets. Each candidate
-  reports its cascade tier (`same_request`, `other_request`, `dmp`,
-  `pooled`),
-  whether it passes every matching key (`matched`), and the reasons it
-  does not (`mismatched_keys`); for a tumor, `would_be_selected` marks
-  the candidate the strategy cascade would pick. Supports manual
-  pairing (e.g. pinning a DMP normal via `POST /v1/pairing/trigger`).
-  Optional `pairing_logic_id` / `pairing_logic_name` selects the logic;
-  otherwise the `DEFAULT_PAIRING_LOGIC_NAME` logic is used.
+  match(es) plus all potential matches: `current_matches` lists every
+  current pairing (`current_match` keeps the first one, for backward
+  compatibility; a normal can be currently paired to several tumors).
+  Candidates are same-patient normals/tumors, plus pooled normals for
+  strategies with a pooled tier (`argos`); the `argos` strategy
+  additionally lists same-patient DMP samples (tier `dmp`) — DMP
+  pairing is manual, so they are always reported as mismatches and
+  exist purely as override targets. Each candidate reports its cascade
+  tier (`same_request`, `other_request`, `dmp`, `pooled`), whether it
+  passes every matching key (`matched`), and the reasons it does not
+  (`mismatched_keys`); for a tumor, `would_be_selected` marks the
+  candidate the strategy cascade would pick. `other_matches` is a
+  bounded page (`limit`/`offset`; default `limit` 500, max 5000);
+  `other_matches_total` / `other_matches_matched` /
+  `other_matches_tiers` / `other_matches_breakdown` describe the full
+  candidate scope regardless of the page. Supports manual pairing (e.g.
+  pinning a DMP normal via `POST /v1/pairing/trigger`). Optional
+  `pairing_logic_id` / `pairing_logic_name` selects the logic; when
+  neither is given, the sample's bait-set-assigned primary logic is
+  used (see the bait-set endpoints below) and `DEFAULT_PAIRING_LOGIC_NAME`
+  only when no bait-set assignment exists.
 - `POST /v1/pairing/trigger` — create or override a pairing for a
   tumor. `trigger_type` is `manual`, `automatic`, or `override`.
   `normal_id` pins a specific normal sample: with it, the normal is
   paired even when matching keys differ and the differences are
-  recorded in the pairing's `mismatched_keys`. Without it,
-  `override` behaves like `manual` (re-pair against the latest
-  matching normal via the strategy cascade). `strict=true` rejects a
-  pinned `normal_id` with 400 when the strategy reports any mismatch
-  instead of recording it.
+  recorded in the pairing's `mismatched_keys`. Without it, `automatic`
+  keeps the tumor's existing pairing when one exists and runs the
+  strategy cascade only when it does not; `manual` (and `override`,
+  which behaves like `manual`) always re-run the cascade against the
+  latest matching normal. `strict=true` rejects a pinned `normal_id`
+  with 400 when the strategy reports any mismatch instead of
+  recording it.
 - `GET /v1/pairing` — list pairings, newest first. Optional filters
   (combined with AND): `latest` (`true`/`false`, default `false`)
   restricts to current pairings; `sample_id` matches pairings where the
@@ -119,14 +213,40 @@ tables.
   `name`, `description` (optional), `active` (default `true`),
   `strategy_name`, and `config` (optional per-logic strategy settings,
   see Pairing strategies). Duplicate names are rejected with 409.
+- `GET /v1/machines` — list pooled-machine reference rows
+  (`machine_name`, `machine_class`, `machine_type`), ordered by
+  machine name.
+- `POST /v1/machines` — create or update a pooled-machine row (upsert
+  on `machine_name`, case-insensitive; `machine_name` and
+  `machine_class` required, `machine_type` optional; 400 when a
+  required field is blank). These rows resolve a pooled normal's raw
+  `run_mode` (its machine name) to a machine class (`novaseq`/`hiseq`)
+  for the `argos` pooled tier's run-mode check (see Pairing
+  strategies). Seeded at startup by `seed_pooled_machines` (idempotent;
+  existing rows are left untouched).
+- `GET /v1/bait-sets` — list bait-set → primary pairing logic
+  assignments, ordered by bait-set name.
+- `GET /v1/bait-sets/lookup?name=...` — the assigned logic for a bait
+  set. Unregistered names matching a naming rule (`ACCESS` in the name
+  → ACCESS; `HEMEPACT` or `IMPACT` in the name → ARGOS) are registered
+  on first lookup; returns `null` when no assignment exists.
+- `POST /v1/bait-sets` — create or reassign a bait set's primary
+  pairing logic (`pairing_logic_name`; 404 when no logic carries that
+  name). Bait-set assignments decide the logic `possible-matches` uses
+  when no logic is passed explicitly. Seeded at startup by
+  `seed_bait_sets` from explicit lists of known TEMPO and ACCESS bait
+  sets (idempotent; existing rows are left untouched).
 
 ## Front end
 
 A basic static web UI (no build step, no extra dependencies) is served
-at `/ui`; the root path `/` redirects there. It lets you:
+at `/ui`; the root path `/` redirects there. It has tabs for samples,
+patients, requests, pooled normals, pairs by logic, and matches &
+overrides, and lets you:
 
-- query and filter samples by the matching fields (patient, request,
-  panel, bait set, run mode, sample type, role) with pagination;
+- query and filter samples (search plus per-field filters on
+  primary_id, cmo_sample_name, patient, request, sample type, gene
+  panel, bait set, run mode, file group, and role) with pagination;
 - browse patients: each patient's metadata, sample counts, and all
   their samples with their current match per pairing logic
   (`GET /v1/patient` + `GET /v1/pairing?latest=true`);
@@ -134,19 +254,33 @@ at `/ui`; the root path `/` redirects there. It lets you:
   sample types, and all its samples and patients — clicking a sample
   opens its matches & overrides and clicking a patient opens the
   patient's view (`GET /v1/request` + `GET /v1/pairing?latest=true`);
+- browse pooled normals: the shared patient-less pooled normals
+  (`sample_type` "Pooled Normal", null `patient_id` — the ARGOS
+  cascade's last-resort tier) with search and field filters (gene
+  panel, bait set, run mode, file group) and pagination (`GET
+  /v1/sample` with `no_patient=true`); the same view shows the
+  pooled-machine reference table and lets you add or edit machines
+  (`GET /v1/machines` + `POST /v1/machines`, upsert on machine name);
 - view a sample's current match and all potential matches per pairing
   logic (via `possible-matches`), with cascade tier, match status,
-  mismatch reasons, and the candidate the cascade would pick; clicking
-  a sample (from the samples, patients, or requests view) opens this
-  view, pre-selecting the logic the sample is currently paired under
-  when known;
+  mismatch reasons, and the candidate the cascade would pick; the
+  Matches & Overrides tab picks a sample by search, and clicking a
+  sample (from the samples, patients, requests, or pooled view) opens
+  it directly, pre-selecting the logic the sample is currently paired
+  under when known;
+- browse pairs by logic: pick a pairing logic to list its current
+  pairs (tumor `primary_id`, normal `primary_id`, bait set —
+  `GET /v1/pairing?latest=true`) and download the table as CSV or TSV;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the
   recorded mismatches shown afterwards.
 
-A back button returns to the previous screen (in-app navigation
-history; disabled at the start of a session).
+Navigation state lives in the URL hash (`#/samples`,
+`#/patients/<patient_id>`, `#/requests/<request_id>`,
+`#/matches/<primary_id>`, `#/pooled`, `#/pairs`), so the browser
+Back/Forward buttons, page reloads, and shared links all work; every
+navigation pushes a history entry.
 
 ## Authentication (Keycloak)
 
@@ -154,7 +288,7 @@ All `/v1` API endpoints require a Keycloak token. The app reads
 `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID` and
 `KEYCLOAK_CLIENT_SECRET` (see `Settings` in `database.py`); in
 production `KEYCLOAK_URL` points at an externally managed Keycloak.
-The `keycloak` service in `docker-compose.yml` is strictly for local
+The dev Keycloak in `docker-compose.dev.yml` is strictly for local
 development.
 
 **Flow (browser):** a browser without a session lands on the `/login`
@@ -164,7 +298,10 @@ Keycloak returns to `/auth/callback`, which exchanges the
 authorization code for a token, stores it in an `HttpOnly`
 `auth_token` cookie, and sends the browser to `/ui`. API clients skip
 the browser dance and send `Authorization: Bearer <token>` instead.
-`GET /auth/logout` clears the cookie and returns to `/login`.
+`GET /auth/logout` clears the cookie and returns to `/login`;
+`GET /auth/me` returns the current user (`sub`, `email`,
+`display_name`) for a valid token — the UI uses it to show the
+signed-in user and sign out (it is also mounted at `/v1/auth/me`).
 
 **Allow-list:** only emails that have an *active* row in
 `allowed_users` may log in; a valid Keycloak token for anyone else
@@ -174,11 +311,14 @@ gets `403`. Provision users with:
 
 **Local development:**
 
-1. `docker compose up -d db keycloak` — starts the dev-only Keycloak
-   on **8081** (admin credentials `admin`/`admin`) and Postgres on
-   **5435** (ports chosen to avoid local clashes).
+1. Start the dev stack (app on **8000**, Keycloak on the default port
+   **8080** with admin credentials `admin`/`admin`, syzygy Postgres
+   on **5435** — the host's own Postgres occupies the default
+   5432 — and Keycloak on its own Postgres):
 
-2. One-time setup at <http://localhost:8081>, in the **master** realm:
+       docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+2. One-time setup at <http://localhost:8080>, in the **master** realm:
    - **Clients** → create client `syzygy`: Client authentication
      **ON** (confidential), Standard flow **ON**, Valid redirect URI
      `http://localhost:8000/auth/callback`, Web Origins
@@ -186,17 +326,19 @@ gets `403`. Provision users with:
    - **Users** → create a user with a real email (e.g.
      `you@example.com`) and set a password.
 
-   Keycloak runs in `start-dev` (in-memory) mode: a full
-   `docker compose down` wipes the client, users, and secret, so
-   repeat this step after a teardown.
+   Keycloak stores this setup in its own Postgres (volume
+   `keycloak_db_data`), so it survives `docker compose down`; only
+   `down -v` wipes it.
 
 3. Configure and run the app **on the host**, not in the compose
    `app` container — the token's `iss` claim is stamped from the
    URL the *browser* uses to reach Keycloak, so the app's
    `KEYCLOAK_URL` must equal that browser-side URL, which is
    unreachable from inside the app container and the code exchange
-   would fail:
+   would fail. Stop the compose app first so the host app owns
+   port 8000:
 
+       docker compose -f docker-compose.yml -f docker-compose.dev.yml stop app
        cp .env.example .env   # then set KEYCLOAK_CLIENT_SECRET
        source .venv/bin/activate
        uvicorn main:app --reload
@@ -208,9 +350,13 @@ gets `403`. Provision users with:
        python scripts/manage_allowed_users.py add --email you@example.com
 
 5. Open <http://localhost:8000/ui> and log in. In production, point
-   `KEYCLOAK_URL` at the externally managed org Keycloak instead.
+   `KEYCLOAK_URL` at the externally managed org Keycloak instead
+   (see Docker compose).
 
-`/health`, `/`, `/ui`, `/docs` and `/openapi.json` stay public.
+`/health`, `/`, `/login`, `/ui`, `/docs`, `/redoc` and
+`/openapi.json` stay public, as do the OAuth dance paths
+`/auth/redirect`, `/auth/callback` and `/auth/logout`; `/auth/me`
+requires a token.
 
 ## Pairing strategies
 

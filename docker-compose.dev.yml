@@ -1,0 +1,121 @@
+# Local-development override, layered ON docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# It adds the two services the app needs locally — its Postgres (the
+# production file bundles no database) and a dev Keycloak with its own
+# Postgres — and overrides the app's env with dev values. Production
+# runs docker-compose.yml alone and points DATABASE_URL / KEYCLOAK_URL
+# / KEYCLOAK_CLIENT_SECRET at external services.
+name: syzygy
+
+services:
+  app:
+    # The dev database sits on the shared network as `db`. The host-side
+    # app (run from .venv for local logins) reaches it at 127.0.0.1:5435
+    # via .env (see .env.example).
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      KEYCLOAK_URL: http://localhost:8080
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - syzygy-dev
+
+  # Dev-only database, NOT part of the production stack.
+  db:
+    image: postgres:16
+    container_name: syzygy-db
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      # 5435, not 5432: the host's own Postgres owns 5432 and serves
+      # other dev databases (beagle).
+      - "5435:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - syzygy-dev
+    restart: unless-stopped
+
+  # Dev-only Keycloak. Production points KEYCLOAK_URL at the externally
+  # managed org Keycloak instead.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    command: start-dev
+    container_name: syzygy-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Keycloak stores its own config (realms, clients, users) in the
+      # dedicated keycloak-db Postgres instead of the in-container H2
+      # file, so the client/user setup survives `docker compose down`.
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      # Keycloak 26 serves /health/ready on the management interface
+      # (port 9000) by default; these keep health enabled on the main
+      # HTTP interface (8080) so the in-container healthcheck below works.
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_MANAGEMENT_HEALTH_ENABLED: "false"
+    # Default Keycloak port.
+    ports:
+      - "8080:8080"
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    healthcheck:
+      # The image has no curl/wget/nc, and its bash (RHEL build) lacks
+      # /dev/tcp, so the probe is a tiny JEP 330 Java program run by the
+      # JRE keycloak ships (java.net.http is in the JDK).
+      test: ["CMD-SHELL", 'printf "public class Probe { public static void main(String[] a) throws Exception { var r = java.net.http.HttpClient.newHttpClient().send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(\\042http://localhost:8080/health/ready\\042)).build(), java.net.http.HttpResponse.BodyHandlers.discarding()); System.exit(r.statusCode() == 200 ? 0 : 1); } }" > /tmp/kc_probe.java && java /tmp/kc_probe.java']
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - syzygy-dev
+    restart: unless-stopped
+
+  # Keycloak's own database. Not published on the host; reach it with
+  # `docker compose -f docker-compose.yml -f docker-compose.dev.yml
+  # exec keycloak-db psql -U keycloak keycloak` (or uncomment the mapping
+  # for host access):
+  #   ports:
+  #     - "5436:5432"
+  keycloak-db:
+    image: postgres:16
+    container_name: syzygy-keycloak-db
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+      POSTGRES_DB: keycloak
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - keycloak_db_data:/var/lib/postgresql/data
+    networks:
+      - syzygy-dev
+    restart: unless-stopped
+
+networks:
+  syzygy-dev:
+    # Pin the literal Docker network name (compose would otherwise
+    # prefix it with the project name).
+    name: syzygy-dev
+
+volumes:
+  db_data:
+  keycloak_db_data:

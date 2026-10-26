@@ -1,5 +1,6 @@
 .git
 .gitignore
+.env
 .python-version
 .aider*
 __pycache__/

@@ -1,81 +1,50 @@
+# Syzygy app — production base.
+#
+# This is the minimal stack: just the app, wired to an EXTERNAL database
+# and an EXTERNAL (org-managed) Keycloak. It bundles neither. For local
+# development, layer docker-compose.dev.yml on top — it adds a local
+# Postgres and a local dev Keycloak and sets dev values for the app's
+# env:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# For a production run, set the required variables on the command line
+# (shell environment wins over any .env in this directory):
+#   DATABASE_URL=... KEYCLOAK_URL=... KEYCLOAK_CLIENT_SECRET=*** \
+#     docker compose up -d
+name: syzygy
+
 services:
   app:
     build:
       context: .
       dockerfile: Dockerfile
     image: sample-pairing-app
-    command: uvicorn main:app --host 0.0.0.0 --port 8100
+    container_name: syzygy-app
+    # The Dockerfile CMD runs uvicorn on port 8000, which matches the
+    # healthcheck below and the 8000:8000 port mapping.
     environment:
-      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      # Required: the database this app uses. This file does not provide
+      # one — deployments point at their own Postgres.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL, e.g. postgresql+psycopg2://user:pass@host:5432/app}
       # KEYCLOAK_URL must be the same URL the BROWSER uses: the token's
       # issuer claim is stamped from the browser-side authorize request,
-      # so this must match or every login 401s. Inside the app container,
-      # localhost:8081 does NOT reach the keycloak service (the code
-      # exchange would fail), so for local dev run the app on the host
-      # instead (see README "Local development"). In production this
-      # points at the externally managed org Keycloak.
-      KEYCLOAK_URL: http://localhost:8081
-      KEYCLOAK_REALM: master
-      KEYCLOAK_CLIENT_ID: syzygy
-      KEYCLOAK_CLIENT_SECRET: ""
+      # so a mismatch makes every login 401. In production this is the
+      # externally managed org Keycloak.
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-http://localhost:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-master}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-syzygy}
+      # Read from the environment or this directory's .env (compose loads
+      # .env automatically). Never commit the value.
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
     ports:
       - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      # Single-quoted CMD-SHELL scalar: compose v2.33 re-tokenizes
+      # double-quoted flow-sequence entries (it split the old -c probe
+      # into 8 argv entries), but single-quoted ones pass through intact.
+      test: ["CMD-SHELL", 'python -c ''import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3)''']
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     restart: unless-stopped
-
-  # Dev-only Keycloak: in production KEYCLOAK_URL points at an
-  # externally managed Keycloak and this service is not used.
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.8.1
-    command: start-dev
-    environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      # Keycloak 26 serves /health/ready on the management interface
-      # (port 9000) by default; these keep health enabled on the main
-      # HTTP interface (8080) so the in-container healthcheck below works.
-      KC_HEALTH_ENABLED: "true"
-      KC_HTTP_ENABLED: "true"
-      KC_HTTP_MANAGEMENT_HEALTH_ENABLED: "false"
-    # 8081, not 8080: 8080 is used by other local services (llama-server).
-    ports:
-      - "8081:8080"
-    healthcheck:
-      # The image has no curl/wget/nc, and its bash (RHEL build) lacks
-      # /dev/tcp, so the probe is a tiny JEP 330 Java program run by the
-      # JRE keycloak ships (java.net.http is in the JDK).
-      test: ["CMD-SHELL", 'printf "public class Probe { public static void main(String[] a) throws Exception { var r = java.net.http.HttpClient.newHttpClient().send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(\042http://localhost:8080/health/ready\042)).build(), java.net.http.HttpResponse.BodyHandlers.discarding()); System.exit(r.statusCode() == 200 ? 0 : 1); } }" > /tmp/kc_probe.java && java /tmp/kc_probe.java']
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: app
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d app"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    ports:
-      # 5435, not 5434: 5434 is used by other local dev databases.
-      - "5435:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-volumes:
-  db_data:
