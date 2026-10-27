@@ -146,6 +146,27 @@ class PairingRead(BaseModel):
     latest: bool
 
 
+class TriggerAllRead(BaseModel):
+    """Summary of a POST /pairing/trigger-all backfill run.
+
+    ``scanned`` is the total number of tumor samples processed and the
+    per-outcome counts sum to it. ``new_pairings`` lists the pairings
+    created by this run (tumors that previously had no latest pairing
+    under their bait-set-resolved logic).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    scanned: int
+    already_paired: int
+    paired: int
+    unpaired: int
+    skipped_dmp: int
+    skipped_no_logic: int
+    skipped_inactive_logic: int
+    new_pairings: list[PairingRead]
+
+
 class PossibleMatchCandidate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

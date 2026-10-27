@@ -12,17 +12,18 @@ from sqlalchemy.pool import StaticPool
 import database
 import pairing_service
 from database import Base
-from models import PairingLogic, PairingTable, Sample
+from models import BaitSet, PairingLogic, PairingTable, Sample
 from pairing_service import (
     _create_pairing,
     _get_latest_pairing,
     resolve_pairing_logic,
     trigger_pairing,
     trigger_pairing_for_normal,
+    trigger_pairing_for_unpaired_tumors,
 )
 from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
-from routers.pairings import list_pairings, trigger_pairing_endpoint
+from routers.pairings import list_pairings, trigger_all_pairings_endpoint, trigger_pairing_endpoint
 from routers.patients import PATIENT_META_KEYS, list_patients
 from routers.requests import list_requests
 from routers.samples import create_sample, list_samples
@@ -2672,3 +2673,147 @@ def test_argos_dmp_override_pin_records_manual_reason(db):
     assert result.normal_id == dmp.id
     assert result.trigger_type == "override"
     assert "DMP: manual pairing only" in result.mismatched_keys
+
+
+# ---------------------------------------------------------------------------
+# Bulk backfill (POST /pairing/trigger-all)
+# ---------------------------------------------------------------------------
+
+
+def _bait_logic(db, name="TEMPO", bait="BAIT-1", strategy_name="default", active=True):
+    """A pairing logic plus the bait-set row assigning it."""
+    logic = PairingLogic(name=name, strategy_name=strategy_name, active=active)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    bait_row = BaitSet(bait_set=bait, pairing_logic_id=logic.id)
+    db.add(bait_row)
+    db.commit()
+    db.refresh(bait_row)
+    return logic
+
+
+def test_trigger_all_pairs_unpaired_tumors(db):
+    """Each tumor pairs under its bait-set logic; unpairable ones are counted."""
+    _bait_logic(db)
+    pairable = _sample(db, "TA-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    _sample(db, "TA-N-1")
+    _sample(
+        db,
+        "TA-T-2",
+        patient_id="PATIENT-002",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+    )
+
+    result = trigger_pairing_for_unpaired_tumors(db)
+    assert result["scanned"] == 2
+    assert result["already_paired"] == 0
+    assert result["paired"] == 1
+    assert result["unpaired"] == 1
+    assert result["skipped_dmp"] == 0
+    assert result["skipped_no_logic"] == 0
+    assert result["skipped_inactive_logic"] == 0
+    (pairing,) = result["new_pairings"]
+    assert pairing.tumor_id == pairable.id
+    assert pairing.trigger_type == "automatic"
+
+
+def test_trigger_all_skips_already_paired_tumors(db):
+    """Existing pairings are never replaced or re-run."""
+    logic = _bait_logic(db)
+    tumor = _sample(db, "TA-KEEP-T", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    _sample(db, "TA-KEEP-N")
+    existing = trigger_pairing(db, tumor, logic, "manual")
+    assert existing is not None
+
+    result = trigger_pairing_for_unpaired_tumors(db)
+    assert result["already_paired"] == 1
+    assert result["paired"] == 0
+    assert result["new_pairings"] == []
+    latest = _get_latest_pairing(db, tumor.id, logic.id)
+    assert latest.id == existing.id
+    assert latest.trigger_type == "manual"
+
+
+def test_trigger_all_skips_dmp_tumors(db):
+    """DMP tumors are skipped even when a matching normal exists."""
+    _bait_logic(db)
+    dmp_tumor = _sample(
+        db,
+        "TA-DMP-T",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP",
+    )
+    _sample(db, "TA-DMP-N")
+
+    result = trigger_pairing_for_unpaired_tumors(db)
+    assert result["skipped_dmp"] == 1
+    assert result["paired"] == 0
+    assert result["unpaired"] == 0
+    assert db.scalar(select(PairingTable).where(PairingTable.tumor_id == dmp_tumor.id)) is None
+
+
+def test_trigger_all_skips_tumors_without_logic(db):
+    """Null bait set and unregistered bait names skip, never error."""
+    _bait_logic(db)
+    _sample(db, "TA-NOL-T1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set=None)
+    _sample(
+        db,
+        "TA-NOL-T2",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+        bait_set="BAIT-UNKNOWN",
+    )
+
+    result = trigger_pairing_for_unpaired_tumors(db)
+    assert result["skipped_no_logic"] == 2
+    assert result["paired"] == 0
+    assert result["unpaired"] == 0
+
+
+def test_trigger_all_skips_inactive_logic(db):
+    """A bait set whose assigned logic is inactive is skipped."""
+    _bait_logic(db, active=False)
+    tumor = _sample(db, "TA-INACT-T", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    _sample(db, "TA-INACT-N")
+
+    result = trigger_pairing_for_unpaired_tumors(db)
+    assert result["skipped_inactive_logic"] == 1
+    assert result["paired"] == 0
+    assert db.scalar(select(PairingTable).where(PairingTable.tumor_id == tumor.id)) is None
+
+
+def test_trigger_all_registers_unregistered_bait_on_first_sight(db):
+    """Unregistered bait names matching a rule register and pair."""
+    logic = PairingLogic(name="ARGOS", strategy_name="default")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    _sample(
+        db,
+        "TA-REG-T",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+        bait_set="IMPACT468",
+    )
+    _sample(db, "TA-REG-N", bait_set="IMPACT468")
+
+    result = trigger_pairing_for_unpaired_tumors(db)
+    assert result["paired"] == 1
+    assert result["new_pairings"][0].pairing_logic_id == logic.id
+    bait_row = db.scalar(select(BaitSet).where(BaitSet.bait_set == "IMPACT468"))
+    assert bait_row is not None
+    assert bait_row.pairing_logic_id == logic.id
+
+
+def test_trigger_all_endpoint_returns_summary(db):
+    _bait_logic(db)
+    tumor = _sample(db, "TA-EP-T", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    _sample(db, "TA-EP-N")
+
+    result = trigger_all_pairings_endpoint(db=db)
+    assert result["scanned"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
+    assert result["skipped_dmp"] == 0
+    assert result["skipped_no_logic"] == 0
+    assert result["skipped_inactive_logic"] == 0
+    assert [p.tumor_id for p in result["new_pairings"]] == [tumor.id]

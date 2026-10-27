@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import PairingLogic, PairingTable, Sample, utcnow
+from bait_sets import resolve_bait_set_logic
 from pairing_strategies import get_pairing_strategy
 from schemas import TumorOrNormal
 
@@ -223,6 +224,82 @@ def trigger_pairing_for_normal(
             trigger_type="automatic",
             notes=selection.notes or None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Bulk backfill (POST /pairing/trigger-all)
+# ---------------------------------------------------------------------------
+
+
+def _is_dmp_sample(sample: Sample) -> bool:
+    """Provenance flag for DMP-ingested samples (manual pairing only)."""
+    return str(sample.sample_type or "").strip().upper() == "DMP"
+
+
+def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
+    """Backfill pairings for every tumor that has no latest pairing yet.
+
+    Intended as an occasional bulk operation (POST /pairing/trigger-all),
+    e.g. after a bulk ingest or to pick up tumors that were unpairable
+    at ingest time. Each tumor's pairing logic is resolved from its
+    assigned bait set (``bait_sets.resolve_bait_set_logic``), and:
+
+    * DMP tumors are skipped (manual pairing only);
+    * tumors whose bait set has no assigned logic, or whose logic is not
+      active, are skipped (never paired under a wrong or disabled logic);
+    * tumors that already have a latest pairing under their resolved
+      logic are left untouched — ``trigger_pairing`` with ``automatic``
+      short-circuits on it, so nothing existing is ever replaced.
+
+    New pairings are recorded with ``trigger_type="automatic"``. Returns a
+    summary dict: per-outcome counts (summing to ``scanned``) plus the
+    newly created pairings in ``new_pairings``.
+    """
+    tumors = db.scalars(
+        select(Sample).where(Sample.tumor_or_normal == TumorOrNormal.TUMOR.value)
+    ).all()
+
+    scanned = 0
+    already_paired = 0
+    paired = 0
+    unpaired = 0
+    skipped_dmp = 0
+    skipped_no_logic = 0
+    skipped_inactive_logic = 0
+    new_pairings: list[PairingTable] = []
+
+    for tumor in tumors:
+        scanned += 1
+        if _is_dmp_sample(tumor):
+            skipped_dmp += 1
+            continue
+        logic = resolve_bait_set_logic(db, tumor.bait_set)
+        if logic is None:
+            skipped_no_logic += 1
+            continue
+        if not logic.active:
+            skipped_inactive_logic += 1
+            continue
+        if _get_latest_pairing(db, tumor.id, logic.id) is not None:
+            already_paired += 1
+            continue
+        pairing = trigger_pairing(db, tumor, logic, "automatic")
+        if pairing is None:
+            unpaired += 1
+        else:
+            paired += 1
+            new_pairings.append(pairing)
+
+    return {
+        "scanned": scanned,
+        "already_paired": already_paired,
+        "paired": paired,
+        "unpaired": unpaired,
+        "skipped_dmp": skipped_dmp,
+        "skipped_no_logic": skipped_no_logic,
+        "skipped_inactive_logic": skipped_inactive_logic,
+        "new_pairings": new_pairings,
+    }
 
 
 # Default page size for the bounded ``other_matches`` slice. The strategy
