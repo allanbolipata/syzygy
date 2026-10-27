@@ -464,12 +464,16 @@ dict customizes the strategy at use time.
     match the tumor's run-mode family (a NovaSeq X run is a NovaSeq
     machine).
   - **preservation gating** — each side's `preservation` /
-    `sample_origin` must resolve to the same category, fuzzily
-    (case-insensitive): preservation `FFPE` → ffpe, anything else →
-    frozen; `sample_origin` (checked when preservation is empty)
-    resolves `FFPE` → ffpe and `Fresh or Frozen` / `frozen` →
-    frozen. When both fields are present they must agree; a sample
-    that is unresolvable, or that disagrees with the other side,
+    `sample_origin` resolves to a category, fuzzily
+    (case-insensitive): a present `preservation` decides (an entry
+    containing `FFPE` → ffpe, anything else → frozen), and
+    `sample_origin` is free then unless it names the opposite
+    category (a within-side conflict → unresolvable); a missing
+    `preservation` lets a resolvable `sample_origin` decide (`FFPE` →
+    ffpe; `Fresh or Frozen` / `frozen` → frozen; anything else →
+    unresolvable); both fields empty means the side is **not
+    considered**. When both sides are considered their categories must
+    agree; a not-considered side never blocks; an unresolvable side
     blocks the pair — including in the pooled tier.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,

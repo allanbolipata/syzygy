@@ -743,8 +743,8 @@ def test_argos_preservation_gate_skips_disagreement(db):
 
 def test_argos_unresolvable_preservation_blocks(db):
     """Unresolvable preservation blocks pairing: fields disagreeing
-    within one sample (preservation FFPE + origin Frozen), and missing
-    data on either side."""
+    within one sample (preservation FFPE + origin Frozen, or vice
+    versa), or a junk origin alone with no preservation."""
     argos = strategies["argos"]
     tumor = _sample(
         db, "TUMOR-UNK-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
@@ -759,11 +759,45 @@ def test_argos_unresolvable_preservation_blocks(db):
     assert selection.normal is None
     assert any("unresolvable" in note for note in selection.notes)
 
-    bare = _sample(
+    conflict_normal = _sample(
+        db, "NORM-UNK-PRES-2", preservation=["Frozen"], sample_origin=["FFPE"],
+        run_mode="NovaSeq X",
+    )
+    assert any("unresolvable" in r for r in argos.mismatch_reasons(tumor, conflict_normal))
+
+    junk_origin_tumor = _sample(
+        db, "TUMOR-JUNK-ORIGIN", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_origin=["Tissue"], run_mode="NovaSeq X",
+    )
+    assert any("unresolvable" in r for r in argos.mismatch_reasons(junk_origin_tumor, normal))
+
+
+def test_argos_not_considered_preservation_passes(db):
+    """A side with no preservation data at all (both fields empty) is
+    'not considered': the gate does not apply, so it passes against any
+    resolvable category and against another not-considered side."""
+    argos = strategies["argos"]
+    bare_tumor = _sample(
         db, "TUMOR-NO-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
         run_mode="NovaSeq X",
     )
-    assert any("unresolvable" in r for r in argos.mismatch_reasons(bare, normal))
+    ffpe_normal = _sample(
+        db, "NORM-FFPE-3", preservation=["FFPE"], sample_origin=["FFPE"],
+        run_mode="NovaSeq X",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    bare_normal = _sample(
+        db, "NORM-NO-PRES-1", run_mode="NovaSeq X",
+        sequencing_date=datetime(2024, 2, 1, tzinfo=timezone.utc),
+    )
+    assert argos.matches(bare_tumor, ffpe_normal)
+    assert not any("preservation" in r
+                   for r in argos.mismatch_reasons(bare_tumor, ffpe_normal))
+    assert argos.matches(bare_tumor, bare_normal)
+    selection = argos.select_latest_normal(db, bare_tumor)
+    # Both candidates pass the gate; the latest wins.
+    assert selection.normal.id == bare_normal.id
+    assert not any("preservation" in note for note in selection.notes)
 
 
 def test_argos_pooled_normal_tier(db):
@@ -854,13 +888,34 @@ def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
                    for note in selection.notes)
 
 
-def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
-    """An FFPE pooled normal does not match a tumor with no preservation
-    data (unresolvable blocks the pooled tier)."""
-    tumor = _sample(db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value)
+def test_argos_pooled_preservation_gate_not_considered_passes(db):
+    """A pooled normal matches a tumor with no preservation data: the
+    tumor side is 'not considered', so the gate does not apply."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X",
+    )
     pooled = _sample(
         db, "NORM-POOL-3", patient_id=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == pooled.id
+    assert not any("preservation" in note for note in selection.notes)
+
+
+def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
+    """A within-side conflict (preservation FFPE + origin Frozen) makes
+    the tumor unresolvable and blocks the pooled tier."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-3B", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["Frozen"], run_mode="NovaSeq X",
+    )
+    pooled = _sample(
+        db, "NORM-POOL-3B", patient_id=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal is None
