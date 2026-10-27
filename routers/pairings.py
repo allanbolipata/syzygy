@@ -8,9 +8,14 @@ from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db, settings
 from models import PairingLogic, PairingTable, Sample
-from pairing_service import find_logic_by_name, resolve_pairing_logic, trigger_pairing
+from pairing_service import (
+    find_logic_by_name,
+    resolve_pairing_logic,
+    trigger_pairing,
+    trigger_pairing_for_unpaired_tumors,
+)
 from pairing_strategies import get_pairing_strategy
-from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal
+from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal, TriggerAllRead
 
 
 router = APIRouter(prefix="/pairing", tags=["pairings"])
@@ -149,3 +154,16 @@ def trigger_pairing_endpoint(
                 detail += ": " + " | ".join(selection.notes)
         raise HTTPException(status_code=404, detail=detail)
     return pairing
+
+
+@router.post("/trigger-all", response_model=TriggerAllRead)
+def trigger_all_pairings_endpoint(db: Session = Depends(get_db)) -> dict:
+    """Backfill pairings for every tumor that has no latest pairing yet.
+
+    Occasional bulk operation (e.g. after a bulk ingest): each tumor's
+    pairing logic is resolved from its assigned bait set, DMP tumors
+    (manual pairing only) and tumors with no assigned or inactive logic
+    are skipped and counted, and existing pairings are never touched.
+    New pairings are recorded with ``trigger_type="automatic"``.
+    """
+    return trigger_pairing_for_unpaired_tumors(db)
