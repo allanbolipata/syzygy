@@ -218,7 +218,7 @@ def merge_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str,
     Rows are processed in a deterministic order (LIMS rows first, then
     groups alphabetically, then primaryId) with first-non-null-wins; the
     sample's ``file_group`` is the first group seen. Records with no
-    primaryId (e.g. ``REQ_B``) attach to the candidate sample whose
+    primaryId (e.g. ``SAMPLE_01``) attach to the candidate sample whose
     igoRequestId matches; they take no keys the candidate already has.
     """
 

@@ -71,7 +71,7 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
     Parameters
     ----------
     sample_id: str
-        The DMP ``sample`` value (e.g. ``P-0001231-T01-IM6``).
+        The DMP ``sample`` value (e.g. ``P-0001234-N01-IM6``).
     meta: dict
         The record's ``metadata`` dict from the beagle dump.
     """

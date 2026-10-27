@@ -1,36 +1,26 @@
 #!/usr/bin/env python3
 """Populate the syzygy database with pairing-validation datasets and
-validate syzygy's pairing strategies against beagle-derived ground truth.
+validate syzygy's pairing strategies against ground truth.
 
 Scenarios
 ---------
-argos (default)
-    Loads the five canonical ARGOS request fixtures from beagle
-    (``fixtures/tests/<name>.filemetadata.json``):
+argos
+    Loads the canonical ARGOS request fixtures from a local beagle checkout
+    (``<fixtures_dir>/<name>.filemetadata.json``), merges them into one
+    sample per primaryId, and validates syzygy's argos strategy against the
+    expected tumor/normal pairings.
 
-        REQ_A      (5 samples: 3 tumor, 2 normal)
-        REQ_A_2    (1 normal)
-        REQ_A_3    (1 tumor)
-        REQ_A_4    (1 normal)
-        REQ_B     (1 tumor, 1 normal)
-
-    -> 10 unique samples, 3 patients (C-EXAMPLE1, C-TEST123, C-EXAMPLE2),
-       5 requests, all IMPACT468 / HiSeq High Output.
-
-    Deliberately excluded (and why):
-      * REQ_A_single_TN_pair, juno_argos_demo2  -- derived fixtures that
-        duplicate REQ_A_5 / REQ_A_3 with variant cmoSampleName formats;
-        loading them would overwrite the canonical rows (dedup is by
-        primaryId).
-      * REQ_C -- MSK-CH bait, cell lines, no runMode/runDate; used by
-        other beagle tests (argos_pdx/etl), not the ARGOS v2.3.0 pairing
-        tests.
-      * REQ_D  -- argos input fixture, not sample metadata.
+    The fixture names, expected pairs, and fixture directory reference real
+    beagle identifiers, so they are NOT committed to this repo. They are read
+    from the local, gitignored file ``scripts/.beagle_ground_truth.json``
+    (shape shown in ``scripts/.beagle_ground_truth.example.json``). Without
+    that file the argos scenario cannot run.
 
 tempo
-    Beagle has no TEMPO/CHRONOS fixtures, so this scenario uses a
-    hand-derived dummy dataset (TEMPO_SAMPLES below) built to exercise
-    every branch of beagle's TEMPO/CHRONOS pairing logic
+    Beagle has no TEMPO/CHRONOS fixtures, so this scenario is fully
+    self-contained (no external files). It uses a hand-derived dummy dataset
+    (TEMPO_SAMPLES below) built to exercise every branch of beagle's
+    TEMPO/CHRONOS pairing logic
     (runner/operator/tempo_mpgen_operator/bin/tempo_patient.py and the
     near-identical runner/operator/chronos_operator/bin/tempo_patient.py):
 
@@ -56,11 +46,8 @@ tempo
     15 samples, 7 patients, 13 requests; every patient is isolated so
     tiers never leak across cases.
 
-both
-    Loads both datasets and validates both.
-
 dmp
-    Loads beagle's DMP fixture (file_system/fixtures/DMP_data.json) and
+    Loads a local beagle DMP fixture (a ``DMP_data.json`` dump) and
     translates the DMP-schema records into Sample rows via
     dmp_translator.to_dmp_sample_kwargs:
 
@@ -75,17 +62,16 @@ dmp
 
     anon_id is never stored (security); patient.dmp, project_name, and
     DMP's 1/0 metastasis flag are deferred to a later additional_metadata
-    change. The fixture holds four unique tumor records (type "T"; eight
-    file records, two per sample across two file groups -- duplicates are
-    merged): P-0001231/2 -> C-EXAMPLE4, P-0001234/5 -> C-EXAMPLE3, all
-    IMPACT468. There are no DMP normals in the fixture, so every DMP
-    tumor is expected to stay unpaired: DMP pairing is manual (the
-    operator pins a DMP normal via POST /pairing/trigger with an explicit
-    normal_id), and the automatic argos cascade does not select DMP
-    samples.
+    change. The DMP fixture's sample and patient ids are real beagle
+    identifiers, so the expected DMP results (which samples must stay
+    unpaired, plus translation spot-checks) are read from the local
+    ``scripts/.beagle_ground_truth.json`` file, not committed here. DMP
+    pairing is manual (the operator pins a DMP normal via
+    POST /pairing/trigger with an explicit normal_id), so every DMP tumor
+    is expected to stay unpaired.
 
-all
-    Loads all three datasets and validates all.
+both / all
+    Load and validate the selected combination of the above.
 
 Field mapping (beagle filemetadata -> syzygy Sample, argos scenario)
 --------------------------------------------------------------------
@@ -103,11 +89,11 @@ Field mapping (beagle filemetadata -> syzygy Sample, argos scenario)
     runDate              -> sequencing_date  (UTC midnight)
     misc                 -> additional_metadata
 
-beagle stores R1/R2 fastq rows per sample (and, for REQ_B, latest=True
-rows without cmoSampleName alongside latest=False rows without primaryId);
-rows are merged into one record per sample, first non-null value wins, and
-the REQ_B anonymous rows are merged by (igoRequestId, tumorOrNormal)
-when unambiguous.
+    beagle stores R1/R2 fastq rows per sample, and some fixtures hold
+    latest=False rows without a primaryId alongside latest=True rows; rows
+    are merged into one record per sample, first non-null value wins, and
+    anonymous rows are merged by (igoRequestId, tumorOrNormal) when
+    unambiguous.
 
 Pairing trigger
 ---------------
@@ -121,35 +107,19 @@ fixtures; syzygy triggers at ingest time, so ingest order can affect
 cross-request winners -- triggering over the complete dataset is the
 order-independent comparison basis).
 
-Expected pairs, argos scenario (ground truth from beagle v2.3.0 tests,
-runner/tests/operator/argos_operator/v2_3_0/test_pair_request.py, with the
-merged five-fixture dataset):
-
-    REQ_A_1   -> REQ_A_2    (test_compile_pairs4/5: same-request normal)
-    REQ_A_4   -> REQ_A_2    (same-request normal, patient C-EXAMPLE1)
-    REQ_A_5   -> REQ_A_3    (same-request normal, patient C-TEST123)
-    REQ_A_3_5 -> REQ_A_4_3  (test_get_most_recent_normal1: latest
-                                 run_date 2019-12-13 wins across requests)
-    REQ_B_1  -> REQ_B_2   (same-request normal, patient C-EXAMPLE2)
-    REQ_A_2_3 -> unpaired     (no tumor selects it; D_3_5 takes D_4_3)
-
-Expected pairs, tempo scenario (ground truth derived from beagle's
-tempo_patient.py pairing rules -- pre_pairing first, then bait_set AND
-run_mode match, latest run_date wins):
-
-    TMP-A_T -> TMP-A_N1, TMP-B_T -> TMP-B_N1,
-    TMP-F_T -> TMP-F_N,  TMP-G_T -> TMP-G_N;
-    unpaired tumors: TMP-C_T, TMP-D_T, TMP-E_T
-    unpaired normals: TMP-A_N2, TMP-B_N2, TMP-C_N, TMP-D_N
+Expected pairs
+--------------
+    tempo: the TEMPO_EXPECTED_PAIRS constant (dummy data) below.
+    argos: loaded from the local ground-truth file (see above).
+    dmp:   loaded from the local ground-truth file (see above).
 
 Usage
 -----
-    DATABASE_URL="postgresql+psycopg2://app:app@127.0.0.1:5434/app" \
-        python scripts/populate_from_beagle.py [--scenario argos|tempo|both]
+    Export DATABASE_URL for your local syzygy db, then:
 
-Note: the syzygy db container is published on host port 5434 (5432 is
-shadowed by a native Homebrew postgres on this machine; 5433 is beagle's
-postgres). See docker-compose.yml.
+        python scripts/populate_from_beagle.py --scenario tempo   # self-contained
+        python scripts/populate_from_beagle.py --scenario argos   # needs scripts/.beagle_ground_truth.json
+        python scripts/populate_from_beagle.py --scenario dmp     # needs scripts/.beagle_ground_truth.json
 
 Idempotent: wipes samples/pairings/pairing_logic, re-seeds logics
 (ARGOS/IMPACT -> argos strategy; TEMPO/CHRONOS -> tempo strategy; ACCESS
@@ -164,38 +134,54 @@ import os
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_BEAGLE_FIXTURES = (
-    "/path/to/"
-    "EXAMPLE-ORG/work/dev/"
-    "beagle_checkout/fixtures/tests"
-)
-CANONICAL_FIXTURES = ["REQ_A", "REQ_A_2", "REQ_A_3", "REQ_A_4", "REQ_B"]
-DEFAULT_DMP_FIXTURE = (
-    "/path/to/"
-    "EXAMPLE-ORG/work/dev/"
-    "beagle_checkout/file_system/fixtures/DMP_data.json"
+# The argos and dmp scenarios validate against REAL beagle fixtures, so their
+# ground truth (fixture names, expected pairs, fixture paths) references real
+# beagle identifiers. To keep those out of the public repo, they live in a
+# local, gitignored file: scripts/.beagle_ground_truth.json (shape shown in
+# scripts/.beagle_ground_truth.example.json). The tempo scenario is fully
+# self-contained (TEMPO_SAMPLES below) and needs no such file.
+LOCAL_GROUND_TRUTH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".beagle_ground_truth.json"
 )
 
-# Ground truth: beagle v2.3.0 test_pair_request.py, merged five-fixture DB.
-EXPECTED_PAIRS: dict[str, tuple[str, str]] = {
-    "REQ_A_1": ("REQ_A_2", "same-request normal (test_compile_pairs4/5)"),
-    "REQ_A_4": ("REQ_A_2", "same-request normal (patient C-EXAMPLE1)"),
-    "REQ_A_5": ("REQ_A_3", "same-request normal (patient C-TEST123)"),
-    "REQ_A_3_5": ("REQ_A_4_3", "latest run_date across requests (test_get_most_recent_normal1)"),
-    "REQ_B_1": ("REQ_B_2", "same-request normal (patient C-EXAMPLE2)"),
-}
-EXPECTED_UNPAIRED_NORMALS = {
-    "REQ_A_2_3": "no tumor selects it in the merged dataset",
-}
+# Populated by load_ground_truth() from the local file (empty until then).
+CANONICAL_FIXTURES: list[str] = []
+EXPECTED_PAIRS: dict[str, tuple[str, str]] = {}
+EXPECTED_UNPAIRED_NORMALS: dict[str, str] = {}
+EXPECTED_DMP_UNPAIRED: dict[str, str] = {}
+DMP_CHECKS: list[tuple[str, str, str, str]] = []
+BEAGLE_FIXTURES_DIR: str | None = None
+DMP_FIXTURE_PATH: str | None = None
 
-# DMP fixture: every record is a type "T" tumor; there are no DMP normals
-# in the fixture and DMP pairing is manual, so none of them pair.
-EXPECTED_DMP_UNPAIRED = {
-    "P-0001231-T01-IM6": "no normals in fixture; DMP pairing is manual",
-    "P-0001232-T01-IM6": "no normals in fixture; DMP pairing is manual",
-    "P-0001234-T01-IM6": "no normals in fixture; DMP pairing is manual",
-    "P-0001235-T01-IM6": "no normals in fixture; DMP pairing is manual",
-}
+
+def load_ground_truth() -> bool:
+    """Populate the argos/dmp ground-truth globals from the local file.
+
+    Returns True if the file was found and parsed. A missing file is not an
+    error by itself: the tempo scenario runs fine without it, and main()
+    reports a clear message if argos/dmp is requested without it.
+    """
+    global CANONICAL_FIXTURES, EXPECTED_PAIRS, EXPECTED_UNPAIRED_NORMALS, \
+        EXPECTED_DMP_UNPAIRED, DMP_CHECKS, BEAGLE_FIXTURES_DIR, DMP_FIXTURE_PATH
+    if not os.path.exists(LOCAL_GROUND_TRUTH):
+        return False
+    try:
+        with open(LOCAL_GROUND_TRUTH) as f:
+            gt = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(
+            f"ERROR: could not read {LOCAL_GROUND_TRUTH}: {e}\n"
+            "Copy scripts/.beagle_ground_truth.example.json to "
+            "scripts/.beagle_ground_truth.json and fill in your local values."
+        )
+    CANONICAL_FIXTURES = list(gt.get("canonical_fixtures", []))
+    EXPECTED_PAIRS = {k: tuple(v) for k, v in gt.get("expected_pairs", {}).items()}
+    EXPECTED_UNPAIRED_NORMALS = dict(gt.get("expected_unpaired_normals", {}))
+    EXPECTED_DMP_UNPAIRED = dict(gt.get("expected_dmp_unpaired", {}))
+    DMP_CHECKS = [tuple(c) for c in gt.get("dmp_checks", [])]
+    BEAGLE_FIXTURES_DIR = gt.get("fixtures_dir")
+    DMP_FIXTURE_PATH = gt.get("dmp_fixture")
+    return True
 
 # ---------------------------------------------------------------------------
 # TEMPO dummy dataset (derived from beagle's TEMPO/CHRONOS pairing logic;
@@ -308,7 +294,7 @@ def load_fixture_rows(fixtures_dir: str, names: list[str]) -> list[dict]:
 def merge_samples(rows: list[dict]) -> tuple[dict[str, dict], int]:
     """Group filemetadata rows into one record per sample (keyed by primaryId).
 
-    Rows lacking primaryId (REQ_B latest=False rows) are merged into the
+    Rows lacking primaryId (some latest=False rows) are merged into the
     same-request sample with the matching tumorOrNormal, when unambiguous.
     Returns (samples keyed by primaryId, count of anonymous rows merged).
     """
@@ -439,11 +425,12 @@ def _trigger(db, samples: list, logic, label: str, trigger_type: str = "automati
 
 def main() -> int:
     global trigger_pairing
+    have_gt = load_ground_truth()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--fixtures-dir", default=DEFAULT_BEAGLE_FIXTURES,
+    ap.add_argument("--fixtures-dir", default=BEAGLE_FIXTURES_DIR,
                     help="beagle fixtures/tests directory")
-    ap.add_argument("--dmp-fixture", default=DEFAULT_DMP_FIXTURE,
+    ap.add_argument("--dmp-fixture", default=DMP_FIXTURE_PATH,
                     help="beagle DMP_data.json path")
     ap.add_argument("--scenario", choices=["argos", "tempo", "dmp", "both", "all"],
                     default="argos",
@@ -464,6 +451,20 @@ def main() -> int:
     want_argos = args.scenario in ("argos", "both", "all")
     want_tempo = args.scenario in ("tempo", "both", "all")
     want_dmp = args.scenario in ("dmp", "all")
+
+    if (want_argos or want_dmp) and not have_gt:
+        print(
+            "ERROR: the argos/dmp scenarios validate against real beagle "
+            "fixtures, so they need the local, gitignored ground-truth file "
+            "scripts/.beagle_ground_truth.json (fixture names, expected "
+            "pairs, fixture paths). Copy "
+            "scripts/.beagle_ground_truth.example.json to "
+            "scripts/.beagle_ground_truth.json and fill in your local beagle "
+            "values. The tempo scenario is self-contained and needs no "
+            "such file.",
+            file=sys.stderr,
+        )
+        return 1
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -699,12 +700,7 @@ def validate_dmp(db, dmp_samples: list) -> int:
         print("  [PASS]    no excluded DMP identifiers persisted "
               "(anon_id, patient.dmp, project_name, sample_type.dmp)")
 
-    checks = [
-        ("P-0001231-T01-IM6", "C-EXAMPLE4", "IMPACT468", "TUMOR"),
-        ("P-0001232-T01-IM6", "C-EXAMPLE4", "IMPACT468", "TUMOR"),
-        ("P-0001234-T01-IM6", "C-EXAMPLE3", "IMPACT468", "TUMOR"),
-        ("P-0001235-T01-IM6", "C-EXAMPLE3", "IMPACT468", "TUMOR"),
-    ]
+    checks = DMP_CHECKS
     by_pid = {s.primary_id: s for s in dmp_samples}
     for pid, patient, panel, ton in checks:
         s = by_pid.get(pid)
