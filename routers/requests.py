@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -10,6 +10,37 @@ from schemas import RequestRead
 
 
 router = APIRouter(prefix="/request", tags=["requests"])
+
+
+def _request_page(db: Session, limit, offset, q):
+    """One row per request: id + sample/tumor/normal counts.
+
+    Aggregation happens in SQL (GROUP BY) with limit/offset applied at the
+    database level, so a paginated call never loads more than ``limit``
+    requests' worth of group rows. Dialect-agnostic (Postgres + SQLite).
+    """
+    stmt = (
+        select(
+            Sample.request_id,
+            func.count().label("sample_count"),
+            func.sum(case((Sample.tumor_or_normal == "TUMOR", 1), else_=0)).label(
+                "tumor_count"
+            ),
+            func.sum(case((Sample.tumor_or_normal == "NORMAL", 1), else_=0)).label(
+                "normal_count"
+            ),
+        )
+        .where(Sample.request_id.is_not(None))
+        .group_by(Sample.request_id)
+    )
+    if q is not None:
+        stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
+    stmt = stmt.order_by(Sample.request_id)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return db.execute(stmt).all()
 
 
 @router.get("/", response_model=list[RequestRead])
@@ -25,35 +56,36 @@ def list_requests(
     ``patients`` lists the distinct patient_ids across the request's
     samples (non-null); ``sample_types`` and ``gene_panels`` are the
     distinct values carried by the request's samples.
+
+    Counts come from a SQL GROUP BY with DB-level limit/offset; the
+    distinct lists are then computed in Python over only the current
+    page's samples.
     """
-    stmt = select(Sample).where(Sample.request_id.is_not(None))
-    if q is not None:
-        stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
-    samples = db.scalars(stmt).all()
+    rows = _request_page(db, limit, offset, q)
+    if not rows:
+        return []
+
+    request_ids = [row.request_id for row in rows]
+    samples = db.scalars(
+        select(Sample).where(Sample.request_id.in_(request_ids))
+    ).all()
 
     by_request: dict[str, list[Sample]] = {}
     for s in samples:
         by_request.setdefault(s.request_id, []).append(s)
 
     requests: list[RequestRead] = []
-    for request_id in sorted(by_request):
-        rows = by_request[request_id]
-        tumors = [s for s in rows if s.tumor_or_normal == "TUMOR"]
-        normals = [s for s in rows if s.tumor_or_normal == "NORMAL"]
+    for row in rows:
+        rows_for_request = by_request.get(row.request_id, [])
         requests.append(
             RequestRead(
-                request_id=request_id,
-                sample_count=len(rows),
-                tumor_count=len(tumors),
-                normal_count=len(normals),
-                patients=sorted({s.patient_id for s in rows if s.patient_id}),
-                sample_types=sorted({s.sample_type for s in rows if s.sample_type}),
-                gene_panels=sorted({s.gene_panel for s in rows if s.gene_panel}),
+                request_id=row.request_id,
+                sample_count=row.sample_count,
+                tumor_count=row.tumor_count,
+                normal_count=row.normal_count,
+                patients=sorted({s.patient_id for s in rows_for_request if s.patient_id}),
+                sample_types=sorted({s.sample_type for s in rows_for_request if s.sample_type}),
+                gene_panels=sorted({s.gene_panel for s in rows_for_request if s.gene_panel}),
             )
         )
-
-    if offset is not None:
-        requests = requests[offset:]
-    if limit is not None:
-        requests = requests[:limit]
     return requests

@@ -23,10 +23,17 @@ from pairing_service import (
 from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from routers.pairings import list_pairings, trigger_pairing_endpoint
-from routers.patients import list_patients
+from routers.patients import PATIENT_META_KEYS, list_patients
 from routers.requests import list_requests
 from routers.samples import create_sample, list_samples
-from schemas import PairingLogicCreate, PairingTriggerCreate, SampleCreate, TumorOrNormal
+from schemas import (
+    PairingLogicCreate,
+    PairingTriggerCreate,
+    PatientRead,
+    RequestRead,
+    SampleCreate,
+    TumorOrNormal,
+)
 
 
 class CustomPairingStrategy:
@@ -1615,6 +1622,329 @@ def test_list_requests_q_and_pagination(db):
     # Pagination slices the sorted, aggregated list.
     assert [r.request_id for r in list_requests(q="REQ", limit=2, offset=0, db=db)] == ["REQ-A", "REQ-B"]
     assert [r.request_id for r in list_requests(q="REQ", limit=2, offset=1, db=db)] == ["REQ-B", "REQ-C"]
+
+
+class _ResultProxy:
+    """Replays a fully fetched Result: ``.all()`` returns the cached rows."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _RecordingSession:
+    """Wraps a Session, recording each query's SQL text and row count.
+
+    Fetches each result exactly once and replays the cached rows, since a
+    SQLAlchemy Result is consumed by the first ``.all()`` call.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self.queries: list[tuple[str, int]] = []
+
+    def execute(self, stmt, *args, **kwargs):
+        rows = self._session.execute(stmt, *args, **kwargs).all()
+        self.queries.append((str(stmt), len(rows)))
+        return _ResultProxy(rows)
+
+    def scalars(self, stmt, *args, **kwargs):
+        rows = self._session.scalars(stmt, *args, **kwargs).all()
+        self.queries.append((str(stmt), len(rows)))
+        return _ResultProxy(rows)
+
+
+def _seed_scaled_patients(db, prefix: str, n_patients: int, per_patient: int = 5):
+    """Bulk-seed patients: 3 TUMOR + 2 NORMAL samples each, with a unique
+    prefix so page contents are fully determined."""
+    samples = []
+    for i in range(n_patients):
+        pid = f"{prefix}-{i:05d}"
+        for j in range(per_patient):
+            samples.append(
+                Sample(
+                    primary_id=f"{pid}-S{j}",
+                    cmo_sample_name=f"{pid}-S{j} name",
+                    patient_id=pid,
+                    sample_type="tissue",
+                    gene_panel="PANEL-A",
+                    bait_set="BAIT-1",
+                    tumor_or_normal=(
+                        TumorOrNormal.TUMOR.value if j < 3 else TumorOrNormal.NORMAL.value
+                    ),
+                    request_id=f"{pid}-R{j}" if j % 2 == 0 else None,
+                    additional_metadata={"species": "Mouse"} if j == 0 else None,
+                )
+            )
+    db.add_all(samples)
+    db.commit()
+
+
+def test_list_patients_sql_aggregation_scale(db):
+    _seed_scaled_patients(db, "SCALE-PAT", 2000)  # 10,000 samples
+
+    rec = _RecordingSession(db)
+    page = list_patients(limit=10, offset=100, q="SCALE-PAT", db=rec)
+
+    # Correct page contents: 10 patients, exact counts, requests, metadata.
+    expected_ids = [f"SCALE-PAT-{i:05d}" for i in range(100, 110)]
+    assert [p.patient_id for p in page] == expected_ids
+    for p in page:
+        assert (p.sample_count, p.tumor_count, p.normal_count) == (5, 3, 2)
+        assert p.requests == [f"{p.patient_id}-R0", f"{p.patient_id}-R2", f"{p.patient_id}-R4"]
+        assert p.metadata == {"species": "Mouse"}
+
+    # Boundedness: exactly 2 queries. The first is a GROUP BY that returns
+    # only the 10 page rows (not 10,000); the second fetches only the
+    # page's samples (10 x 5 = 50), not the whole table.
+    assert len(rec.queries) == 2
+    first_sql, first_rows = rec.queries[0]
+    second_sql, second_rows = rec.queries[1]
+    assert "GROUP BY" in first_sql.upper()
+    assert "LIMIT" in first_sql.upper() and "OFFSET" in first_sql.upper()
+    assert first_rows == 10
+    assert "IN (" in second_sql.upper()
+    assert second_rows == 10 * 5
+
+
+def _seed_scaled_requests(db, prefix: str, n_requests: int, per_request: int = 5):
+    samples = []
+    for i in range(n_requests):
+        rid = f"{prefix}-{i:05d}"
+        for j in range(per_request):
+            samples.append(
+                Sample(
+                    primary_id=f"{rid}-S{j}",
+                    cmo_sample_name=f"{rid}-S{j} name",
+                    patient_id=f"PAT-S-{i:05d}-{j % 2}",
+                    sample_type="tissue" if j % 2 == 0 else "blood",
+                    gene_panel="PANEL-A" if j < 3 else "PANEL-B",
+                    bait_set="BAIT-1",
+                    tumor_or_normal=(
+                        TumorOrNormal.TUMOR.value if j < 2 else TumorOrNormal.NORMAL.value
+                    ),
+                    request_id=rid,
+                )
+            )
+    db.add_all(samples)
+    db.commit()
+
+
+def test_list_requests_sql_aggregation_scale(db):
+    _seed_scaled_requests(db, "SCALE-REQ", 2000)  # 10,000 samples
+
+    rec = _RecordingSession(db)
+    page = list_requests(limit=10, offset=100, q="SCALE-REQ", db=rec)
+
+    expected_ids = [f"SCALE-REQ-{i:05d}" for i in range(100, 110)]
+    assert [r.request_id for r in page] == expected_ids
+    for r in page:
+        assert (r.sample_count, r.tumor_count, r.normal_count) == (5, 2, 3)
+        i = r.request_id.rsplit("-", 1)[1]
+        assert r.patients == sorted([f"PAT-S-{i}-0", f"PAT-S-{i}-1"])
+        assert r.sample_types == ["blood", "tissue"]
+        assert r.gene_panels == ["PANEL-A", "PANEL-B"]
+
+    assert len(rec.queries) == 2
+    first_sql, first_rows = rec.queries[0]
+    second_sql, second_rows = rec.queries[1]
+    assert "GROUP BY" in first_sql.upper()
+    assert "LIMIT" in first_sql.upper() and "OFFSET" in first_sql.upper()
+    assert first_rows == 10
+    assert "IN (" in second_sql.upper()
+    assert second_rows == 10 * 5
+
+
+def test_list_patients_pagination_edges(db):
+    for pid in ("PAT-E-1", "PAT-E-2", "PAT-E-3"):
+        _make_sample2(db, f"TUMOR-{pid}", pid, TumorOrNormal.TUMOR.value)
+
+    # Offset past the end (with and without limit) returns nothing.
+    assert list_patients(limit=10, offset=99, db=db) == []
+    assert list_patients(limit=None, offset=3, db=db) == []
+    # A limit larger than the result set returns everything.
+    assert [p.patient_id for p in list_patients(limit=100, offset=0, db=db)] == [
+        "PAT-E-1",
+        "PAT-E-2",
+        "PAT-E-3",
+    ]
+    # q with no match returns nothing.
+    assert list_patients(q="zzz-none", limit=None, offset=None, db=db) == []
+    # Samples without a request_id contribute no request entries.
+    _make_sample2(db, "TUMOR-NO-REQ", "PAT-E-NO-REQ", TumorOrNormal.TUMOR.value)
+    no_req = [p for p in list_patients(limit=None, offset=None, db=db) if p.patient_id == "PAT-E-NO-REQ"]
+    assert len(no_req) == 1 and no_req[0].requests == []
+
+
+def test_list_requests_pagination_edges(db):
+    for rid in ("REQ-E-1", "REQ-E-2", "REQ-E-3"):
+        _make_sample2(db, f"TUMOR-{rid}", "PAT-Y", TumorOrNormal.TUMOR.value, request_id=rid)
+
+    # Offset past the end (with and without limit) returns nothing.
+    assert list_requests(limit=10, offset=99, db=db) == []
+    assert list_requests(limit=None, offset=3, db=db) == []
+    # A limit larger than the result set returns everything.
+    assert [r.request_id for r in list_requests(limit=100, offset=0, db=db)] == [
+        "REQ-E-1",
+        "REQ-E-2",
+        "REQ-E-3",
+    ]
+    # q with no match returns nothing.
+    assert list_requests(q="zzz-none", limit=None, offset=None, db=db) == []
+    # Pooled normals (no patient_id) inside a request: excluded from patients,
+    # but still counted in the sample totals.
+    _make_sample2(db, "POOL-REQ-E", None, TumorOrNormal.NORMAL.value, request_id="REQ-E-1")
+    r1 = [r for r in list_requests(limit=None, offset=None, db=db) if r.request_id == "REQ-E-1"]
+    assert len(r1) == 1
+    assert r1[0].patients == ["PAT-Y"]
+    assert (r1[0].sample_count, r1[0].tumor_count, r1[0].normal_count) == (2, 1, 1)
+
+
+def _legacy_list_patients(db, limit, offset, q):
+    """Copy of the pre-refactor in-memory implementation, for parity checks."""
+    stmt = select(Sample).where(Sample.patient_id.is_not(None))
+    if q is not None:
+        stmt = stmt.where(Sample.patient_id.ilike(f"%{q}%"))
+    samples = db.scalars(stmt).all()
+
+    by_patient: dict[str, list[Sample]] = {}
+    for s in samples:
+        by_patient.setdefault(s.patient_id, []).append(s)
+
+    patients: list[PatientRead] = []
+    for patient_id in sorted(by_patient):
+        rows = by_patient[patient_id]
+        tumors = [s for s in rows if s.tumor_or_normal == "TUMOR"]
+        normals = [s for s in rows if s.tumor_or_normal == "NORMAL"]
+        metadata: dict = {}
+        for key in PATIENT_META_KEYS:
+            for s in tumors + normals:
+                value = (s.additional_metadata or {}).get(key)
+                if value is not None:
+                    metadata[key] = value
+                    break
+        patients.append(
+            PatientRead(
+                patient_id=patient_id,
+                sample_count=len(rows),
+                tumor_count=len(tumors),
+                normal_count=len(normals),
+                requests=sorted({s.request_id for s in rows if s.request_id}),
+                metadata=metadata,
+            )
+        )
+    if offset is not None:
+        patients = patients[offset:]
+    if limit is not None:
+        patients = patients[:limit]
+    return patients
+
+
+def test_list_patients_matches_legacy_in_memory_aggregation(db):
+    # Mixed dataset: overlapping metadata, null request_ids, pooled normals.
+    _make_sample2(
+        db, "TUMOR-P1-A", "PAT-P-1", TumorOrNormal.TUMOR.value,
+        request_id="REQ-P-1",
+        additional_metadata={"species": "Dog", "sex": "X"},
+    )
+    _make_sample2(
+        db, "NORMAL-P1-A", "PAT-P-1", TumorOrNormal.NORMAL.value,
+        additional_metadata={"species": "Mouse", "sex": "F"},
+    )
+    _make_sample2(
+        db, "TUMOR-P1-B", "PAT-P-1", TumorOrNormal.TUMOR.value,
+        request_id="REQ-P-2",
+        additional_metadata={"oncotreeCode": "LUSC"},
+    )
+    _make_sample2(db, "NORMAL-P1-B", "PAT-P-1", TumorOrNormal.NORMAL.value)
+    _make_sample2(db, "TUMOR-P2", "PAT-P-2", TumorOrNormal.TUMOR.value)
+    _make_sample2(db, "TUMOR-P3-A", "PAT-P-3", TumorOrNormal.TUMOR.value, request_id="REQ-P-3")
+    _make_sample2(db, "NORMAL-P3-A", "PAT-P-3", TumorOrNormal.NORMAL.value, request_id="REQ-P-3")
+    _make_sample2(db, "DMP-POOL-P", None, TumorOrNormal.NORMAL.value)
+
+    for limit, offset, q in (
+        (None, None, None),
+        (2, 0, None),
+        (1, 1, None),
+        (5, 2, None),
+        (None, 10, None),
+        (10, 0, "PAT-P"),
+        (1, 1, "p-1"),
+        (1, 0, "zzz"),
+    ):
+        new = [p.model_dump() for p in list_patients(limit=limit, offset=offset, q=q, db=db)]
+        old = [p.model_dump() for p in _legacy_list_patients(db, limit, offset, q)]
+        assert new == old, f"divergence for limit={limit}, offset={offset}, q={q!r}"
+
+
+def _legacy_list_requests(db, limit, offset, q):
+    """Copy of the pre-refactor in-memory implementation, for parity checks."""
+    stmt = select(Sample).where(Sample.request_id.is_not(None))
+    if q is not None:
+        stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
+    samples = db.scalars(stmt).all()
+
+    by_request: dict[str, list[Sample]] = {}
+    for s in samples:
+        by_request.setdefault(s.request_id, []).append(s)
+
+    requests: list[RequestRead] = []
+    for request_id in sorted(by_request):
+        rows = by_request[request_id]
+        tumors = [s for s in rows if s.tumor_or_normal == "TUMOR"]
+        normals = [s for s in rows if s.tumor_or_normal == "NORMAL"]
+        requests.append(
+            RequestRead(
+                request_id=request_id,
+                sample_count=len(rows),
+                tumor_count=len(tumors),
+                normal_count=len(normals),
+                patients=sorted({s.patient_id for s in rows if s.patient_id}),
+                sample_types=sorted({s.sample_type for s in rows if s.sample_type}),
+                gene_panels=sorted({s.gene_panel for s in rows if s.gene_panel}),
+            )
+        )
+    if offset is not None:
+        requests = requests[offset:]
+    if limit is not None:
+        requests = requests[:limit]
+    return requests
+
+
+def test_list_requests_matches_legacy_in_memory_aggregation(db):
+    _make_sample2(
+        db, "TUMOR-R1-A", "PAT-R-1", TumorOrNormal.TUMOR.value,
+        request_id="REQ-R-1", sample_type="tissue", gene_panel="PANEL-A",
+    )
+    _make_sample2(
+        db, "NORMAL-R1-A", "PAT-R-1", TumorOrNormal.NORMAL.value,
+        request_id="REQ-R-1", sample_type="blood", gene_panel="PANEL-B",
+    )
+    _make_sample2(
+        db, "POOL-R1", None, TumorOrNormal.NORMAL.value,
+        request_id="REQ-R-1", sample_type="pooled normal",
+    )
+    _make_sample2(
+        db, "TUMOR-R2-A", "PAT-R-2", TumorOrNormal.TUMOR.value,
+        request_id="REQ-R-2", sample_type="tissue", gene_panel="PANEL-A",
+    )
+    _make_sample2(db, "TUMOR-R3-A", "PAT-R-3", TumorOrNormal.TUMOR.value, request_id="REQ-R-3")
+    _make_sample2(db, "DMP-POOL-R", None, TumorOrNormal.NORMAL.value)
+
+    for limit, offset, q in (
+        (None, None, None),
+        (1, 0, None),
+        (1, 1, None),
+        (2, 1, None),
+        (None, 10, None),
+        (10, 0, "REQ-R"),
+        (1, 0, "zzz"),
+    ):
+        new = [r.model_dump() for r in list_requests(limit=limit, offset=offset, q=q, db=db)]
+        old = [r.model_dump() for r in _legacy_list_requests(db, limit, offset, q)]
+        assert new == old, f"divergence for limit={limit}, offset={offset}, q={q!r}"
 
 
 def test_list_pairings_ordered_and_paginated(db, tumor_sample, normal_sample, pairing_logic):

@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -14,6 +14,37 @@ router = APIRouter(prefix="/patient", tags=["patients"])
 # Patient-level fields carried in sample additional_metadata. Sample-level
 # keys (runId, flowCellId, platform, ...) are deliberately excluded.
 PATIENT_META_KEYS = ("species", "sex", "oncotreeCode", "diagnosisDate")
+
+
+def _patient_page(db: Session, limit, offset, q):
+    """One row per patient: id + sample/tumor/normal counts.
+
+    Aggregation happens in SQL (GROUP BY) with limit/offset applied at the
+    database level, so a paginated call never loads more than ``limit``
+    patients' worth of group rows. Dialect-agnostic (Postgres + SQLite).
+    """
+    stmt = (
+        select(
+            Sample.patient_id,
+            func.count().label("sample_count"),
+            func.sum(case((Sample.tumor_or_normal == "TUMOR", 1), else_=0)).label(
+                "tumor_count"
+            ),
+            func.sum(case((Sample.tumor_or_normal == "NORMAL", 1), else_=0)).label(
+                "normal_count"
+            ),
+        )
+        .where(Sample.patient_id.is_not(None))
+        .group_by(Sample.patient_id)
+    )
+    if q is not None:
+        stmt = stmt.where(Sample.patient_id.ilike(f"%{q}%"))
+    stmt = stmt.order_by(Sample.patient_id)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return db.execute(stmt).all()
 
 
 @router.get("/", response_model=list[PatientRead])
@@ -29,21 +60,29 @@ def list_patients(
     ``metadata`` holds patient-level fields derived from the patient's
     sample ``additional_metadata`` (first non-null value per key; tumor
     samples take priority).
+
+    Counts come from a SQL GROUP BY with DB-level limit/offset; the
+    derived fields are then computed in Python over only the current
+    page's samples.
     """
-    stmt = select(Sample).where(Sample.patient_id.is_not(None))
-    if q is not None:
-        stmt = stmt.where(Sample.patient_id.ilike(f"%{q}%"))
-    samples = db.scalars(stmt).all()
+    rows = _patient_page(db, limit, offset, q)
+    if not rows:
+        return []
+
+    patient_ids = [row.patient_id for row in rows]
+    samples = db.scalars(
+        select(Sample).where(Sample.patient_id.in_(patient_ids))
+    ).all()
 
     by_patient: dict[str, list[Sample]] = {}
     for s in samples:
         by_patient.setdefault(s.patient_id, []).append(s)
 
     patients: list[PatientRead] = []
-    for patient_id in sorted(by_patient):
-        rows = by_patient[patient_id]
-        tumors = [s for s in rows if s.tumor_or_normal == "TUMOR"]
-        normals = [s for s in rows if s.tumor_or_normal == "NORMAL"]
+    for row in rows:
+        rows_for_patient = by_patient.get(row.patient_id, [])
+        tumors = [s for s in rows_for_patient if s.tumor_or_normal == "TUMOR"]
+        normals = [s for s in rows_for_patient if s.tumor_or_normal == "NORMAL"]
 
         metadata: dict = {}
         for key in PATIENT_META_KEYS:
@@ -55,17 +94,12 @@ def list_patients(
 
         patients.append(
             PatientRead(
-                patient_id=patient_id,
-                sample_count=len(rows),
-                tumor_count=len(tumors),
-                normal_count=len(normals),
-                requests=sorted({s.request_id for s in rows if s.request_id}),
+                patient_id=row.patient_id,
+                sample_count=row.sample_count,
+                tumor_count=row.tumor_count,
+                normal_count=row.normal_count,
+                requests=sorted({s.request_id for s in rows_for_patient if s.request_id}),
                 metadata=metadata,
             )
         )
-
-    if offset is not None:
-        patients = patients[offset:]
-    if limit is not None:
-        patients = patients[:limit]
     return patients
