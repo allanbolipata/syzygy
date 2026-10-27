@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy this file to scripts/.beagle_ground_truth.json (which is gitignored) and fill in your LOCAL Beagle fixture names, paths, and expected pairing ground truth. The committed repo deliberately contains no real Beagle identifiers.",
+  "fixtures_dir": "/path/to/beagle_checkout/fixtures/tests",
+  "dmp_fixture": "/path/to/beagle_checkout/file_system/fixtures/DMP_data.json",
+  "canonical_fixtures": ["REQ_A", "REQ_B", "REQ_C"],
+  "expected_pairs": {
+    "REQ_A_1": ["REQ_A_2", "same-request normal"],
+    "REQ_B_1": ["REQ_C_2", "latest run_date wins across requests"]
+  },
+  "expected_unpaired_normals": {
+    "REQ_A_2_3": "no tumor selects it in the merged dataset"
+  },
+  "expected_dmp_unpaired": {
+    "DMP-T-901-N01-IM6": "no normals in fixture; DMP pairing is manual"
+  },
+  "dmp_checks": [
+    ["DMP-T-901-N01-IM6", "C-EXAMPLE1", "IMPACT468", "TUMOR"]
+  ]
+}

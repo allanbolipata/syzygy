@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syzygy login</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>Syzygy <span class="sub">login</span></h1>
+</header>
+
+<main class="view">
+  <div id="login-error" class="login-error hidden"></div>
+  <section class="panel">
+    <h2>Sign in</h2>
+    <p>Sign in with your Keycloak account</p>
+    <div class="actions">
+      <button type="button" class="primary" id="btn-signin">Sign in with Keycloak</button>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">Syzygy dev UI &mdash; no-build static front end served by FastAPI at <code>/ui</code></footer>
+<script>
+  document.getElementById("btn-signin").addEventListener("click", function () {
+    location.href = "/auth/redirect";
+  });
+  var errEl = document.getElementById("login-error");
+  function showError(msg) {
+    if (!msg) return;
+    errEl.textContent = msg;
+    errEl.classList.remove("hidden");
+  }
+  // Explanation passed along by the UI after a 403 (e.g. "User not
+  // allowed: ... has no email address").
+  showError(new URLSearchParams(location.search).get("error"));
+  // Redirect straight to the UI when a session is already valid; if the
+  // session is valid but NOT allow-listed (403), show the reason and stay
+  // here instead of bouncing back to the UI in a loop; otherwise
+  // (401/404 or network error) leave the sign-in button visible.
+  fetch("/v1/auth/me")
+    .then(function (r) {
+      if (r.ok) {
+        location.href = "/ui";
+        return null;
+      }
+      if (r.status === 403) {
+        return r.json().then(function (b) {
+          showError(b.detail || "Your account is not allowed to use Syzygy");
+        });
+      }
+      return null;
+    })
+    .catch(function () {
+      /* no session: stay on this page */
+    });
+</script>
+</body>
+</html>

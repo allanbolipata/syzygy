@@ -1,0 +1,10 @@
+.aider*
+clickup_ticket.md
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+docs/audit/
+scripts/.beagle_ground_truth.json

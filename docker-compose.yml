@@ -1,35 +1,50 @@
+# Syzygy app — production base.
+#
+# This is the minimal stack: just the app, wired to an EXTERNAL database
+# and an EXTERNAL (org-managed) Keycloak. It bundles neither. For local
+# development, layer docker-compose.dev.yml on top — it adds a local
+# Postgres and a local dev Keycloak and sets dev values for the app's
+# env:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# For a production run, set the required variables on the command line
+# (shell environment wins over any .env in this directory):
+#   DATABASE_URL=... KEYCLOAK_URL=... KEYCLOAK_CLIENT_SECRET=*** \
+#     docker compose up -d
+name: syzygy
+
 services:
   app:
     build:
       context: .
       dockerfile: Dockerfile
     image: sample-pairing-app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    container_name: syzygy-app
+    # The Dockerfile CMD runs uvicorn on port 8000, which matches the
+    # healthcheck below and the 8000:8000 port mapping.
     environment:
-      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      # Required: the database this app uses. This file does not provide
+      # one — deployments point at their own Postgres.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL, e.g. postgresql+psycopg2://user:pass@host:5432/app}
+      # KEYCLOAK_URL must be the same URL the BROWSER uses: the token's
+      # issuer claim is stamped from the browser-side authorize request,
+      # so a mismatch makes every login 401. In production this is the
+      # externally managed org Keycloak.
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-http://localhost:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-master}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-syzygy}
+      # Read from the environment or this directory's .env (compose loads
+      # .env automatically). Never commit the value.
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
     ports:
       - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: app
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d app"]
-      interval: 5s
+      # Single-quoted CMD-SHELL scalar: compose v2.33 re-tokenizes
+      # double-quoted flow-sequence entries (it split the old -c probe
+      # into 8 argv entries), but single-quoted ones pass through intact.
+      test: ["CMD-SHELL", 'python -c ''import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3)''']
+      interval: 10s
       timeout: 5s
-      retries: 10
-    ports:
-      - "5432:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
-
-volumes:
-  db_data:
