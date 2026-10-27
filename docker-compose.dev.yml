@@ -24,7 +24,7 @@ services:
 
   # Dev-only database, NOT part of the production stack.
   db:
-    image: postgres:16
+    image: postgres:17
     container_name: syzygy-db
     environment:
       POSTGRES_USER: app
