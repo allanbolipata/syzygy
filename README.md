@@ -214,6 +214,10 @@ database:
   (`TUMOR`/`NORMAL`); `no_patient=true` restricts to samples with a
   null `patient_id` (e.g. pooled normals); `limit` / `offset`
   paginate.
+- `GET /v1/sample/lookup?q=&limit=&offset=` — case-insensitive
+  partial-match lookup on `primary_id` and `cmo_sample_name` only (the
+  sample identifiers used in manual pairing workflows), newest first;
+  powers the Try Pairing tab's sample picker.
 - `GET /v1/patient` — patients derived from samples (a patient is a
   distinct non-null `patient_id`), sorted by `patient_id`. Returns
   sample/tumor/normal counts, the patient's distinct `request_id`s, and
@@ -313,8 +317,8 @@ database:
 
 A basic static web UI (no build step, no extra dependencies) is served
 at `/ui`; the root path `/` redirects there. It has tabs for samples,
-patients, requests, pooled normals, pairs by logic, and matches &
-overrides, and lets you:
+patients, requests, pooled normals, pairs by logic, matches &
+overrides, and a read-only Try Pairing dry-run tab, and lets you:
 
 - query and filter samples (search plus per-field filters on
   primary_id, cmo_sample_name, patient, request, sample type, gene
@@ -346,13 +350,22 @@ overrides, and lets you:
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the
-  recorded mismatches shown afterwards.
+  recorded mismatches shown afterwards;
+- dry-run pairing (Try Pairing tab, read-only — never creates, updates,
+  or overrides a pairing): resolve a sample by `primary_id` or
+  `cmo_sample_name` (case-insensitive, via `GET /v1/sample/lookup`),
+  pick any pairing logic (the sample's bait-set logic is preselected
+  when known), and preview what the cascade would do — cascade tier,
+  candidates, mismatch reasons, and the candidate the cascade would
+  pick — via `GET /v1/sample/{id}/possible-matches`; an explainer panel
+  describes how the selected logic pairs, sourced from
+  `pairing_strategies.py`.
 
 Navigation state lives in the URL hash (`#/samples`,
 `#/patients/<patient_id>`, `#/requests/<request_id>`,
-`#/matches/<primary_id>`, `#/pooled`, `#/pairs`), so the browser
-Back/Forward buttons, page reloads, and shared links all work; every
-navigation pushes a history entry.
+`#/matches/<primary_id>`, `#/try/<primary_id>`, `#/pooled`,
+`#/pairs`), so the browser Back/Forward buttons, page reloads, and
+shared links all work; every navigation pushes a history entry.
 
 ## Authentication (Keycloak)
 

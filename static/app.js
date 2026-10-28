@@ -78,8 +78,9 @@ async function api(path, opts) {
  * Every navigation (tab switch, opening/closing a detail panel, opening
  * matches for a sample) pushes a history entry. */
 
-const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches"];
+const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", "try"];
 let restoringNav = false;
+let PAIRING_LOGICS = [];
 
 function currentViewName() {
   const el = document.querySelector("main.view:not(.hidden)");
@@ -92,6 +93,7 @@ function currentHash() {
   if (view === "patients" && patientsState.patient) id = patientsState.patient.patient_id;
   else if (view === "requests" && requestsState.request) id = requestsState.request.request_id;
   else if (view === "matches" && matchesState.sample) id = matchesState.sample.primary_id;
+  else if (view === "try" && tryState.sample) id = tryState.sample.primary_id;
   return `#/${view}` + (id ? `/${encodeURIComponent(id)}` : "");
 }
 
@@ -153,6 +155,18 @@ async function restoreFromHash() {
         if (row) await openMatchesFor(row);
         else banner("error", `Sample ${esc(id)} not found.`, true);
       }
+    } else if (view === "try" && id) {
+      const rows = await api(`/sample/lookup?q=${encodeURIComponent(id)}&limit=25`);
+      const row = rows.find((x) =>
+        x.primary_id.toLowerCase() === id.toLowerCase() ||
+        x.cmo_sample_name.toLowerCase() === id.toLowerCase()
+      );
+      if (row) {
+        $("#tq-id").value = id;
+        tryFillSelect(rows);
+        $("#tq-sample").value = row.id;
+        await selectTrySample(row);
+      } else banner("error", `Sample ${esc(id)} not found.`, true);
     }
   } catch (e) {
     banner("error", `Failed to restore view: ${esc(e.message)}`, true);
@@ -301,6 +315,12 @@ async function loadLogics() {
     $("#pr-logic").innerHTML = logics.map((l) =>
       `<option value="${esc(l.name)}">${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
+    PAIRING_LOGICS = logics;
+    // Try Pairing: active logics only (the dry-run endpoint refuses
+    // inactive ones), same options as the Matches tab.
+    $("#tq-logic").innerHTML = logics.map((l) =>
+      `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
+    ).join("");
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -308,12 +328,12 @@ async function loadLogics() {
 
 /* Select the pairing logic assigned to the sample's bait set (server-side
    bait_sets table), so the page doesn't default to the first logic. */
-async function applyBaitSetLogic(sample) {
+async function applyBaitSetLogic(sample, logicSelId) {
   if (!sample || !sample.bait_set) return false;
   try {
     const row = await api(`/bait-sets/lookup?name=${encodeURIComponent(sample.bait_set)}`);
     if (!row) return false;
-    const logicSel = $("#m-logic");
+    const logicSel = $(`#${logicSelId || "m-logic"}`);
     const opt = [...logicSel.options].find((o) => o.value === row.pairing_logic && !o.disabled);
     if (!opt) return false;
     logicSel.value = opt.value;
@@ -1084,6 +1104,237 @@ $("#pr-logic").addEventListener("change", loadPairs);
 $("#pr-download").addEventListener("click", downloadPairs);
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
 
+/* ---------- try pairing view (dry run) ---------- */
+
+/* Read-only preview: resolve a sample by primary_id / cmo_sample_name,
+ * pick a pairing logic, and show what the pairing cascade *would* do.
+ * Only GET endpoints are used (sample lookup + possible-matches) — no
+ * pairing row is ever created, updated, or overridden. */
+
+const tryState = { sample: null, candidates: [], busy: false };
+
+function tryFillSelect(rows) {
+  tryState.candidates = rows;
+  const sel = $("#tq-sample");
+  sel.innerHTML = rows.map((s) =>
+    `<option value="${s.id}">${esc(sampleLabel(s))}</option>`
+  ).join("");
+  sel.disabled = rows.length === 0;
+  $("#tq-run").disabled = rows.length === 0;
+}
+
+async function trySearch() {
+  const q = $("#tq-id").value.trim();
+  if (!q || tryState.busy) return;
+  tryState.busy = true;
+  $("#tq-lookup").disabled = true;
+  try {
+    const rows = await api(`/sample/lookup?q=${encodeURIComponent(q)}&limit=25`);
+    if (!rows.length) {
+      tryState.sample = null;
+      tryFillSelect([]);
+      $("#tq-summary").classList.add("hidden");
+      $("#tq-result").classList.add("hidden");
+      banner("info", `No sample matches "${esc(q)}" (primary_id / cmo_sample_name).`);
+      return;
+    }
+    tryFillSelect(rows);
+    const first = rows[0];
+    $("#tq-sample").value = first.id;
+    await selectTrySample(first);
+  } catch (e) {
+    banner("error", `Sample lookup failed: ${esc(e.message)}`, true);
+  } finally {
+    tryState.busy = false;
+    $("#tq-lookup").disabled = false;
+  }
+}
+
+async function selectTrySample(sample) {
+  tryState.sample = sample;
+  $("#tq-run").disabled = false;
+  const kv = [
+    ["primary_id", esc(sample.primary_id)],
+    ["cmo_sample_name", esc(sample.cmo_sample_name)],
+    ["patient_id", sample.patient_id ? esc(sample.patient_id) : "—"],
+    ["request_id", sample.request_id ? esc(sample.request_id) : "—"],
+    ["role", `<span class="badge ${sample.tumor_or_normal.toLowerCase()}">${esc(sample.tumor_or_normal)}</span>`],
+    ["sample_type", esc(sample.sample_type)],
+    ["gene_panel", esc(sample.gene_panel)],
+    ["bait_set", esc(sample.bait_set || "—")],
+    ["run_mode", esc(sample.run_mode || "—")],
+    ["file_group", esc(sample.file_group || "—")],
+    ["preservation", metaText(sample.preservation)],
+    ["sample_origin", metaText(sample.sample_origin)],
+    ["sequencing_date", fmtDate(sample.sequencing_date)],
+  ];
+  $("#tq-summary-kv").innerHTML = kv.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  $("#tq-summary").classList.remove("hidden");
+  pushNav();
+  // Preselect the sample's own bait-set logic when known; otherwise
+  // keep whatever logic the user already picked.
+  await applyBaitSetLogic(sample, "tq-logic");
+  renderTryExplainer($("#tq-logic").value);
+}
+
+async function runTry() {
+  const sample = tryState.sample;
+  const logic = $("#tq-logic").value;
+  if (!sample || !logic || tryState.busy) return;
+  tryState.busy = true;
+  $("#tq-run").disabled = true;
+  const params = new URLSearchParams();
+  params.set("pairing_logic_name", logic);
+  params.set("limit", OTHERS_PAGE_SIZE);
+  params.set("offset", 0);
+  try {
+    const data = await api(`/sample/${sample.id}/possible-matches?${params}`);
+    renderTryResult(data, logic);
+  } catch (e) {
+    banner("error", `Dry run failed: ${esc(e.message)}`, true);
+  } finally {
+    tryState.busy = false;
+    $("#tq-run").disabled = false;
+  }
+}
+
+function renderTryResult(data, logic) {
+  const s = data.sample;
+  const isTumor = s.tumor_or_normal === "TUMOR";
+  const parts = [];
+
+  parts.push(`<p class="hint">Dry run for <strong>${esc(s.primary_id)} — ${esc(s.cmo_sample_name)}</strong> under logic <strong>${esc(logic)}</strong>. Read-only preview: nothing was recorded.</p>`);
+
+  // Pre-existing pairings (informational — not from this dry run).
+  const cmList = data.current_matches || [];
+  if (cmList.length) {
+    parts.push(`<h3>Currently recorded pairings (pre-existing data, not from this run)</h3>`);
+    parts.push(cmList.map((cm) => `
+      <div class="current-match">
+        <dl class="kv">
+          <dt>matched ${isTumor ? "normal" : "tumor"}</dt>
+          <dd>${esc(cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient_id || "no patient")})</dd>
+          <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
+          <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
+        </dl>
+        ${noteList(cm.notes)}
+      </div>`).join(""));
+  }
+
+  // What the cascade would do.
+  const rows = data.other_matches || [];
+  const winner = rows.find((c) => c.would_be_selected);
+  if (isTumor) {
+    if (winner) {
+      parts.push(`<h3>Cascade outcome</h3>
+        <p>The cascade would pick <strong>${esc(winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong> (${esc(winner.sample.patient_id || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
+    } else {
+      parts.push(`<h3>Cascade outcome</h3>
+        <p>No candidate would be selected — the sample would stay unpaired under this logic.</p>`);
+    }
+  } else {
+    const matchedN = (typeof data.other_matches_matched === "number") ? data.other_matches_matched : "—";
+    parts.push(`<h3>Cascade outcome</h3>
+      <p>This is a <strong>${esc(s.tumor_or_normal)}</strong> sample: the cascade has no single winner. ${esc(String(matchedN))} of the in-scope candidates pass every key — those are the samples this logic would consider pairing with it.</p>`);
+  }
+
+  // Candidate scope summary.
+  const total = (typeof data.other_matches_total === "number") ? data.other_matches_total : rows.length;
+  const summaryParts = [];
+  summaryParts.push(`${total} candidate${total === 1 ? "" : "s"} in scope`);
+  if (typeof data.other_matches_matched === "number") summaryParts.push(`${data.other_matches_matched} pass every key`);
+  const tierBits = Object.entries(data.other_matches_tiers || {}).map(([t, n]) => `${n} ${t.replace(/_/g, " ")}`).join(", ");
+  if (tierBits) summaryParts.push(`tiers: ${tierBits}`);
+  const breakdownBits = (data.other_matches_breakdown || []).slice(0, 3).map((b) => `${b.count} on ${b.mismatched_keys.join(" + ")}`).join(", ");
+  if (breakdownBits) summaryParts.push(`mismatches: ${breakdownBits}`);
+  parts.push(`<h3>Candidates (${esc(logic)})</h3><p class="hint">${summaryParts.join(" · ")}</p>`);
+
+  if (!rows.length) {
+    parts.push(`<p class="empty">No candidates.</p>`);
+  } else {
+    parts.push(`<table>
+      <thead><tr><th>sample</th><th>patient</th><th>tier</th><th>status</th><th>mismatched keys</th><th>sequencing date</th></tr></thead>
+      <tbody>${rows.map((c) => {
+        const cs = c.sample;
+        const status = c.matched
+          ? '<span class="badge ok">matches all keys</span>'
+          : '<span class="badge bad">mismatch</span>';
+        const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
+        return `<tr>
+          <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
+          <td>${esc(cs.patient_id || "—")}</td>
+          <td><span class="badge tier">${esc(c.tier)}</span></td>
+          <td>${status}</td>
+          <td>${c.mismatched_keys ? keyList(c.mismatched_keys) : "—"}</td>
+          <td>${fmtDate(cs.sequencing_date)}</td>
+        </tr>`;
+      }).join("")}</tbody></table>`);
+  }
+
+  $("#tq-result-body").innerHTML = parts.join("");
+  $("#tq-result").classList.remove("hidden");
+}
+
+/* How each strategy pairs — sourced from pairing_strategies.py (keep the
+ * wording in sync with that module). */
+const TRY_EXPLAINERS = {
+  argos: `
+    <h4>Hard matching keys</h4>
+    <p>Same <code>patient_id</code>, <code>gene_panel</code>, and <code>bait_set</code> (case-insensitive). <code>sample_type</code> is <em>not</em> a key (beagle v2.3.0 semantics).</p>
+    <h4>Additional gates (every tier)</h4>
+    <ul>
+      <li><strong>Run mode</strong>: raw run-mode strings are normalized to buckets (<code>novaseq x</code> → novaseq_x, <code>novaseq</code>, <code>hiseq</code>; any other value must match exactly) and must be equal on both sides.</li>
+      <li><strong>Preservation</strong>: each side's (preservation, sample_origin) pair resolves to a category — both fields empty → that side is <em>not considered</em> and never blocks; a present preservation decides (any "ffpe" entry → ffpe, anything else → frozen) and the origin is free unless it names the <em>opposite</em> category (a within-side conflict → unresolvable → blocks); with preservation empty, the origin alone decides ("ffpe", or "fresh or frozen"/"frozen"; any other value is unresolvable → blocks). Two considered sides must agree, and an unresolvable side blocks the pair.</li>
+    </ul>
+    <h4>Cascade tiers (in order; latest sequencing_date wins within a tier)</h4>
+    <ol>
+      <li>normals ingested under the same <code>request_id</code>;</li>
+      <li>all other normals for the same patient;</li>
+      <li>pooled normals (<code>sample_type</code> "Pooled Normal", no patient): <code>gene_panel</code> + <code>bait_set</code> must match, and run mode is resolved through the pooled-machines table (the pool's machine name → machine class; the tumor's run_mode → novaseq/hiseq family; both must resolve and agree).</li>
+    </ol>
+    <p>DMP samples (<code>sample_type</code> "DMP") are manual-pairing only: the cascade never selects them, and any pair involving one carries the "DMP: manual pairing only" mismatch reason.</p>
+  `,
+  tempo: `
+    <h4>Tiers (in order)</h4>
+    <ol>
+      <li><strong>Historical pairing</strong>: the tumor's current latest pairing under this logic is retained unconditionally — bait and run-mode checks are bypassed (any mismatches are only noted). There is no fallback: if the historical normal is missing, the tumor stays unpaired.</li>
+      <li><strong>Patient-wide</strong>: same <code>patient_id</code> (the only hard key); <code>bait_set</code> (case-insensitive) and the run-mode bucket (<code>novaseq</code>/<code>hiseq</code> substrings) must match; the latest <code>sequencing_date</code> wins.</li>
+    </ol>
+    <p><code>gene_panel</code> and <code>sample_type</code> are not keys; there is no request cascade and no pooled tier.</p>
+  `,
+  default: `
+    <h4>Hard matching keys</h4>
+    <p>Same <code>patient_id</code>, <code>gene_panel</code>, and <code>bait_set</code> (case-insensitive).</p>
+    <h4>Cascade (latest sequencing_date wins within a tier)</h4>
+    <ol>
+      <li>normals ingested under the same <code>request_id</code> (when the tumor has one);</li>
+      <li>all other normals for the same patient.</li>
+    </ol>
+    <p>No run-mode or preservation gates and no pooled tier — the reference implementation (used by ACCESS), not beagle-aligned.</p>
+  `,
+};
+
+function renderTryExplainer(logicName) {
+  const logic = PAIRING_LOGICS.find((l) => l.name === logicName);
+  const key = logic ? logic.strategy_name : null;
+  const body = TRY_EXPLAINERS[key];
+  $("#tq-explain-body").innerHTML = body
+    ? body
+    : `<p>No explainer available for strategy <code>${esc(key || logicName || "—")}</code> — see <code>pairing_strategies.py</code>.</p>`;
+  $("#tq-explain").classList.remove("hidden");
+}
+
+$("#tq-lookup").addEventListener("click", trySearch);
+$("#tq-id").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") trySearch();
+});
+$("#tq-sample").addEventListener("change", (e) => {
+  const picked = tryState.candidates.find((s) => String(s.id) === e.target.value);
+  if (picked) selectTrySample(picked);
+});
+$("#tq-logic").addEventListener("change", (e) => renderTryExplainer(e.target.value));
+$("#tq-run").addEventListener("click", runTry);
+
 /* ---------- auth: current user + sign-out ---------- */
 
 /* The browser sends the auth_token cookie automatically (same origin),
@@ -1118,6 +1369,7 @@ $("#logout-btn").addEventListener("click", signOut);
 (async function init() {
   loadCurrentUser();
   await loadLogics();
+  if ($("#tq-logic").value) renderTryExplainer($("#tq-logic").value);
   loadPairs();
   loadSamples(0);
   loadPatients();

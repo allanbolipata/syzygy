@@ -16,6 +16,7 @@
     <button class="tab" data-tab="pooled">Pooled Normals</button>
     <button class="tab" data-tab="pairs">Pairs by Logic</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
+    <button class="tab" data-tab="try">Try Pairing</button>
   </nav>
   <div class="user-area">
     <span id="current-user"></span>
@@ -397,6 +398,45 @@
       <input type="checkbox" id="m-strict">
       reject if any matching key differs (strict override)
     </label>
+  </section>
+</main>
+
+<main id="view-try" class="view hidden">
+  <section class="panel">
+    <h2>Try pairing <span class="sub">(dry run)</span></h2>
+    <p class="hint">
+      Read-only &mdash; shows what the pairing cascade <em>would</em> do for one
+      sample under the chosen logic. Nothing is created, updated, or overridden.
+    </p>
+    <div class="actions">
+      <label>sample
+        <input id="tq-id" placeholder="primary_id or cmo_sample_name">
+      </label>
+      <button id="tq-lookup" class="primary">Lookup</button>
+      <label>sample (matched)
+        <select id="tq-sample" disabled></select>
+      </label>
+      <label>pairing logic
+        <select id="tq-logic"></select>
+      </label>
+      <button id="tq-run" class="primary" disabled>Run dry run</button>
+    </div>
+    <p class="hint">Lookup matches primary_id and cmo_sample_name case-insensitively; the sample&rsquo;s bait-set logic is preselected when known.</p>
+  </section>
+
+  <section id="tq-summary" class="panel hidden">
+    <h3 id="tq-summary-title">Resolved sample</h3>
+    <dl id="tq-summary-kv" class="kv"></dl>
+  </section>
+
+  <section id="tq-result" class="panel hidden">
+    <div id="tq-result-body"></div>
+  </section>
+
+  <section id="tq-explain" class="panel hidden">
+    <h3>How the selected logic pairs</h3>
+    <div id="tq-explain-body"></div>
+    <p class="hint">Sourced from <code>pairing_strategies.py</code> &mdash; see that module for the authoritative rules.</p>
   </section>
 </main>
 
