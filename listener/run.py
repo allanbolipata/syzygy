@@ -44,6 +44,13 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     config = build_config()
+    # The fail-closed ingest endpoint rejects every message without a
+    # matching token, so warn loudly at startup if ours is unset.
+    if not os.environ.get("SYZYGY_NATS_TOKEN"):
+        logging.warning(
+            "SYZYGY_NATS_TOKEN not set: the ingest endpoint (fail-closed) "
+            "will reject every message this listener sends"
+        )
     # The subscribe subject and the consumer's filter subject are the same
     # wildcard, so one durable consumer receives all three cmo subjects.
     subject = config["NATS_FILTER_SUBJECT"]

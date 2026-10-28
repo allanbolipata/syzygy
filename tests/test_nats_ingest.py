@@ -96,35 +96,48 @@ def test_dispatch_unknown_subject_is_error(db):
     assert "unknown subject" in result["detail"]
 
 
-def test_router_dispatch_returns_200_shape(db, caplog):
+def test_router_dispatch_returns_200_shape(monkeypatch, db, caplog):
     caplog.set_level(logging.INFO)
+    monkeypatch.setattr(database.settings, "nats_ingest_token", "secret")
     body = NatsIngestIn(subject=REQUEST_UPDATE, payload=[{"id": "x"}])
-    result = ingest_nats(body, db, x_nats_token=None)
+    result = ingest_nats(body, db, x_nats_token="secret")
     assert set(result) == {"subject", "status", "detail"}
     assert result["subject"] == REQUEST_UPDATE
     assert result["status"] == "ok"
     # The entry names no known request: reported in the detail line.
     assert "1 missing" in result["detail"]
-    # No token configured (dev default) => allowed, with a warning logged.
-    assert "no token configured" in caplog.text
 
 
-def test_router_accepts_list_payload(db, caplog):
+def test_router_accepts_list_payload(monkeypatch, db, caplog):
     """request-update bodies are JSON arrays; they must dispatch, not 422."""
     caplog.set_level(logging.INFO)
+    monkeypatch.setattr(database.settings, "nats_ingest_token", "secret")
     body = NatsIngestIn(subject=REQUEST_UPDATE, payload=[{"igoRequestId": "x"}])
-    result = ingest_nats(body, db, x_nats_token=None)
+    result = ingest_nats(body, db, x_nats_token="secret")
     assert result["status"] == "ok"
     # The named request has no sample rows: reported as missing, nothing
     # created.
     assert "1 missing" in result["detail"]
 
 
-def test_router_unknown_subject_is_422(db):
+def test_router_unknown_subject_is_422(monkeypatch, db):
+    monkeypatch.setattr(database.settings, "nats_ingest_token", "secret")
     body = NatsIngestIn(subject="MDB_STREAM.server.cpt-gateway.bogus", payload={})
     with pytest.raises(HTTPException) as exc:
-        ingest_nats(body, db, x_nats_token=None)
+        ingest_nats(body, db, x_nats_token="secret")
     assert exc.value.status_code == 422
+
+
+def test_router_rejects_everything_when_token_unconfigured(monkeypatch, db):
+    """Fail-closed: no token configured => 403 even with a presented header."""
+    monkeypatch.setattr(database.settings, "nats_ingest_token", "")
+    body = NatsIngestIn(subject=NEW_REQUEST, payload={})
+    with pytest.raises(HTTPException) as exc:
+        ingest_nats(body, db, x_nats_token="anything")
+    assert exc.value.status_code == 403
+    with pytest.raises(HTTPException) as exc_missing:
+        ingest_nats(body, db, x_nats_token=None)
+    assert exc_missing.value.status_code == 403
 
 
 def test_router_token_rejects_wrong_or_missing(monkeypatch, db):

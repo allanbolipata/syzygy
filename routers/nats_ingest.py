@@ -1,12 +1,13 @@
 """Internal NATS ingest endpoint for the standalone smile-listener service.
 
 Not part of the public API surface: no Keycloak auth — a shared-secret
-X-NATS-Token header when settings.nats_ingest_token is configured (an
-empty token allows unauthenticated ingest and logs a warning, the dev
-default). The listener POSTs each consumed JetStream message here as
-{"subject": ..., "payload": ...}; the message is dispatched by subject
-to the per-event stub handlers (see nats_ingest.py).
+X-NATS-Token header, enforced fail-closed. An empty
+settings.nats_ingest_token rejects EVERY request (403); a configured
+token must match exactly. The listener POSTs each consumed JetStream
+message here as {"subject": ..., "payload": ...}; the message is
+dispatched by subject to the per-event stub handlers (see nats_ingest.py).
 """
+import hmac
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,13 @@ from database import get_db, settings
 from nats_ingest import dispatch
 
 logger = logging.getLogger(__name__)
+
+# Fail-closed: a missing token means the endpoint is disabled, not open.
+if not settings.nats_ingest_token:
+    logger.warning(
+        "NATS ingest endpoint is DISABLED: NATS_INGEST_TOKEN is not set; "
+        "every request to /v1/ingest/nats will be rejected (403)"
+    )
 
 router = APIRouter(prefix="/ingest", tags=["nats-ingest"])
 
@@ -38,13 +46,10 @@ def ingest_nats(
     x_nats_token: Optional[str] = Header(default=None, alias="X-NATS-Token"),
 ) -> Dict[str, Any]:
     """Receive one NATS message from the smile-listener and dispatch it."""
-    if settings.nats_ingest_token:
-        if x_nats_token != settings.nats_ingest_token:
-            raise HTTPException(status_code=403, detail="invalid X-NATS-Token")
-    else:
-        logger.warning(
-            "NATS ingest: no token configured; allowing unauthenticated ingest"
-        )
+    if not settings.nats_ingest_token or not hmac.compare_digest(
+        x_nats_token or "", settings.nats_ingest_token
+    ):
+        raise HTTPException(status_code=403, detail="invalid X-NATS-Token")
     result = dispatch(db, body.subject, body.payload)
     if result["status"] == "error":
         raise HTTPException(status_code=422, detail=result["detail"])

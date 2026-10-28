@@ -200,7 +200,10 @@ messages onto the `MDB_STREAM` JetStream stream, and a standalone
 [mskcc/smile-client](https://github.com/mskcc/smile-client) copy in
 `listener/`, running as the `smile-listener` compose service — consumes
 them and POSTs each message to the app's internal `POST /v1/ingest/nats`
-endpoint. For local work, `scripts/mock_smile.py` stands in for SMILE.
+endpoint. The endpoint is fail-closed: it rejects every request (403)
+unless `NATS_INGEST_TOKEN` is set, and the listener must send the same
+value as its `SYZYGY_NATS_TOKEN` (the dev compose sets both to the same
+dev value). For local work, `scripts/mock_smile.py` stands in for SMILE.
 
 **1. Bring up the full stack** (this Mac has no Docker — Podman):
 
