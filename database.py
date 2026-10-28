@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     keycloak_client_id: str = "syzygy"
     keycloak_client_secret: str = ""
 
+    # Dev-only local login: when dev_auth_token is non-empty, that static
+    # token (sent as Bearer or in the auth_token cookie) authenticates as
+    # the local dev admin WITHOUT contacting Keycloak or consulting
+    # allowed_users. Default "" = disabled; never set in production.
+    dev_auth_token: str = ""
+    dev_auth_email: str = "dev-admin@syzygy.local"
+
     # NATS ingest (internal endpoint used by the standalone smile-listener;
     # the app itself never connects to NATS). Fail-closed: an empty token
     # (the default) DISABLES the endpoint — every request is rejected 403.

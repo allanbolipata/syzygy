@@ -5,6 +5,7 @@ endpoint. Raises TokenError for anything that is not a valid, current
 token for this client.
 """
 
+import hmac
 import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
@@ -26,6 +27,24 @@ _jwks_cache: Dict[str, Dict[str, Any]] = {}
 
 class TokenError(Exception):
     """Raised when a token fails verification."""
+
+
+def dev_auth_enabled() -> bool:
+    """True when the dev-only local login is configured
+    (``dev_auth_token`` set). Never true in production."""
+    return bool(settings.dev_auth_token)
+
+
+def _dev_user() -> dict:
+    """Identity for the dev-only local admin. No Keycloak token and no
+    allowed_users row are involved; this path only exists when
+    ``dev_auth_token`` is set."""
+    return {
+        "sub": "dev-admin",
+        "email": settings.dev_auth_email,
+        "preferred_username": "dev-admin",
+        "display_name": "Dev Admin (local)",
+    }
 
 
 def _get_jwks() -> dict:
@@ -113,6 +132,17 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], O
     token = _extract_token(request)
     if token is None:
         return ("none", None, None)
+    # Dev-only local login: a configured static token authenticates as
+    # the local dev admin without contacting Keycloak or consulting
+    # allowed_users. Constant-time compare; a non-matching token falls
+    # through to normal Keycloak verification (and fails there).
+    if (
+        dev_auth_enabled()
+        and hmac.compare_digest(
+            token.encode("utf-8"), settings.dev_auth_token.encode("utf-8")
+        )
+    ):
+        return ("ok", _dev_user(), None)
     try:
         claims = verify_token(token)
     except TokenError:
@@ -182,9 +212,30 @@ def logout() -> RedirectResponse:
     return response
 
 
+@router.get("/dev-login")
+def dev_login() -> dict:
+    """Public flag for the login page: whether the Keycloak-less local
+    dev login is enabled. Returns only the flag — never the token.
+    (Mounted at /auth/dev-login and /v1/auth/dev-login.)"""
+    return {"dev_login": dev_auth_enabled()}
+
+
 @router.get("/redirect")
 def redirect(request: Request) -> RedirectResponse:
     """Kick the browser to the Keycloak authorize endpoint."""
+    if dev_auth_enabled():
+        # Dev-only: skip the Keycloak dance entirely and hand the
+        # browser a local dev-admin session directly.
+        response = RedirectResponse("/ui")
+        response.set_cookie(
+            "auth_token",
+            settings.dev_auth_token,
+            httponly=True,
+            samesite="lax",
+            path="/",
+            max_age=43200,
+        )
+        return response
     now = time.monotonic()
     for state in [s for s, exp in _login_states.items() if exp <= now]:
         del _login_states[state]
