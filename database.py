@@ -15,6 +15,22 @@ class Settings(BaseSettings):
     keycloak_client_id: str = "syzygy"
     keycloak_client_secret: str = ""
 
+    # NATS ingest (internal endpoint used by the standalone smile-listener;
+    # the app itself never connects to NATS). Empty token = no token check
+    # (dev default); the listener must send the same value as X-NATS-Token.
+    nats_ingest_token: str = ""
+    # Production subject names (JetStream stream MDB_STREAM); dispatch maps
+    # each to its handler, so the mapping follows these settings values.
+    nats_new_request_subject: str = (
+        "MDB_STREAM.server.cpt-gateway.cmo-new-request"
+    )
+    nats_request_update_subject: str = (
+        "MDB_STREAM.server.cpt-gateway.cmo-request-update"
+    )
+    nats_sample_update_subject: str = (
+        "MDB_STREAM.server.cpt-gateway.cmo-sample-update"
+    )
+
 
 settings = Settings()
 

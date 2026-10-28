@@ -191,6 +191,73 @@ database:
    that database's container sits on `syzygy-dev`, reference it by
    its service or container name in the URL.
 
+## Mocking the production SMILE flow (dev NATS)
+
+In production the app does **not** connect to NATS. SMILE publishes
+`cmo-new-request`, `cmo-sample-update` and `cmo-request-update`
+messages onto the `MDB_STREAM` JetStream stream, and a standalone
+**smile-listener** service — the vendored
+[mskcc/smile-client](https://github.com/mskcc/smile-client) copy in
+`listener/`, running as the `smile-listener` compose service — consumes
+them and POSTs each message to the app's internal `POST /v1/ingest/nats`
+endpoint. For local work, `scripts/mock_smile.py` stands in for SMILE.
+
+**1. Bring up the full stack** (this Mac has no Docker — Podman):
+
+    podman compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+Services: `app` (in-container ingest target on :8123, not published to
+the host), `db` (:5435), `keycloak` (:8080), `keycloak-db`, `nats`
+(:4222 client / :8222 monitor), one-shot `nats-init` (creates the
+`MDB_STREAM` stream), and `smile-listener`. Verify: `curl
+http://127.0.0.1:8000/health` (the host-side app), `curl
+http://127.0.0.1:8080/health/ready`, and `curl http://127.0.0.1:8222/jsz`
+(the JetStream summary — `streams: 1` once `MDB_STREAM` is created).
+
+**2. Log in through dev Keycloak** — open
+`http://127.0.0.1:8000/login` in a browser (realm `master`; the one-time
+client/user setup and the allow-listed user are described in the
+[Authentication (Keycloak)](#authentication-keycloak) section). Browser
+login runs against the host-side uvicorn process, not the container app.
+
+**3. Publish the vendored fixtures** in this order:
+
+    python scripts/mock_smile.py pub new-request   tests/fixtures/nats/99908_C_new_request.json
+    python scripts/mock_smile.py pub update-sample tests/fixtures/nats/99908_C_1_update_sample.json
+    python scripts/mock_smile.py pub request-update tests/fixtures/nats/99990_D_request_update.json
+
+**Expected state** (verify against `127.0.0.1:5435`, user `app`):
+
+- the 5 samples of request `99908_C` are registered with
+  `file_group = 'SMILE'`; each carries
+  `additional_metadata["requestMetadata"]` (parsed from `requestJson`)
+  and `["requestStatus"]`;
+- `99908_C_1` ends up `TUMOR` (the update flips it) with its
+  `sampleMetadataList` preserved; its `Frozen` + `Tissue`
+  preservation/origin combination is unresolvable, so it stays unpaired
+  by design;
+- `99990_D_2` has no registered samples, so the request-update is
+  reported missing (WARN in the app log) and changes nothing. If the
+  dev DB already holds `99990_D_2` samples from an earlier populate,
+  they are updated in place instead.
+
+**Proving the auto-pairing path:** the fixtures alone complete no
+pairing. `scripts/e2e_nats.py` therefore also publishes one synthetic
+`new-request` whose single TUMOR mirrors an existing pairable NORMAL
+(patient, gene panel, bait set, run mode and preservation copied from
+it) and asserts the resulting `pairing_table` row has
+`trigger_type = 'automatic'`.
+
+**4. Re-runnable automation** (assumes the stack is already up):
+
+    python scripts/e2e_nats.py
+
+It idempotently re-publishes the three fixtures, re-runs every assertion
+above, proves the auto-pairing path and exits 0/1 with a printed
+summary. The matching integration test is `tests/test_nats_e2e.py`
+(skips only when the NATS server or the dev DB is genuinely
+unreachable).
+
 ## API
 
 - `GET /health` — liveness probe.
