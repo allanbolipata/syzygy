@@ -1,3 +1,5 @@
+import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,11 +15,14 @@ from bait_sets import seed_bait_sets
 from auth import get_current_user, router as auth_router
 from routers.bait_sets import router as bait_sets_router
 from routers.machines import router as machines_router
+from routers.nats_ingest import router as nats_ingest_router
 from routers.patients import router as patients_router
 from routers.pairing_logic import router as pairing_logic_router
 from routers.pairings import router as pairings_router
 from routers.requests import router as requests_router
 from routers.samples import router as samples_router
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 
 @asynccontextmanager
@@ -84,6 +89,10 @@ app.include_router(
 app.include_router(
     machines_router, prefix="/v1", dependencies=[Depends(get_current_user)]
 )
+# Internal NATS ingest endpoint for the standalone smile-listener service.
+# Token-auth is handled inside the endpoint (shared X-NATS-Token), not via
+# the Keycloak dependency; the app itself never connects to NATS.
+app.include_router(nats_ingest_router, prefix="/v1")
 app.include_router(
     bait_sets_router, prefix="/v1", dependencies=[Depends(get_current_user)]
 )

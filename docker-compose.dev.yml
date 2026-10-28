@@ -13,14 +13,77 @@ services:
     # The dev database sits on the shared network as `db`. The host-side
     # app (run from .venv for local logins) reaches it at 127.0.0.1:5435
     # via .env (see .env.example).
+    #
+    # The in-container app exists here as the NATS ingest target for the
+    # standalone smile-listener (reachable in-network at http://app:8123).
+    # It is deliberately NOT published on the host: browser login stays on
+    # the host-side uvicorn (issuer pitfall — the app must see the
+    # browser-side Keycloak URL, which only works from the host).
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8123"]
     environment:
       DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
       KEYCLOAK_URL: http://localhost:8080
+      # Shared secret the smile-listener sends as X-NATS-Token.
+      NATS_INGEST_TOKEN: dev-syzygy-nats-token
+    # Note: podman-compose concatenates list-valued keys across compose
+    # files, so the base file's healthcheck (probing 8000) cannot be
+    # overridden here. In dev the container app serves 8123 and therefore
+    # reports unhealthy — cosmetic; nothing depends on the app's health.
     depends_on:
       db:
         condition: service_healthy
     networks:
       - syzygy-dev
+
+  # Dev-only NATS server with JetStream enabled — required: the SMILE
+  # subjects are stored on the MDB_STREAM JetStream stream. (The official
+  # NATS image is the Docker library image `nats`; natsio/nats does not
+  # exist on Docker Hub.)
+  nats:
+    image: nats:2.15.2
+    # The official image's entrypoint IS the nats-server wrapper, so the
+    # command carries flags only (no "nats-server" token).
+    command: ["-js", "-http_port", "8222"]
+    container_name: syzygy-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    networks:
+      - syzygy-dev
+    restart: unless-stopped
+
+  # One-shot bootstrap: create the JetStream stream MDB_STREAM
+  # idempotently. Runs to completion before the listener starts and never
+  # restarts.
+  nats-init:
+    build: ./listener
+    command: ["python", "/app/init_nats_stream.py"]
+    environment:
+      NATS_URL: nats://nats:4222
+    depends_on:
+      - nats
+    networks:
+      - syzygy-dev
+    restart: "no"
+
+  # Standalone smile-client consumer: one durable consumer on the wildcard
+  # MDB_STREAM.server.cpt-gateway.> receives all three cmo subjects and
+  # POSTs each message to the app's internal ingest endpoint.
+  smile-listener:
+    build: ./listener
+    command: ["python", "/app/run.py"]
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_FILTER_SUBJECT: "MDB_STREAM.server.cpt-gateway.>"
+      NATS_DURABLE: "syzygy"
+      SYZYGY_APP_URL: http://app:8123
+      SYZYGY_NATS_TOKEN: dev-syzygy-nats-token
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+    networks:
+      - syzygy-dev
+    restart: unless-stopped
 
   # Dev-only database, NOT part of the production stack.
   db:
