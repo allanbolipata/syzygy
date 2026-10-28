@@ -524,6 +524,26 @@ gets `403`. Provision users with:
    `KEYCLOAK_URL` at the externally managed org Keycloak instead
    (see Docker compose).
 
+**Keycloak-free local login (dev only):** to skip Keycloak entirely
+(client setup, user creation, allow-list provisioning), set
+`DEV_AUTH_TOKEN` in the app environment (e.g. add `DEV_AUTH_TOKEN=...`
+to `.env`) and start only the services you need — `db`, plus
+`nats`/`nats-init`/`smile-listener` when testing ingest:
+
+    podman compose -f docker-compose.yml -f docker-compose.dev.yml up -d db
+    DEV_AUTH_TOKEN=*** uvicorn main:app --reload
+
+`http://localhost:8000/login` then shows a *Sign in (local dev
+admin)* button; clicking it issues the `auth_token` cookie directly —
+no Keycloak round trip — and signs you in with a full local session
+(`sub` `dev-admin`, email from `DEV_AUTH_EMAIL`, default
+`dev-admin@syzygy.local`) with no `allowed_users` row needed. The
+token is also accepted as `Authorization: Bearer <token>` for API
+scripts. When `DEV_AUTH_TOKEN` is empty (the default; always in
+production) this path is off and the Keycloak flow is the only one.
+The login page detects the mode via `GET /auth/dev-login`, which
+returns only the boolean flag — never the token.
+
 `/health`, `/`, `/login`, `/ui`, `/docs`, `/redoc` and
 `/openapi.json` stay public, as do the OAuth dance paths
 `/auth/redirect`, `/auth/callback` and `/auth/logout`; `/auth/me`
