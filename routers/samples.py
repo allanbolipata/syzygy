@@ -106,6 +106,35 @@ def list_samples(
     return db.scalars(stmt).all()
 
 
+@router.get("/lookup", response_model=list[SampleRead])
+def lookup_samples_endpoint(
+    q: str = Query(..., min_length=1),
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """Case-insensitive partial-match lookup on ``primary_id`` and
+    ``cmo_sample_name`` only — the two sample identifiers used in manual
+    pairing workflows (the "Try Pairing" tab). Newest first."""
+    if limit is not None and (limit < 1 or limit > 10000):
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 10000")
+    if offset is not None and offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    like = f"%{q.strip()}%"
+    if not like.strip("%"):
+        raise HTTPException(status_code=400, detail="q must not be blank")
+    stmt = (
+        select(Sample)
+        .where(or_(Sample.primary_id.ilike(like), Sample.cmo_sample_name.ilike(like)))
+        .order_by(Sample.created_date.desc(), Sample.id.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    return db.scalars(stmt).all()
+
+
 @router.get("/{sample_id}/possible-matches", response_model=PossibleMatchesRead)
 def possible_matches_endpoint(
     sample_id: UUID,

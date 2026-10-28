@@ -67,9 +67,10 @@ def _sample(
     preservation: Optional[list] = None,
     sample_origin: Optional[list] = None,
 ):
-    # Real samples carry preservation data; the ARGOS gate requires
-    # resolvable, agreeing categories, so fixtures default to FFPE
-    # (callers can override to test the gate itself).
+    # Real samples carry preservation data; the ARGOS gate passes
+    # resolvable, agreeing categories (and skips sides with no data),
+    # so fixtures default to FFPE (callers can override to test the
+    # gate itself).
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",

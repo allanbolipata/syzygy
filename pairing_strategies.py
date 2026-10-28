@@ -17,9 +17,12 @@ Registered strategies:
     pooled normal tier (shared across patients). Beagle's v2.3.0 logic
     does not key on specimen/sample type, so it is not a matching key
     here (still stored on the sample). Preservation is a gate on every
-    tier, pooled included: both sides' (preservation, sample_origin)
-    must resolve to the same category ("ffpe"/"frozen"; see
-    ``resolve_preservation``), and an unresolvable side blocks the pair.
+    tier, pooled included: each side's (preservation, sample_origin)
+    resolves to a category ("ffpe"/"frozen") or is not considered when
+    both fields are empty (see ``resolve_preservation``); two considered
+    sides must agree, a not-considered side never blocks, and an
+    unresolvable side (a within-side conflict, or a junk origin when
+    preservation is empty) blocks the pair.
     The pooled tier also resolves run mode through the pooled_machines
     table (pool machine name -> machine class; tumor run_mode ->
     novaseq/hiseq family). DMP samples (``sample_type`` == "DMP") are
@@ -178,32 +181,47 @@ def normalize_run_mode(value: Optional[str], mapping: Optional[Dict[str, str]] =
     return v
 
 
-def resolve_preservation(preservation, sample_origin) -> str:
-    """Resolve (preservation, sample_origin) to "ffpe", "frozen", or "".
+def resolve_preservation(preservation, sample_origin) -> Optional[str]:
+    """Resolve (preservation, sample_origin) for the ARGOS preservation
+    gate.
 
-    Fuzzy, case-insensitive category resolution (ARGOS preservation
-    gate):
+    Returns one of:
+      * ``"ffpe"`` / ``"frozen"`` — the side's resolved category;
+      * ``""`` (empty string) — unresolvable: the fields conflict
+        (preservation says ffpe but the origin names frozen, or
+        vice versa), or preservation is empty and the origin alone
+        does not resolve to a category. An unresolvable side blocks
+        the pair;
+      * ``None`` — not considered: both fields empty. The gate does
+        not apply to that side and it never blocks.
+
+    Fuzzy, case-insensitive resolution:
       * preservation non-empty -> "ffpe" if any entry is "ffpe",
-        otherwise "frozen" (anything else);
+        otherwise "frozen" (anything else). sample_origin is then free
+        (junk origins like "Tissue" no longer block) unless it names
+        the OPPOSITE category: an ffpe-side with origin "frozen" /
+        "fresh or frozen", or a frozen-side with origin "ffpe", is
+        unresolvable (within-side conflict);
       * preservation empty, sample_origin non-empty -> the origin's
         category: "ffpe" for "ffpe"; "frozen" for "fresh or frozen" or
         "frozen"; any other origin value is unresolvable;
-      * both non-empty -> the two categories must agree (e.g.
-        preservation "Frozen" == sample_origin "Fresh or Frozen");
-        disagreement — or a present-but-unresolvable origin — is
-        unresolvable.
-    The empty string means unresolvable; the ARGOS gate blocks a pair
-    when either side is unresolvable.
+      * both empty -> not considered (None).
     """
     p = _value_set(preservation)
     o = _value_set(sample_origin)
+    if not p and not o:
+        return None
     p_cat = "ffpe" if "ffpe" in p else "frozen" if p else None
-    o_cat = _origin_category(o) if o else None
     if p_cat is None:
-        return o_cat or ""
-    if o_cat is None:
-        return "" if o else p_cat
-    return p_cat if p_cat == o_cat else ""
+        # Preservation empty: the origin alone decides.
+        return _origin_category(o) or ""
+    if (p_cat == "ffpe" and _FROZEN_ORIGIN_VALUES & o) or (
+        p_cat == "frozen" and "ffpe" in o
+    ):
+        # Preservation present, but the origin names the opposite
+        # category: within-side conflict -> unresolvable.
+        return ""
+    return p_cat
 
 
 @dataclass
@@ -501,11 +519,16 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     is dropped from the hard keys; it remains stored on the sample and
     is surfaced in pairing notes/reads.
 
-    Preservation is a soft gate on every tier, pooled included: each
-    side's (preservation, sample_origin) must resolve to the same
-    category via ``resolve_preservation`` (fuzzy, case-insensitive:
-    "ffpe"/"frozen"). A side that is unresolvable, or whose category
-    disagrees with the other side, blocks the pair.
+    Preservation is a soft gate on every tier, pooled included. Each
+    side's (preservation, sample_origin) resolves via
+    ``resolve_preservation``: a present preservation decides the
+    category (any "ffpe" entry -> "ffpe", anything else -> "frozen"),
+    with the sample origin free unless it names the opposite category
+    (a within-side conflict -> unresolvable); a missing preservation
+    lets a resolvable origin decide; both fields empty means the side
+    is not considered. When both sides are considered their categories
+    must agree; a not-considered side never blocks; an unresolvable
+    side (conflict, or a junk origin-only value) blocks the pair.
 
     Extends the default strategy with:
       * run-mode (sequencer) matching — the raw ``run_mode`` strings are
@@ -552,7 +575,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return str(sample.sample_type or "").lower() in self._pooled_types()
 
     @staticmethod
-    def _resolved_preservation(sample: Sample) -> str:
+    def _resolved_preservation(sample: Sample) -> Optional[str]:
         return resolve_preservation(sample.preservation, sample.sample_origin)
 
     @staticmethod
@@ -580,16 +603,27 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return reasons
 
     def _preservation_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
-        """Preservation agreement gate: both sides must resolve to the
-        same category; unresolvable on either side blocks the pair."""
-        t_cat = self._resolved_preservation(tumor)
-        n_cat = self._resolved_preservation(candidate)
-        if not t_cat:
-            return ["preservation unresolvable on tumor"]
-        if not n_cat:
-            return ["preservation unresolvable on normal"]
-        if t_cat != n_cat:
-            return [f"preservation mismatch ({t_cat} vs {n_cat})"]
+        """Preservation gate.
+
+        Each side resolves via ``resolve_preservation`` to "ffpe",
+        "frozen", "" (unresolvable), or None (not considered: both
+        fields empty). An unresolvable side blocks the pair (even
+        against a not-considered partner); a not-considered side never
+        blocks; two considered sides must agree on category.
+        """
+        t_res = self._resolved_preservation(tumor)
+        n_res = self._resolved_preservation(candidate)
+        reasons: List[str] = []
+        if t_res == "":
+            reasons.append("preservation unresolvable on tumor")
+        if n_res == "":
+            reasons.append("preservation unresolvable on normal")
+        if reasons:
+            return reasons
+        if t_res is None or n_res is None:
+            return []
+        if t_res != n_res:
+            return [f"preservation mismatch ({t_res} vs {n_res})"]
         return []
 
     @staticmethod

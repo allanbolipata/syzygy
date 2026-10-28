@@ -214,6 +214,10 @@ database:
   (`TUMOR`/`NORMAL`); `no_patient=true` restricts to samples with a
   null `patient_id` (e.g. pooled normals); `limit` / `offset`
   paginate.
+- `GET /v1/sample/lookup?q=&limit=&offset=` — case-insensitive
+  partial-match lookup on `primary_id` and `cmo_sample_name` only (the
+  sample identifiers used in manual pairing workflows), newest first;
+  powers the Try Pairing tab's sample picker.
 - `GET /v1/patient` — patients derived from samples (a patient is a
   distinct non-null `patient_id`), sorted by `patient_id`. Returns
   sample/tumor/normal counts, the patient's distinct `request_id`s, and
@@ -313,8 +317,8 @@ database:
 
 A basic static web UI (no build step, no extra dependencies) is served
 at `/ui`; the root path `/` redirects there. It has tabs for samples,
-patients, requests, pooled normals, pairs by logic, and matches &
-overrides, and lets you:
+patients, requests, pooled normals, pairs by logic, matches &
+overrides, and a read-only Try Pairing dry-run tab, and lets you:
 
 - query and filter samples (search plus per-field filters on
   primary_id, cmo_sample_name, patient, request, sample type, gene
@@ -341,18 +345,35 @@ overrides, and lets you:
   it directly, pre-selecting the logic the sample is currently paired
   under when known;
 - browse pairs by logic: pick a pairing logic to list its current
-  pairs (tumor `primary_id`, normal `primary_id`, bait set —
-  `GET /v1/pairing?latest=true`) and download the table as CSV or TSV;
+  pairs (`GET /v1/pairing?latest=true`) and download the table as CSV
+  or TSV. A column picker chooses which metadata columns to view and
+  export — the original three (tumor `primary_id`, normal
+  `primary_id`, bait set) plus per-side sample metadata (patient id,
+  `cmo_sample_name`, role, sample type, gene panel, request id, run
+  mode, file group, preservation, sample origin, sequencing date,
+  additional metadata, errors, sample id) and pairing-level fields
+  (logic, trigger type, mismatched keys, created date); an "All
+  metadata" button selects every column in one click, and the export
+  contains exactly the selected columns;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the
-  recorded mismatches shown afterwards.
+  recorded mismatches shown afterwards;
+- dry-run pairing (Try Pairing tab, read-only — never creates, updates,
+  or overrides a pairing): resolve a sample by `primary_id` or
+  `cmo_sample_name` (case-insensitive, via `GET /v1/sample/lookup`),
+  pick any pairing logic (the sample's bait-set logic is preselected
+  when known), and preview what the cascade would do — cascade tier,
+  candidates, mismatch reasons, and the candidate the cascade would
+  pick — via `GET /v1/sample/{id}/possible-matches`; an explainer panel
+  describes how the selected logic pairs, sourced from
+  `pairing_strategies.py`.
 
 Navigation state lives in the URL hash (`#/samples`,
 `#/patients/<patient_id>`, `#/requests/<request_id>`,
-`#/matches/<primary_id>`, `#/pooled`, `#/pairs`), so the browser
-Back/Forward buttons, page reloads, and shared links all work; every
-navigation pushes a history entry.
+`#/matches/<primary_id>`, `#/try/<primary_id>`, `#/pooled`,
+`#/pairs`), so the browser Back/Forward buttons, page reloads, and
+shared links all work; every navigation pushes a history entry.
 
 ## Authentication (Keycloak)
 
@@ -464,12 +485,16 @@ dict customizes the strategy at use time.
     match the tumor's run-mode family (a NovaSeq X run is a NovaSeq
     machine).
   - **preservation gating** — each side's `preservation` /
-    `sample_origin` must resolve to the same category, fuzzily
-    (case-insensitive): preservation `FFPE` → ffpe, anything else →
-    frozen; `sample_origin` (checked when preservation is empty)
-    resolves `FFPE` → ffpe and `Fresh or Frozen` / `frozen` →
-    frozen. When both fields are present they must agree; a sample
-    that is unresolvable, or that disagrees with the other side,
+    `sample_origin` resolves to a category, fuzzily
+    (case-insensitive): a present `preservation` decides (an entry
+    containing `FFPE` → ffpe, anything else → frozen), and
+    `sample_origin` is free then unless it names the opposite
+    category (a within-side conflict → unresolvable); a missing
+    `preservation` lets a resolvable `sample_origin` decide (`FFPE` →
+    ffpe; `Fresh or Frozen` / `frozen` → frozen; anything else →
+    unresolvable); both fields empty means the side is **not
+    considered**. When both sides are considered their categories must
+    agree; a not-considered side never blocks; an unresolvable side
     blocks the pair — including in the pooled tier.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,

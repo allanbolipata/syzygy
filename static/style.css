@@ -30,6 +30,7 @@ header {
 }
 header h1 { font-size: 1.15rem; margin: 0; }
 header .sub { color: var(--muted); font-weight: 400; font-size: 0.9rem; }
+h2 .sub { color: var(--muted); font-weight: 400; font-size: 0.9rem; }
 nav.tabs { margin-left: auto; }
 header .user-area { display: flex; align-items: baseline; gap: 0.7rem; }
 #current-user { color: var(--muted); font-size: 0.9rem; }
@@ -88,6 +89,29 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   display: flex; flex-direction: column; gap: 0.2rem;
   font-size: 0.8rem; color: var(--muted);
 }
+
+/* Column picker on the "Pairs by Logic" tab. */
+.colpick {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.8rem 0.6rem;
+  margin: 0 0 0.6rem;
+}
+.colpick-head { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
+.colpick-head strong { font-size: 0.82rem; }
+.colpick-grid { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-top: 0.45rem; }
+.col-group {
+  width: 100%;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 0.3rem;
+}
+.col-group:first-child { margin-top: 0; }
+.col-check { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; cursor: pointer; }
+.col-check input { width: auto; min-width: 0; margin: 0; }
 .filters input, .actions input, .actions select, .filters select,
 #m-sample, #m-logic {
   font: inherit;
