@@ -1064,33 +1064,121 @@ for (const id of ["#pm-name", "#pm-class", "#pm-type"]) {
   });
 }
 
-/* ---------- pairs-by-logic view ---------- */
+/* ---------- pairs-by-logic view (selectable columns) ---------- */
 
-const pairsState = { rows: [], logic: null };
-const PAIR_HEADER = ["TUMOR_SAMPLE", "NORMAL_SAMPLE", "BAIT_SET"];
+/* Plain-text renderer shared by the on-screen cells and the CSV/TSV
+ * export: nulls become empty strings, JSON lists are joined, objects are
+ * compacted to JSON. */
+function pairText(v) {
+  if (v === null || v === undefined || v === "") return "";
+  if (Array.isArray(v)) return v.map(pairText).join(", ");
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+function pairDate(v) {
+  if (!v) return "";
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toISOString().slice(0, 16).replace("T", " ");
+}
+
+/* Every column the pairs table can show/export, in canonical order (that
+ * order drives the table and the export). The first three are the original
+ * columns and form the default selection, so the default view and export
+ * are unchanged. ``text`` maps a PairingRead row to the column's value. */
+const PAIR_COLUMNS = [
+  { key: "tumor_primary_id", header: "TUMOR_SAMPLE", group: "Tumor sample", text: (r) => r.tumor.primary_id },
+  { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id },
+  { key: "tumor_bait_set", header: "BAIT_SET", group: "Tumor sample", text: (r) => r.tumor.bait_set || "" },
+  { key: "tumor_patient_id", header: "TUMOR_PATIENT_ID", group: "Tumor sample", text: (r) => r.tumor.patient_id || "" },
+  { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name) },
+  { key: "tumor_role", header: "TUMOR_ROLE", group: "Tumor sample", text: (r) => r.tumor.tumor_or_normal || "" },
+  { key: "tumor_sample_type", header: "TUMOR_SAMPLE_TYPE", group: "Tumor sample", text: (r) => r.tumor.sample_type || "" },
+  { key: "tumor_gene_panel", header: "TUMOR_GENE_PANEL", group: "Tumor sample", text: (r) => r.tumor.gene_panel || "" },
+  { key: "tumor_request_id", header: "TUMOR_REQUEST_ID", group: "Tumor sample", text: (r) => r.tumor.request_id || "" },
+  { key: "tumor_run_mode", header: "TUMOR_RUN_MODE", group: "Tumor sample", text: (r) => r.tumor.run_mode || "" },
+  { key: "tumor_file_group", header: "TUMOR_FILE_GROUP", group: "Tumor sample", text: (r) => r.tumor.file_group || "" },
+  { key: "tumor_preservation", header: "TUMOR_PRESERVATION", group: "Tumor sample", text: (r) => pairText(r.tumor.preservation) },
+  { key: "tumor_sample_origin", header: "TUMOR_SAMPLE_ORIGIN", group: "Tumor sample", text: (r) => pairText(r.tumor.sample_origin) },
+  { key: "tumor_sequencing_date", header: "TUMOR_SEQUENCING_DATE", group: "Tumor sample", text: (r) => pairDate(r.tumor.sequencing_date) },
+  { key: "tumor_additional_metadata", header: "TUMOR_ADDITIONAL_METADATA", group: "Tumor sample", text: (r) => pairText(r.tumor.additional_metadata) },
+  { key: "tumor_errors", header: "TUMOR_ERRORS", group: "Tumor sample", text: (r) => (r.tumor.errors || []).join("; ") },
+  { key: "tumor_id", header: "TUMOR_ID", group: "Tumor sample", text: (r) => r.tumor.id },
+  { key: "normal_bait_set", header: "NORMAL_BAIT_SET", group: "Normal sample", text: (r) => r.normal.bait_set || "" },
+  { key: "normal_patient_id", header: "NORMAL_PATIENT_ID", group: "Normal sample", text: (r) => r.normal.patient_id || "" },
+  { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name) },
+  { key: "normal_role", header: "NORMAL_ROLE", group: "Normal sample", text: (r) => r.normal.tumor_or_normal || "" },
+  { key: "normal_sample_type", header: "NORMAL_SAMPLE_TYPE", group: "Normal sample", text: (r) => r.normal.sample_type || "" },
+  { key: "normal_gene_panel", header: "NORMAL_GENE_PANEL", group: "Normal sample", text: (r) => r.normal.gene_panel || "" },
+  { key: "normal_request_id", header: "NORMAL_REQUEST_ID", group: "Normal sample", text: (r) => r.normal.request_id || "" },
+  { key: "normal_run_mode", header: "NORMAL_RUN_MODE", group: "Normal sample", text: (r) => r.normal.run_mode || "" },
+  { key: "normal_file_group", header: "NORMAL_FILE_GROUP", group: "Normal sample", text: (r) => r.normal.file_group || "" },
+  { key: "normal_preservation", header: "NORMAL_PRESERVATION", group: "Normal sample", text: (r) => pairText(r.normal.preservation) },
+  { key: "normal_sample_origin", header: "NORMAL_SAMPLE_ORIGIN", group: "Normal sample", text: (r) => pairText(r.normal.sample_origin) },
+  { key: "normal_sequencing_date", header: "NORMAL_SEQUENCING_DATE", group: "Normal sample", text: (r) => pairDate(r.normal.sequencing_date) },
+  { key: "normal_additional_metadata", header: "NORMAL_ADDITIONAL_METADATA", group: "Normal sample", text: (r) => pairText(r.normal.additional_metadata) },
+  { key: "normal_errors", header: "NORMAL_ERRORS", group: "Normal sample", text: (r) => (r.normal.errors || []).join("; ") },
+  { key: "normal_id", header: "NORMAL_ID", group: "Normal sample", text: (r) => r.normal.id },
+  { key: "pairing_logic", header: "PAIRING_LOGIC", group: "Pairing", text: (r) => r.pairing_logic },
+  { key: "trigger_type", header: "TRIGGER_TYPE", group: "Pairing", text: (r) => r.trigger_type || "" },
+  { key: "mismatched_keys", header: "MISMATCHED_KEYS", group: "Pairing", text: (r) => (r.mismatched_keys || []).join("; ") },
+  { key: "created_date", header: "CREATED_DATE", group: "Pairing", text: (r) => pairDate(r.created_date) },
+];
+const PAIR_DEFAULT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"];
+const PAIR_GROUPS = ["Tumor sample", "Normal sample", "Pairing"];
+
+const pairsState = { rows: [], logic: null, selected: new Set(PAIR_DEFAULT_KEYS) };
+
+function selectedPairColumns() {
+  return PAIR_COLUMNS.filter((c) => pairsState.selected.has(c.key));
+}
+
+/* Checkbox picker, grouped by side in PAIR_GROUPS order. */
+function renderPairsColumns() {
+  const byGroup = new Map(PAIR_GROUPS.map((g) => [g, []]));
+  for (const c of PAIR_COLUMNS) byGroup.get(c.group).push(c);
+  $("#pr-columns").innerHTML = PAIR_GROUPS.map((g) =>
+    `<div class="col-group">${esc(g)}</div>` +
+    byGroup.get(g).map((c) =>
+      `<label class="col-check"><input type="checkbox" data-pcol="${c.key}"${pairsState.selected.has(c.key) ? " checked" : ""}>${esc(c.header)}</label>`
+    ).join("")
+  ).join("");
+}
+
+function renderPairsTable() {
+  const cols = selectedPairColumns();
+  $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) => `<th>${esc(c.header)}</th>`).join("")}</tr>`;
+  $("#pairs-table tbody").innerHTML = pairsState.rows.map((r) =>
+    `<tr>${cols.map((c) => `<td>${esc(c.text(r))}</td>`).join("")}</tr>`).join("");
+  const empty = pairsState.rows.length === 0 || cols.length === 0;
+  $("#pr-empty").classList.toggle("hidden", !empty);
+  $("#pr-count").textContent = cols.length === 0
+    ? "no columns selected"
+    : `${pairsState.rows.length} pair${pairsState.rows.length === 1 ? "" : "s"}`;
+  $("#pr-download").disabled = empty;
+}
 
 async function loadPairs() {
   const logic = $("#pr-logic").value;
   if (!logic) return;
   try {
-    const rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
-    pairsState.rows = rows.map((r) => [r.tumor.primary_id, r.normal.primary_id, r.tumor.bait_set || ""]);
+    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
     pairsState.logic = logic;
-    $("#pairs-table tbody").innerHTML = pairsState.rows.map((r) =>
-      `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("");
-    $("#pr-empty").classList.toggle("hidden", rows.length > 0);
-    $("#pr-count").textContent = `${rows.length} pair${rows.length === 1 ? "" : "s"}`;
-    $("#pr-download").disabled = rows.length === 0;
+    renderPairsTable();
   } catch (e) {
     banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
   }
 }
 
 function downloadPairs() {
+  if (!pairsState.logic) return;
+  const cols = selectedPairColumns();
+  if (cols.length === 0 || pairsState.rows.length === 0) return;
   const tsv = $("#pr-format").value === "tsv";
   const sep = tsv ? "\t" : ",";
   const cell = (v) => (!tsv && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v.replace(/[\t\r\n]/g, " "));
-  const text = [PAIR_HEADER, ...pairsState.rows].map((r) => r.map(cell).join(sep)).join("\n") + "\n";
+  const rows = [cols.map((c) => c.header), ...pairsState.rows.map((r) => cols.map((c) => c.text(r)))];
+  const text = rows.map((r) => r.map(cell).join(sep)).join("\n") + "\n";
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([text], { type: tsv ? "text/tab-separated-values" : "text/csv" }));
   a.download = `pairs_${pairsState.logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
@@ -1103,6 +1191,24 @@ function downloadPairs() {
 $("#pr-logic").addEventListener("change", loadPairs);
 $("#pr-download").addEventListener("click", downloadPairs);
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
+$("#pr-columns").addEventListener("change", (e) => {
+  const cb = e.target;
+  if (!cb.dataset || !cb.dataset.pcol) return;
+  if (cb.checked) pairsState.selected.add(cb.dataset.pcol);
+  else pairsState.selected.delete(cb.dataset.pcol);
+  renderPairsTable();
+});
+$("#pr-cols-all").addEventListener("click", () => {
+  for (const c of PAIR_COLUMNS) pairsState.selected.add(c.key);
+  renderPairsColumns();
+  renderPairsTable();
+});
+$("#pr-cols-default").addEventListener("click", () => {
+  pairsState.selected = new Set(PAIR_DEFAULT_KEYS);
+  renderPairsColumns();
+  renderPairsTable();
+});
+renderPairsColumns();
 
 /* ---------- try pairing view (dry run) ---------- */
 

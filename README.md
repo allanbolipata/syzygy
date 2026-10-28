@@ -345,8 +345,16 @@ overrides, and a read-only Try Pairing dry-run tab, and lets you:
   it directly, pre-selecting the logic the sample is currently paired
   under when known;
 - browse pairs by logic: pick a pairing logic to list its current
-  pairs (tumor `primary_id`, normal `primary_id`, bait set —
-  `GET /v1/pairing?latest=true`) and download the table as CSV or TSV;
+  pairs (`GET /v1/pairing?latest=true`) and download the table as CSV
+  or TSV. A column picker chooses which metadata columns to view and
+  export — the original three (tumor `primary_id`, normal
+  `primary_id`, bait set) plus per-side sample metadata (patient id,
+  `cmo_sample_name`, role, sample type, gene panel, request id, run
+  mode, file group, preservation, sample origin, sequencing date,
+  additional metadata, errors, sample id) and pairing-level fields
+  (logic, trigger type, mismatched keys, created date); an "All
+  metadata" button selects every column in one click, and the export
+  contains exactly the selected columns;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the

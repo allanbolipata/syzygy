@@ -219,7 +219,7 @@
 <main id="view-pairs" class="view hidden">
   <section class="panel">
     <h2>Pairs by pairing logic</h2>
-    <p class="hint">Current (latest) pairings under the selected logic. Download uses <code>primary_id</code> for samples and the tumor's bait set.</p>
+    <p class="hint">Current (latest) pairings under the selected logic. Check the columns to view and export &mdash; the download contains exactly the selected columns.</p>
     <div class="filters">
       <label>pairing logic
         <select id="pr-logic"></select>
@@ -233,9 +233,18 @@
       <button id="pr-download" disabled>Download</button>
       <span id="pr-count" class="hint"></span>
     </div>
+    <div class="colpick">
+      <div class="colpick-head">
+        <strong>Columns</strong>
+        <span class="hint">Viewed and exported exactly as checked.</span>
+        <button type="button" class="small" id="pr-cols-all">All metadata</button>
+        <button type="button" class="small" id="pr-cols-default">Default</button>
+      </div>
+      <div class="colpick-grid" id="pr-columns"></div>
+    </div>
     <div class="table-wrap">
       <table id="pairs-table">
-        <thead><tr><th>TUMOR_SAMPLE</th><th>NORMAL_SAMPLE</th><th>BAIT_SET</th></tr></thead>
+        <thead></thead>
         <tbody></tbody>
       </table>
     </div>
