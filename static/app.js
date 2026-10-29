@@ -73,7 +73,7 @@ async function api(path, opts) {
 
 /* Navigation state lives in the URL hash, so browser Back/Forward, reloads
  * and shared links all work:
- *   #/samples   #/patients[/<patient_id>]   #/requests[/<request_id>]
+ *   #/samples   #/patients[/<patient__cmo>]   #/requests[/<request_id>]
  *   #/matches[/<sample primary_id>]
  * Every navigation (tab switch, opening/closing a detail panel, opening
  * matches for a sample) pushes a history entry. */
@@ -90,7 +90,7 @@ function currentViewName() {
 function currentHash() {
   const view = currentViewName() || "samples";
   let id = null;
-  if (view === "patients" && patientsState.patient) id = patientsState.patient.patient_id;
+  if (view === "patients" && patientsState.patient) id = patientsState.patient.patient__cmo;
   else if (view === "requests" && requestsState.request) id = requestsState.request.request_id;
   else if (view === "matches" && matchesState.sample) id = matchesState.sample.primary_id;
   else if (view === "try" && tryState.sample) id = tryState.sample.primary_id;
@@ -134,9 +134,9 @@ async function restoreFromHash() {
     showView(view);
     if (view === "patients") {
       if (!id) closePatientDetail();
-      else if (!patientsState.patient || patientsState.patient.patient_id !== id) {
+      else if (!patientsState.patient || patientsState.patient.patient__cmo !== id) {
         const rows = await api(`/patient/?q=${encodeURIComponent(id)}&limit=200`);
-        const row = rows.find((p) => p.patient_id === id);
+        const row = rows.find((p) => p.patient__cmo === id);
         if (row) await openPatient(row);
         else banner("error", `Patient ${esc(id)} not found.`, true);
       }
@@ -181,14 +181,14 @@ document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => showView(btn.dataset.tab));
 });
 
-/* ---------- cross-view navigation (patient_id / request_id links) ---------- */
+/* ---------- cross-view navigation (patient__cmo / request_id links) ---------- */
 
 function navigateToPatient(patientId) {
   $("#p-q").value = patientId;
   showView("patients");
   loadPatients().then((results) => {
     if (!results) return;
-    const row = results.find((p) => p.patient_id === patientId);
+    const row = results.find((p) => p.patient__cmo === patientId);
     if (row) openPatient(row);
     else banner("error", `No patient found with id ${esc(patientId)}.`, true);
   });
@@ -210,7 +210,7 @@ function navigateToRequest(requestId) {
 const samplesState = { limit: 50, offset: 0, results: [] };
 
 const SAMPLE_FILTER_IDS = [
-  "primary_id", "cmo_sample_name", "patient_id", "request_id",
+  "primary_id", "cmo_sample_name", "patient__cmo", "request_id",
   "sample_type", "gene_panel", "bait_set", "run_mode", "file_group",
 ];
 
@@ -247,8 +247,10 @@ function renderSamples() {
     <tr class="click" data-id="${s.id}">
       <td>${esc(s.primary_id)}</td>
       <td>${esc(s.cmo_sample_name)}</td>
-      <td>${esc(s.patient_id || "")}</td>
-      <td>${esc(s.request_id || "")}</td>
+      <td>${esc(s.patient__cmo || "—")}</td>
+      <td>${esc(s.patient__dmp || "—")}</td>
+      <td>${esc(s.anon_id || "—")}</td>
+      <td>${esc(s.request_id)}</td>
       <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
       <td>${esc(s.sample_type)}</td>
       <td>${esc(s.gene_panel)}</td>
@@ -367,7 +369,7 @@ async function openMatchesFor(sample) {
 }
 
 function sampleLabel(s) {
-  return `${s.primary_id} — ${s.cmo_sample_name} (${s.patient_id || "no patient"}, ${s.tumor_or_normal})`;
+  return `${s.primary_id} — ${s.cmo_sample_name} (${s.patient__cmo || "no patient"}, ${s.tumor_or_normal})`;
 }
 
 async function searchMatchesSamples() {
@@ -436,7 +438,9 @@ function renderMatches(data, logic) {
       <dt>id</dt><dd>${esc(s.id)}</dd>
       <dt>primary_id</dt><dd>${esc(s.primary_id)}</dd>
       <dt>cmo_sample_name</dt><dd>${esc(s.cmo_sample_name)}</dd>
-      <dt>patient_id</dt><dd>${s.patient_id ? `<span class="nav-link" data-nav-patient="${esc(s.patient_id)}" title="Go to the patient page">${esc(s.patient_id)}</span>` : "—"}</dd>
+      <dt>patient__cmo</dt><dd>${s.patient__cmo ? `<span class="nav-link" data-nav-patient="${esc(s.patient__cmo)}" title="Go to the patient page">${esc(s.patient__cmo)}</span>` : "—"}</dd>
+      <dt>patient__dmp</dt><dd>${esc(s.patient__dmp || "—")}</dd>
+      <dt>anon_id</dt><dd>${esc(s.anon_id || "—")}</dd>
       <dt>request_id</dt><dd>${s.request_id ? `<span class="nav-link" data-nav-request="${esc(s.request_id)}" title="Show the samples for this request">${esc(s.request_id)}</span>` : "—"}</dd>
       <dt>role</dt><dd><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></dd>
       <dt>sample_type</dt><dd>${esc(s.sample_type)}</dd>
@@ -449,7 +453,7 @@ function renderMatches(data, logic) {
       <dt>sequencing_date</dt><dd>${fmtDate(s.sequencing_date)}</dd>
       <dt>errors</dt><dd>${s.errors && s.errors.length ? esc(s.errors.join("; ")) : "—"}</dd>
     </dl>
-    <p class="hint">Click patient_id / request_id to go to that patient's or request's page.</p>`;
+    <p class="hint">Click patient__cmo / request_id to go to that patient's or request's page.</p>`;
 
   // Current matches: a tumor has at most one; a normal matches 1-to-many
   // and lists every currently-paired tumor here.
@@ -466,7 +470,7 @@ function renderMatches(data, logic) {
         <div class="current-match">
           <dl class="kv">
             <dt>matched ${counterpartWord}</dt>
-            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${esc(c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient_id || "no patient")})</span></dd>
+            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${esc(c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient__cmo || "no patient")})</span></dd>
             <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
             <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
           </dl>
@@ -491,7 +495,8 @@ function renderMatches(data, logic) {
     return `
       <tr class="${c.would_be_selected ? "current click" : "click"}" data-sample-id="${esc(cs.id)}" title="Open this sample's matches &amp; overrides">
         <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
-        <td>${esc(cs.patient_id || "—")}</td>
+        <td>${esc(cs.patient__cmo || "—")}</td>
+        <td>${esc(cs.patient__dmp || "—")}</td>
         <td><span class="badge tier">${esc(c.tier)}</span></td>
         <td>${status}</td>
         <td>${c.mismatched_keys ? keyList(c.mismatched_keys) : "—"}</td>
@@ -553,7 +558,7 @@ $("#m-others-next").addEventListener("click", () => {
   if (next < matchesState.othersTotal) showMatches(next);
 });
 
-/* Sample panel: click a patient_id / request_id value to go to its page. */
+/* Sample panel: click a patient__cmo / request_id value to go to its page. */
 $("#m-summary").addEventListener("click", (e) => {
   const el = e.target.closest("[data-nav-patient],[data-nav-request]");
   if (!el) return;
@@ -635,8 +640,8 @@ function renderPatients() {
     const meta = Object.entries(p.metadata)
       .map(([k, v]) => `${esc(k)}: ${metaText(v)}`).join(", ");
     return `
-      <tr class="click" data-pid="${esc(p.patient_id)}">
-        <td>${esc(p.patient_id)}</td>
+      <tr class="click" data-pid="${esc(p.patient__cmo)}">
+        <td>${esc(p.patient__cmo)}</td>
         <td>${p.sample_count}</td>
         <td>${p.tumor_count}</td>
         <td>${p.normal_count}</td>
@@ -647,7 +652,7 @@ function renderPatients() {
   $("#p-empty").classList.toggle("hidden", rows.length > 0);
   tbody.querySelectorAll("tr[data-pid]").forEach((tr) => {
     tr.addEventListener("click", () => {
-      const row = rows.find((p) => p.patient_id === tr.dataset.pid);
+      const row = rows.find((p) => p.patient__cmo === tr.dataset.pid);
       if (row) openPatient(row);
     });
   });
@@ -688,7 +693,7 @@ async function openPatient(row) {
   patientsState.patient = row;
   $("#p-detail").classList.remove("hidden");
   pushNav();
-  $("#p-detail-title").textContent = `Patient ${row.patient_id}`;
+  $("#p-detail-title").textContent = `Patient ${row.patient__cmo}`;
   $("#p-detail-meta").innerHTML =
     `<dt>samples</dt><dd>${row.sample_count} (${row.tumor_count} tumors, ${row.normal_count} normals)</dd>` +
     `<dt>requests</dt><dd>${esc((row.requests || []).join(", ") || "—")}</dd>` +
@@ -699,8 +704,8 @@ async function openPatient(row) {
   $("#p-samples-empty").classList.remove("hidden");
   try {
     const [samples] = await Promise.all([
-      api(`/sample/?patient_id=${encodeURIComponent(row.patient_id)}&limit=200`),
-      loadPairingMap({ patient_id: row.patient_id }),
+      api(`/sample/?patient__cmo=${encodeURIComponent(row.patient__cmo)}&limit=200`),
+      loadPairingMap({ patient__cmo: row.patient__cmo }),
     ]);
     patientsState.patientSamples = samples;
     tbody.innerHTML = samples.map((s) => `
@@ -810,12 +815,12 @@ async function openRequest(row) {
     const samples = (requestsState.requestSamples =
       fetchedSamples.filter((s) => s.request_id === row.request_id));
 
-    // Per-patient counts within this request (non-null patient_id only).
+    // Per-patient counts within this request (non-null patient__cmo only).
     const byPatient = {};
     for (const s of samples) {
-      if (!s.patient_id) continue;
-      const g = (byPatient[s.patient_id] =
-        byPatient[s.patient_id] || { patient_id: s.patient_id, count: 0, tumor: 0, normal: 0 });
+      if (!s.patient__cmo) continue;
+      const g = (byPatient[s.patient__cmo] =
+        byPatient[s.patient__cmo] || { patient__cmo: s.patient__cmo, count: 0, tumor: 0, normal: 0 });
       g.count += 1;
       if (s.tumor_or_normal === "TUMOR") g.tumor += 1;
       else if (s.tumor_or_normal === "NORMAL") g.normal += 1;
@@ -828,7 +833,7 @@ async function openRequest(row) {
         <td>${esc(s.cmo_sample_name)}</td>
         <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
         <td>${esc(s.sample_type)}</td>
-        <td>${esc(s.patient_id || "")}</td>
+        <td>${esc(s.patient__cmo || "")}</td>
         <td>${currentMatchCell(s.id)}</td>
       </tr>`).join("");
     $("#r-samples-empty").classList.toggle("hidden", samples.length > 0);
@@ -840,8 +845,8 @@ async function openRequest(row) {
     });
 
     pbody.innerHTML = requestsState.requestPatients.map((p) => `
-      <tr class="click" data-pid="${esc(p.patient_id)}">
-        <td>${esc(p.patient_id)}</td>
+      <tr class="click" data-pid="${esc(p.patient__cmo)}">
+        <td>${esc(p.patient__cmo)}</td>
         <td>${p.count}</td>
         <td>${p.tumor}</td>
         <td>${p.normal}</td>
@@ -862,7 +867,7 @@ async function openPatientFromRequest(patientId) {
   showView("patients");
   try {
     const rows = await api(`/patient/?q=${encodeURIComponent(patientId)}&limit=200`);
-    const row = rows.find((p) => p.patient_id === patientId);
+    const row = rows.find((p) => p.patient__cmo === patientId);
     if (row) openPatient(row);
     else banner("error", `Patient ${esc(patientId)} not found.`, true);
   } catch (e) {
@@ -1091,7 +1096,9 @@ const PAIR_COLUMNS = [
   { key: "tumor_primary_id", header: "TUMOR_SAMPLE", group: "Tumor sample", text: (r) => r.tumor.primary_id },
   { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id },
   { key: "tumor_bait_set", header: "BAIT_SET", group: "Tumor sample", text: (r) => r.tumor.bait_set || "" },
-  { key: "tumor_patient_id", header: "TUMOR_PATIENT_ID", group: "Tumor sample", text: (r) => r.tumor.patient_id || "" },
+  { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "" },
+  { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "" },
+  { key: "tumor_anon_id", header: "TUMOR_ANON_ID", group: "Tumor sample", text: (r) => r.tumor.anon_id || "" },
   { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name) },
   { key: "tumor_role", header: "TUMOR_ROLE", group: "Tumor sample", text: (r) => r.tumor.tumor_or_normal || "" },
   { key: "tumor_sample_type", header: "TUMOR_SAMPLE_TYPE", group: "Tumor sample", text: (r) => r.tumor.sample_type || "" },
@@ -1106,7 +1113,9 @@ const PAIR_COLUMNS = [
   { key: "tumor_errors", header: "TUMOR_ERRORS", group: "Tumor sample", text: (r) => (r.tumor.errors || []).join("; ") },
   { key: "tumor_id", header: "TUMOR_ID", group: "Tumor sample", text: (r) => r.tumor.id },
   { key: "normal_bait_set", header: "NORMAL_BAIT_SET", group: "Normal sample", text: (r) => r.normal.bait_set || "" },
-  { key: "normal_patient_id", header: "NORMAL_PATIENT_ID", group: "Normal sample", text: (r) => r.normal.patient_id || "" },
+  { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "" },
+  { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "" },
+  { key: "normal_anon_id", header: "NORMAL_ANON_ID", group: "Normal sample", text: (r) => r.normal.anon_id || "" },
   { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name) },
   { key: "normal_role", header: "NORMAL_ROLE", group: "Normal sample", text: (r) => r.normal.tumor_or_normal || "" },
   { key: "normal_sample_type", header: "NORMAL_SAMPLE_TYPE", group: "Normal sample", text: (r) => r.normal.sample_type || "" },
@@ -1480,7 +1489,9 @@ async function selectTrySample(sample) {
   const kv = [
     ["primary_id", esc(sample.primary_id)],
     ["cmo_sample_name", esc(sample.cmo_sample_name)],
-    ["patient_id", sample.patient_id ? esc(sample.patient_id) : "—"],
+    ["patient__cmo", sample.patient__cmo ? esc(sample.patient__cmo) : "—"],
+    ["patient__dmp", sample.patient__dmp ? esc(sample.patient__dmp) : "—"],
+    ["anon_id", sample.anon_id ? esc(sample.anon_id) : "—"],
     ["request_id", sample.request_id ? esc(sample.request_id) : "—"],
     ["role", `<span class="badge ${sample.tumor_or_normal.toLowerCase()}">${esc(sample.tumor_or_normal)}</span>`],
     ["sample_type", esc(sample.sample_type)],
@@ -1537,7 +1548,7 @@ function renderTryResult(data, logic) {
       <div class="current-match">
         <dl class="kv">
           <dt>matched ${isTumor ? "normal" : "tumor"}</dt>
-          <dd>${esc(cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient_id || "no patient")})</dd>
+          <dd>${esc(cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient__cmo || "no patient")})</dd>
           <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
           <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
         </dl>
@@ -1551,7 +1562,7 @@ function renderTryResult(data, logic) {
   if (isTumor) {
     if (winner) {
       parts.push(`<h3>Cascade outcome</h3>
-        <p>The cascade would pick <strong>${esc(winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong> (${esc(winner.sample.patient_id || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
+        <p>The cascade would pick <strong>${esc(winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong> (${esc(winner.sample.patient__cmo || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
     } else {
       parts.push(`<h3>Cascade outcome</h3>
         <p>No candidate would be selected — the sample would stay unpaired under this logic.</p>`);
@@ -1577,7 +1588,7 @@ function renderTryResult(data, logic) {
     parts.push(`<p class="empty">No candidates.</p>`);
   } else {
     parts.push(`<table>
-      <thead><tr><th>sample</th><th>patient</th><th>tier</th><th>status</th><th>mismatched keys</th><th>sequencing date</th></tr></thead>
+      <thead><tr><th>sample</th><th>patient</th><th>patient__dmp</th><th>tier</th><th>status</th><th>mismatched keys</th><th>sequencing date</th></tr></thead>
       <tbody>${rows.map((c) => {
         const cs = c.sample;
         const status = c.matched
@@ -1586,7 +1597,8 @@ function renderTryResult(data, logic) {
         const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
         return `<tr>
           <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
-          <td>${esc(cs.patient_id || "—")}</td>
+          <td>${esc(cs.patient__cmo || "—")}</td>
+          <td>${esc(cs.patient__dmp || "—")}</td>
           <td><span class="badge tier">${esc(c.tier)}</span></td>
           <td>${status}</td>
           <td>${c.mismatched_keys ? keyList(c.mismatched_keys) : "—"}</td>
@@ -1604,7 +1616,7 @@ function renderTryResult(data, logic) {
 const TRY_EXPLAINERS = {
   argos: `
     <h4>Hard matching keys</h4>
-    <p>Same <code>patient_id</code>, <code>gene_panel</code>, and <code>bait_set</code> (case-insensitive). <code>sample_type</code> is <em>not</em> a key (beagle v2.3.0 semantics).</p>
+    <p>Same <code>patient__cmo</code>, <code>gene_panel</code>, and <code>bait_set</code> (case-insensitive). <code>sample_type</code> is <em>not</em> a key (beagle v2.3.0 semantics).</p>
     <h4>Additional gates (every tier)</h4>
     <ul>
       <li><strong>Run mode</strong>: raw run-mode strings are normalized to buckets (<code>novaseq x</code> → novaseq_x, <code>novaseq</code>, <code>hiseq</code>; any other value must match exactly) and must be equal on both sides.</li>
@@ -1622,13 +1634,26 @@ const TRY_EXPLAINERS = {
     <h4>Tiers (in order)</h4>
     <ol>
       <li><strong>Historical pairing</strong>: the tumor's current latest pairing under this logic is retained unconditionally — bait and run-mode checks are bypassed (any mismatches are only noted). There is no fallback: if the historical normal is missing, the tumor stays unpaired.</li>
-      <li><strong>Patient-wide</strong>: same <code>patient_id</code> (the only hard key); <code>bait_set</code> (case-insensitive) and the run-mode bucket (<code>novaseq</code>/<code>hiseq</code> substrings) must match; the latest <code>sequencing_date</code> wins.</li>
+      <li><strong>Patient-wide</strong>: same <code>patient__cmo</code> (the only hard key); <code>bait_set</code> (case-insensitive) and the run-mode bucket (<code>novaseq</code>/<code>hiseq</code> substrings) must match; the latest <code>sequencing_date</code> wins.</li>
     </ol>
     <p><code>gene_panel</code> and <code>sample_type</code> are not keys; there is no request cascade and no pooled tier.</p>
   `,
+  dmp: `
+    <h4>Scope</h4>
+    <p>Strictly <code>sample_type</code> "DMP" on both sides: LIMS samples, pooled normals, and cross-group DMP↔LIMS candidates are never paired here (those stay manual under the ARGOS logic).</p>
+    <h4>Hard matching keys (case-insensitive)</h4>
+    <ul>
+      <li><code>patient__dmp</code> (the P- patient id): both sides must have one.</li>
+      <li><code>gene_panel</code>: a DMP patient can carry both IMPACT and ACCESS samples, so a cross-assay T/N is invalid.</li>
+    </ul>
+    <p>No run-mode or preservation gates (DMP samples carry no preservation data) and no pooled tier.</p>
+    <h4>Cascade</h4>
+    <p>Single tier of key-matching DMP normals; the winner is deterministic — the first candidate in <code>primary_id</code> (string) order.</p>
+    <p>Automatic DMP pairing runs via the import script's <code>--trigger-dmp</code> flag (or the dashboard); manual pairing still exists and always wins — an existing pairing (including a manual/override one) is returned unchanged on re-runs.</p>
+  `,
   default: `
     <h4>Hard matching keys</h4>
-    <p>Same <code>patient_id</code>, <code>gene_panel</code>, and <code>bait_set</code> (case-insensitive).</p>
+    <p>Same <code>patient__cmo</code>, <code>gene_panel</code>, and <code>bait_set</code> (case-insensitive).</p>
     <h4>Cascade (latest sequencing_date wins within a tier)</h4>
     <ol>
       <li>normals ingested under the same <code>request_id</code> (when the tumor has one);</li>

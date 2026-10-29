@@ -65,12 +65,12 @@ def _pairing_rows(db):
     return list(db.scalars(select(PairingTable)).all())
 
 
-def _register_single_sample(db, request_id: str, patient_id: str) -> None:
+def _register_single_sample(db, request_id: str, patient__cmo: str) -> None:
     """Register one TUMOR sample under a request via the ingest path."""
     entry = {
         "primaryId": f"{request_id}_1",
-        "cmoSampleName": f"{patient_id}-X001-d01",
-        "cmoPatientId": patient_id,
+        "cmoSampleName": f"{patient__cmo}-X001-d01",
+        "cmoPatientId": patient__cmo,
         "sampleType": "Biopsy",
         "tumorOrNormal": "Tumor",
         "genePanel": "IMPACT505",
@@ -100,7 +100,7 @@ def test_update_refreshes_sample_metadata(db, new_request_payload, update_payloa
     sample = _sample_by_primary_id(db, "99908_C_1")
     assert sample.tumor_or_normal == "TUMOR"
     assert sample.request_id == "99908_C"
-    assert sample.patient_id == "C-PPPPP6"
+    assert sample.patient__cmo == "C-PPPPP6"
     assert sample.gene_panel == "IMPACT505"
     assert sample.bait_set == "IMPACT505_BAITS"
     assert sample.cmo_sample_name == update_payload["latestSampleMetadata"]["cmoSampleName"]
@@ -125,7 +125,7 @@ def test_update_refreshes_sample_metadata(db, new_request_payload, update_payloa
     assert len(list(db.scalars(select(Sample)).all())) == 5
     other = _sample_by_primary_id(db, "99908_C_17")
     assert other.tumor_or_normal == "NORMAL"
-    assert other.patient_id == "C-PPPP16"
+    assert other.patient__cmo == "C-PPPP16"
 
 
 def test_update_with_unknown_request_is_skipped(db, caplog, update_payload):
@@ -229,7 +229,7 @@ def test_flip_to_tumor_triggers_pairing(db, new_request_payload, update_payload)
     normal = Sample(
         primary_id="99908_B_1",
         cmo_sample_name="99908_B_1_1_1_1",
-        patient_id="C-PPPPP6",
+        patient__cmo="C-PPPPP6",
         request_id="99908_B",
         sample_type="other",
         gene_panel="IMPACT505",

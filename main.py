@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
             ("ARGOS", "argos"),
             ("TEMPO", "tempo"),
             ("ACCESS", "default"),
+            ("DMP", "dmp"),
         ):
             existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
             if existing is None:

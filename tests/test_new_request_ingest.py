@@ -70,7 +70,7 @@ def test_vendored_fixture_registers_all_samples(db, fixture_payload):
     }
 
     sample = _sample_by_primary_id(db, "99908_C_17")
-    assert sample.patient_id == "C-PPPP16"
+    assert sample.patient__cmo == "C-PPPP16"
     assert sample.request_id == "99908_C"
     assert sample.cmo_sample_name == "C-PPPP16-X001-d01"
     assert sample.gene_panel == "IMPACT505"
@@ -111,7 +111,7 @@ def _seed_normal(db, primary_id="99908_B_1", request_id="99908_B") -> Sample:
     normal = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id}_1_1_1",
-        patient_id="C-PPPP16",
+        patient__cmo="C-PPPP16",
         request_id=request_id,
         sample_type="other",
         gene_panel="IMPACT505",
@@ -129,7 +129,7 @@ def _seed_normal(db, primary_id="99908_B_1", request_id="99908_B") -> Sample:
 
 def test_tumor_ingest_pairs_with_seeded_normal(db):
     """A new-request tumor whose patient has a NORMAL with the same
-    patient_id + gene_panel + bait_set and matching run_mode/preservation
+    patient__cmo + gene_panel + bait_set and matching run_mode/preservation
     is auto-paired on ingest."""
     normal = _seed_normal(db)
     tumor_entry = {

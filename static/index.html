@@ -39,8 +39,8 @@
       <label>cmo_sample_name
         <input id="f-cmo_sample_name" name="cmo_sample_name">
       </label>
-      <label>patient_id
-        <input id="f-patient_id" name="patient_id">
+      <label>patient__cmo
+        <input id="f-patient__cmo" name="patient__cmo">
       </label>
       <label>request_id
         <input id="f-request_id" name="request_id">
@@ -89,7 +89,7 @@
       <table id="samples-table">
         <thead>
           <tr>
-            <th>primary_id</th><th>cmo_sample_name</th><th>patient_id</th><th>request_id</th>
+            <th>primary_id</th><th>cmo_sample_name</th><th>patient__cmo</th><th>patient__dmp</th><th>anon_id</th><th>request_id</th>
             <th>role</th><th>sample_type</th><th>gene_panel</th><th>bait_set</th>
             <th>run_mode</th><th>file_group</th><th>preservation</th><th>sample_origin</th><th>sequencing_date</th>
           </tr>
@@ -110,7 +110,7 @@
   <section class="panel">
     <h2>Patients</h2>
     <div class="actions">
-      <label>patient_id
+      <label>patient__cmo
         <input id="p-q" placeholder="partial match, e.g. C-EXAMPLE1">
       </label>
       <button id="p-search" class="primary">Search</button>
@@ -120,7 +120,7 @@
       <table id="patients-table">
         <thead>
           <tr>
-            <th>patient_id</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th>patient__cmo</th><th>samples</th><th>tumors</th><th>normals</th>
             <th>requests</th><th>metadata</th>
           </tr>
         </thead>
@@ -191,7 +191,7 @@
         <thead>
           <tr>
             <th>primary_id</th><th>cmo_sample_name</th><th>role</th><th>sample_type</th>
-            <th>patient_id</th><th>current match</th>
+            <th>patient__cmo</th><th>current match</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -205,7 +205,7 @@
       <table id="r-patients">
         <thead>
           <tr>
-            <th>patient_id</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th>patient__cmo</th><th>samples</th><th>tumors</th><th>normals</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -408,7 +408,7 @@
     <div class="table-wrap">
       <table id="m-others">
         <thead>
-          <tr><th>candidate</th><th>patient_id</th><th>tier</th><th>keys</th><th>mismatched keys</th><th>sequencing_date</th><th></th></tr>
+          <tr><th>candidate</th><th>patient__cmo</th><th>patient__dmp</th><th>tier</th><th>keys</th><th>mismatched keys</th><th>sequencing_date</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>

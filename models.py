@@ -32,7 +32,13 @@ class Sample(Base):
     primary_id: Mapped[str] = mapped_column(sa.String(255), index=True)
     cmo_sample_name: Mapped[str] = mapped_column(sa.String(255))
     # Nullable: shared (pooled) normals belong to no patient.
-    patient_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    patient__cmo: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    # DMP-only (sample_type == "DMP"): the DMP "P-" patient id
+    # (patient.dmp in the DMP metadata); None for LIMS/IGO samples.
+    patient__dmp: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    # DMP-only (sample_type == "DMP"): the DMP anonymous sample id
+    # (anon_id in the DMP metadata); None for LIMS/IGO samples.
+    anon_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     request_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     sample_type: Mapped[str] = mapped_column(sa.String(255))
     gene_panel: Mapped[str] = mapped_column(sa.String(255))

@@ -99,7 +99,7 @@ def test_new_request_ingest_via_nats():
     request_id = "99907_E2EIT"
     stamp = int(time.time() * 1000)
     primary_id = f"E2EIT_{stamp}"
-    patient_id = f"C-E2EIT-{stamp}"
+    patient__cmo = f"C-E2EIT-{stamp}"
     payload = {
         "igoRequestId": request_id,
         "requestJson": json.dumps({
@@ -111,7 +111,7 @@ def test_new_request_ingest_via_nats():
         "samples": [{
             "primaryId": primary_id,
             "cmoSampleName": f"E2EIT-{stamp}",
-            "cmoPatientId": patient_id,
+            "cmoPatientId": patient__cmo,
             "sampleName": "E2E integration tumor",
             "sampleType": "Biopsy",
             "species": "Human",
@@ -150,7 +150,7 @@ def test_new_request_ingest_via_nats():
         while time.monotonic() < deadline:
             cur.execute(
                 """
-                SELECT tumor_or_normal, patient_id, request_id, file_group,
+                SELECT tumor_or_normal, patient__cmo, request_id, file_group,
                        gene_panel, bait_set, run_mode, sequencing_date,
                        additional_metadata::jsonb
                 FROM samples
@@ -174,7 +174,7 @@ def test_new_request_ingest_via_nats():
     if isinstance(meta, str):
         meta = json.loads(meta)
     assert tumor == "TUMOR"
-    assert p_id == patient_id
+    assert p_id == patient__cmo
     assert req_id == request_id
     assert file_group == "SMILE"
     assert panel == "HC_IMPACT"

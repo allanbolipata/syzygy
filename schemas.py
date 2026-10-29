@@ -15,7 +15,11 @@ class SampleCreate(BaseModel):
     primary_id: str
     cmo_sample_name: str
     # Optional: shared (pooled) normals belong to no patient.
-    patient_id: Optional[str] = None
+    patient__cmo: Optional[str] = None
+    # DMP-only: the DMP "P-" patient id (patient.dmp in the DMP metadata).
+    patient__dmp: Optional[str] = None
+    # DMP-only: the DMP anonymous sample id.
+    anon_id: Optional[str] = None
     request_id: Optional[str] = None
     sample_type: str
     gene_panel: str
@@ -45,7 +49,11 @@ class SampleRead(BaseModel):
     id: UUID
     primary_id: str
     cmo_sample_name: str
-    patient_id: Optional[str] = None
+    patient__cmo: Optional[str] = None
+    # DMP-only: the DMP "P-" patient id (None for LIMS/IGO samples).
+    patient__dmp: Optional[str] = None
+    # DMP-only: the DMP anonymous sample id (None for LIMS/IGO samples).
+    anon_id: Optional[str] = None
     request_id: Optional[str] = None
     sample_type: str
     gene_panel: str
@@ -63,9 +71,9 @@ class SampleRead(BaseModel):
 
 
 class PatientRead(BaseModel):
-    # Patients are derived from samples (``patient_id`` non-null); there is
+    # Patients are derived from samples (``patient__cmo`` non-null); there is
     # no separate patient table yet.
-    patient_id: str
+    patient__cmo: str
     sample_count: int
     tumor_count: int
     normal_count: int
@@ -83,7 +91,7 @@ class RequestRead(BaseModel):
     sample_count: int
     tumor_count: int
     normal_count: int
-    # Distinct patient_ids across the request's samples (non-null).
+    # Distinct patient__cmo values across the request's samples (non-null).
     patients: list[str]
     # Distinct sample_types / gene_panels across the request's samples.
     sample_types: list[str]

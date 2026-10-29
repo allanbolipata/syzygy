@@ -1,24 +1,33 @@
 import pytest
 
-from dmp_translator import ASSAY_MAPPING, to_dmp_sample_kwargs
+from dmp_translator import ASSAY_MAPPING, EXCLUDED_DMP_KEYS, to_dmp_sample_kwargs
 
 
 def _meta(**overrides):
+    # A full DMP record (beagle "DMP BAMs" filemetadata), anonymized.
     meta = {
         "type": "N",
         "assay": "IM6",
         "sample": "P-0001234-N01-IM6",
-        "anon_id": "anon-should-not-leak",
+        "anon_id": "anon-0001234",
         "patient": {"cmo": "TEST123", "dmp": "P-0001234"},
-        "cmo_assay": "IMPACT468",
-        "external_id": "EXT-0001234-N01",
-        "sample_type": "0",
-        "project_name": "proj",
+        "updated": "2024-04-30T12:00:00",
+        "version": 1,
         "coverage": 687,
+        "imported": "2023-02-21T09:00:00",
+        "cmo_assay": "IMPACT468",
+        "tumor_type": "lung",
+        "external_id": "EXT-0001234-N01",
+        # DMP's 1/0 metastasis flag — NOT a sample type; stored verbatim.
+        "sample_type": "0",
+        "tissue_type": "fresh",
+        "primary_site": None,
+        "project_name": "proj",
+        "part_c_consent": 0,
+        "metastasis_site": None,
+        "somatic_calling_status": None,
         "major_allele_contamination": 0.451,
         "minor_allele_contamination": 0.00085,
-        "tumor_type": "lung",
-        "tissue_type": "fresh",
     }
     meta.update(overrides)
     return meta
@@ -28,7 +37,7 @@ def test_core_mapping():
     kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta())
     assert kw["primary_id"] == "P-0001234-N01-IM6"
     assert kw["cmo_sample_name"] == "EXT-0001234-N01"
-    assert kw["patient_id"] == "C-TEST123"
+    assert kw["patient__cmo"] == "C-TEST123"
     assert kw["gene_panel"] == "IMPACT468"
     assert kw["tumor_or_normal"] == "NORMAL"
     assert kw["sample_type"] == "DMP"
@@ -38,19 +47,52 @@ def test_core_mapping():
     assert kw["preservation"] is None
     assert kw["sample_origin"] is None
     assert kw["sequencing_date"] is None
-    assert kw["additional_metadata"] == {
-        "coverage": 687,
-        "major_allele_contamination": 0.451,
-        "minor_allele_contamination": 0.00085,
-    }
 
 
-def test_anon_id_and_deferred_keys_not_stored():
+def test_identifiers_now_stored_in_columns():
     kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta())
-    assert "anon_id" not in kw
-    extra = kw["additional_metadata"] or {}
-    for key in ("anon_id", "patient.dmp", "project_name", "sample_type.dmp", "patient"):
+    # patient__dmp is stored as-is (no prefix); anon_id in its own column.
+    assert kw["patient__dmp"] == "P-0001234"
+    assert kw["anon_id"] == "anon-0001234"
+    # "C-" prefix rule on patient__cmo is unchanged.
+    assert kw["patient__cmo"] == "C-TEST123"
+    # Absent patient/anon_id -> None columns.
+    kw2 = to_dmp_sample_kwargs("P-1-T01-IM6", _meta(patient=None, anon_id=None))
+    assert kw2["patient__dmp"] is None
+    assert kw2["anon_id"] is None
+    assert kw2["patient__cmo"] is None
+
+
+def test_additional_metadata_carrying_every_unmapped_key_verbatim():
+    meta = _meta()
+    kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", meta)
+    extra = kw["additional_metadata"]
+    # Every unmapped key that is present and non-null lands verbatim.
+    for key in (
+        "updated",
+        "version",
+        "coverage",
+        "imported",
+        "tumor_type",
+        "tissue_type",
+        "project_name",
+        "part_c_consent",
+        "sample_type",
+        "major_allele_contamination",
+        "minor_allele_contamination",
+    ):
+        assert key in extra, f"{key} missing from additional_metadata"
+        assert extra[key] == meta[key], f"{key} changed: {extra[key]!r} != {meta[key]!r}"
+    # Null values are skipped.
+    for key in ("primary_site", "metastasis_site", "somatic_calling_status"):
         assert key not in extra
+
+
+def test_column_mapped_keys_not_duplicated_into_metadata():
+    kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta())
+    extra = kw["additional_metadata"]
+    for key in EXCLUDED_DMP_KEYS:
+        assert key not in extra, f"column-mapped key {key!r} leaked into additional_metadata"
 
 
 def test_gene_panel_fallback_to_assay_mapping():
@@ -67,7 +109,7 @@ def test_gene_panel_fallback_to_assay_mapping():
 def test_tumor_type_t_and_fallbacks():
     kw = to_dmp_sample_kwargs("P-1-T01-IM6", _meta(type="T", patient=None))
     assert kw["tumor_or_normal"] == "TUMOR"
-    assert kw["patient_id"] is None
+    assert kw["patient__cmo"] is None
     # cmo_sample_name falls back to the DMP sample id when external_id is missing.
     kw2 = to_dmp_sample_kwargs("P-1-T01-IM6", _meta(external_id=None))
     assert kw2["cmo_sample_name"] == "P-1-T01-IM6"
@@ -83,7 +125,7 @@ def test_argos_dmp_pairs_are_manual_pairing_only():
     from pairing_strategies import strategies
 
     def mk(**kw):
-        base = dict(patient_id="C-1", gene_panel="IMPACT468", bait_set="IMPACT468")
+        base = dict(patient__cmo="C-1", gene_panel="IMPACT468", bait_set="IMPACT468")
         base.update(kw)
         return Sample(**base)
 
