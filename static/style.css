@@ -90,28 +90,97 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   font-size: 0.8rem; color: var(--muted);
 }
 
-/* Column picker on the "Pairs by Logic" tab. */
-.colpick {
+/* Pair Report: left split-panel column filter. */
+.linkbtn {
+  background: none;
+  border: none;
+  padding: 0.1rem 0.3rem;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.linkbtn:hover { text-decoration: underline; }
+.pr-split { display: flex; gap: 0.8rem; align-items: flex-start; margin-top: 0.6rem; }
+.pr-panel {
+  flex: 0 0 16.5rem;
+  width: 16.5rem;
+  background: #f7f8fa;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem 0.7rem;
+  position: sticky;
+  top: 0.6rem;
+  max-height: calc(100vh - 1.2rem);
+  overflow-y: auto;
+}
+.pr-panel.collapsed { display: none; }
+.pr-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.4rem; }
+.pr-panel-head strong { font-size: 0.82rem; }
+.pr-panel-body label {
+  display: flex; flex-direction: column; gap: 0.2rem;
+  font-size: 0.8rem; color: var(--muted);
+}
+#pr-groupby {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 0.5rem 0.8rem 0.6rem;
-  margin: 0 0 0.6rem;
-}
-.colpick-head { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
-.colpick-head strong { font-size: 0.82rem; }
-.colpick-grid { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-top: 0.45rem; }
-.col-group {
+  background: #fff;
   width: 100%;
-  font-size: 0.72rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-top: 0.3rem;
+  margin-top: 0.15rem;
 }
-.col-group:first-child { margin-top: 0; }
+.pr-panel-actions {
+  display: flex; gap: 0.4rem;
+  margin-top: 0.5rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid var(--line);
+}
+.pr-panel-open {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding: 0.35rem 0.6rem;
+}
+.pr-main { flex: 1; min-width: 0; }
+
+.pr-group { border-bottom: 1px solid var(--line); padding: 0.35rem 0; }
+.pr-group:first-child { padding-top: 0.2rem; }
+.pr-group:last-child { border-bottom: none; }
+.pr-group-head { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
+.pr-group-label {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  cursor: pointer; font-weight: 600; font-size: 0.82rem;
+}
+.pr-group-label input { width: auto; min-width: 0; margin: 0; }
+.pr-group-count {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.72rem;
+  background: #eceef1;
+  border-radius: 999px;
+  padding: 0.02rem 0.5rem;
+}
+.pr-group-body { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; padding: 0.35rem 0 0.15rem; }
+.pr-group-body .col-check { font-size: 0.78rem; }
 .col-check { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; cursor: pointer; }
 .col-check input { width: auto; min-width: 0; margin: 0; }
+
+/* DMP "About these columns" legend (only shown for the DMP logic). */
+.pr-legend {
+  margin: 0.6rem 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f7f8fa;
+  padding: 0.45rem 0.8rem 0.6rem;
+}
+.pr-legend summary { cursor: pointer; font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+.pr-legend-table { margin-top: 0.5rem; }
+.pr-legend-table th, .pr-legend-table td {
+  white-space: normal;
+  max-width: none;
+  font-size: 0.8rem;
+}
+.pr-legend-table td:first-child { font-weight: 600; white-space: nowrap; }
 .filters input, .actions input, .actions select, .filters select,
 #m-sample, #m-logic {
   font: inherit;

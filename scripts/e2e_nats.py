@@ -24,7 +24,7 @@ What it does (idempotent, re-runnable):
      is created; pre-existing 99990_D_2 rows are updated in place).
 3. Proves the automatic pairing path: publishes one synthetic
    new-request whose single TUMOR mirrors an existing pairable
-   NORMAL (patient_id, gene_panel, bait_set, run_mode and
+   NORMAL (patient__cmo, gene_panel, bait_set, run_mode and
    preservation/sample_origin copied from it) and asserts a
    pairing_table row for that tumor with trigger_type='automatic'.
 
@@ -73,16 +73,16 @@ SYNTHETIC_REQUEST_ID = "99999_E2E"
 SYNTHETIC_PRIMARY_PREFIX = "E2E_NAT_"
 
 PROVEN_NORMAL_SQL = """
-    SELECT s.primary_id, s.patient_id, s.gene_panel, s.bait_set,
+    SELECT s.primary_id, s.patient__cmo, s.gene_panel, s.bait_set,
            s.run_mode, s.preservation, s.sample_origin, s.sample_type
     FROM samples s
     JOIN pairing_table p
       ON p.normal_id = s.id AND p.latest AND p.trigger_type = 'automatic'
     WHERE s.tumor_or_normal = 'NORMAL'
-      AND s.patient_id IS NOT NULL
+      AND s.patient__cmo IS NOT NULL
       AND s.request_id <> %(syn)s
       AND s.primary_id NOT LIKE %(prefix)s
-    ORDER BY s.patient_id, s.primary_id
+    ORDER BY s.patient__cmo, s.primary_id
     LIMIT 1
 """
 
@@ -200,7 +200,7 @@ def _maybe_json(value):
 
 def build_synthetic(normal):
     """A synthetic new-request whose TUMOR mirrors the given NORMAL."""
-    (primary_id, patient_id, gene_panel, bait_set,
+    (primary_id, patient__cmo, gene_panel, bait_set,
      run_mode, preservation, sample_origin, sample_type) = normal
     tumor_primary_id = f"{SYNTHETIC_PRIMARY_PREFIX}{primary_id}"
     payload = {
@@ -214,7 +214,7 @@ def build_synthetic(normal):
         "samples": [{
             "primaryId": tumor_primary_id,
             "cmoSampleName": f"E2E-NAT-{primary_id}",
-            "cmoPatientId": patient_id,
+            "cmoPatientId": patient__cmo,
             "sampleName": "E2E synthetic tumor",
             "sampleType": (
                 sample_type

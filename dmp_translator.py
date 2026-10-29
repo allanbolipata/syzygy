@@ -6,21 +6,25 @@ module is the single point of translation so the same mapping can be
 used by the dev ingestion script (``scripts/populate_from_beagle.py``)
 and, later, the real DMP connector.
 
-Field mapping (DMP metadata -> syzygy Sample):
+The ENTIRE DMP record is stored. Field mapping (DMP metadata ->
+syzygy Sample):
     sample              -> primary_id            (cmo_sample_name fallback)
     external_id         -> cmo_sample_name       (DMP's CMO sample label)
-    patient.cmo         -> patient_id            ("C-" prefixed)
+    patient.cmo         -> patient__cmo            ("C-" prefixed)
+    patient.dmp         -> patient__dmp            (as-is, no prefix)
+    anon_id             -> anon_id
     cmo_assay           -> gene_panel            (fallback: ASSAY_MAPPING[assay])
     type ("T"/"N")      -> tumor_or_normal       (TUMOR / NORMAL)
     "DMP" (constant)    -> sample_type           (provenance marker)
-    coverage,
-    major_allele_contamination,
-    minor_allele_contamination -> additional_metadata (allowlisted only)
+    every other key     -> additional_metadata   (verbatim under the
+                                                  original key; null/empty
+                                                  values skipped)
 
-Deliberately NOT stored:
-    anon_id            -- patient-identifying; excluded for security.
-    patient.dmp, project_name, sample_type (DMP's 1/0 metastasis flag)
-                       -- deferred; move to additional_metadata later.
+Only the column-mapped fields (EXCLUDED_DMP_KEYS) are excluded from
+additional_metadata; everything else is kept, including project_name and
+the DMP "sample_type" key — note that this key is a 1/0 metastasis flag,
+NOT a sample type; storing it verbatim under its original name is
+intentional.
 
 DMP records carry no IGO/LIMS keys, so request_id, run_mode,
 preservation, sample_origin, and sequencing_date are None; bait_set is set
@@ -45,14 +49,17 @@ ASSAY_MAPPING: dict[str, str] = {
     "IH4": "HEMEPACT_v4",
 }
 
-# DMP ``sample_type`` ("1"/"0") records whether the tumor metastasized;
-# irrelevant for pairing, kept out of the schema for now.
-EXCLUDED_DMP_KEYS = ("anon_id", "sample_type", "project_name")
-
-ADDITIONAL_METADATA_KEYS = (
-    "coverage",
-    "major_allele_contamination",
-    "minor_allele_contamination",
+# Fields mapped to Sample columns (or used to build them). These are the
+# ONLY keys excluded from additional_metadata; every other key in the
+# DMP record is stored there verbatim.
+EXCLUDED_DMP_KEYS = (
+    "sample",
+    "external_id",
+    "type",
+    "patient",
+    "cmo_assay",
+    "assay",
+    "anon_id",
 )
 
 
@@ -65,8 +72,19 @@ def resolve_gene_panel(meta: dict) -> Optional[str]:
     return ASSAY_MAPPING.get(assay) if assay else None
 
 
+def unmapped_metadata(meta: dict) -> dict:
+    """The DMP record's keys that are not mapped to columns, verbatim.
+
+    Null and empty-string values are skipped; ``0`` / ``False`` are kept.
+    """
+    return {
+        k: v for k, v in meta.items()
+        if k not in EXCLUDED_DMP_KEYS and v is not None and v != ""
+    }
+
+
 def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
-    """Build ``Sample`` kwargs for one DMP record.
+    """Build ``Sample`` kwargs for one DMP record (the entire record).
 
     Parameters
     ----------
@@ -83,13 +101,13 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
 
     patient = meta.get("patient") or {}
     patient_cmo = patient.get("cmo")
-    additional = {
-        k: meta[k] for k in ADDITIONAL_METADATA_KEYS if meta.get(k) is not None
-    }
     return dict(
         primary_id=sample_id,
         cmo_sample_name=meta.get("external_id") or sample_id,
-        patient_id=f"C-{patient_cmo}" if patient_cmo else None,
+        patient__cmo=f"C-{patient_cmo}" if patient_cmo else None,
+        # Stored as-is (e.g. "P-0045965") — no prefix; None when absent.
+        patient__dmp=patient.get("dmp") or None,
+        anon_id=meta.get("anon_id") or None,
         request_id=None,
         sample_type="DMP",
         gene_panel=resolve_gene_panel(meta),
@@ -101,6 +119,6 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
         preservation=None,
         sample_origin=None,
         sequencing_date=None,
-        additional_metadata=additional or None,
+        additional_metadata=unmapped_metadata(meta) or None,
         errors=None,
     )

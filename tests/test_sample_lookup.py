@@ -43,11 +43,11 @@ def db(engine):
 
 
 def _sample(db, primary_id, cmo=None, created_date=None,
-            patient_id="C-1"):
+            patient__cmo="C-1"):
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=cmo or f"{primary_id}_name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type="tissue",
         gene_panel="IMPACT468",
         bait_set="agilent",

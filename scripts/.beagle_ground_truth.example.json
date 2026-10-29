@@ -1,19 +1,43 @@
 {
-  "_comment": "Copy this file to scripts/.beagle_ground_truth.json (which is gitignored) and fill in your LOCAL Beagle fixture names, paths, and expected pairing ground truth. The committed repo deliberately contains no real Beagle identifiers.",
-  "fixtures_dir": "/path/to/beagle_checkout/fixtures/tests",
-  "dmp_fixture": "/path/to/beagle_checkout/file_system/fixtures/DMP_data.json",
-  "canonical_fixtures": ["REQ_A", "REQ_B", "REQ_C"],
+  "_comment": "LOCAL ground truth for the beagle import validation (scripts/populate_from_beagle.py). The fixture's sample and patient ids are real beagle identifiers, so this file is git-ignored (see .gitignore). Copy this example to .beagle_ground_truth.json and fill in the real values.",
+  "_comment_canonical": "Basenames of the beagle fixtures (sample.tsv + request.tsv) loaded by the argos scenario, read from fixtures_dir.",
+  "_comment_pairs": "primary_id -> [normal_id, why] for pairs beagle produces (ARGOS logic).",
+  "_comment_unpaired": "primary_id -> why the normal should stay unpaired.",
+  "_comment_dmp_fixture": "Path to the beagle DMP fixture (DMP_data.json with sampleStructure + patient rows).",
+  "_comment_dmp_pairs": "DMP tumor primary id -> [DMP normal primary id, why]; for fixtures that DO contain a DMP T+N pair with the same patient__dmp + gene_panel (pairing runs under the DMP logic).",
+  "_comment_dmp_unpaired": "DMP tumor primary id -> why the tumor stays unpaired (no same-patient__dmp same-gene_panel counterpart in the fixture).",
+  "_comment_dmp_checks": "One entry per DMP record to spot-check: [sample, expected patient__cmo, expected gene_panel, expected tumor_or_normal, expected patient__dmp, expected anon_id]. Completeness of the stored record (columns + full additional_metadata) is checked automatically for every DMP sample.",
+  "canonical_fixtures": [
+    "<fixture_basename>"
+  ],
   "expected_pairs": {
-    "REQ_A_1": ["REQ_A_2", "same-request normal"],
-    "REQ_B_1": ["REQ_C_2", "latest run_date wins across requests"]
+    "<tumor_primary_id>": [
+      "<normal_primary_id>",
+      "same request (igoRequestId)"
+    ]
   },
   "expected_unpaired_normals": {
-    "REQ_A_2_3": "no tumor selects it in the merged dataset"
+    "<normal_primary_id>": "no matching tumor"
+  },
+  "expected_dmp_pairs": {
+    "<DMP tumor primary id>": [
+      "<DMP normal primary id>",
+      "same patient__dmp (P-...) + gene_panel in fixture"
+    ]
   },
   "expected_dmp_unpaired": {
-    "DMP-T-901-N01-IM6": "no normals in fixture; DMP pairing is manual"
+    "<DMP tumor primary id>": "no same-patient__dmp same-gene_panel counterpart in fixture"
   },
   "dmp_checks": [
-    ["DMP-T-901-N01-IM6", "C-EXAMPLE1", "IMPACT468", "TUMOR"]
-  ]
+    [
+      "<DMP sample primary id>",
+      "C-<patient cmo>",
+      "IMPACT468",
+      "TUMOR",
+      "P-<patient dmp>",
+      "<anon id>"
+    ]
+  ],
+  "fixtures_dir": "<path to beagle fixtures dir>",
+  "dmp_fixture": "<path to DMP_data.json>"
 }

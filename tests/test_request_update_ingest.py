@@ -49,7 +49,7 @@ def _seed_sample(db, primary_id, extra_metadata):
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id}_1_1_1",
-        patient_id="C-99990",
+        patient__cmo="C-99990",
         request_id="99990_D_2",
         sample_type="Biopsy",
         gene_panel="IMPACT468",

@@ -197,7 +197,7 @@ def trigger_pairing_for_normal(
 ) -> None:
     """Auto-pair a normal sample against tumors that have no pairing yet.
 
-    No-op for pooled normals: with a null patient_id no tumor matches, so
+    No-op for pooled normals: with a null patient__cmo no tumor matches, so
     pooled normals enter pairing only when a tumor's cascade reaches the
     pooled tier.
     """
@@ -329,9 +329,12 @@ def possible_matches(
     compared case-insensitively, plus the strategy's extra tiers (e.g.
     argos's pooled-normal tier and same-patient DMP samples). This
     mirrors pairing, so the list stays bounded instead of returning the
-    whole opposite-type table. DMP candidates (tier "dmp", argos only)
-    are always mismatches: DMP samples are manual-pairing only and are
-    never auto-selected, so they are listed purely as override targets.
+    whole opposite-type table. DMP candidates (tier "dmp") under the
+    argos strategy are always mismatches: DMP samples are
+    manual-pairing only and are never auto-selected, so they are listed
+    purely as override targets. Under the dmp strategy the candidate
+    scope is DMP-group only; matching DMP candidates are ``matched`` and
+    the winner carries ``would_be_selected``.
 
     ``other_matches`` is a bounded page of that scope (``limit``/``offset``,
     default ``DEFAULT_OTHER_MATCHES_LIMIT``); ``other_matches_total``
@@ -406,8 +409,10 @@ def possible_matches(
         if strategy.HAS_POOLED_TIER and strategy._is_pooled(normal):
             tier = "pooled"
         elif strategy._is_dmp(cand):
-            # The candidate itself is a DMP sample: manual-pairing tier
-            # (argos only). Non-DMP candidates keep their natural tier.
+            # The candidate itself is a DMP sample: under argos it is
+            # the manual-pairing tier (never auto-selected); under the
+            # dmp strategy it is the DMP-group cascade tier. Non-DMP
+            # candidates keep their natural tier.
             tier = "dmp"
         elif normal.request_id is not None and normal.request_id == tumor.request_id:
             tier = "same_request"

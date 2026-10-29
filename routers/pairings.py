@@ -25,7 +25,7 @@ router = APIRouter(prefix="/pairing", tags=["pairings"])
 SAMPLE_FILTER_FIELDS = (
     "primary_id",
     "cmo_sample_name",
-    "patient_id",
+    "patient__cmo",
     "request_id",
     "sample_type",
     "gene_panel",
@@ -42,7 +42,7 @@ def list_pairings(
     pairing_logic_name: Optional[str] = None,
     primary_id: Optional[str] = None,
     cmo_sample_name: Optional[str] = None,
-    patient_id: Optional[str] = None,
+    patient__cmo: Optional[str] = None,
     request_id: Optional[str] = None,
     sample_type: Optional[str] = None,
     gene_panel: Optional[str] = None,
@@ -76,7 +76,7 @@ def list_pairings(
         for field, value in (
             ("primary_id", primary_id),
             ("cmo_sample_name", cmo_sample_name),
-            ("patient_id", patient_id),
+            ("patient__cmo", patient__cmo),
             ("request_id", request_id),
             ("sample_type", sample_type),
             ("gene_panel", gene_panel),

@@ -31,7 +31,7 @@ def _make_sample(primary_id, request_id, **extra):
     return Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id}_1_1_1",
-        patient_id="P-1",
+        patient__cmo="P-1",
         request_id=request_id,
         sample_type="Biopsy",
         gene_panel="IMPACT468",

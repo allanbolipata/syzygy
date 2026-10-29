@@ -57,7 +57,7 @@ def _sample(
     db,
     primary_id,
     tumor_or_normal=TumorOrNormal.NORMAL.value,
-    patient_id: Optional[str] = "C-1",
+    patient__cmo: Optional[str] = "C-1",
     request_id: Optional[str] = None,
     sample_type: str = "tissue",
     gene_panel: str = "IMPACT468",
@@ -74,7 +74,7 @@ def _sample(
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type=sample_type,
         gene_panel=gene_panel,
         bait_set=bait_set,
@@ -115,11 +115,11 @@ def test_tumor_current_and_other_matches(db, argos):
                  sequencing_date=datetime(2023, 1, 1, tzinfo=timezone.utc))
     n3 = _sample(db, "N3", request_id="R1", bait_set="idt",
                  run_mode="NovaSeq X 1000")
-    n4 = _sample(db, "N4", patient_id="C-2", request_id="R1")
-    p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal",
+    n4 = _sample(db, "N4", patient__cmo="C-2", request_id="R1")
+    p1 = _sample(db, "P1", patient__cmo=None, sample_type="Pooled Normal",
                  run_mode="diana",
                  sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc))
-    p2 = _sample(db, "P2", patient_id=None, sample_type="Pooled Normal",
+    p2 = _sample(db, "P2", patient__cmo=None, sample_type="Pooled Normal",
                  gene_panel="IMPACT505")
 
     trigger_pairing(db, t1, argos, "automatic")
@@ -166,10 +166,10 @@ def test_tumor_current_and_other_matches(db, argos):
 def test_tumor_without_current_match_marks_cascade_winner(db, argos):
     # Tumor with no patient normals and unknown bait set; run mode
     # resolves to the pool's machine family.
-    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
+    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient__cmo="C-9",
                  bait_set=None, run_mode="NovaSeq X 1000")
-    p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal")
-    p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
+    p1 = _sample(db, "P1", patient__cmo=None, sample_type="Pooled Normal")
+    p3 = _sample(db, "P3", patient__cmo=None, sample_type="Pooled Normal",
                  bait_set=None, run_mode="diana")
 
     res = _endpoints(db, t2)
@@ -187,11 +187,11 @@ def test_dmp_tumor_never_auto_selected(db, argos):
     # A DMP tumor lists its same-patient and pooled candidates but is
     # never auto-paired: every candidate involving the DMP tumor carries
     # the manual-only reason, and nothing is marked for selection.
-    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
+    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient__cmo="C-9",
                  sample_type="DMP", bait_set=None, run_mode="NovaSeq X 1000")
-    p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
+    p3 = _sample(db, "P3", patient__cmo=None, sample_type="Pooled Normal",
                  bait_set=None, run_mode="diana")
-    n1 = _sample(db, "N1", patient_id="C-9", bait_set="agilent")
+    n1 = _sample(db, "N1", patient__cmo="C-9", bait_set="agilent")
 
     res = _endpoints(db, t2)
     assert res["current_match"] is None
@@ -242,9 +242,9 @@ def test_normal_current_and_other_matches(db, argos):
 def test_pooled_normal_lists_cross_patient_tumors(db, argos):
     t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, request_id="R1",
                  run_mode="NovaSeq X 1000")
-    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient_id="C-9",
+    t2 = _sample(db, "T2", TumorOrNormal.TUMOR.value, patient__cmo="C-9",
                  sample_type="DMP", bait_set=None, run_mode="NovaSeq X 1000")
-    p3 = _sample(db, "P3", patient_id=None, sample_type="Pooled Normal",
+    p3 = _sample(db, "P3", patient__cmo=None, sample_type="Pooled Normal",
                  bait_set=None, run_mode="diana")
 
     res = _endpoints(db, p3)
@@ -375,10 +375,10 @@ def test_limit_validation(db, argos):
 def test_hard_keys_compared_case_insensitively(db, argos):
     # Production data stores the same values in different cases across
     # sample types; matching keys must compare case-insensitively.
-    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient_id="C-1",
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient__cmo="C-1",
                  gene_panel="IMPACT468", bait_set="Agilent",
                  run_mode="NovaSeq X 1000")
-    n1 = _sample(db, "N1", patient_id="c-1", gene_panel="impact468",
+    n1 = _sample(db, "N1", patient__cmo="c-1", gene_panel="impact468",
                  bait_set="AGILENT", run_mode="NovaSeq X 1000")
 
     res = _endpoints(db, t1)
@@ -391,10 +391,10 @@ def test_hard_keys_compared_case_insensitively(db, argos):
 def test_pooled_tier_matches_across_case(db, argos):
     # The pooled tier was dead in production data: pooled normals store
     # e.g. "impact505" while tumors store "IMPACT505".
-    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient_id="C-1",
+    t1 = _sample(db, "T1", TumorOrNormal.TUMOR.value, patient__cmo="C-1",
                  gene_panel="IMPACT468", bait_set="agilent",
                  run_mode="NovaSeq X 1000")
-    p1 = _sample(db, "P1", patient_id=None, sample_type="Pooled Normal",
+    p1 = _sample(db, "P1", patient__cmo=None, sample_type="Pooled Normal",
                  gene_panel="impact468", bait_set="agilent",
                  run_mode="diana")
 
@@ -417,7 +417,7 @@ def test_tumor_lists_same_patient_dmp_normals(db, argos):
                  run_mode="NovaSeq X 1000")
     d1 = _sample(db, "D1", sample_type="DMP", gene_panel="IMPACT341",
                  bait_set="IMPACT341")
-    d2 = _sample(db, "D2", patient_id="C-2", sample_type="DMP",
+    d2 = _sample(db, "D2", patient__cmo="C-2", sample_type="DMP",
                  gene_panel="IMPACT341", bait_set="IMPACT341")
 
     res = _endpoints(db, t1)
@@ -437,7 +437,7 @@ def test_dmp_sample_lists_all_same_patient_opposite_type(db, argos):
                  gene_panel="IMPACT341", bait_set="IMPACT341")
     n1 = _sample(db, "N1", bait_set="agilent")
     n2 = _sample(db, "N2", sample_type="DMP")
-    _sample(db, "N3", patient_id="C-2")
+    _sample(db, "N3", patient__cmo="C-2")
 
     res = _endpoints(db, t1)
     others = _others(res)
@@ -455,7 +455,7 @@ def test_normal_lists_same_patient_dmp_tumors(db, argos):
     d1 = _sample(db, "D1", TumorOrNormal.TUMOR.value, sample_type="DMP",
                  gene_panel="IMPACT341", bait_set="IMPACT341")
     d2 = _sample(db, "D2", TumorOrNormal.TUMOR.value, sample_type="DMP",
-                 patient_id="C-2", gene_panel="IMPACT341",
+                 patient__cmo="C-2", gene_panel="IMPACT341",
                  bait_set="IMPACT341")
 
     res = _endpoints(db, n1)

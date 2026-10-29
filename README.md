@@ -277,27 +277,27 @@ unreachable).
   rows).
 - `GET /v1/sample` — list samples, newest first. Optional filters
   (combined with AND): `q` matches any of `primary_id`,
-  `cmo_sample_name`, `patient_id`, `request_id`; `primary_id`,
-  `cmo_sample_name`, `patient_id`, `request_id`, `sample_type`,
+  `cmo_sample_name`, `patient__cmo`, `request_id`; `primary_id`,
+  `cmo_sample_name`, `patient__cmo`, `request_id`, `sample_type`,
   `gene_panel`, `bait_set`, `run_mode`, `file_group` are
   case-insensitive partial matches; `tumor_or_normal` is exact
   (`TUMOR`/`NORMAL`); `no_patient=true` restricts to samples with a
-  null `patient_id` (e.g. pooled normals); `limit` / `offset`
+  null `patient__cmo` (e.g. pooled normals); `limit` / `offset`
   paginate.
 - `GET /v1/sample/lookup?q=&limit=&offset=` — case-insensitive
   partial-match lookup on `primary_id` and `cmo_sample_name` only (the
   sample identifiers used in manual pairing workflows), newest first;
   powers the Try Pairing tab's sample picker.
 - `GET /v1/patient` — patients derived from samples (a patient is a
-  distinct non-null `patient_id`), sorted by `patient_id`. Returns
+  distinct non-null `patient__cmo`), sorted by `patient__cmo`. Returns
   sample/tumor/normal counts, the patient's distinct `request_id`s, and
   patient-level `metadata` (species, sex, oncotreeCode, diagnosisDate)
   derived from the samples' `additional_metadata` (first non-null value
   per key; tumor samples take priority). `q` is a case-insensitive
-  partial match on `patient_id`; `limit` / `offset` paginate.
+  partial match on `patient__cmo`; `limit` / `offset` paginate.
 - `GET /v1/request` — requests derived from samples (a request is a
   distinct non-null `request_id`), sorted by `request_id`. Returns
-  sample/tumor/normal counts, the request's distinct `patient_id`s, and
+  sample/tumor/normal counts, the request's distinct `patient__cmo`s, and
   the distinct `sample_type`s and `gene_panel`s carried by its samples.
   `q` is a case-insensitive partial match on `request_id`; `limit` /
   `offset` paginate.
@@ -339,7 +339,7 @@ unreachable).
   restricts to current pairings; `sample_id` matches pairings where the
   sample is tumor or normal; `request_id`, `run_mode` (case-insensitive
   exact match), and the sample fields `primary_id`, `cmo_sample_name`,
-  `patient_id`, `sample_type`, `gene_panel`, `bait_set` match a sample
+  `patient__cmo`, `sample_type`, `gene_panel`, `bait_set` match a sample
   on either side (when several are given, they must all match the same
   sample); `tumor_or_normal` scopes that match to the tumor or normal
   role; `pairing_logic_id` / `pairing_logic_name` select the logic;
@@ -387,7 +387,7 @@ unreachable).
 
 A basic static web UI (no build step, no extra dependencies) is served
 at `/ui`; the root path `/` redirects there. It has tabs for samples,
-patients, requests, pooled normals, pairs by logic, matches &
+patients, requests, pooled normals, pair report, matches &
 overrides, and a read-only Try Pairing dry-run tab, and lets you:
 
 - query and filter samples (search plus per-field filters on
@@ -401,7 +401,7 @@ overrides, and a read-only Try Pairing dry-run tab, and lets you:
   opens its matches & overrides and clicking a patient opens the
   patient's view (`GET /v1/request` + `GET /v1/pairing?latest=true`);
 - browse pooled normals: the shared patient-less pooled normals
-  (`sample_type` "Pooled Normal", null `patient_id` — the ARGOS
+  (`sample_type` "Pooled Normal", null `patient__cmo` — the ARGOS
   cascade's last-resort tier) with search and field filters (gene
   panel, bait set, run mode, file group) and pagination (`GET
   /v1/sample` with `no_patient=true`); the same view shows the
@@ -414,17 +414,28 @@ overrides, and a read-only Try Pairing dry-run tab, and lets you:
   sample (from the samples, patients, requests, or pooled view) opens
   it directly, pre-selecting the logic the sample is currently paired
   under when known;
-- browse pairs by logic: pick a pairing logic to list its current
+- browse the pair report: pick a pairing logic to list its current
   pairs (`GET /v1/pairing?latest=true`) and download the table as CSV
-  or TSV. A column picker chooses which metadata columns to view and
-  export — the original three (tumor `primary_id`, normal
-  `primary_id`, bait set) plus per-side sample metadata (patient id,
-  `cmo_sample_name`, role, sample type, gene panel, request id, run
+  or TSV. A left-side split-panel filter (collapsible to a small
+  show/hide toggle) groups the selectable columns by side (tumor /
+  normal / pairing) or by pairing logic (one group per logic); each
+  group header shows its column count and toggles every column in the
+  group, and the table and export update live as columns are checked.
+  The selectable columns are the original three (tumor `primary_id`,
+  normal `primary_id`, bait set) plus per-side sample metadata (patient
+  id, `cmo_sample_name`, role, sample type, gene panel, request id, run
   mode, file group, preservation, sample origin, sequencing date,
   additional metadata, errors, sample id) and pairing-level fields
-  (logic, trigger type, mismatched keys, created date); an "All
-  metadata" button selects every column in one click, and the export
-  contains exactly the selected columns;
+  (logic, trigger type, mismatched keys, created date); All / None /
+  Default buttons reset the selection, and the export contains exactly
+  the selected columns. The DMP logic switches to the legacy DMP export
+  columns (tumor_sample, patient, tumor_idx, tumor_IM_ver,
+  tumor_bamname, tumor_group, tumor_matched, tumor_bam_exists,
+  tumor_bam_coverage, normal_sample, normal_bamname, normal_IM_ver,
+  pool_id, normal_bam_exists, normal_bam_coverage), unmatched DMP
+  samples appear with the opposite-side columns empty, and an
+  "About these columns" panel (plus header tooltips) explains where
+  each value comes from;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the
@@ -440,7 +451,7 @@ overrides, and a read-only Try Pairing dry-run tab, and lets you:
   `pairing_strategies.py`.
 
 Navigation state lives in the URL hash (`#/samples`,
-`#/patients/<patient_id>`, `#/requests/<request_id>`,
+`#/patients/<patient__cmo>`, `#/requests/<request_id>`,
 `#/matches/<primary_id>`, `#/try/<primary_id>`, `#/pooled`,
 `#/pairs`), so the browser Back/Forward buttons, page reloads, and
 shared links all work; every navigation pushes a history entry.
@@ -556,7 +567,7 @@ pairing logic via `PairingLogic.strategy_name`; a logic's `config`
 dict customizes the strategy at use time.
 
 - `default` — patient-scoped matching on hard keys
-  (`patient_id`, `gene_panel`, `bait_set`) with a
+  (`patient__cmo`, `gene_panel`, `bait_set`) with a
   request-first cascade: normals ingested under the tumor's own
   `request_id` are preferred, then all other normals of the same
   patient; the latest matching `sequencing_date` wins (tie-break on
@@ -564,7 +575,7 @@ dict customizes the strategy at use time.
   (aligned with beagle v2.3.0). `ACCESS` registers as an alias of
   this strategy.
 - `argos` — WES strategy aligned with beagle's ARGOS pairing logic
-  (v2.3.0). Hard keys are (`patient_id`, `gene_panel`, `bait_set`);
+  (v2.3.0). Hard keys are (`patient__cmo`, `gene_panel`, `bait_set`);
   `sample_type` is not a matching key (beagle v2.3.0 never gates on
   it; it remains stored on the sample). Extends `default` with:
   - **run-mode gating** — raw `run_mode` strings are normalized to

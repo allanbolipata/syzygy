@@ -83,7 +83,7 @@ _PAIRING_RELEVANT_COLUMNS = (
     "preservation",
     "sample_origin",
     "run_mode",
-    "patient_id",
+    "patient__cmo",
 )
 
 
@@ -196,7 +196,7 @@ def _upsert_sample(
     fields = {
         "primary_id": primary_id,
         "cmo_sample_name": sample_entry["cmoSampleName"],
-        "patient_id": sample_entry.get("cmoPatientId"),
+        "patient__cmo": sample_entry.get("cmoPatientId"),
         "request_id": request_id,
         "sample_type": sample_entry["sampleType"],
         "gene_panel": sample_entry["genePanel"],
@@ -569,21 +569,21 @@ def handle_sample_update(
             fields[column] = latest[payload_key]
     if request_id:
         fields["request_id"] = request_id
-    cmo_patient_id = latest.get("cmoPatientId")
-    if not cmo_patient_id:
+    patient_cmo = latest.get("cmoPatientId")
+    if not patient_cmo:
         patient = payload.get("patient")
         if isinstance(patient, dict):
-            patient_id = patient.get("cmoPatientId")
+            cmo = patient.get("cmoPatientId")
             # The update envelope wraps patient.cmoPatientId as
             # {"value": ..., "namespace": ...} while
             # latestSampleMetadata carries it as a plain string — accept
             # both shapes.
-            if isinstance(patient_id, dict):
-                patient_id = patient_id.get("value")
-            if patient_id:
-                cmo_patient_id = patient_id
-    if cmo_patient_id:
-        fields["patient_id"] = cmo_patient_id
+            if isinstance(cmo, dict):
+                cmo = cmo.get("value")
+            if cmo:
+                patient_cmo = cmo
+    if patient_cmo:
+        fields["patient__cmo"] = patient_cmo
     run = _first_run(latest)
     if run.get("runMode"):
         fields["run_mode"] = run["runMode"]
