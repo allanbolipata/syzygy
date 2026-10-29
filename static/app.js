@@ -316,6 +316,7 @@ async function loadLogics() {
       `<option value="${esc(l.name)}">${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
     PAIRING_LOGICS = logics;
+    renderPrGroups();
     // Try Pairing: active logics only (the dry-run endpoint refuses
     // inactive ones), same options as the Matches tab.
     $("#tq-logic").innerHTML = logics.map((l) =>
@@ -1127,47 +1128,227 @@ const PAIR_COLUMNS = [
 const PAIR_DEFAULT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"];
 const PAIR_GROUPS = ["Tumor sample", "Normal sample", "Pairing"];
 
-const pairsState = { rows: [], logic: null, selected: new Set(PAIR_DEFAULT_KEYS) };
+/* Legacy DMP export columns: the exact headers and order of the beagle DMP
+ * filemetadata export, no additions or removals. Values come from the DMP
+ * sample record (primary_id / patient__dmp / anon_id) plus its
+ * additional_metadata (coverage, project_name). */
+const DMP_PLACEHOLDER = "\u2014"; // "—" — columns whose source is not available yet
+function dmpMetaText(sample, key) {
+  const meta = (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
+  const v = meta[key];
+  return v === null || v === undefined ? "" : String(v);
+}
+/* Second-to-last / last dash-separated segments of a DMP sample name,
+ * e.g. "P-0000001-T01-IM7" -> ["T01", "IM7"]; blank when unparseable. */
+function dmpNameParts(name) {
+  const parts = String(name || "").split("-");
+  if (parts.length < 2) return ["", ""];
+  return [parts[parts.length - 2], parts[parts.length - 1]];
+}
+const DMP_COLUMNS = [
+  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: (r) => (r.tumor ? r.tumor.primary_id : "") },
+  { key: "patient", header: "patient", group: "Tumor", text: (r) => (r.tumor ? r.tumor.patient__dmp || "" : "") },
+  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[0] : "") },
+  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[1] : "") },
+  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: (r) => (r.tumor ? r.tumor.anon_id || "" : "") },
+  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: () => DMP_PLACEHOLDER },
+  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: (r) => (r.tumor ? (r.normal ? "Matched" : "Unmatched") : "") },
+  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: () => DMP_PLACEHOLDER },
+  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "coverage") },
+  { key: "normal_sample", header: "normal_sample", group: "Normal", text: (r) => (r.normal ? r.normal.primary_id : "") },
+  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: (r) => (r.normal ? (r.normal.anon_id || "") : "") },
+  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: (r) => (r.normal ? dmpNameParts(r.normal.primary_id)[1] : "") },
+  { key: "pool_id", header: "pool_id", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "project_name") },
+  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: () => DMP_PLACEHOLDER },
+  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: (r) => dmpMetaText(r.normal, "coverage") },
+];
+/* Where each legacy DMP column comes from (shown in the "About these
+ * columns" panel and as tooltips on the column headers). */
+const DMP_LEGEND = {
+  tumor_sample: "DMP sample name (primary_id), e.g. P-0000001-T01-IM7",
+  patient: "patient__dmp: the DMP \u201cP-\u201d patient id",
+  tumor_idx: "Sample name, second-to-last dash segment (e.g. T01); blank when unparseable",
+  tumor_IM_ver: "Sample name, last dash segment (e.g. IM7); blank when unparseable",
+  tumor_bamname: "anon_id: the DMP anonymous sample id",
+  tumor_group: "Placeholder: source not yet available",
+  tumor_matched: "\u201cMatched\u201d when a normal is paired to this DMP sample, else \u201cUnmatched\u201d",
+  tumor_bam_exists: "Placeholder: source not yet available",
+  tumor_bam_coverage: "coverage from the DMP record's additional_metadata",
+  normal_sample: "Paired normal's sample name (primary_id)",
+  normal_bamname: "Paired normal's anon_id",
+  normal_IM_ver: "Paired normal's name, last dash segment",
+  pool_id: "project_name from the tumor-side DMP record's additional_metadata",
+  normal_bam_exists: "Placeholder: source not yet available",
+  normal_bam_coverage: "coverage from the paired normal's additional_metadata",
+};
+const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
+const pairsState = {
+  rows: [],
+  logic: null,
+  // Per-logic selected column keys (each logic has its own column set and
+  // its own selection, so ARGOS choices never affect DMP and vice versa).
+  selected: {},
+  // Split-panel filter groups that the user collapsed (default: expanded).
+  groupCollapsed: {},
+};
+
+function isDmpLogic(logicName) {
+  const l = PAIRING_LOGICS.find((x) => x.name === logicName);
+  return !!logicName && (l ? l.strategy_name === "dmp" || logicName.toUpperCase() === "DMP" : logicName.toUpperCase() === "DMP");
+}
+function columnsForLogic(logicName) {
+  return isDmpLogic(logicName) ? DMP_COLUMNS : PAIR_COLUMNS;
+}
+function defaultSelectionFor(logicName) {
+  return new Set(isDmpLogic(logicName) ? DMP_DEFAULT_KEYS : PAIR_DEFAULT_KEYS);
+}
+function selectionFor(logicName) {
+  if (!logicName) return new Set();
+  if (!pairsState.selected[logicName]) pairsState.selected[logicName] = defaultSelectionFor(logicName);
+  return pairsState.selected[logicName];
+}
+function activeLogicName() {
+  return pairsState.logic || $("#pr-logic").value || null;
+}
 function selectedPairColumns() {
-  return PAIR_COLUMNS.filter((c) => pairsState.selected.has(c.key));
+  const logic = activeLogicName();
+  if (!logic) return [];
+  return columnsForLogic(logic).filter((c) => selectionFor(logic).has(c.key));
 }
 
-/* Checkbox picker, grouped by side in PAIR_GROUPS order. */
-function renderPairsColumns() {
-  const byGroup = new Map(PAIR_GROUPS.map((g) => [g, []]));
-  for (const c of PAIR_COLUMNS) byGroup.get(c.group).push(c);
-  $("#pr-columns").innerHTML = PAIR_GROUPS.map((g) =>
-    `<div class="col-group">${esc(g)}</div>` +
-    byGroup.get(g).map((c) =>
-      `<label class="col-check"><input type="checkbox" data-pcol="${c.key}"${pairsState.selected.has(c.key) ? " checked" : ""}>${esc(c.header)}</label>`
-    ).join("")
-  ).join("");
+/* Groups for the left split-panel filter.
+ *  - "side": the active logic's columns, grouped by side (Tumor / Normal /
+ *    Pairing for the standard set; Tumor / Normal for DMP).
+ *  - "logic": one group per pairing logic (ARGOS, TEMPO, ACCESS, DMP, ...),
+ *    each carrying that logic's full column set. */
+function pairReportGroups() {
+  const mode = $("#pr-groupby").value;
+  if (mode === "logic") {
+    return PAIRING_LOGICS.map((l) => ({
+      key: `logic:${l.name}`,
+      label: l.name,
+      logic: l.name,
+      columns: columnsForLogic(l.name),
+    }));
+  }
+  const logic = activeLogicName();
+  if (!logic) return [];
+  const bySide = new Map();
+  for (const c of columnsForLogic(logic)) {
+    if (!bySide.has(c.group)) bySide.set(c.group, []);
+    bySide.get(c.group).push(c);
+  }
+  return [...bySide.entries()].map(([label, columns]) => ({
+    key: `side:${logic}:${label}`,
+    label,
+    logic,
+    columns,
+  }));
+}
+
+/* Render the split-panel: one collapsible group per entry of
+ * pairReportGroups(); the group header shows its item count and toggles
+ * every column in the group (indeterminate when partially checked). */
+function renderPrGroups() {
+  const groups = pairReportGroups();
+  $("#pr-groups").innerHTML = groups.map((g) => {
+    const sel = selectionFor(g.logic);
+    const collapsed = !!pairsState.groupCollapsed[g.key];
+    const allChecked = g.columns.every((c) => sel.has(c.key));
+    return `<div class="pr-group">
+      <div class="pr-group-head">
+        <label class="pr-group-label">
+          <input type="checkbox" data-prgroup="${esc(g.key)}" data-prlogic="${esc(g.logic)}"${allChecked ? " checked" : ""}>
+          <span class="pr-group-name">${esc(g.label)}</span>
+          <span class="pr-group-count" title="columns in this group">${g.columns.length}</span>
+        </label>
+        <button type="button" class="linkbtn" data-prcaret="${esc(g.key)}" title="Expand / collapse this group">${collapsed ? "\u25B8" : "\u25BE"}</button>
+      </div>
+      <div class="pr-group-body${collapsed ? " hidden" : ""}">
+        ${g.columns.map((c) =>
+          `<label class="col-check"><input type="checkbox" data-prcol="${esc(c.key)}" data-prlogic="${esc(g.logic)}"${sel.has(c.key) ? " checked" : ""}>${esc(c.header)}</label>`
+        ).join("")}
+      </div>
+    </div>`;
+  }).join("");
+  for (const g of groups) {
+    const sel = selectionFor(g.logic);
+    const all = g.columns.every((c) => sel.has(c.key));
+    const some = g.columns.some((c) => sel.has(c.key));
+    const head = $(`#pr-groups input[data-prgroup="${g.key}"]`);
+    if (head) head.indeterminate = some && !all;
+  }
 }
 
 function renderPairsTable() {
+  const logic = activeLogicName();
+  const dmp = isDmpLogic(logic);
   const cols = selectedPairColumns();
-  $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) => `<th>${esc(c.header)}</th>`).join("")}</tr>`;
-  $("#pairs-table tbody").innerHTML = pairsState.rows.map((r) =>
-    `<tr>${cols.map((c) => `<td>${esc(c.text(r))}</td>`).join("")}</tr>`).join("");
+  $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) =>
+    `<th${dmp && DMP_LEGEND[c.key] ? ` title="${esc(DMP_LEGEND[c.key])}"` : ""}>${esc(c.header)}</th>`
+  ).join("")}</tr>`;
+  $("#pairs-table tbody").innerHTML = pairsState.rows
+    .map((r) => `<tr>${cols.map((c) => `<td>${esc(c.text(r))}</td>`).join("")}</tr>`).join("");
+  const matched = pairsState.rows.filter((r) => r.tumor && r.normal).length;
   const empty = pairsState.rows.length === 0 || cols.length === 0;
   $("#pr-empty").classList.toggle("hidden", !empty);
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
-    : `${pairsState.rows.length} pair${pairsState.rows.length === 1 ? "" : "s"}`;
+    : dmp
+      ? `${pairsState.rows.length} rows: ${matched} matched, ${pairsState.rows.length - matched} unmatched`
+      : `${pairsState.rows.length} pair${pairsState.rows.length === 1 ? "" : "s"}`;
   $("#pr-download").disabled = empty;
+  // Legend (and header tooltips) only for the legacy DMP column set.
+  $("#pr-legend").classList.toggle("hidden", !dmp);
+  if (dmp) {
+    $("#pr-legend-body").innerHTML = DMP_COLUMNS.map((c) =>
+      `<tr><td>${esc(c.header)}</td><td>${esc(DMP_LEGEND[c.key] || "")}</td></tr>`
+    ).join("");
+  }
 }
 
 async function loadPairs() {
   const logic = $("#pr-logic").value;
   if (!logic) return;
   try {
-    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
     pairsState.logic = logic;
+    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
+    if (isDmpLogic(logic)) await appendUnmatchedDmpSamples();
+    renderPrGroups();
     renderPairsTable();
   } catch (e) {
     banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
   }
+}
+
+/* DMP report: the legacy export lists every DMP sample, so DMP samples
+ * without a pairing yet are appended as rows with the opposite-side
+ * columns left empty. */
+async function appendUnmatchedDmpSamples() {
+  const paired = new Set();
+  for (const r of pairsState.rows) {
+    paired.add(r.tumor.id);
+    paired.add(r.normal.id);
+  }
+  const extra = [];
+  const page = 1000;
+  for (let offset = 0; ; offset += page) {
+    const batch = await api(`/sample/?${new URLSearchParams({ sample_type: "DMP", limit: String(page), offset: String(offset) })}`);
+    for (const s of batch) {
+      if (paired.has(s.id)) continue;
+      extra.push({
+        tumor: s.tumor_or_normal === "TUMOR" ? s : null,
+        normal: s.tumor_or_normal === "NORMAL" ? s : null,
+        pairing_logic: pairsState.logic,
+        trigger_type: null,
+        mismatched_keys: [],
+        created_date: s.created_date,
+      });
+    }
+    if (batch.length < page) break;
+  }
+  pairsState.rows = pairsState.rows.concat(extra);
 }
 
 function downloadPairs() {
@@ -1191,24 +1372,61 @@ function downloadPairs() {
 $("#pr-logic").addEventListener("change", loadPairs);
 $("#pr-download").addEventListener("click", downloadPairs);
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
-$("#pr-columns").addEventListener("change", (e) => {
-  const cb = e.target;
-  if (!cb.dataset || !cb.dataset.pcol) return;
-  if (cb.checked) pairsState.selected.add(cb.dataset.pcol);
-  else pairsState.selected.delete(cb.dataset.pcol);
+$("#pr-groupby").addEventListener("change", renderPrGroups);
+$("#pr-groups").addEventListener("change", (e) => {
+  const t = e.target;
+  if (!t.dataset) return;
+  if (t.dataset.prcol) {
+    const sel = selectionFor(t.dataset.prlogic);
+    if (t.checked) sel.add(t.dataset.prcol);
+    else sel.delete(t.dataset.prcol);
+  } else if (t.dataset.prgroup) {
+    const g = pairReportGroups().find((x) => x.key === t.dataset.prgroup);
+    if (!g) return;
+    const sel = selectionFor(g.logic);
+    for (const c of g.columns) {
+      if (t.checked) sel.add(c.key);
+      else sel.delete(c.key);
+    }
+  } else {
+    return;
+  }
   renderPairsTable();
+  renderPrGroups();
 });
-$("#pr-cols-all").addEventListener("click", () => {
-  for (const c of PAIR_COLUMNS) pairsState.selected.add(c.key);
-  renderPairsColumns();
+$("#pr-groups").addEventListener("click", (e) => {
+  const btn = e.target.closest ? e.target.closest("[data-prcaret]") : null;
+  if (!btn) return;
+  const k = btn.dataset.prcaret;
+  pairsState.groupCollapsed[k] = !pairsState.groupCollapsed[k];
+  const group = btn.closest(".pr-group");
+  const body = group && group.querySelector(".pr-group-body");
+  if (body) body.classList.toggle("hidden", pairsState.groupCollapsed[k]);
+  btn.textContent = pairsState.groupCollapsed[k] ? "\u25B8" : "\u25BE";
+});
+$("#pr-panel-collapse").addEventListener("click", () => {
+  $("#pr-panel").classList.add("collapsed");
+  $("#pr-panel-open").classList.remove("hidden");
+});
+$("#pr-panel-open").addEventListener("click", () => {
+  $("#pr-panel").classList.remove("collapsed");
+  $("#pr-panel-open").classList.add("hidden");
+});
+function setSelectionForActive(keys) {
+  const logic = activeLogicName();
+  if (!logic) return;
+  const sel = selectionFor(logic);
+  sel.clear();
+  for (const k of keys) sel.add(k);
+  renderPrGroups();
   renderPairsTable();
-});
-$("#pr-cols-default").addEventListener("click", () => {
-  pairsState.selected = new Set(PAIR_DEFAULT_KEYS);
-  renderPairsColumns();
-  renderPairsTable();
-});
-renderPairsColumns();
+}
+$("#pr-cols-all").addEventListener("click", () =>
+  setSelectionForActive(columnsForLogic(activeLogicName()).map((c) => c.key)));
+$("#pr-cols-none").addEventListener("click", () => setSelectionForActive([]));
+$("#pr-cols-default").addEventListener("click", () =>
+  setSelectionForActive([...defaultSelectionFor(activeLogicName())]));
+renderPrGroups();
 
 /* ---------- try pairing view (dry run) ---------- */
 

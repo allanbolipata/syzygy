@@ -387,7 +387,7 @@ unreachable).
 
 A basic static web UI (no build step, no extra dependencies) is served
 at `/ui`; the root path `/` redirects there. It has tabs for samples,
-patients, requests, pooled normals, pairs by logic, matches &
+patients, requests, pooled normals, pair report, matches &
 overrides, and a read-only Try Pairing dry-run tab, and lets you:
 
 - query and filter samples (search plus per-field filters on
@@ -414,17 +414,28 @@ overrides, and a read-only Try Pairing dry-run tab, and lets you:
   sample (from the samples, patients, requests, or pooled view) opens
   it directly, pre-selecting the logic the sample is currently paired
   under when known;
-- browse pairs by logic: pick a pairing logic to list its current
+- browse the pair report: pick a pairing logic to list its current
   pairs (`GET /v1/pairing?latest=true`) and download the table as CSV
-  or TSV. A column picker chooses which metadata columns to view and
-  export — the original three (tumor `primary_id`, normal
-  `primary_id`, bait set) plus per-side sample metadata (patient id,
-  `cmo_sample_name`, role, sample type, gene panel, request id, run
+  or TSV. A left-side split-panel filter (collapsible to a small
+  show/hide toggle) groups the selectable columns by side (tumor /
+  normal / pairing) or by pairing logic (one group per logic); each
+  group header shows its column count and toggles every column in the
+  group, and the table and export update live as columns are checked.
+  The selectable columns are the original three (tumor `primary_id`,
+  normal `primary_id`, bait set) plus per-side sample metadata (patient
+  id, `cmo_sample_name`, role, sample type, gene panel, request id, run
   mode, file group, preservation, sample origin, sequencing date,
   additional metadata, errors, sample id) and pairing-level fields
-  (logic, trigger type, mismatched keys, created date); an "All
-  metadata" button selects every column in one click, and the export
-  contains exactly the selected columns;
+  (logic, trigger type, mismatched keys, created date); All / None /
+  Default buttons reset the selection, and the export contains exactly
+  the selected columns. The DMP logic switches to the legacy DMP export
+  columns (tumor_sample, patient, tumor_idx, tumor_IM_ver,
+  tumor_bamname, tumor_group, tumor_matched, tumor_bam_exists,
+  tumor_bam_coverage, normal_sample, normal_bamname, normal_IM_ver,
+  pool_id, normal_bam_exists, normal_bam_coverage), unmatched DMP
+  samples appear with the opposite-side columns empty, and an
+  "About these columns" panel (plus header tooltips) explains where
+  each value comes from;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the

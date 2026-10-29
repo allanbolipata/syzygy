@@ -14,7 +14,7 @@
     <button class="tab" data-tab="patients">Patients</button>
     <button class="tab" data-tab="requests">Requests</button>
     <button class="tab" data-tab="pooled">Pooled Normals</button>
-    <button class="tab" data-tab="pairs">Pairs by Logic</button>
+    <button class="tab" data-tab="pairs">Pair Report</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
     <button class="tab" data-tab="try">Try Pairing</button>
   </nav>
@@ -218,37 +218,61 @@
 
 <main id="view-pairs" class="view hidden">
   <section class="panel">
-    <h2>Pairs by pairing logic</h2>
-    <p class="hint">Current (latest) pairings under the selected logic. Check the columns to view and export &mdash; the download contains exactly the selected columns.</p>
-    <div class="filters">
-      <label>pairing logic
-        <select id="pr-logic"></select>
-      </label>
-      <label>format
-        <select id="pr-format">
-          <option value="csv">CSV</option>
-          <option value="tsv">TSV</option>
-        </select>
-      </label>
-      <button id="pr-download" disabled>Download</button>
-      <span id="pr-count" class="hint"></span>
-    </div>
-    <div class="colpick">
-      <div class="colpick-head">
-        <strong>Columns</strong>
-        <span class="hint">Viewed and exported exactly as checked.</span>
-        <button type="button" class="small" id="pr-cols-all">All metadata</button>
-        <button type="button" class="small" id="pr-cols-default">Default</button>
+    <h2>Pair Report</h2>
+    <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the legacy DMP export columns.</p>
+    <div class="pr-split" id="pr-split">
+      <aside class="pr-panel" id="pr-panel">
+        <div class="pr-panel-head">
+          <strong>Columns</strong>
+          <button type="button" class="linkbtn" id="pr-panel-collapse" title="Collapse filter panel">&lsaquo;</button>
+        </div>
+        <div class="pr-panel-body" id="pr-panel-body">
+          <label>group by
+            <select id="pr-groupby">
+              <option value="side">Tumor / Normal</option>
+              <option value="logic">Pair logic / Strategy</option>
+            </select>
+          </label>
+          <p class="hint">A group header toggles every column in its group. The table and export update live.</p>
+          <div id="pr-groups"></div>
+          <div class="pr-panel-actions">
+            <button type="button" class="small" id="pr-cols-all">All</button>
+            <button type="button" class="small" id="pr-cols-none">None</button>
+            <button type="button" class="small" id="pr-cols-default">Default</button>
+          </div>
+        </div>
+      </aside>
+      <button type="button" class="pr-panel-open hidden" id="pr-panel-open" title="Show filter panel">&rsaquo;</button>
+      <div class="pr-main">
+        <div class="filters">
+          <label>pairing logic
+            <select id="pr-logic"></select>
+          </label>
+          <label>format
+            <select id="pr-format">
+              <option value="csv">CSV</option>
+              <option value="tsv">TSV</option>
+            </select>
+          </label>
+          <button id="pr-download" disabled>Download</button>
+          <span id="pr-count" class="hint"></span>
+        </div>
+        <details class="pr-legend hidden" id="pr-legend">
+          <summary>About these columns</summary>
+          <table class="pr-legend-table">
+            <thead><tr><th>column</th><th>where it comes from</th></tr></thead>
+            <tbody id="pr-legend-body"></tbody>
+          </table>
+        </details>
+        <div class="table-wrap">
+          <table id="pairs-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="pr-empty" class="empty hidden">No current pairs for this logic.</p>
       </div>
-      <div class="colpick-grid" id="pr-columns"></div>
     </div>
-    <div class="table-wrap">
-      <table id="pairs-table">
-        <thead></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-    <p id="pr-empty" class="empty hidden">No current pairs for this logic.</p>
   </section>
 </main>
 
