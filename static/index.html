@@ -248,6 +248,8 @@
           <label>pairing logic
             <select id="pr-logic"></select>
           </label>
+          <button type="button" id="pr-run-dmp" class="small hidden" title="Pair every unpaired DMP tumor with its DMP normal (DMP logic only — automatic pairing)">Run DMP pairing</button>
+          <span id="pr-dmp-status" class="hint"></span>
           <label>format
             <select id="pr-format">
               <option value="csv">CSV</option>
@@ -428,6 +430,12 @@
       to 500 per page &mdash; use Prev/Next to page the full scope.
       Click a candidate row to open its matches &amp; overrides.
       Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
+    </p>
+    <p id="m-dmp-warning" class="hint hidden">
+      The DMP logic is automatic-only: DMP tumors pair with their DMP
+      normals via the <em>Run DMP pairing</em> button on the Pairs tab.
+      To pin a DMP tumor to a non-DMP normal, switch to another logic
+      (e.g. ARGOS) first.
     </p>
     <label class="check">
       <input type="checkbox" id="m-strict">

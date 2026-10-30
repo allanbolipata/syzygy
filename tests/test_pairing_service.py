@@ -5,7 +5,7 @@ from typing import Optional
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,13 +17,19 @@ from pairing_service import (
     _create_pairing,
     _get_latest_pairing,
     resolve_pairing_logic,
+    trigger_dmp_pairing,
     trigger_pairing,
     trigger_pairing_for_normal,
     trigger_pairing_for_unpaired_tumors,
 )
 from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
-from routers.pairings import list_pairings, trigger_all_pairings_endpoint, trigger_pairing_endpoint
+from routers.pairings import (
+    list_pairings,
+    trigger_all_pairings_endpoint,
+    trigger_dmp_pairing_endpoint,
+    trigger_pairing_endpoint,
+)
 from routers.patients import PATIENT_META_KEYS, list_patients
 from routers.requests import list_requests
 from routers.samples import create_sample, list_samples
@@ -2872,3 +2878,185 @@ def test_trigger_all_endpoint_returns_summary(db):
     assert result["skipped_no_logic"] == 0
     assert result["skipped_inactive_logic"] == 0
     assert [p.tumor_id for p in result["new_pairings"]] == [tumor.id]
+
+
+# ---------------------------------------------------------------------------
+# DMP automatic pairing (POST /pairing/trigger-dmp)
+# ---------------------------------------------------------------------------
+
+
+def _dmp_logic(db, name="DMP", active=True):
+    logic = PairingLogic(name=name, strategy_name="dmp", active=active)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    return logic
+
+
+def _dmp_sample(
+    db,
+    primary_id,
+    patient__dmp,
+    tumor_or_normal=TumorOrNormal.NORMAL.value,
+    gene_panel="PANEL-A",
+):
+    sample = _sample(
+        db,
+        primary_id,
+        patient__cmo=f"CMO-{patient__dmp}",
+        tumor_or_normal=tumor_or_normal,
+        sample_type="DMP",
+        gene_panel=gene_panel,
+    )
+    sample.patient__dmp = patient__dmp
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_trigger_dmp_pairs_dmp_tumor_with_dmp_normal(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000001-T1-X1", "P-0000001", TumorOrNormal.TUMOR.value)
+    normal = _dmp_sample(db, "P-0000001-N1-X1", "P-0000001")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["pairing_logic"] == "DMP"
+    assert result["scanned"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
+    assert result["already_paired"] == 0
+    assert result["missing_patient__dmp"] == 0
+    (pairing,) = result["new_pairings"]
+    assert pairing.tumor_id == tumor.id
+    assert pairing.normal_id == normal.id
+    assert pairing.trigger_type == "automatic"
+    assert pairing.pairing_logic_id == db.scalar(
+        select(PairingLogic.id).where(PairingLogic.name == "DMP")
+    )
+
+
+def test_trigger_dmp_picks_deterministic_normal_on_tie(db):
+    _dmp_logic(db)
+    _dmp_sample(db, "P-0000002-T1-X1", "P-0000002", TumorOrNormal.TUMOR.value)
+    later = _dmp_sample(db, "P-0000002-N2-X1", "P-0000002")
+    first = _dmp_sample(db, "P-0000002-N1-X1", "P-0000002")
+
+    result = trigger_dmp_pairing(db)
+
+    (pairing,) = result["new_pairings"]
+    assert pairing.normal_id == first.id  # min primary_id wins
+    assert later.id != pairing.normal_id
+
+
+def test_trigger_dmp_requires_same_dmp_patient(db):
+    _dmp_logic(db)
+    _dmp_sample(db, "P-0000003-T1-X1", "P-0000003", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-9999999-N1-X1", "P-9999999")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 0
+    assert result["unpaired"] == 1
+    assert result["new_pairings"] == []
+
+
+def test_trigger_dmp_requires_same_gene_panel(db):
+    _dmp_logic(db)
+    _dmp_sample(
+        db, "P-0000004-T1-X1", "P-0000004", TumorOrNormal.TUMOR.value,
+        gene_panel="PANEL-A",
+    )
+    _dmp_sample(db, "P-0000004-N1-X1", "P-0000004", gene_panel="PANEL-B")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 0
+    assert result["unpaired"] == 1
+
+
+def test_trigger_dmp_reports_missing_patient_dmp(db):
+    _dmp_logic(db)
+    tumor = _sample(
+        db, "DMP-NODMP-T", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP", patient__cmo="CMO-NODMP",
+    )
+    _dmp_sample(db, "P-0000005-N1-X1", "P-0000005")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["scanned"] == 1
+    assert result["missing_patient__dmp"] == 1
+    assert result["paired"] == 0
+    assert result["unpaired"] == 0
+    assert db.scalar(
+        select(PairingTable).where(PairingTable.tumor_id == tumor.id)
+    ) is None
+
+
+def test_trigger_dmp_skips_already_paired_tumors(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000006-T1-X1", "P-0000006", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-0000006-N1-X1", "P-0000006")
+
+    first = trigger_dmp_pairing(db)
+    assert first["paired"] == 1
+
+    second = trigger_dmp_pairing(db)
+    assert second["scanned"] == 1
+    assert second["already_paired"] == 1
+    assert second["paired"] == 0
+    assert second["new_pairings"] == []
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.tumor_id == tumor.id
+            )
+        )
+        == 1
+    )
+
+
+def test_trigger_dmp_400_when_no_dmp_logic(db):
+    _sample(db, "DMP-NOLOGIC-T", tumor_or_normal=TumorOrNormal.TUMOR.value,
+            sample_type="DMP", patient__cmo="CMO-X")
+    with pytest.raises(HTTPException) as exc:
+        trigger_dmp_pairing(db)
+    assert exc.value.status_code == 400
+    assert "DMP" in exc.value.detail
+
+
+def test_trigger_dmp_400_when_dmp_logic_inactive(db):
+    _dmp_logic(db, active=False)
+    with pytest.raises(HTTPException) as exc:
+        trigger_dmp_pairing(db)
+    assert exc.value.status_code == 400
+
+
+def test_manual_trigger_endpoint_refuses_dmp_logic(db):
+    """POST /pairing/trigger rejects the DMP strategy (automatic-only)."""
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000007-T1-X1", "P-0000007", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-0000007-N1-X1", "P-0000007")
+    payload = PairingTriggerCreate(
+        tumor_id=tumor.id, trigger_type="manual", pairing_logic_name="DMP"
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 400
+    assert "automatic" in exc.value.detail
+    assert db.scalar(
+        select(PairingTable).where(PairingTable.tumor_id == tumor.id)
+    ) is None
+
+
+def test_trigger_dmp_endpoint_pairs(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000008-T1-X1", "P-0000008", TumorOrNormal.TUMOR.value)
+    normal = _dmp_sample(db, "P-0000008-N1-X1", "P-0000008")
+
+    result = trigger_dmp_pairing_endpoint(db=db)
+
+    assert result["paired"] == 1
+    (pairing,) = result["new_pairings"]
+    assert (pairing.tumor_id, pairing.normal_id) == (tumor.id, normal.id)

@@ -1,3 +1,11 @@
+"""Pairing endpoints.
+
+DMP tumors pair with their own DMP normals (same ``patient__dmp`` and gene
+panel) automatically via ``POST /pairing/trigger-dmp`` under the DMP
+pairing logic. DMP samples are also pairable manually, but only under the
+other logics (e.g. ARGOS) — ``POST /pairing/trigger`` refuses the DMP
+strategy, which is reserved for the automatic trigger.
+"""
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
@@ -11,11 +19,13 @@ from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
     find_logic_by_name,
     resolve_pairing_logic,
+    trigger_dmp_pairing,
     trigger_pairing,
     trigger_pairing_for_unpaired_tumors,
 )
-from pairing_strategies import get_pairing_strategy
+from pairing_strategies import get_pairing_strategy, strategies
 from schemas import (
+    DmpTriggerRead,
     PairingRead,
     PairingTriggerCreate,
     SampleRead,
@@ -183,6 +193,15 @@ def trigger_pairing_endpoint(
             status_code=400,
             detail="pairing_logic_id or pairing_logic_name is required",
         )
+    if strategies.get(pairing_logic.strategy_name) is strategies["dmp"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The DMP strategy is automatic: DMP tumors pair with their "
+                "own DMP normals via POST /pairing/trigger-dmp. Pair this "
+                "sample under another logic (e.g. ARGOS) instead."
+            ),
+        )
 
     pairing = trigger_pairing(
         db,
@@ -209,8 +228,22 @@ def trigger_all_pairings_endpoint(db: Session = Depends(get_db)) -> dict:
 
     Occasional bulk operation (e.g. after a bulk ingest): each tumor's
     pairing logic is resolved from its assigned bait set, DMP tumors
-    (manual pairing only) and tumors with no assigned or inactive logic
-    are skipped and counted, and existing pairings are never touched.
+    (paired automatically under the DMP logic) and tumors with no
+    assigned or inactive logic are skipped and counted, and existing
+    pairings are never touched.
     New pairings are recorded with ``trigger_type="automatic"``.
     """
     return trigger_pairing_for_unpaired_tumors(db)
+
+
+@router.post("/trigger-dmp", response_model=DmpTriggerRead)
+def trigger_dmp_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+    """Run automatic DMP pairing under the DMP pairing logic.
+
+    Every unpaired DMP tumor is paired with its DMP normal (same
+    ``patient__dmp`` and gene panel) via the DMP strategy. Existing
+    pairings are never modified or replaced. DMP tumors without a
+    ``patient__dmp`` value cannot be matched and are reported in
+    ``missing_patient__dmp``.
+    """
+    return trigger_dmp_pairing(db)

@@ -175,6 +175,26 @@ class TriggerAllRead(BaseModel):
     new_pairings: list[PairingRead]
 
 
+class DmpTriggerRead(BaseModel):
+    """Summary of a POST /pairing/trigger-dmp run.
+
+    ``scanned`` counts the DMP tumor samples processed; the four outcome
+    counts sum to it. ``missing_patient__dmp`` are DMP tumors without a
+    patient identifier that the DMP strategy cannot match.
+    ``new_pairings`` lists the pairings created by this run.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    pairing_logic: str
+    scanned: int
+    already_paired: int
+    missing_patient__dmp: int
+    paired: int
+    unpaired: int
+    new_pairings: list[PairingRead]
+
+
 class PossibleMatchCandidate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

@@ -232,7 +232,7 @@ def trigger_pairing_for_normal(
 
 
 def _is_dmp_sample(sample: Sample) -> bool:
-    """Provenance flag for DMP-ingested samples (manual pairing only)."""
+    """Provenance flag for DMP-ingested samples."""
     return str(sample.sample_type or "").strip().upper() == "DMP"
 
 
@@ -244,7 +244,7 @@ def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
     at ingest time. Each tumor's pairing logic is resolved from its
     assigned bait set (``bait_sets.resolve_bait_set_logic``), and:
 
-    * DMP tumors are skipped (manual pairing only);
+    * DMP tumors are skipped (paired automatically under the DMP logic);
     * tumors whose bait set has no assigned logic, or whose logic is not
       active, are skipped (never paired under a wrong or disabled logic);
     * tumors that already have a latest pairing under their resolved
@@ -298,6 +298,90 @@ def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
         "skipped_dmp": skipped_dmp,
         "skipped_no_logic": skipped_no_logic,
         "skipped_inactive_logic": skipped_inactive_logic,
+        "new_pairings": new_pairings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Automatic DMP pairing (POST /pairing/trigger-dmp)
+# ---------------------------------------------------------------------------
+
+#: Name of the pairing logic under which DMP samples pair automatically.
+#: The DMP strategy is strictly DMP-group scoped (DMP tumor <-> DMP normal,
+#: same patient__dmp and gene panel), so running it in bulk can only create
+#: DMP-DMP pairings and never touches other sample groups.
+DMP_LOGIC_NAME = "DMP"
+
+
+def trigger_dmp_pairing(db: Session) -> dict:
+    """Bulk automatic DMP pairing under the DMP pairing logic.
+
+    Every unpaired DMP tumor is paired with its best DMP normal (same
+    ``patient__dmp`` and gene panel) via the DMP strategy. Existing pairings
+    are never modified: a tumor that already has a latest pairing under the
+    DMP logic is skipped, whatever that pairing's trigger type is.
+
+    Returns ``{"pairing_logic", "scanned", "already_paired",
+    "missing_patient__dmp", "paired", "unpaired", "new_pairings"}`` where
+    the four outcome counts sum to ``scanned``. DMP tumors without
+    ``patient__dmp`` cannot match (the strategy is patient-scoped) and are
+    reported in ``missing_patient__dmp``.
+
+    Raises ``HTTPException(400)`` when no active pairing logic named
+    "DMP" exists: the trigger has nothing to run against.
+    """
+    logic = find_logic_by_name(db, DMP_LOGIC_NAME)
+    if logic is None or not logic.active:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No active pairing logic named '{DMP_LOGIC_NAME}': the DMP "
+                "pairing trigger has nothing to run against."
+            ),
+        )
+
+    # Tumors already carrying a latest pairing under this logic — one query
+    # instead of a lookup per tumor.
+    already_paired_ids = set(
+        db.scalars(
+            select(PairingTable.tumor_id).where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+            )
+        ).all()
+    )
+
+    tumors = db.scalars(
+        select(Sample).where(
+            Sample.sample_type == "DMP",
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+        )
+    ).all()
+
+    scanned = already_paired = missing_patient = paired = unpaired = 0
+    new_pairings: list[PairingTable] = []
+    for tumor in tumors:
+        scanned += 1
+        if tumor.id in already_paired_ids:
+            already_paired += 1
+            continue
+        if not (tumor.patient__dmp or "").strip():
+            missing_patient += 1
+            continue
+        pairing = trigger_pairing(db, tumor, logic, "automatic")
+        if pairing is None:
+            unpaired += 1
+        else:
+            paired += 1
+            new_pairings.append(pairing)
+
+    return {
+        "pairing_logic": logic.name,
+        "scanned": scanned,
+        "already_paired": already_paired,
+        "missing_patient__dmp": missing_patient,
+        "paired": paired,
+        "unpaired": unpaired,
         "new_pairings": new_pairings,
     }
 

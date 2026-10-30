@@ -324,6 +324,7 @@ async function loadLogics() {
     $("#tq-logic").innerHTML = logics.map((l) =>
       `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
+    updateDmpTriggerButton();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -401,6 +402,7 @@ async function searchMatchesSamples() {
 async function showMatches(offset) {
   const sample = matchesState.sample;
   const logic = $("#m-logic").value;
+  $("#m-dmp-warning").classList.toggle("hidden", !isDmpLogic(logic));
   if (!sample || !logic) return;
   if (matchesState.busy) return;
   if (offset === undefined || typeof offset !== "number") offset = matchesState.othersOffset;
@@ -591,6 +593,13 @@ function submitOverride(normalId) {
   const data = matchesState.data;
   const strict = $("#m-strict").checked;
   const logic = $("#m-logic").value;
+  if (isDmpLogic(logic)) {
+    banner("error",
+      "The DMP logic is automatic-only: use the “Run DMP pairing” button on " +
+      "the Pairs tab, or switch to another logic (e.g. ARGOS) to pin a " +
+      "DMP tumor to a non-DMP normal.", true);
+    return;
+  }
   const payload = {
     tumor_id: data.sample.id,
     normal_id: normalId,
@@ -1399,7 +1408,43 @@ function downloadPairs() {
   URL.revokeObjectURL(a.href);
 }
 
-$("#pr-logic").addEventListener("change", loadPairs);
+/* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
+ * with its DMP normal (same patient__dmp and gene panel). The button is
+ * shown only for the active DMP logic; manual pairing of DMP samples
+ * happens under the other logics (e.g. ARGOS). */
+async function runDmpPairing() {
+  const btn = $("#pr-run-dmp");
+  btn.disabled = true;
+  $("#pr-dmp-status").textContent = "Pairing…";
+  try {
+    const r = await api("/pairing/trigger-dmp", { method: "POST" });
+    $("#pr-dmp-status").textContent =
+      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
+      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
+    banner("ok", `DMP pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
+      `${r.missing_patient__dmp} missing patient__dmp`, true);
+    await loadPairs();
+  } catch (e) {
+    banner("error", `DMP pairing failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* Show/hide the DMP trigger button per selected logic (DMP logic only). */
+function updateDmpTriggerButton() {
+  const logic = $("#pr-logic").value;
+  const l = PAIRING_LOGICS.find((x) => x.name === logic);
+  const show = isDmpLogic(logic) && !!l && !!l.active;
+  $("#pr-run-dmp").classList.toggle("hidden", !show);
+  if (!show) $("#pr-dmp-status").textContent = "";
+}
+
+$("#pr-logic").addEventListener("change", () => {
+  updateDmpTriggerButton();
+  loadPairs();
+});
+$("#pr-run-dmp").addEventListener("click", runDmpPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
   if (pairsState.page > 0) {
