@@ -52,7 +52,7 @@ def list_samples(
     q: Optional[str] = None,
     primary_id: Optional[str] = None,
     cmo_sample_name: Optional[str] = None,
-    patient_id: Optional[str] = None,
+    patient__cmo: Optional[str] = None,
     request_id: Optional[str] = None,
     sample_type: Optional[str] = None,
     gene_panel: Optional[str] = None,
@@ -66,9 +66,9 @@ def list_samples(
     """List samples, newest first, with optional field filters.
 
     ``q`` matches any of ``primary_id``, ``cmo_sample_name``,
-    ``patient_id``, or ``request_id``. The per-field filters are
+    ``patient__cmo``, or ``request_id``. The per-field filters are
     case-insensitive substring matches; ``tumor_or_normal`` is exact;
-    ``no_patient`` restricts to samples with a null patient_id (e.g.
+    ``no_patient`` restricts to samples with a null patient__cmo (e.g.
     pooled normals). All filters combine with AND.
     """
     stmt = select(Sample).order_by(Sample.created_date.desc(), Sample.id.desc())
@@ -78,14 +78,14 @@ def list_samples(
             or_(
                 Sample.primary_id.ilike(like),
                 Sample.cmo_sample_name.ilike(like),
-                Sample.patient_id.ilike(like),
+                Sample.patient__cmo.ilike(like),
                 Sample.request_id.ilike(like),
             )
         )
     for field, value in {
         "primary_id": primary_id,
         "cmo_sample_name": cmo_sample_name,
-        "patient_id": patient_id,
+        "patient__cmo": patient__cmo,
         "request_id": request_id,
         "sample_type": sample_type,
         "gene_panel": gene_panel,
@@ -96,9 +96,38 @@ def list_samples(
         if value is not None:
             stmt = stmt.where(getattr(Sample, field).ilike(f"%{value}%"))
     if no_patient:
-        stmt = stmt.where(Sample.patient_id.is_(None))
+        stmt = stmt.where(Sample.patient__cmo.is_(None))
     if tumor_or_normal is not None:
         stmt = stmt.where(Sample.tumor_or_normal == tumor_or_normal.value)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    return db.scalars(stmt).all()
+
+
+@router.get("/lookup", response_model=list[SampleRead])
+def lookup_samples_endpoint(
+    q: str = Query(..., min_length=1),
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """Case-insensitive partial-match lookup on ``primary_id`` and
+    ``cmo_sample_name`` only — the two sample identifiers used in manual
+    pairing workflows (the "Try Pairing" tab). Newest first."""
+    if limit is not None and (limit < 1 or limit > 10000):
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 10000")
+    if offset is not None and offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    like = f"%{q.strip()}%"
+    if not like.strip("%"):
+        raise HTTPException(status_code=400, detail="q must not be blank")
+    stmt = (
+        select(Sample)
+        .where(or_(Sample.primary_id.ilike(like), Sample.cmo_sample_name.ilike(like)))
+        .order_by(Sample.created_date.desc(), Sample.id.desc())
+    )
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:

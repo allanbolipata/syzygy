@@ -36,6 +36,22 @@
   // Explanation passed along by the UI after a 403 (e.g. "User not
   // allowed: ... has no email address").
   showError(new URLSearchParams(location.search).get("error"));
+  // Dev-only local login: when the server has DEV_AUTH_TOKEN set, the
+  // sign-in button issues a local dev-admin session instead of kicking
+  // to Keycloak (the flag endpoint exposes only the flag, never the
+  // token).
+  fetch("/auth/dev-login")
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (info) {
+      if (!info || !info.dev_login) return;
+      document.getElementById("btn-signin").textContent =
+        "Sign in (local dev admin)";
+      document.querySelector(".panel p").textContent =
+        "Dev mode: signs you in as the local dev admin, without Keycloak.";
+    })
+    .catch(function () {
+      /* flag unavailable: keep the Keycloak button */
+    });
   // Redirect straight to the UI when a session is already valid; if the
   // session is valid but NOT allow-listed (403), show the reason and stay
   // here instead of bouncing back to the UI in a loop; otherwise

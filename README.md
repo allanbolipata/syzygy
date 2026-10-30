@@ -191,6 +191,76 @@ database:
    that database's container sits on `syzygy-dev`, reference it by
    its service or container name in the URL.
 
+## Mocking the production SMILE flow (dev NATS)
+
+In production the app does **not** connect to NATS. SMILE publishes
+`cmo-new-request`, `cmo-sample-update` and `cmo-request-update`
+messages onto the `MDB_STREAM` JetStream stream, and a standalone
+**smile-listener** service — the vendored
+[mskcc/smile-client](https://github.com/mskcc/smile-client) copy in
+`listener/`, running as the `smile-listener` compose service — consumes
+them and POSTs each message to the app's internal `POST /v1/ingest/nats`
+endpoint. The endpoint is fail-closed: it rejects every request (403)
+unless `NATS_INGEST_TOKEN` is set, and the listener must send the same
+value as its `SYZYGY_NATS_TOKEN` (the dev compose sets both to the same
+dev value). For local work, `scripts/mock_smile.py` stands in for SMILE.
+
+**1. Bring up the full stack** (this Mac has no Docker — Podman):
+
+    podman compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+Services: `app` (in-container ingest target on :8123, not published to
+the host), `db` (:5435), `keycloak` (:8080), `keycloak-db`, `nats`
+(:4222 client / :8222 monitor), one-shot `nats-init` (creates the
+`MDB_STREAM` stream), and `smile-listener`. Verify: `curl
+http://127.0.0.1:8000/health` (the host-side app), `curl
+http://127.0.0.1:8080/health/ready`, and `curl http://127.0.0.1:8222/jsz`
+(the JetStream summary — `streams: 1` once `MDB_STREAM` is created).
+
+**2. Log in through dev Keycloak** — open
+`http://127.0.0.1:8000/login` in a browser (realm `master`; the one-time
+client/user setup and the allow-listed user are described in the
+[Authentication (Keycloak)](#authentication-keycloak) section). Browser
+login runs against the host-side uvicorn process, not the container app.
+
+**3. Publish the vendored fixtures** in this order:
+
+    python scripts/mock_smile.py pub new-request   tests/fixtures/nats/99908_C_new_request.json
+    python scripts/mock_smile.py pub update-sample tests/fixtures/nats/99908_C_1_update_sample.json
+    python scripts/mock_smile.py pub request-update tests/fixtures/nats/99990_D_request_update.json
+
+**Expected state** (verify against `127.0.0.1:5435`, user `app`):
+
+- the 5 samples of request `99908_C` are registered with
+  `file_group = 'SMILE'`; each carries
+  `additional_metadata["requestMetadata"]` (parsed from `requestJson`)
+  and `["requestStatus"]`;
+- `99908_C_1` ends up `TUMOR` (the update flips it) with its
+  `sampleMetadataList` preserved; its `Frozen` + `Tissue`
+  preservation/origin combination is unresolvable, so it stays unpaired
+  by design;
+- `99990_D_2` has no registered samples, so the request-update is
+  reported missing (WARN in the app log) and changes nothing. If the
+  dev DB already holds `99990_D_2` samples from an earlier populate,
+  they are updated in place instead.
+
+**Proving the auto-pairing path:** the fixtures alone complete no
+pairing. `scripts/e2e_nats.py` therefore also publishes one synthetic
+`new-request` whose single TUMOR mirrors an existing pairable NORMAL
+(patient, gene panel, bait set, run mode and preservation copied from
+it) and asserts the resulting `pairing_table` row has
+`trigger_type = 'automatic'`.
+
+**4. Re-runnable automation** (assumes the stack is already up):
+
+    python scripts/e2e_nats.py
+
+It idempotently re-publishes the three fixtures, re-runs every assertion
+above, proves the auto-pairing path and exits 0/1 with a printed
+summary. The matching integration test is `tests/test_nats_e2e.py`
+(skips only when the NATS server or the dev DB is genuinely
+unreachable).
+
 ## API
 
 - `GET /health` — liveness probe.
@@ -207,23 +277,27 @@ database:
   rows).
 - `GET /v1/sample` — list samples, newest first. Optional filters
   (combined with AND): `q` matches any of `primary_id`,
-  `cmo_sample_name`, `patient_id`, `request_id`; `primary_id`,
-  `cmo_sample_name`, `patient_id`, `request_id`, `sample_type`,
+  `cmo_sample_name`, `patient__cmo`, `request_id`; `primary_id`,
+  `cmo_sample_name`, `patient__cmo`, `request_id`, `sample_type`,
   `gene_panel`, `bait_set`, `run_mode`, `file_group` are
   case-insensitive partial matches; `tumor_or_normal` is exact
   (`TUMOR`/`NORMAL`); `no_patient=true` restricts to samples with a
-  null `patient_id` (e.g. pooled normals); `limit` / `offset`
+  null `patient__cmo` (e.g. pooled normals); `limit` / `offset`
   paginate.
+- `GET /v1/sample/lookup?q=&limit=&offset=` — case-insensitive
+  partial-match lookup on `primary_id` and `cmo_sample_name` only (the
+  sample identifiers used in manual pairing workflows), newest first;
+  powers the Try Pairing tab's sample picker.
 - `GET /v1/patient` — patients derived from samples (a patient is a
-  distinct non-null `patient_id`), sorted by `patient_id`. Returns
+  distinct non-null `patient__cmo`), sorted by `patient__cmo`. Returns
   sample/tumor/normal counts, the patient's distinct `request_id`s, and
   patient-level `metadata` (species, sex, oncotreeCode, diagnosisDate)
   derived from the samples' `additional_metadata` (first non-null value
   per key; tumor samples take priority). `q` is a case-insensitive
-  partial match on `patient_id`; `limit` / `offset` paginate.
+  partial match on `patient__cmo`; `limit` / `offset` paginate.
 - `GET /v1/request` — requests derived from samples (a request is a
   distinct non-null `request_id`), sorted by `request_id`. Returns
-  sample/tumor/normal counts, the request's distinct `patient_id`s, and
+  sample/tumor/normal counts, the request's distinct `patient__cmo`s, and
   the distinct `sample_type`s and `gene_panel`s carried by its samples.
   `q` is a case-insensitive partial match on `request_id`; `limit` /
   `offset` paginate.
@@ -265,7 +339,7 @@ database:
   restricts to current pairings; `sample_id` matches pairings where the
   sample is tumor or normal; `request_id`, `run_mode` (case-insensitive
   exact match), and the sample fields `primary_id`, `cmo_sample_name`,
-  `patient_id`, `sample_type`, `gene_panel`, `bait_set` match a sample
+  `patient__cmo`, `sample_type`, `gene_panel`, `bait_set` match a sample
   on either side (when several are given, they must all match the same
   sample); `tumor_or_normal` scopes that match to the tumor or normal
   role; `pairing_logic_id` / `pairing_logic_name` select the logic;
@@ -313,8 +387,8 @@ database:
 
 A basic static web UI (no build step, no extra dependencies) is served
 at `/ui`; the root path `/` redirects there. It has tabs for samples,
-patients, requests, pooled normals, pairs by logic, and matches &
-overrides, and lets you:
+patients, requests, pooled normals, pair report, matches &
+overrides, and a read-only Try Pairing dry-run tab, and lets you:
 
 - query and filter samples (search plus per-field filters on
   primary_id, cmo_sample_name, patient, request, sample type, gene
@@ -327,7 +401,7 @@ overrides, and lets you:
   opens its matches & overrides and clicking a patient opens the
   patient's view (`GET /v1/request` + `GET /v1/pairing?latest=true`);
 - browse pooled normals: the shared patient-less pooled normals
-  (`sample_type` "Pooled Normal", null `patient_id` — the ARGOS
+  (`sample_type` "Pooled Normal", null `patient__cmo` — the ARGOS
   cascade's last-resort tier) with search and field filters (gene
   panel, bait set, run mode, file group) and pagination (`GET
   /v1/sample` with `no_patient=true`); the same view shows the
@@ -340,19 +414,47 @@ overrides, and lets you:
   sample (from the samples, patients, requests, or pooled view) opens
   it directly, pre-selecting the logic the sample is currently paired
   under when known;
-- browse pairs by logic: pick a pairing logic to list its current
-  pairs (tumor `primary_id`, normal `primary_id`, bait set —
-  `GET /v1/pairing?latest=true`) and download the table as CSV or TSV;
+- browse the pair report: pick a pairing logic to list its current
+  pairs (`GET /v1/pairing?latest=true`) and download the table as CSV
+  or TSV. A left-side split-panel filter (collapsible to a small
+  show/hide toggle) groups the selectable columns by side (tumor /
+  normal / pairing) or by pairing logic (one group per logic); each
+  group header shows its column count and toggles every column in the
+  group, and the table and export update live as columns are checked.
+  The selectable columns are the original three (tumor `primary_id`,
+  normal `primary_id`, bait set) plus per-side sample metadata (patient
+  id, `cmo_sample_name`, role, sample type, gene panel, request id, run
+  mode, file group, preservation, sample origin, sequencing date,
+  additional metadata, errors, sample id) and pairing-level fields
+  (logic, trigger type, mismatched keys, created date); All / None /
+  Default buttons reset the selection, and the export contains exactly
+  the selected columns. The DMP logic switches to the legacy DMP export
+  columns (tumor_sample, patient, tumor_idx, tumor_IM_ver,
+  tumor_bamname, tumor_group, tumor_matched, tumor_bam_exists,
+  tumor_bam_coverage, normal_sample, normal_bamname, normal_IM_ver,
+  pool_id, normal_bam_exists, normal_bam_coverage), unmatched DMP
+  samples appear with the opposite-side columns empty, and an
+  "About these columns" panel (plus header tooltips) explains where
+  each value comes from;
 - submit overrides: pin a candidate normal as the tumor's current
   pairing for the selected logic (`POST /v1/pairing/trigger` with
   `trigger_type=override`), optionally in strict mode, with the
-  recorded mismatches shown afterwards.
+  recorded mismatches shown afterwards;
+- dry-run pairing (Try Pairing tab, read-only — never creates, updates,
+  or overrides a pairing): resolve a sample by `primary_id` or
+  `cmo_sample_name` (case-insensitive, via `GET /v1/sample/lookup`),
+  pick any pairing logic (the sample's bait-set logic is preselected
+  when known), and preview what the cascade would do — cascade tier,
+  candidates, mismatch reasons, and the candidate the cascade would
+  pick — via `GET /v1/sample/{id}/possible-matches`; an explainer panel
+  describes how the selected logic pairs, sourced from
+  `pairing_strategies.py`.
 
 Navigation state lives in the URL hash (`#/samples`,
-`#/patients/<patient_id>`, `#/requests/<request_id>`,
-`#/matches/<primary_id>`, `#/pooled`, `#/pairs`), so the browser
-Back/Forward buttons, page reloads, and shared links all work; every
-navigation pushes a history entry.
+`#/patients/<patient__cmo>`, `#/requests/<request_id>`,
+`#/matches/<primary_id>`, `#/try/<primary_id>`, `#/pooled`,
+`#/pairs`), so the browser Back/Forward buttons, page reloads, and
+shared links all work; every navigation pushes a history entry.
 
 ## Authentication (Keycloak)
 
@@ -433,6 +535,26 @@ gets `403`. Provision users with:
    `KEYCLOAK_URL` at the externally managed org Keycloak instead
    (see Docker compose).
 
+**Keycloak-free local login (dev only):** to skip Keycloak entirely
+(client setup, user creation, allow-list provisioning), set
+`DEV_AUTH_TOKEN` in the app environment (e.g. add `DEV_AUTH_TOKEN=...`
+to `.env`) and start only the services you need — `db`, plus
+`nats`/`nats-init`/`smile-listener` when testing ingest:
+
+    podman compose -f docker-compose.yml -f docker-compose.dev.yml up -d db
+    DEV_AUTH_TOKEN=*** uvicorn main:app --reload
+
+`http://localhost:8000/login` then shows a *Sign in (local dev
+admin)* button; clicking it issues the `auth_token` cookie directly —
+no Keycloak round trip — and signs you in with a full local session
+(`sub` `dev-admin`, email from `DEV_AUTH_EMAIL`, default
+`dev-admin@syzygy.local`) with no `allowed_users` row needed. The
+token is also accepted as `Authorization: Bearer <token>` for API
+scripts. When `DEV_AUTH_TOKEN` is empty (the default; always in
+production) this path is off and the Keycloak flow is the only one.
+The login page detects the mode via `GET /auth/dev-login`, which
+returns only the boolean flag — never the token.
+
 `/health`, `/`, `/login`, `/ui`, `/docs`, `/redoc` and
 `/openapi.json` stay public, as do the OAuth dance paths
 `/auth/redirect`, `/auth/callback` and `/auth/logout`; `/auth/me`
@@ -445,7 +567,7 @@ pairing logic via `PairingLogic.strategy_name`; a logic's `config`
 dict customizes the strategy at use time.
 
 - `default` — patient-scoped matching on hard keys
-  (`patient_id`, `gene_panel`, `bait_set`) with a
+  (`patient__cmo`, `gene_panel`, `bait_set`) with a
   request-first cascade: normals ingested under the tumor's own
   `request_id` are preferred, then all other normals of the same
   patient; the latest matching `sequencing_date` wins (tie-break on
@@ -453,7 +575,7 @@ dict customizes the strategy at use time.
   (aligned with beagle v2.3.0). `ACCESS` registers as an alias of
   this strategy.
 - `argos` — WES strategy aligned with beagle's ARGOS pairing logic
-  (v2.3.0). Hard keys are (`patient_id`, `gene_panel`, `bait_set`);
+  (v2.3.0). Hard keys are (`patient__cmo`, `gene_panel`, `bait_set`);
   `sample_type` is not a matching key (beagle v2.3.0 never gates on
   it; it remains stored on the sample). Extends `default` with:
   - **run-mode gating** — raw `run_mode` strings are normalized to
@@ -464,12 +586,16 @@ dict customizes the strategy at use time.
     match the tumor's run-mode family (a NovaSeq X run is a NovaSeq
     machine).
   - **preservation gating** — each side's `preservation` /
-    `sample_origin` must resolve to the same category, fuzzily
-    (case-insensitive): preservation `FFPE` → ffpe, anything else →
-    frozen; `sample_origin` (checked when preservation is empty)
-    resolves `FFPE` → ffpe and `Fresh or Frozen` / `frozen` →
-    frozen. When both fields are present they must agree; a sample
-    that is unresolvable, or that disagrees with the other side,
+    `sample_origin` resolves to a category, fuzzily
+    (case-insensitive): a present `preservation` decides (an entry
+    containing `FFPE` → ffpe, anything else → frozen), and
+    `sample_origin` is free then unless it names the opposite
+    category (a within-side conflict → unresolvable); a missing
+    `preservation` lets a resolvable `sample_origin` decide (`FFPE` →
+    ffpe; `Fresh or Frozen` / `frozen` → frozen; anything else →
+    unresolvable); both fields empty means the side is **not
+    considered**. When both sides are considered their categories must
+    agree; a not-considered side never blocks; an unresolvable side
     blocks the pair — including in the pooled tier.
   - **pooled-normal tier** — when no patient-level match exists,
     shared pooled normals (`sample_type` in `pooled_sample_types`,

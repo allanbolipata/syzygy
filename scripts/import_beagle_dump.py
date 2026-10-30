@@ -13,10 +13,15 @@ Record sources (all from ``file_system_filemetadata`` latest rows):
 
 * **DMP samples** — rows whose file group is ``DMP BAMs``. These carry the
   DMP data structure and are converted with
-  :func:`dmp_translator.to_dmp_sample_kwargs` (anon_id / project_name /
-  metastasis flag excluded by design). DMP pairing stays MANUAL: these
-  samples are imported unpaired and operators pin DMP normals via the
-  dashboard or ``POST /v1/pairing/trigger``.
+  :func:`dmp_translator.to_dmp_sample_kwargs`, which stores the ENTIRE
+  record: every field mapped to a column (including anon_id and patient.dmp)
+  goes to its column, and every remaining key goes verbatim into
+  additional_metadata. DMP samples are auto-paired ONLY when --trigger-dmp
+  is set (under the "DMP" pairing logic); without the flag they are
+  imported unpaired. Manual DMP pairing (dashboard pin or
+  ``POST /v1/pairing/trigger``) still exists and always takes precedence:
+  existing pairings — automatic, manual or override — are returned
+  untouched, never replaced, on re-runs.
 * **LIMS/IGO samples** — every other latest row carrying ``primaryId`` (or
   an ``igoRequestId`` + ``tumorOrNormal`` pair for records with no
   primaryId). These groups share the LIMS/IGO filemetadata structure
@@ -39,12 +44,16 @@ Usage:
     python scripts/import_beagle_dump.py [--beagle-dsn DSN]
                                           [--argos-name NAME]
                                           [--trigger]
+                                          [--trigger-dmp]
+                                          [--dmp-name NAME]
 
 Defaults: beagle DSN ``postgresql+psycopg2://app:app@127.0.0.1:5434/beagle`` and
 the ``ARGOS`` pairing logic. ``--trigger`` runs automatic pairing (argos)
-for the imported LIMS/IGO tumors and normals after the upsert; safe to
-re-run (existing pairings are returned, never replaced). DMP samples are
-never auto-paired (manual by design).
+for the imported LIMS/IGO tumors and normals after the upsert, and
+``--trigger-dmp`` runs automatic pairing under the ``DMP`` logic (named by
+``--dmp-name``) for the imported DMP tumors and normals after the DMP
+upsert; both are safe to re-run (existing pairings are returned, never
+replaced, so MANUAL pairings always win and survive re-runs).
 """
 from __future__ import annotations
 
@@ -144,7 +153,7 @@ def to_sample_kwargs(metadata: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
         "primary_id": primary_id or igo_id,
         "cmo_sample_name": cmo_name,
         # Pooled normals belong to no patient.
-        "patient_id": None if (pooled or not cmo_patient) else cmo_patient,
+        "patient__cmo": None if (pooled or not cmo_patient) else cmo_patient,
         "request_id": igo_id or None,
         "sample_type": sample_type,
         "gene_panel": gene_panel,
@@ -171,7 +180,7 @@ def to_pooled_normal_kwargs(row: Any) -> dict[str, Any]:
     return {
         "primary_id": key,
         "cmo_sample_name": key,
-        "patient_id": None,
+        "patient__cmo": None,
         "request_id": None,
         "sample_type": "Pooled Normal",
         "gene_panel": gene_panel or "unknown",
@@ -205,8 +214,8 @@ def merge_dmp_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[
                 continue
             if isinstance(v, str):
                 v = v.strip()
-            if not v:
-                continue
+                if not v:
+                    continue
             if kwargs.get(k) in (None, ""):
                 kwargs[k] = v
     return samples
@@ -350,6 +359,19 @@ def main() -> None:
         action="store_true",
         help="Run automatic (argos) pairing for imported LIMS/IGO tumors/normals.",
     )
+    parser.add_argument(
+        "--trigger-dmp",
+        action="store_true",
+        help="Run automatic DMP pairing (under the --dmp-name logic) for "
+        "imported DMP tumors/normals after the DMP upsert. Idempotent: "
+        "existing pairings — including MANUAL ones — are returned, never "
+        "replaced.",
+    )
+    parser.add_argument(
+        "--dmp-name",
+        default="DMP",
+        help="Name of the pairing logic to use with --trigger-dmp (default: DMP).",
+    )
     args = parser.parse_args()
 
     print("Importing beagle data into syzygy — all data stays on this machine.")
@@ -361,6 +383,11 @@ def main() -> None:
         argos_logic = (
             db.execute(sa.select(PairingLogic).where(PairingLogic.name == args.argos_name)).scalar_one_or_none()
             if args.trigger
+            else None
+        )
+        dmp_logic = (
+            db.execute(sa.select(PairingLogic).where(PairingLogic.name == args.dmp_name)).scalar_one_or_none()
+            if args.trigger_dmp
             else None
         )
 
@@ -393,10 +420,40 @@ def main() -> None:
                 print(f"    - {count} x {reason}")
         dmp_created, dmp_updated = upsert_samples(db, dmp_list)
         print(f"  upserted: {dmp_created} created, {dmp_updated} updated")
+        dmp_pids = [s["primary_id"] for s in dmp_list]
         del dmp_list, dmp_samples
 
-        # ---- Phase 2: LIMS/IGO samples (every other sample-structure row) -
-        print("[2/4] Reading LIMS/IGO records (primaryId rows, all other groups) ...")
+        # ---- Phase 2: optional automatic DMP pairing ----------------------
+        if args.trigger_dmp:
+            if dmp_logic is None:
+                print(f"[2/5] SKIP: pairing logic {args.dmp_name!r} not found.")
+            else:
+                print(f"[2/5] Automatic pairing (logic {dmp_logic.name!r}) for DMP samples ...")
+                dmp_paired = 0
+                for i, pid in enumerate(dmp_pids, 1):
+                    sample = db.execute(
+                        sa.select(Sample).where(Sample.primary_id == pid)
+                    ).scalar_one_or_none()
+                    if sample is None:
+                        continue
+                    try:
+                        if sample.tumor_or_normal == "TUMOR":
+                            trigger_pairing(db, sample, dmp_logic, "automatic")
+                        else:
+                            trigger_pairing_for_normal(db, sample, dmp_logic)
+                    except ValueError:
+                        db.rollback()
+                        dmp_paired += 1
+                        continue
+                    dmp_paired += 1
+                    if i % 2000 == 0:
+                        print(f"  ...{i}/{len(dmp_pids)}", flush=True)
+                print(f"  pairing attempts: {dmp_paired}")
+        else:
+            print("[2/5] No --trigger-dmp: skipping automatic DMP pairing.")
+
+        # ---- Phase 3: LIMS/IGO samples (every other sample-structure row) -
+        print("[3/5] Reading LIMS/IGO records (primaryId rows, all other groups) ...")
         lims_rows: list[tuple[str, dict[str, Any]]] = []
         skipped_no_key = 0
         with beagle_session() as bs:
@@ -430,8 +487,8 @@ def main() -> None:
         lims_pids = [s["primary_id"] for s in lims_list]
         del lims_list, lims_samples
 
-        # ---- Phase 3: pooled normals ---------------------------------------
-        print("[3/4] Reading pooled normals (file_system_poolednormal) ...")
+        # ---- Phase 4: pooled normals ---------------------------------------
+        print("[4/5] Reading pooled normals (file_system_poolednormal) ...")
         pooled_list: list[dict[str, Any]] = []
         with beagle_session() as bs:
             for row in bs.execute(
@@ -446,13 +503,13 @@ def main() -> None:
         pooled_created, pooled_updated = upsert_samples(db, pooled_list)
         print(f"  upserted: {pooled_created} created, {pooled_updated} updated")
 
-        # ---- Phase 4: optional automatic pairing --------------------------
+        # ---- Phase 5: optional automatic pairing (LIMS/IGO) ---------------
         paired = 0
         if args.trigger:
             if argos_logic is None:
-                print(f"[4/4] SKIP: pairing logic {args.argos_name!r} not found.")
+                print(f"[5/5] SKIP: pairing logic {args.argos_name!r} not found.")
             else:
-                print(f"[4/4] Automatic pairing (logic {argos_logic.name!r}) for LIMS/IGO samples ...")
+                print(f"[5/5] Automatic pairing (logic {argos_logic.name!r}) for LIMS/IGO samples ...")
                 for i, pid in enumerate(lims_pids, 1):
                     sample = db.execute(
                         sa.select(Sample).where(Sample.primary_id == pid)
@@ -473,7 +530,7 @@ def main() -> None:
                         print(f"  ...{i}/{len(lims_pids)}", flush=True)
                 print(f"  pairing attempts: {paired}")
         else:
-            print("[4/4] No --trigger: skipping automatic pairing.")
+            print("[5/5] No --trigger: skipping automatic pairing.")
 
         total = db.execute(sa.select(sa.func.count(Sample.id))).scalar_one()
         by_ton = dict(

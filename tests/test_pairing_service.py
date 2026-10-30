@@ -5,7 +5,7 @@ from typing import Optional
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,13 +17,19 @@ from pairing_service import (
     _create_pairing,
     _get_latest_pairing,
     resolve_pairing_logic,
+    trigger_dmp_pairing,
     trigger_pairing,
     trigger_pairing_for_normal,
     trigger_pairing_for_unpaired_tumors,
 )
 from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
-from routers.pairings import list_pairings, trigger_all_pairings_endpoint, trigger_pairing_endpoint
+from routers.pairings import (
+    list_pairings,
+    trigger_all_pairings_endpoint,
+    trigger_dmp_pairing_endpoint,
+    trigger_pairing_endpoint,
+)
 from routers.patients import PATIENT_META_KEYS, list_patients
 from routers.requests import list_requests
 from routers.samples import create_sample, list_samples
@@ -41,14 +47,14 @@ class CustomPairingStrategy:
     def matches(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
     ) -> bool:
-        return tumor.patient_id == normal.patient_id and tumor.gene_panel == normal.gene_panel
+        return tumor.patient__cmo == normal.patient__cmo and tumor.gene_panel == normal.gene_panel
 
     def mismatch_reasons(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
     ) -> list:
         reasons = []
-        if tumor.patient_id != normal.patient_id:
-            reasons.append(f"patient_id mismatch ({tumor.patient_id} vs {normal.patient_id})")
+        if tumor.patient__cmo != normal.patient__cmo:
+            reasons.append(f"patient__cmo mismatch ({tumor.patient__cmo} vs {normal.patient__cmo})")
         if tumor.gene_panel != normal.gene_panel:
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {normal.gene_panel})")
         return reasons
@@ -58,7 +64,7 @@ class CustomPairingStrategy:
     ) -> NormalSelection:
         stmt = select(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
-            Sample.patient_id == tumor.patient_id,
+            Sample.patient__cmo == tumor.patient__cmo,
             Sample.gene_panel == tumor.gene_panel,
         )
         return NormalSelection(db.scalar(stmt))
@@ -68,7 +74,7 @@ class CustomPairingStrategy:
     ) -> list:
         stmt = select(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
-            Sample.patient_id == normal.patient_id,
+            Sample.patient__cmo == normal.patient__cmo,
             Sample.gene_panel == normal.gene_panel,
         )
         return db.scalars(stmt).all()
@@ -151,7 +157,7 @@ def tumor_sample(db):
     sample = Sample(
         primary_id="TUMOR-001",
         cmo_sample_name="Tumor Sample 1",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -169,7 +175,7 @@ def normal_sample(db):
     sample = Sample(
         primary_id="NORMAL-001",
         cmo_sample_name="Normal Sample 1",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -187,7 +193,7 @@ def older_normal_sample(db):
     sample = Sample(
         primary_id="NORMAL-002",
         cmo_sample_name="Normal Sample 2",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -205,7 +211,7 @@ def non_matching_normal(db):
     sample = Sample(
         primary_id="NORMAL-003",
         cmo_sample_name="Normal Sample 3",
-        patient_id="PATIENT-002",
+        patient__cmo="PATIENT-002",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -267,7 +273,7 @@ def test_matches_false_different_gene_panel(db, tumor_sample):
     normal = Sample(
         primary_id="NORMAL-004",
         cmo_sample_name="Normal Sample 4",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-B",
         bait_set="BAIT-1",
@@ -283,7 +289,7 @@ def test_matches_false_different_bait_set(db, tumor_sample):
     normal = Sample(
         primary_id="NORMAL-005",
         cmo_sample_name="Normal Sample 5",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-2",
@@ -301,7 +307,7 @@ def test_matches_ignores_sample_type(db, tumor_sample):
     normal = Sample(
         primary_id="NORMAL-BLOOD-1",
         cmo_sample_name="Normal Blood 1",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="blood",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -334,7 +340,7 @@ def test_select_matching_tumors_no_match(db, normal_sample):
     non_matching = Sample(
         primary_id="NORMAL-006",
         cmo_sample_name="Normal Sample 6",
-        patient_id="PATIENT-999",
+        patient__cmo="PATIENT-999",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -374,7 +380,7 @@ def test_trigger_pairing_automatic_does_not_replace_existing(db, tumor_sample, n
     newer_normal = Sample(
         primary_id="NORMAL-007",
         cmo_sample_name="Normal Sample 7",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -404,7 +410,7 @@ def test_trigger_pairing_manual_replaces_existing(db, tumor_sample, normal_sampl
     newer_normal = Sample(
         primary_id="NORMAL-008",
         cmo_sample_name="Normal Sample 8",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -444,7 +450,7 @@ def test_trigger_pairing_override_with_normal_id(db, tumor_sample, normal_sample
     override_normal = Sample(
         primary_id="NORMAL-009",
         cmo_sample_name="Normal Sample 9",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -468,7 +474,7 @@ def test_trigger_pairing_override_strict_normal_does_not_match(
     with pytest.raises(HTTPException) as exc_info:
         trigger_pairing(db, tumor_sample, pairing_logic, "override", non_matching_normal.id, strict=True)
     assert exc_info.value.status_code == 400
-    assert "patient_id mismatch" in exc_info.value.detail
+    assert "patient__cmo mismatch" in exc_info.value.detail
 
 
 def test_trigger_pairing_override_force_records_mismatched_keys(
@@ -480,7 +486,7 @@ def test_trigger_pairing_override_force_records_mismatched_keys(
     assert result.normal_id == non_matching_normal.id
     assert result.latest is True
     assert result.trigger_type == "override"
-    assert any("patient_id mismatch" in key for key in (result.mismatched_keys or []))
+    assert any("patient__cmo mismatch" in key for key in (result.mismatched_keys or []))
 
 
 def test_trigger_pairing_no_pairing_logic(db, tumor_sample, normal_sample):
@@ -501,7 +507,7 @@ def test_trigger_pairing_no_matching_normal(db, tumor_sample, pairing_logic):
 def _sample(
     db,
     primary_id,
-    patient_id="PATIENT-001",
+    patient__cmo="PATIENT-001",
     tumor_or_normal=TumorOrNormal.NORMAL.value,
     request_id=None,
     run_mode=None,
@@ -515,7 +521,7 @@ def _sample(
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type=sample_type,
         gene_panel=gene_panel,
         bait_set=bait_set,
@@ -618,7 +624,7 @@ def test_trigger_pairing_endpoint_strict_override_rejects(
     with pytest.raises(HTTPException) as exc:
         trigger_pairing_endpoint(payload, db=db)
     assert exc.value.status_code == 400
-    assert "patient_id mismatch" in exc.value.detail
+    assert "patient__cmo mismatch" in exc.value.detail
 
 
 def test_trigger_pairing_endpoint_404_includes_selection_notes(db):
@@ -743,8 +749,8 @@ def test_argos_preservation_gate_skips_disagreement(db):
 
 def test_argos_unresolvable_preservation_blocks(db):
     """Unresolvable preservation blocks pairing: fields disagreeing
-    within one sample (preservation FFPE + origin Frozen), and missing
-    data on either side."""
+    within one sample (preservation FFPE + origin Frozen, or vice
+    versa), or a junk origin alone with no preservation."""
     argos = strategies["argos"]
     tumor = _sample(
         db, "TUMOR-UNK-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
@@ -759,11 +765,45 @@ def test_argos_unresolvable_preservation_blocks(db):
     assert selection.normal is None
     assert any("unresolvable" in note for note in selection.notes)
 
-    bare = _sample(
+    conflict_normal = _sample(
+        db, "NORM-UNK-PRES-2", preservation=["Frozen"], sample_origin=["FFPE"],
+        run_mode="NovaSeq X",
+    )
+    assert any("unresolvable" in r for r in argos.mismatch_reasons(tumor, conflict_normal))
+
+    junk_origin_tumor = _sample(
+        db, "TUMOR-JUNK-ORIGIN", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_origin=["Tissue"], run_mode="NovaSeq X",
+    )
+    assert any("unresolvable" in r for r in argos.mismatch_reasons(junk_origin_tumor, normal))
+
+
+def test_argos_not_considered_preservation_passes(db):
+    """A side with no preservation data at all (both fields empty) is
+    'not considered': the gate does not apply, so it passes against any
+    resolvable category and against another not-considered side."""
+    argos = strategies["argos"]
+    bare_tumor = _sample(
         db, "TUMOR-NO-PRES", tumor_or_normal=TumorOrNormal.TUMOR.value,
         run_mode="NovaSeq X",
     )
-    assert any("unresolvable" in r for r in argos.mismatch_reasons(bare, normal))
+    ffpe_normal = _sample(
+        db, "NORM-FFPE-3", preservation=["FFPE"], sample_origin=["FFPE"],
+        run_mode="NovaSeq X",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    bare_normal = _sample(
+        db, "NORM-NO-PRES-1", run_mode="NovaSeq X",
+        sequencing_date=datetime(2024, 2, 1, tzinfo=timezone.utc),
+    )
+    assert argos.matches(bare_tumor, ffpe_normal)
+    assert not any("preservation" in r
+                   for r in argos.mismatch_reasons(bare_tumor, ffpe_normal))
+    assert argos.matches(bare_tumor, bare_normal)
+    selection = argos.select_latest_normal(db, bare_tumor)
+    # Both candidates pass the gate; the latest wins.
+    assert selection.normal.id == bare_normal.id
+    assert not any("preservation" in note for note in selection.notes)
 
 
 def test_argos_pooled_normal_tier(db):
@@ -773,7 +813,7 @@ def test_argos_pooled_normal_tier(db):
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
-        db, "NORM-POOL-1", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-1", patient__cmo=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
@@ -793,12 +833,12 @@ def test_argos_pooled_run_mode_resolved_via_machines(db):
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     _sample(
-        db, "NORM-POOL-2A", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-2A", patient__cmo=None, sample_type="Pooled Normal",
         bait_set="BAIT-2", preservation=["FFPE"], sample_origin=["FFPE"],
         run_mode="diana",
     )
     pool_nova = _sample(
-        db, "NORM-POOL-2B", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-2B", patient__cmo=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = argos.select_latest_normal(db, tumor_nova)
@@ -806,11 +846,11 @@ def test_argos_pooled_run_mode_resolved_via_machines(db):
 
     tumor_hiseq = _sample(
         db, "TUMOR-POOL-2C", tumor_or_normal=TumorOrNormal.TUMOR.value,
-        patient_id="PATIENT-002",
+        patient__cmo="PATIENT-002",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="HiSeq 3000",
     )
     pool_hiseq = _sample(
-        db, "NORM-POOL-2D", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-2D", patient__cmo=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="pitt",
     )
     assert any("run_mode mismatch" in r
@@ -827,7 +867,7 @@ def test_argos_pooled_unknown_machine_blocks(db):
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
-        db, "NORM-POOL-U", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-U", patient__cmo=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="bono",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
@@ -845,7 +885,7 @@ def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
             preservation=["FFPE"], sample_origin=["FFPE"], run_mode=rm,
         )
         _sample(
-            db, f"NORM-POOL-{rm}", patient_id=None, sample_type="Pooled Normal",
+            db, f"NORM-POOL-{rm}", patient__cmo=None, sample_type="Pooled Normal",
             preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
         )
         selection = strategies["argos"].select_latest_normal(db, tumor)
@@ -854,13 +894,34 @@ def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
                    for note in selection.notes)
 
 
-def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
-    """An FFPE pooled normal does not match a tumor with no preservation
-    data (unresolvable blocks the pooled tier)."""
-    tumor = _sample(db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value)
+def test_argos_pooled_preservation_gate_not_considered_passes(db):
+    """A pooled normal matches a tumor with no preservation data: the
+    tumor side is 'not considered', so the gate does not apply."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        run_mode="NovaSeq X",
+    )
     pooled = _sample(
-        db, "NORM-POOL-3", patient_id=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"],
+        db, "NORM-POOL-3", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal.id == pooled.id
+    assert not any("preservation" in note for note in selection.notes)
+
+
+def test_argos_pooled_preservation_gate_blocks_unresolvable(db):
+    """A within-side conflict (preservation FFPE + origin Frozen) makes
+    the tumor unresolvable and blocks the pooled tier."""
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-3B", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["Frozen"], run_mode="NovaSeq X",
+    )
+    pooled = _sample(
+        db, "NORM-POOL-3B", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal is None
@@ -877,11 +938,11 @@ def test_argos_pooled_preservation_gate_matches_category(db):
         run_mode="NovaSeq X",
     )
     _sample(
-        db, "NORM-POOL-F-FFPE", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-F-FFPE", patient__cmo=None, sample_type="Pooled Normal",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     frozen_pool = _sample(
-        db, "NORM-POOL-F-FROZEN", patient_id=None, sample_type="Pooled Normal",
+        db, "NORM-POOL-F-FROZEN", patient__cmo=None, sample_type="Pooled Normal",
         preservation=["FROZEN"], sample_origin=["FROZEN"], run_mode="diana",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
@@ -904,7 +965,7 @@ def test_argos_pooled_sample_types_configurable(db):
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
     )
     pooled = _sample(
-        db, "NORM-POOLN-1", patient_id=None, sample_type="PoolN",
+        db, "NORM-POOLN-1", patient__cmo=None, sample_type="PoolN",
         preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
     )
     selection = strategy.select_latest_normal(db, tumor)
@@ -975,7 +1036,7 @@ def test_trigger_pairing_for_normal_does_not_replace_existing(db, tumor_sample, 
     newer_normal = Sample(
         primary_id="NORMAL-010",
         cmo_sample_name="Normal Sample 10",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1061,7 +1122,7 @@ def test_custom_strategy_changes_matching(db, tumor_sample, custom_strategy):
     normal = Sample(
         primary_id="NORMAL-CUSTOM-1",
         cmo_sample_name="Normal Custom 1",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-2",
@@ -1086,7 +1147,7 @@ def test_custom_strategy_selects_normal_ignoring_bait_set(db, tumor_sample, cust
     normal = Sample(
         primary_id="NORMAL-CUSTOM-2",
         cmo_sample_name="Normal Custom 2",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-2",
@@ -1111,7 +1172,7 @@ def test_custom_strategy_select_matching_tumors(db, tumor_sample, custom_strateg
     normal = Sample(
         primary_id="NORMAL-CUSTOM-3",
         cmo_sample_name="Normal Custom 3",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-2",
@@ -1135,7 +1196,7 @@ def test_create_pairing_integrity_error_returns_existing(db, tumor_sample, norma
     normal2 = Sample(
         primary_id="NORMAL-IE-1",
         cmo_sample_name="Normal IE 1",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1176,7 +1237,7 @@ def test_trigger_pairing_override_conflict_raises_409(db, tumor_sample, normal_s
     normal_a = Sample(
         primary_id="NORMAL-OC-A",
         cmo_sample_name="Normal OC A",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1185,7 +1246,7 @@ def test_trigger_pairing_override_conflict_raises_409(db, tumor_sample, normal_s
     normal_b = Sample(
         primary_id="NORMAL-OC-B",
         cmo_sample_name="Normal OC B",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1338,7 +1399,7 @@ def test_create_sample_default_logic_active_pairs(db, normal_sample, monkeypatch
     payload = SampleCreate(
         primary_id="TUMOR-010",
         cmo_sample_name="Tumor Sample 10",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1360,7 +1421,7 @@ def test_create_sample_inactive_default_logic_skips_pairing(db, monkeypatch):
     payload = SampleCreate(
         primary_id="TUMOR-011",
         cmo_sample_name="Tumor Sample 11",
-        patient_id="PATIENT-011",
+        patient__cmo="PATIENT-011",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1377,11 +1438,11 @@ def test_create_sample_inactive_default_logic_skips_pairing(db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _sample_with_created_date(db, primary_id, patient_id, created_date):
+def _sample_with_created_date(db, primary_id, patient__cmo, created_date):
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -1422,11 +1483,11 @@ def test_list_samples_ties_broken_by_id(db):
 # ---------------------------------------------------------------------------
 
 
-def _make_sample2(db, primary_id, patient_id, tumor_or_normal, **kw):
+def _make_sample2(db, primary_id, patient__cmo, tumor_or_normal, **kw):
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type=kw.pop("sample_type", "tissue"),
         gene_panel=kw.pop("gene_panel", "PANEL-A"),
         bait_set=kw.pop("bait_set", "BAIT-1"),
@@ -1451,7 +1512,7 @@ def test_list_samples_field_filters(db):
     assert {s.id for s in list_samples(limit=None, offset=None, db=db)} == {t1.id, n1.id, t2.id}
     assert [s.id for s in list_samples(primary_id="TUMOR-101", limit=None, offset=None, db=db)] == [t1.id]
     assert [s.id for s in list_samples(cmo_sample_name="normal-101", limit=None, offset=None, db=db)] == [n1.id]
-    assert [s.id for s in list_samples(patient_id="PAT-202", limit=None, offset=None, db=db)] == [t2.id]
+    assert [s.id for s in list_samples(patient__cmo="PAT-202", limit=None, offset=None, db=db)] == [t2.id]
     assert [s.id for s in list_samples(request_id="REQ-77", limit=None, offset=None, db=db)] == [t2.id]
     assert {s.id for s in list_samples(gene_panel="PANEL-A", limit=None, offset=None, db=db)} == {t1.id, n1.id}
     assert [s.id for s in list_samples(bait_set="BAIT-2", limit=None, offset=None, db=db)] == [t2.id]
@@ -1474,7 +1535,7 @@ def test_list_samples_q_search(db):
         gene_panel="PANEL-B", request_id="REQ-77",
     )
 
-    # q searches primary_id, cmo_sample_name, patient_id, request_id (OR).
+    # q searches primary_id, cmo_sample_name, patient__cmo, request_id (OR).
     assert {s.id for s in list_samples(q="tum", limit=None, offset=None, db=db)} == {t1.id, t2.id}
     assert [s.id for s in list_samples(q="REQ-77", limit=None, offset=None, db=db)] == [t2.id]
     assert {s.id for s in list_samples(q="pat-101", limit=None, offset=None, db=db)} == {t1.id, n1.id}
@@ -1498,7 +1559,7 @@ def test_list_samples_file_group_filter(db):
     assert [s.id for s in list_samples(file_group="poole", limit=None, offset=None, db=db)] == [d1.id]
     # AND-combines with other filters; no match returns empty.
     assert [s.id for s in list_samples(file_group="LIMS", tumor_or_normal=TumorOrNormal.NORMAL, limit=None, offset=None, db=db)] == [n1.id]
-    assert list_samples(file_group="LIMS", patient_id="PAT-202", limit=None, offset=None, db=db) == []
+    assert list_samples(file_group="LIMS", patient__cmo="PAT-202", limit=None, offset=None, db=db) == []
     # Combines with pagination.
     assert [s.id for s in list_samples(file_group="LIMS", limit=1, offset=1, db=db)] in [[t1.id], [n1.id]]
 
@@ -1546,7 +1607,7 @@ def test_list_patients_aggregates_samples(db):
     _make_sample2(db, "TUMOR-202", "PAT-202", TumorOrNormal.TUMOR.value)
 
     patients = list_patients(limit=None, offset=None, q=None, db=db)
-    assert [p.patient_id for p in patients] == ["PAT-101", "PAT-202"]
+    assert [p.patient__cmo for p in patients] == ["PAT-101", "PAT-202"]
 
     p1 = patients[0]
     assert p1.sample_count == 2 and p1.tumor_count == 1 and p1.normal_count == 1
@@ -1557,21 +1618,21 @@ def test_list_patients_aggregates_samples(db):
     p2 = patients[1]
     assert p2.sample_count == 1 and p2.metadata == {}
 
-    # Samples without a patient_id (pooled normals) do not create patients.
-    assert pooled.patient_id is None
-    assert all(p.patient_id for p in patients)
+    # Samples without a patient__cmo (pooled normals) do not create patients.
+    assert pooled.patient__cmo is None
+    assert all(p.patient__cmo for p in patients)
 
 
 def test_list_patients_q_and_pagination(db):
     for pid in ("PAT-A", "PAT-B", "PAT-C"):
         _make_sample2(db, f"TUMOR-{pid}", pid, TumorOrNormal.TUMOR.value)
 
-    # q is a case-insensitive partial match on patient_id.
-    assert [p.patient_id for p in list_patients(q="pat-b", limit=None, offset=None, db=db)] == ["PAT-B"]
+    # q is a case-insensitive partial match on patient__cmo.
+    assert [p.patient__cmo for p in list_patients(q="pat-b", limit=None, offset=None, db=db)] == ["PAT-B"]
     assert list_patients(q="nope", limit=None, offset=None, db=db) == []
     # Pagination slices the sorted, aggregated list.
-    assert [p.patient_id for p in list_patients(q="PAT", limit=2, offset=0, db=db)] == ["PAT-A", "PAT-B"]
-    assert [p.patient_id for p in list_patients(q="PAT", limit=2, offset=1, db=db)] == ["PAT-B", "PAT-C"]
+    assert [p.patient__cmo for p in list_patients(q="PAT", limit=2, offset=0, db=db)] == ["PAT-A", "PAT-B"]
+    assert [p.patient__cmo for p in list_patients(q="PAT", limit=2, offset=1, db=db)] == ["PAT-B", "PAT-C"]
 
 
 # ---------------------------------------------------------------------------
@@ -1605,11 +1666,11 @@ def test_list_requests_aggregates_samples(db):
 
     r2 = requests[1]
     assert r2.sample_count == 2 and r2.tumor_count == 1 and r2.normal_count == 1
-    # Pooled normals (no patient_id) do not appear in patients.
+    # Pooled normals (no patient__cmo) do not appear in patients.
     assert r2.patients == ["PAT-303"]
     assert r2.sample_types == ["blood", "tissue"]
     assert r2.gene_panels == ["PANEL-A", "PANEL-B"]
-    assert pooled.patient_id is None
+    assert pooled.patient__cmo is None
     assert all(r.request_id for r in requests)
 
 
@@ -1668,7 +1729,7 @@ def _seed_scaled_patients(db, prefix: str, n_patients: int, per_patient: int = 5
                 Sample(
                     primary_id=f"{pid}-S{j}",
                     cmo_sample_name=f"{pid}-S{j} name",
-                    patient_id=pid,
+                    patient__cmo=pid,
                     sample_type="tissue",
                     gene_panel="PANEL-A",
                     bait_set="BAIT-1",
@@ -1691,10 +1752,10 @@ def test_list_patients_sql_aggregation_scale(db):
 
     # Correct page contents: 10 patients, exact counts, requests, metadata.
     expected_ids = [f"SCALE-PAT-{i:05d}" for i in range(100, 110)]
-    assert [p.patient_id for p in page] == expected_ids
+    assert [p.patient__cmo for p in page] == expected_ids
     for p in page:
         assert (p.sample_count, p.tumor_count, p.normal_count) == (5, 3, 2)
-        assert p.requests == [f"{p.patient_id}-R0", f"{p.patient_id}-R2", f"{p.patient_id}-R4"]
+        assert p.requests == [f"{p.patient__cmo}-R0", f"{p.patient__cmo}-R2", f"{p.patient__cmo}-R4"]
         assert p.metadata == {"species": "Mouse"}
 
     # Boundedness: exactly 2 queries. The first is a GROUP BY that returns
@@ -1719,7 +1780,7 @@ def _seed_scaled_requests(db, prefix: str, n_requests: int, per_request: int = 5
                 Sample(
                     primary_id=f"{rid}-S{j}",
                     cmo_sample_name=f"{rid}-S{j} name",
-                    patient_id=f"PAT-S-{i:05d}-{j % 2}",
+                    patient__cmo=f"PAT-S-{i:05d}-{j % 2}",
                     sample_type="tissue" if j % 2 == 0 else "blood",
                     gene_panel="PANEL-A" if j < 3 else "PANEL-B",
                     bait_set="BAIT-1",
@@ -1766,7 +1827,7 @@ def test_list_patients_pagination_edges(db):
     assert list_patients(limit=10, offset=99, db=db) == []
     assert list_patients(limit=None, offset=3, db=db) == []
     # A limit larger than the result set returns everything.
-    assert [p.patient_id for p in list_patients(limit=100, offset=0, db=db)] == [
+    assert [p.patient__cmo for p in list_patients(limit=100, offset=0, db=db)] == [
         "PAT-E-1",
         "PAT-E-2",
         "PAT-E-3",
@@ -1775,7 +1836,7 @@ def test_list_patients_pagination_edges(db):
     assert list_patients(q="zzz-none", limit=None, offset=None, db=db) == []
     # Samples without a request_id contribute no request entries.
     _make_sample2(db, "TUMOR-NO-REQ", "PAT-E-NO-REQ", TumorOrNormal.TUMOR.value)
-    no_req = [p for p in list_patients(limit=None, offset=None, db=db) if p.patient_id == "PAT-E-NO-REQ"]
+    no_req = [p for p in list_patients(limit=None, offset=None, db=db) if p.patient__cmo == "PAT-E-NO-REQ"]
     assert len(no_req) == 1 and no_req[0].requests == []
 
 
@@ -1794,7 +1855,7 @@ def test_list_requests_pagination_edges(db):
     ]
     # q with no match returns nothing.
     assert list_requests(q="zzz-none", limit=None, offset=None, db=db) == []
-    # Pooled normals (no patient_id) inside a request: excluded from patients,
+    # Pooled normals (no patient__cmo) inside a request: excluded from patients,
     # but still counted in the sample totals.
     _make_sample2(db, "POOL-REQ-E", None, TumorOrNormal.NORMAL.value, request_id="REQ-E-1")
     r1 = [r for r in list_requests(limit=None, offset=None, db=db) if r.request_id == "REQ-E-1"]
@@ -1805,18 +1866,18 @@ def test_list_requests_pagination_edges(db):
 
 def _legacy_list_patients(db, limit, offset, q):
     """Copy of the pre-refactor in-memory implementation, for parity checks."""
-    stmt = select(Sample).where(Sample.patient_id.is_not(None))
+    stmt = select(Sample).where(Sample.patient__cmo.is_not(None))
     if q is not None:
-        stmt = stmt.where(Sample.patient_id.ilike(f"%{q}%"))
+        stmt = stmt.where(Sample.patient__cmo.ilike(f"%{q}%"))
     samples = db.scalars(stmt).all()
 
     by_patient: dict[str, list[Sample]] = {}
     for s in samples:
-        by_patient.setdefault(s.patient_id, []).append(s)
+        by_patient.setdefault(s.patient__cmo, []).append(s)
 
     patients: list[PatientRead] = []
-    for patient_id in sorted(by_patient):
-        rows = by_patient[patient_id]
+    for patient__cmo in sorted(by_patient):
+        rows = by_patient[patient__cmo]
         tumors = [s for s in rows if s.tumor_or_normal == "TUMOR"]
         normals = [s for s in rows if s.tumor_or_normal == "NORMAL"]
         metadata: dict = {}
@@ -1828,7 +1889,7 @@ def _legacy_list_patients(db, limit, offset, q):
                     break
         patients.append(
             PatientRead(
-                patient_id=patient_id,
+                patient__cmo=patient__cmo,
                 sample_count=len(rows),
                 tumor_count=len(tumors),
                 normal_count=len(normals),
@@ -1902,7 +1963,7 @@ def _legacy_list_requests(db, limit, offset, q):
                 sample_count=len(rows),
                 tumor_count=len(tumors),
                 normal_count=len(normals),
-                patients=sorted({s.patient_id for s in rows if s.patient_id}),
+                patients=sorted({s.patient__cmo for s in rows if s.patient__cmo}),
                 sample_types=sorted({s.sample_type for s in rows if s.sample_type}),
                 gene_panels=sorted({s.gene_panel for s in rows if s.gene_panel}),
             )
@@ -2001,11 +2062,11 @@ def _make_pairing(db, tumor, normal, logic, latest=True, created_date=None):
     return pairing
 
 
-def _extra_tumor(db, primary_id, patient_id):
+def _extra_tumor(db, primary_id, patient__cmo):
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -2083,11 +2144,11 @@ def test_list_pairings_unknown_pairing_logic_name_404(db):
 # ---------------------------------------------------------------------------
 
 
-def _make_sample(db, primary_id, patient_id, tumor_or_normal, gene_panel="PANEL-A", bait_set="BAIT-1", sample_type="tissue"):
+def _make_sample(db, primary_id, patient__cmo, tumor_or_normal, gene_panel="PANEL-A", bait_set="BAIT-1", sample_type="tissue"):
     sample = Sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type=sample_type,
         gene_panel=gene_panel,
         bait_set=bait_set,
@@ -2108,8 +2169,8 @@ def test_list_pairings_filter_by_sample_fields(db, tumor_sample, normal_sample, 
     # Each sample field matches on either side of the pairing.
     assert [p.id for p in list_pairings(primary_id="TUMOR-001", limit=None, offset=None, db=db)] == [p1.id]
     assert [p.id for p in list_pairings(primary_id="NORMAL-001", limit=None, offset=None, db=db)] == [p1.id]
-    assert [p.id for p in list_pairings(patient_id="PATIENT-001", limit=None, offset=None, db=db)] == [p1.id]
-    assert [p.id for p in list_pairings(patient_id="PATIENT-002", limit=None, offset=None, db=db)] == [p2.id]
+    assert [p.id for p in list_pairings(patient__cmo="PATIENT-001", limit=None, offset=None, db=db)] == [p1.id]
+    assert [p.id for p in list_pairings(patient__cmo="PATIENT-002", limit=None, offset=None, db=db)] == [p2.id]
     assert [p.id for p in list_pairings(gene_panel="PANEL-B", limit=None, offset=None, db=db)] == [p2.id]
     assert [p.id for p in list_pairings(bait_set="BAIT-2", limit=None, offset=None, db=db)] == [p2.id]
     assert [p.id for p in list_pairings(sample_type="blood", limit=None, offset=None, db=db)] == [p2.id]
@@ -2125,10 +2186,10 @@ def test_list_pairings_field_filters_match_same_side(db, tumor_sample, normal_sa
     p2 = _make_pairing(db, tumor_b, normal_sample, pairing_logic, created_date=d2)
 
     # Fields must all match one sample; TUMOR-003 is PATIENT-003.
-    assert list_pairings(primary_id="TUMOR-003", patient_id="PATIENT-001", limit=None, offset=None, db=db) == []
-    assert [p.id for p in list_pairings(primary_id="TUMOR-003", patient_id="PATIENT-003", limit=None, offset=None, db=db)] == [p2.id]
+    assert list_pairings(primary_id="TUMOR-003", patient__cmo="PATIENT-001", limit=None, offset=None, db=db) == []
+    assert [p.id for p in list_pairings(primary_id="TUMOR-003", patient__cmo="PATIENT-003", limit=None, offset=None, db=db)] == [p2.id]
     # Both fields match the normal side, so both pairings qualify.
-    assert [p.id for p in list_pairings(primary_id="NORMAL-001", patient_id="PATIENT-001", limit=None, offset=None, db=db)] == [p2.id, p1.id]
+    assert [p.id for p in list_pairings(primary_id="NORMAL-001", patient__cmo="PATIENT-001", limit=None, offset=None, db=db)] == [p2.id, p1.id]
     # Sample-field filters AND-combine with the logic filter.
     assert [p.id for p in list_pairings(primary_id="TUMOR-003", pairing_logic_name="TEMPO", limit=None, offset=None, db=db)] == [p2.id]
 
@@ -2160,11 +2221,11 @@ def test_list_pairings_filter_created_date_range(db, tumor_sample, normal_sample
 # ---------------------------------------------------------------------------
 
 
-def _sample_payload(primary_id, patient_id, tumor_or_normal, **kwargs):
+def _sample_payload(primary_id, patient__cmo, tumor_or_normal, **kwargs):
     return SampleCreate(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id} name",
-        patient_id=patient_id,
+        patient__cmo=patient__cmo,
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -2272,7 +2333,7 @@ def test_trigger_pairing_endpoint_override_replaces_latest(db, tumor_sample, nor
     other_normal = Sample(
         primary_id="NORMAL-TRG-1",
         cmo_sample_name="Normal Trigger 1",
-        patient_id="PATIENT-001",
+        patient__cmo="PATIENT-001",
         sample_type="tissue",
         gene_panel="PANEL-A",
         bait_set="BAIT-1",
@@ -2545,9 +2606,9 @@ def test_tempo_scoped_to_patient(db):
     tumor = _sample(
         db, "TMP-SCOPE-T",
         tumor_or_normal=TumorOrNormal.TUMOR.value,
-        patient_id="PATIENT-1",
+        patient__cmo="PATIENT-1",
     )
-    _sample(db, "TMP-SCOPE-N", patient_id="PATIENT-2")
+    _sample(db, "TMP-SCOPE-N", patient__cmo="PATIENT-2")
     selection = strategies["tempo"].select_latest_normal(db, tumor, logic)
     assert selection.normal is None
 
@@ -2701,7 +2762,7 @@ def test_trigger_all_pairs_unpaired_tumors(db):
     _sample(
         db,
         "TA-T-2",
-        patient_id="PATIENT-002",
+        patient__cmo="PATIENT-002",
         tumor_or_normal=TumorOrNormal.TUMOR.value,
     )
 
@@ -2817,3 +2878,185 @@ def test_trigger_all_endpoint_returns_summary(db):
     assert result["skipped_no_logic"] == 0
     assert result["skipped_inactive_logic"] == 0
     assert [p.tumor_id for p in result["new_pairings"]] == [tumor.id]
+
+
+# ---------------------------------------------------------------------------
+# DMP automatic pairing (POST /pairing/trigger-dmp)
+# ---------------------------------------------------------------------------
+
+
+def _dmp_logic(db, name="DMP", active=True):
+    logic = PairingLogic(name=name, strategy_name="dmp", active=active)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    return logic
+
+
+def _dmp_sample(
+    db,
+    primary_id,
+    patient__dmp,
+    tumor_or_normal=TumorOrNormal.NORMAL.value,
+    gene_panel="PANEL-A",
+):
+    sample = _sample(
+        db,
+        primary_id,
+        patient__cmo=f"CMO-{patient__dmp}",
+        tumor_or_normal=tumor_or_normal,
+        sample_type="DMP",
+        gene_panel=gene_panel,
+    )
+    sample.patient__dmp = patient__dmp
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_trigger_dmp_pairs_dmp_tumor_with_dmp_normal(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000001-T1-X1", "P-0000001", TumorOrNormal.TUMOR.value)
+    normal = _dmp_sample(db, "P-0000001-N1-X1", "P-0000001")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["pairing_logic"] == "DMP"
+    assert result["scanned"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
+    assert result["already_paired"] == 0
+    assert result["missing_patient__dmp"] == 0
+    (pairing,) = result["new_pairings"]
+    assert pairing.tumor_id == tumor.id
+    assert pairing.normal_id == normal.id
+    assert pairing.trigger_type == "automatic"
+    assert pairing.pairing_logic_id == db.scalar(
+        select(PairingLogic.id).where(PairingLogic.name == "DMP")
+    )
+
+
+def test_trigger_dmp_picks_deterministic_normal_on_tie(db):
+    _dmp_logic(db)
+    _dmp_sample(db, "P-0000002-T1-X1", "P-0000002", TumorOrNormal.TUMOR.value)
+    later = _dmp_sample(db, "P-0000002-N2-X1", "P-0000002")
+    first = _dmp_sample(db, "P-0000002-N1-X1", "P-0000002")
+
+    result = trigger_dmp_pairing(db)
+
+    (pairing,) = result["new_pairings"]
+    assert pairing.normal_id == first.id  # min primary_id wins
+    assert later.id != pairing.normal_id
+
+
+def test_trigger_dmp_requires_same_dmp_patient(db):
+    _dmp_logic(db)
+    _dmp_sample(db, "P-0000003-T1-X1", "P-0000003", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-9999999-N1-X1", "P-9999999")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 0
+    assert result["unpaired"] == 1
+    assert result["new_pairings"] == []
+
+
+def test_trigger_dmp_requires_same_gene_panel(db):
+    _dmp_logic(db)
+    _dmp_sample(
+        db, "P-0000004-T1-X1", "P-0000004", TumorOrNormal.TUMOR.value,
+        gene_panel="PANEL-A",
+    )
+    _dmp_sample(db, "P-0000004-N1-X1", "P-0000004", gene_panel="PANEL-B")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 0
+    assert result["unpaired"] == 1
+
+
+def test_trigger_dmp_reports_missing_patient_dmp(db):
+    _dmp_logic(db)
+    tumor = _sample(
+        db, "DMP-NODMP-T", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP", patient__cmo="CMO-NODMP",
+    )
+    _dmp_sample(db, "P-0000005-N1-X1", "P-0000005")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["scanned"] == 1
+    assert result["missing_patient__dmp"] == 1
+    assert result["paired"] == 0
+    assert result["unpaired"] == 0
+    assert db.scalar(
+        select(PairingTable).where(PairingTable.tumor_id == tumor.id)
+    ) is None
+
+
+def test_trigger_dmp_skips_already_paired_tumors(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000006-T1-X1", "P-0000006", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-0000006-N1-X1", "P-0000006")
+
+    first = trigger_dmp_pairing(db)
+    assert first["paired"] == 1
+
+    second = trigger_dmp_pairing(db)
+    assert second["scanned"] == 1
+    assert second["already_paired"] == 1
+    assert second["paired"] == 0
+    assert second["new_pairings"] == []
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.tumor_id == tumor.id
+            )
+        )
+        == 1
+    )
+
+
+def test_trigger_dmp_400_when_no_dmp_logic(db):
+    _sample(db, "DMP-NOLOGIC-T", tumor_or_normal=TumorOrNormal.TUMOR.value,
+            sample_type="DMP", patient__cmo="CMO-X")
+    with pytest.raises(HTTPException) as exc:
+        trigger_dmp_pairing(db)
+    assert exc.value.status_code == 400
+    assert "DMP" in exc.value.detail
+
+
+def test_trigger_dmp_400_when_dmp_logic_inactive(db):
+    _dmp_logic(db, active=False)
+    with pytest.raises(HTTPException) as exc:
+        trigger_dmp_pairing(db)
+    assert exc.value.status_code == 400
+
+
+def test_manual_trigger_endpoint_refuses_dmp_logic(db):
+    """POST /pairing/trigger rejects the DMP strategy (automatic-only)."""
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000007-T1-X1", "P-0000007", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-0000007-N1-X1", "P-0000007")
+    payload = PairingTriggerCreate(
+        tumor_id=tumor.id, trigger_type="manual", pairing_logic_name="DMP"
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 400
+    assert "automatic" in exc.value.detail
+    assert db.scalar(
+        select(PairingTable).where(PairingTable.tumor_id == tumor.id)
+    ) is None
+
+
+def test_trigger_dmp_endpoint_pairs(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000008-T1-X1", "P-0000008", TumorOrNormal.TUMOR.value)
+    normal = _dmp_sample(db, "P-0000008-N1-X1", "P-0000008")
+
+    result = trigger_dmp_pairing_endpoint(db=db)
+
+    assert result["paired"] == 1
+    (pairing,) = result["new_pairings"]
+    assert (pairing.tumor_id, pairing.normal_id) == (tumor.id, normal.id)

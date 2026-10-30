@@ -7,19 +7,22 @@ A logic's ``config`` dict customizes the strategy at use time (see
 ``get_pairing_strategy``).
 
 Registered strategies:
-  * ``default`` — patient-scoped matching on (patient_id, gene_panel,
+  * ``default`` — patient-scoped matching on (patient__cmo, gene_panel,
     bait_set) with a request-first cascade: normals ingested under the
     same ``request_id`` are preferred, then all other normals for the
     patient.
   * ``argos`` — WES strategy aligned with beagle's argos pairing logic
-    (v2_3.0). Matches on (patient_id, gene_panel, bait_set) with
+    (v2_3.0). Matches on (patient__cmo, gene_panel, bait_set) with
     run-mode (sequencer) bucket matching, a request-first cascade, and a
     pooled normal tier (shared across patients). Beagle's v2.3.0 logic
     does not key on specimen/sample type, so it is not a matching key
     here (still stored on the sample). Preservation is a gate on every
-    tier, pooled included: both sides' (preservation, sample_origin)
-    must resolve to the same category ("ffpe"/"frozen"; see
-    ``resolve_preservation``), and an unresolvable side blocks the pair.
+    tier, pooled included: each side's (preservation, sample_origin)
+    resolves to a category ("ffpe"/"frozen") or is not considered when
+    both fields are empty (see ``resolve_preservation``); two considered
+    sides must agree, a not-considered side never blocks, and an
+    unresolvable side (a within-side conflict, or a junk origin when
+    preservation is empty) blocks the pair.
     The pooled tier also resolves run mode through the pooled_machines
     table (pool machine name -> machine class; tumor run_mode ->
     novaseq/hiseq family). DMP samples (``sample_type`` == "DMP") are
@@ -28,13 +31,18 @@ Registered strategies:
     pairing only" mismatch reason, so they surface in the Sample
     Pairing view as overridable candidates. The candidate scope lists
     them by patient only: a non-DMP sample lists every same-patient
-    opposite-type DMP sample, and a DMP sample lists every same-patient
-    opposite-type sample.
+    opposite-type DMP sample, and a DMP sample lists the same-patient
+    opposite-type samples keyed on ``patient__dmp`` (the P- id) when
+    available, or ``patient__cmo`` for legacy rows.
   * ``tempo`` — TEMPO_MPGEN / CHRONOS strategy aligned with beagle's
     tempo_patient.py: a historical-pairing tier (beagle's pre_pairing /
     pairing.tsv) retained unconditionally, then patient-wide matching on
     bait_set (case-insensitive) and run-mode bucket. Gene panel and
     sample_type are not keys; there is no request cascade or pooled tier.
+  * ``dmp`` — DMP-group-only pairing (Syzygy-only; beagle has no DMP
+    pairing logic): matches a DMP tumor to a DMP normal on
+    (patient__dmp, gene_panel); never crosses into LIMS or pooled
+    samples.
   * ``ACCESS`` — alias for ``default``.
   * ``IMPACT`` — alias for ``argos`` (IMPACT is the assay the ARGOS
     pipeline sequences; see ``PAIRING_LOGIC_ALIASES`` in
@@ -83,7 +91,7 @@ TEMPO_RUN_MODE_MAP: Dict[str, str] = {
 }
 
 # sample_type values that mark a shared (pooled) normal. Pooled normals
-# belong to no patient (patient_id is null) and are offered as a last
+# belong to no patient (patient__cmo is null) and are offered as a last
 # resort by the argos strategy. Configurable per pairing logic via the
 # ``pooled_sample_types`` config key.
 DEFAULT_POOLED_SAMPLE_TYPES: tuple = ("Pooled Normal",)
@@ -178,32 +186,47 @@ def normalize_run_mode(value: Optional[str], mapping: Optional[Dict[str, str]] =
     return v
 
 
-def resolve_preservation(preservation, sample_origin) -> str:
-    """Resolve (preservation, sample_origin) to "ffpe", "frozen", or "".
+def resolve_preservation(preservation, sample_origin) -> Optional[str]:
+    """Resolve (preservation, sample_origin) for the ARGOS preservation
+    gate.
 
-    Fuzzy, case-insensitive category resolution (ARGOS preservation
-    gate):
+    Returns one of:
+      * ``"ffpe"`` / ``"frozen"`` — the side's resolved category;
+      * ``""`` (empty string) — unresolvable: the fields conflict
+        (preservation says ffpe but the origin names frozen, or
+        vice versa), or preservation is empty and the origin alone
+        does not resolve to a category. An unresolvable side blocks
+        the pair;
+      * ``None`` — not considered: both fields empty. The gate does
+        not apply to that side and it never blocks.
+
+    Fuzzy, case-insensitive resolution:
       * preservation non-empty -> "ffpe" if any entry is "ffpe",
-        otherwise "frozen" (anything else);
+        otherwise "frozen" (anything else). sample_origin is then free
+        (junk origins like "Tissue" no longer block) unless it names
+        the OPPOSITE category: an ffpe-side with origin "frozen" /
+        "fresh or frozen", or a frozen-side with origin "ffpe", is
+        unresolvable (within-side conflict);
       * preservation empty, sample_origin non-empty -> the origin's
         category: "ffpe" for "ffpe"; "frozen" for "fresh or frozen" or
         "frozen"; any other origin value is unresolvable;
-      * both non-empty -> the two categories must agree (e.g.
-        preservation "Frozen" == sample_origin "Fresh or Frozen");
-        disagreement — or a present-but-unresolvable origin — is
-        unresolvable.
-    The empty string means unresolvable; the ARGOS gate blocks a pair
-    when either side is unresolvable.
+      * both empty -> not considered (None).
     """
     p = _value_set(preservation)
     o = _value_set(sample_origin)
+    if not p and not o:
+        return None
     p_cat = "ffpe" if "ffpe" in p else "frozen" if p else None
-    o_cat = _origin_category(o) if o else None
     if p_cat is None:
-        return o_cat or ""
-    if o_cat is None:
-        return "" if o else p_cat
-    return p_cat if p_cat == o_cat else ""
+        # Preservation empty: the origin alone decides.
+        return _origin_category(o) or ""
+    if (p_cat == "ffpe" and _FROZEN_ORIGIN_VALUES & o) or (
+        p_cat == "frozen" and "ffpe" in o
+    ):
+        # Preservation present, but the origin names the opposite
+        # category: within-side conflict -> unresolvable.
+        return ""
+    return p_cat
 
 
 @dataclass
@@ -307,7 +330,7 @@ def register_pairing_strategy(name: str):
 class DefaultPairingStrategy:
     """Reference pairing strategy (used by ACCESS).
 
-    Base keys: see ``HARD_KEYS`` (patient_id, gene_panel, bait_set).
+    Base keys: see ``HARD_KEYS`` (patient__cmo, gene_panel, bait_set).
     Cascade:
     prefer normals ingested under the same request_id (when the tumor has
     one), then all other normals for the patient.
@@ -315,7 +338,7 @@ class DefaultPairingStrategy:
 
     # Sample attributes that must match on both sides of a pairing.
     # Overridden by strategies that align with other operators (argos).
-    HARD_KEYS: tuple = ("patient_id", "gene_panel", "bait_set")
+    HARD_KEYS: tuple = ("patient__cmo", "gene_panel", "bait_set")
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool = False
 
@@ -496,16 +519,21 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     """ARGOS (WES) pairing strategy, aligned with beagle's argos pairing
     logic (v2_3.0).
 
-    Matching keys (hard): patient_id, gene_panel, bait_set. Beagle's
+    Matching keys (hard): patient__cmo, gene_panel, bait_set. Beagle's
     v2.3.0 logic never keys on specimen/sample type, so ``sample_type``
     is dropped from the hard keys; it remains stored on the sample and
     is surfaced in pairing notes/reads.
 
-    Preservation is a soft gate on every tier, pooled included: each
-    side's (preservation, sample_origin) must resolve to the same
-    category via ``resolve_preservation`` (fuzzy, case-insensitive:
-    "ffpe"/"frozen"). A side that is unresolvable, or whose category
-    disagrees with the other side, blocks the pair.
+    Preservation is a soft gate on every tier, pooled included. Each
+    side's (preservation, sample_origin) resolves via
+    ``resolve_preservation``: a present preservation decides the
+    category (any "ffpe" entry -> "ffpe", anything else -> "frozen"),
+    with the sample origin free unless it names the opposite category
+    (a within-side conflict -> unresolvable); a missing preservation
+    lets a resolvable origin decide; both fields empty means the side
+    is not considered. When both sides are considered their categories
+    must agree; a not-considered side never blocks; an unresolvable
+    side (conflict, or a junk origin-only value) blocks the pair.
 
     Extends the default strategy with:
       * run-mode (sequencer) matching — the raw ``run_mode`` strings are
@@ -515,7 +543,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         patient, with the latest ``sequencing_date`` winning within a
         tier (mirrors beagle's compare_dates "most recent" selection);
       * a pooled-normal tier — shared pooled normals (``sample_type`` in
-        ``pooled_sample_types``, patient_id null), matched across patients
+        ``pooled_sample_types``, patient__cmo null), matched across patients
         on gene_panel + bait_set. Run mode is resolved through the
         pooled_machines table: the pool's machine name (its raw run_mode)
         maps to a machine class, the tumor's run_mode maps to a
@@ -530,10 +558,11 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         reason, so the Sample Pairing view shows them as overridable
         candidates. The candidate scope lists them by patient only: a
         non-DMP sample lists every same-patient opposite-type DMP sample,
-        and a DMP sample lists every same-patient opposite-type sample
-        (LIMS and DMP alike). The run-mode and preservation gates are
-        skipped when either side is DMP (the manual-only reason stands in
-        for them).
+        and a DMP sample lists the same-patient opposite-type samples
+        keyed on ``patient__dmp`` (the P- id) when the row carries one,
+        or on ``patient__cmo`` for legacy rows. The run-mode and
+        preservation gates are skipped when either side is DMP (the
+        manual-only reason stands in for them).
 
     Per-logic config keys:
       * ``run_mode_map`` — dict of raw substring -> bucket, checked in
@@ -542,7 +571,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         pooled normal (default: ["Pooled Normal"]).
     """
 
-    HARD_KEYS: tuple = ("patient_id", "gene_panel", "bait_set")
+    HARD_KEYS: tuple = ("patient__cmo", "gene_panel", "bait_set")
     HAS_POOLED_TIER: bool = True
 
     def _run_mode_map(self) -> Dict[str, str]:
@@ -552,7 +581,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return str(sample.sample_type or "").lower() in self._pooled_types()
 
     @staticmethod
-    def _resolved_preservation(sample: Sample) -> str:
+    def _resolved_preservation(sample: Sample) -> Optional[str]:
         return resolve_preservation(sample.preservation, sample.sample_origin)
 
     @staticmethod
@@ -580,16 +609,27 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         return reasons
 
     def _preservation_reasons(self, tumor: Sample, candidate: Sample) -> List[str]:
-        """Preservation agreement gate: both sides must resolve to the
-        same category; unresolvable on either side blocks the pair."""
-        t_cat = self._resolved_preservation(tumor)
-        n_cat = self._resolved_preservation(candidate)
-        if not t_cat:
-            return ["preservation unresolvable on tumor"]
-        if not n_cat:
-            return ["preservation unresolvable on normal"]
-        if t_cat != n_cat:
-            return [f"preservation mismatch ({t_cat} vs {n_cat})"]
+        """Preservation gate.
+
+        Each side resolves via ``resolve_preservation`` to "ffpe",
+        "frozen", "" (unresolvable), or None (not considered: both
+        fields empty). An unresolvable side blocks the pair (even
+        against a not-considered partner); a not-considered side never
+        blocks; two considered sides must agree on category.
+        """
+        t_res = self._resolved_preservation(tumor)
+        n_res = self._resolved_preservation(candidate)
+        reasons: List[str] = []
+        if t_res == "":
+            reasons.append("preservation unresolvable on tumor")
+        if n_res == "":
+            reasons.append("preservation unresolvable on normal")
+        if reasons:
+            return reasons
+        if t_res is None or n_res is None:
+            return []
+        if t_res != n_res:
+            return [f"preservation mismatch ({t_res} vs {n_res})"]
         return []
 
     @staticmethod
@@ -687,10 +727,31 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             return []
         return super().select_matching_tumors(db, normal, logic)
 
+    @staticmethod
+    def _patient_key_condition(sample: Sample):
+        """Same-patient condition for candidate listing.
+
+        Keys on ``patient__dmp`` (the P- id) when the sample carries
+        one, and falls back to ``patient__cmo`` for legacy rows (LIMS
+        samples never carry ``patient__dmp``). Returns None when the
+        sample carries neither.
+        """
+        if sample.patient__dmp is not None:
+            return _key_condition(Sample.patient__dmp, sample.patient__dmp)
+        if sample.patient__cmo is not None:
+            return _key_condition(Sample.patient__cmo, sample.patient__cmo)
+        return None
+
     def _dmp_candidates(self, db: Session, sample: Sample) -> List[Sample]:
-        """Every opposite-type DMP sample for the sample's patient."""
-        if sample.patient_id is None:
-            # A patient-less DMP sample has no "same patient" to share.
+        """Every opposite-type DMP sample for the sample's patient.
+
+        "Same patient" keys on ``patient__dmp`` (the P- id) when the
+        sample carries one, falling back to ``patient__cmo`` for legacy
+        rows and LIMS samples.
+        """
+        patient_condition = self._patient_key_condition(sample)
+        if patient_condition is None:
+            # A patient-less sample has no "same patient" to share.
             return []
         role = (
             TumorOrNormal.NORMAL.value
@@ -701,7 +762,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             db.scalars(
                 select(Sample).where(
                     Sample.tumor_or_normal == role,
-                    _key_condition(Sample.patient_id, sample.patient_id),
+                    patient_condition,
                     func.trim(func.upper(Sample.sample_type)) == "DMP",
                 )
             ).all()
@@ -747,16 +808,22 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             else TumorOrNormal.TUMOR.value
         )
         if self._is_dmp(sample):
-            # A DMP sample: every same-patient opposite-type sample (LIMS
-            # and DMP alike) is a potential override candidate.
-            candidates = list(
-                db.scalars(
-                    select(Sample).where(
-                        Sample.tumor_or_normal == role,
-                        _key_condition(Sample.patient_id, sample.patient_id),
-                    )
-                ).all()
-            )
+            # A DMP sample: the same-patient opposite-type samples are
+            # potential override candidates, keyed on ``patient__dmp``
+            # (the P- id) when the row carries one, or on
+            # ``patient__cmo`` for legacy rows without it.
+            patient_condition = self._patient_key_condition(sample)
+            if patient_condition is not None:
+                candidates = list(
+                    db.scalars(
+                        select(Sample).where(
+                            Sample.tumor_or_normal == role,
+                            patient_condition,
+                        )
+                    ).all()
+                )
+            else:
+                candidates = []
             if role == TumorOrNormal.NORMAL.value:
                 # The pooled tier still applies for a DMP tumor.
                 pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
@@ -765,7 +832,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             return candidates
         if sample.tumor_or_normal == TumorOrNormal.TUMOR.value:
             candidates = super().candidate_scope(db, sample, logic)
-            if sample.patient_id is None:
+            if sample.patient__cmo is None:
                 # Patient-null hard-key scope already includes every
                 # matching pooled normal; nothing extra to add.
                 return candidates
@@ -785,7 +852,7 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             return list(db.scalars(select(Sample).where(*conds)).all())
         # Non-pooled normal: base scope plus same-patient DMP tumors.
         candidates = super().candidate_scope(db, sample, logic)
-        if sample.patient_id is not None:
+        if sample.patient__cmo is not None:
             dmp = self._dmp_candidates(db, sample)
             known = {c.id for c in candidates}
             candidates.extend(c for c in dmp if c.id not in known)
@@ -822,7 +889,7 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         order (default: TEMPO_RUN_MODE_MAP).
     """
 
-    HARD_KEYS: tuple = ("patient_id",)
+    HARD_KEYS: tuple = ("patient__cmo",)
 
     def _run_mode_map(self) -> Dict[str, str]:
         return self.config.get("run_mode_map") or TEMPO_RUN_MODE_MAP
@@ -847,7 +914,7 @@ class TempoPairingStrategy(DefaultPairingStrategy):
     def mismatch_reasons(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
     ) -> List[str]:
-        # patient_id is the only hard key; bait_set + run_mode are soft.
+        # patient__cmo is the only hard key; bait_set + run_mode are soft.
         reasons = self._base_mismatch_reasons(tumor, normal)
         reasons.extend(self._soft_reasons(tumor, normal))
         return reasons
@@ -885,14 +952,14 @@ class TempoPairingStrategy(DefaultPairingStrategy):
                     ],
                 )
         # 2. Patient-wide tier (no request cascade, no pooled tier).
-        if tumor.patient_id is None:
+        if tumor.patient__cmo is None:
             return NormalSelection(
-                None, ["patient_id missing: tempo pairing is patient-scoped"]
+                None, ["patient__cmo missing: tempo pairing is patient-scoped"]
             )
         candidates = db.scalars(
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
-                _key_condition(Sample.patient_id, tumor.patient_id),
+                _key_condition(Sample.patient__cmo, tumor.patient__cmo),
             )
         ).all()
         picked, tier_notes = self._select_in_candidates(
@@ -906,12 +973,12 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         normal: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> List[Sample]:
-        if normal.patient_id is None:
+        if normal.patient__cmo is None:
             return []
         tumors = db.scalars(
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
-                _key_condition(Sample.patient_id, normal.patient_id),
+                _key_condition(Sample.patient__cmo, normal.patient__cmo),
             )
         ).all()
         return [t for t in tumors if not self._soft_reasons(t, normal)]
@@ -924,7 +991,7 @@ class TempoPairingStrategy(DefaultPairingStrategy):
     ) -> List[Sample]:
         # Tempo is patient-scoped (no pooled tier): everything the
         # patient-wide tier can reach is one same-patient query away.
-        if sample.patient_id is None:
+        if sample.patient__cmo is None:
             return []
         role = (
             TumorOrNormal.NORMAL.value
@@ -933,9 +1000,146 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         )
         conds = [
             Sample.tumor_or_normal == role,
-            _key_condition(Sample.patient_id, sample.patient_id),
+            _key_condition(Sample.patient__cmo, sample.patient__cmo),
         ]
         return list(db.scalars(select(Sample).where(*conds)).all())
+
+
+@register_pairing_strategy("dmp")
+class DmpPairingStrategy(DefaultPairingStrategy):
+    """DMP pairing strategy (Syzygy-only — beagle has no DMP
+    tumor->normal pairing logic).
+
+    Automatic DMP pairing is strictly within the DMP samples group
+    (``sample_type == "DMP"``): it never touches LIMS samples, pooled
+    normals, or cross-group DMP<->LIMS pairs (those stay manual under
+    the argos strategy).
+
+    Matching keys (hard, compared case-insensitively):
+      * ``patient__dmp`` (the "P-" patient id) — must be non-null and
+        equal on both sides; this is the patient key for DMP pairing;
+      * ``gene_panel`` — one P- patient can carry both IMPACT and
+        ACCESS DMP samples, so cross-assay T/N pairing is invalid.
+
+    Tumor vs. normal is enforced by the service exactly like every
+    other strategy (``trigger_pairing`` rejects non-TUMOR input and the
+    cascade queries only opposite-type candidates), so the checks here
+    do not re-test it.
+
+    Gates: preservation — DMP samples carry no preservation data
+    (``preservation`` and ``sample_origin`` are both None), so the
+    both-empty rule (Rule C) marks the gate "not considered" and it
+    always passes; it is deliberately not implemented. run_mode — N/A
+    for DMP, not gated.
+
+    Multiple candidates: when a DMP tumor has several matching DMP
+    normals, the winner is deterministic — the first in ``primary_id``
+    (string) order. This reuses the argos/default selection mechanism
+    (``_select_in_candidates`` picking via ``_latest``) with the
+    ordering key changed from sequencing date to primary_id.
+
+    Per-logic config keys: none.
+    """
+
+    HARD_KEYS: tuple = ("patient__dmp", "gene_panel")
+    HAS_POOLED_TIER: bool = False
+
+    @staticmethod
+    def _is_dmp(sample: Sample) -> bool:
+        return str(sample.sample_type or "").strip().upper() == "DMP"
+
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
+        # The dmp cascade is DMP-group only: a pair with either side
+        # outside the group (LIMS, pooled normal) can never be selected
+        # under this logic and stays manual under argos.
+        if not (self._is_dmp(tumor) and self._is_dmp(normal)):
+            return ["not a DMP sample"]
+        return self._base_mismatch_reasons(tumor, normal)
+
+    def _candidate_conditions(self, sample: Sample) -> List:
+        """Opposite-type, same-patient, same-panel DMP-group candidates
+        for one side of a pair."""
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
+        )
+        return [
+            Sample.tumor_or_normal == role,
+            func.trim(func.upper(Sample.sample_type)) == "DMP",
+            _key_condition(Sample.patient__dmp, sample.patient__dmp),
+            _key_condition(Sample.gene_panel, sample.gene_panel),
+        ]
+
+    @staticmethod
+    def _latest(candidates: Sequence[Sample]) -> Sample:
+        # Deterministic winner: first candidate in primary_id (string)
+        # order.
+        return min(candidates, key=lambda s: str(s.primary_id))
+
+    def select_latest_normal(
+        self,
+        db: Session,
+        tumor: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> NormalSelection:
+        # DMP-group only: a non-DMP tumor has no DMP counterpart, and a
+        # DMP tumor without a P- id cannot be patient__dmp-scoped.
+        if not self._is_dmp(tumor):
+            return NormalSelection(
+                None,
+                ["tumor is not a DMP sample: dmp pairing is DMP-group only"],
+            )
+        if tumor.patient__dmp is None:
+            return NormalSelection(
+                None,
+                [
+                    "patient__dmp missing: "
+                    "dmp pairing is patient__dmp-scoped"
+                ],
+            )
+        candidates = db.scalars(
+            select(Sample).where(*self._candidate_conditions(tumor))
+        ).all()
+        picked, tier_notes = self._select_in_candidates(
+            tumor, candidates, "dmp", self.mismatch_reasons
+        )
+        return NormalSelection(picked, tier_notes)
+
+    def select_matching_tumors(
+        self,
+        db: Session,
+        normal: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        # A non-DMP normal (LIMS) has no DMP-group counterpart, and a
+        # DMP normal without a P- id cannot be patient__dmp-scoped.
+        if not self._is_dmp(normal) or normal.patient__dmp is None:
+            return []
+        tumors = db.scalars(
+            select(Sample).where(*self._candidate_conditions(normal))
+        ).all()
+        return [t for t in tumors if not self.mismatch_reasons(t, normal)]
+
+    def candidate_scope(
+        self,
+        db: Session,
+        sample: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        # The dmp cascade is strictly DMP-group only: a non-DMP sample
+        # (or a DMP sample without a P- id) has no cascade candidates
+        # here — cross-group DMP<->LIMS pairing stays manual under
+        # argos, not here.
+        if not self._is_dmp(sample) or sample.patient__dmp is None:
+            return []
+        return list(
+            db.scalars(
+                select(Sample).where(*self._candidate_conditions(sample))
+            ).all()
+        )
 
 
 # Strategy-name aliases: a PairingLogic row may reference a strategy by

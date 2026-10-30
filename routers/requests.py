@@ -53,7 +53,7 @@ def list_requests(
     """Requests derived from samples (``request_id`` non-null), sorted by
     request_id. ``q`` is a case-insensitive partial match on request_id.
 
-    ``patients`` lists the distinct patient_ids across the request's
+    ``patients`` lists the distinct patient__cmo values across the request's
     samples (non-null); ``sample_types`` and ``gene_panels`` are the
     distinct values carried by the request's samples.
 
@@ -83,7 +83,7 @@ def list_requests(
                 sample_count=row.sample_count,
                 tumor_count=row.tumor_count,
                 normal_count=row.normal_count,
-                patients=sorted({s.patient_id for s in rows_for_request if s.patient_id}),
+                patients=sorted({s.patient__cmo for s in rows_for_request if s.patient__cmo}),
                 sample_types=sorted({s.sample_type for s in rows_for_request if s.sample_type}),
                 gene_panels=sorted({s.gene_panel for s in rows_for_request if s.gene_panel}),
             )

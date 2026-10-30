@@ -14,8 +14,9 @@
     <button class="tab" data-tab="patients">Patients</button>
     <button class="tab" data-tab="requests">Requests</button>
     <button class="tab" data-tab="pooled">Pooled Normals</button>
-    <button class="tab" data-tab="pairs">Pairs by Logic</button>
+    <button class="tab" data-tab="pairs">Pair Report</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
+    <button class="tab" data-tab="try">Try Pairing</button>
   </nav>
   <div class="user-area">
     <span id="current-user"></span>
@@ -38,8 +39,8 @@
       <label>cmo_sample_name
         <input id="f-cmo_sample_name" name="cmo_sample_name">
       </label>
-      <label>patient_id
-        <input id="f-patient_id" name="patient_id">
+      <label>patient__cmo
+        <input id="f-patient__cmo" name="patient__cmo">
       </label>
       <label>request_id
         <input id="f-request_id" name="request_id">
@@ -88,7 +89,7 @@
       <table id="samples-table">
         <thead>
           <tr>
-            <th>primary_id</th><th>cmo_sample_name</th><th>patient_id</th><th>request_id</th>
+            <th>primary_id</th><th>cmo_sample_name</th><th>patient__cmo</th><th>patient__dmp</th><th>anon_id</th><th>request_id</th>
             <th>role</th><th>sample_type</th><th>gene_panel</th><th>bait_set</th>
             <th>run_mode</th><th>file_group</th><th>preservation</th><th>sample_origin</th><th>sequencing_date</th>
           </tr>
@@ -109,7 +110,7 @@
   <section class="panel">
     <h2>Patients</h2>
     <div class="actions">
-      <label>patient_id
+      <label>patient__cmo
         <input id="p-q" placeholder="partial match, e.g. C-EXAMPLE1">
       </label>
       <button id="p-search" class="primary">Search</button>
@@ -119,7 +120,7 @@
       <table id="patients-table">
         <thead>
           <tr>
-            <th>patient_id</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th>patient__cmo</th><th>samples</th><th>tumors</th><th>normals</th>
             <th>requests</th><th>metadata</th>
           </tr>
         </thead>
@@ -190,7 +191,7 @@
         <thead>
           <tr>
             <th>primary_id</th><th>cmo_sample_name</th><th>role</th><th>sample_type</th>
-            <th>patient_id</th><th>current match</th>
+            <th>patient__cmo</th><th>current match</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -204,7 +205,7 @@
       <table id="r-patients">
         <thead>
           <tr>
-            <th>patient_id</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th>patient__cmo</th><th>samples</th><th>tumors</th><th>normals</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -217,28 +218,65 @@
 
 <main id="view-pairs" class="view hidden">
   <section class="panel">
-    <h2>Pairs by pairing logic</h2>
-    <p class="hint">Current (latest) pairings under the selected logic. Download uses <code>primary_id</code> for samples and the tumor's bait set.</p>
-    <div class="filters">
-      <label>pairing logic
-        <select id="pr-logic"></select>
-      </label>
-      <label>format
-        <select id="pr-format">
-          <option value="csv">CSV</option>
-          <option value="tsv">TSV</option>
-        </select>
-      </label>
-      <button id="pr-download" disabled>Download</button>
-      <span id="pr-count" class="hint"></span>
+    <h2>Pair Report</h2>
+    <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the legacy DMP export columns.</p>
+    <div class="pr-split" id="pr-split">
+      <aside class="pr-panel" id="pr-panel">
+        <div class="pr-panel-head">
+          <strong>Columns</strong>
+          <button type="button" class="linkbtn" id="pr-panel-collapse" title="Collapse filter panel">&lsaquo;</button>
+        </div>
+        <div class="pr-panel-body" id="pr-panel-body">
+          <label>group by
+            <select id="pr-groupby">
+              <option value="side">Tumor / Normal</option>
+              <option value="logic">Pair logic / Strategy</option>
+            </select>
+          </label>
+          <p class="hint">A group header toggles every column in its group. The table and export update live.</p>
+          <div id="pr-groups"></div>
+          <div class="pr-panel-actions">
+            <button type="button" class="small" id="pr-cols-all">All</button>
+            <button type="button" class="small" id="pr-cols-none">None</button>
+            <button type="button" class="small" id="pr-cols-default">Default</button>
+          </div>
+        </div>
+      </aside>
+      <button type="button" class="pr-panel-open hidden" id="pr-panel-open" title="Show filter panel">&rsaquo;</button>
+      <div class="pr-main">
+        <div class="filters">
+          <label>pairing logic
+            <select id="pr-logic"></select>
+          </label>
+          <button type="button" id="pr-run-dmp" class="small hidden" title="Pair every unpaired DMP tumor with its DMP normal (DMP logic only — automatic pairing)">Run DMP pairing</button>
+          <span id="pr-dmp-status" class="hint"></span>
+          <label>format
+            <select id="pr-format">
+              <option value="csv">CSV</option>
+              <option value="tsv">TSV</option>
+            </select>
+          </label>
+          <button id="pr-download" disabled>Download</button>
+          <button type="button" id="pr-prev" disabled title="Previous page">&lsaquo;</button>
+          <button type="button" id="pr-next" disabled title="Next page">&rsaquo;</button>
+          <span id="pr-count" class="hint"></span>
+        </div>
+        <details class="pr-legend hidden" id="pr-legend">
+          <summary>About these columns</summary>
+          <table class="pr-legend-table">
+            <thead><tr><th>column</th><th>where it comes from</th></tr></thead>
+            <tbody id="pr-legend-body"></tbody>
+          </table>
+        </details>
+        <div class="table-wrap">
+          <table id="pairs-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="pr-empty" class="empty hidden">No current pairs for this logic.</p>
+      </div>
     </div>
-    <div class="table-wrap">
-      <table id="pairs-table">
-        <thead><tr><th>TUMOR_SAMPLE</th><th>NORMAL_SAMPLE</th><th>BAIT_SET</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-    <p id="pr-empty" class="empty hidden">No current pairs for this logic.</p>
   </section>
 </main>
 
@@ -374,7 +412,7 @@
     <div class="table-wrap">
       <table id="m-others">
         <thead>
-          <tr><th>candidate</th><th>patient_id</th><th>tier</th><th>keys</th><th>mismatched keys</th><th>sequencing_date</th><th></th></tr>
+          <tr><th>candidate</th><th>patient__cmo</th><th>patient__dmp</th><th>tier</th><th>keys</th><th>mismatched keys</th><th>sequencing_date</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
@@ -393,10 +431,55 @@
       Click a candidate row to open its matches &amp; overrides.
       Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
     </p>
+    <p id="m-dmp-warning" class="hint hidden">
+      The DMP logic is automatic-only: DMP tumors pair with their DMP
+      normals via the <em>Run DMP pairing</em> button on the Pairs tab.
+      To pin a DMP tumor to a non-DMP normal, switch to another logic
+      (e.g. ARGOS) first.
+    </p>
     <label class="check">
       <input type="checkbox" id="m-strict">
       reject if any matching key differs (strict override)
     </label>
+  </section>
+</main>
+
+<main id="view-try" class="view hidden">
+  <section class="panel">
+    <h2>Try pairing <span class="sub">(dry run)</span></h2>
+    <p class="hint">
+      Read-only &mdash; shows what the pairing cascade <em>would</em> do for one
+      sample under the chosen logic. Nothing is created, updated, or overridden.
+    </p>
+    <div class="actions">
+      <label>sample
+        <input id="tq-id" placeholder="primary_id or cmo_sample_name">
+      </label>
+      <button id="tq-lookup" class="primary">Lookup</button>
+      <label>sample (matched)
+        <select id="tq-sample" disabled></select>
+      </label>
+      <label>pairing logic
+        <select id="tq-logic"></select>
+      </label>
+      <button id="tq-run" class="primary" disabled>Run dry run</button>
+    </div>
+    <p class="hint">Lookup matches primary_id and cmo_sample_name case-insensitively; the sample&rsquo;s bait-set logic is preselected when known.</p>
+  </section>
+
+  <section id="tq-summary" class="panel hidden">
+    <h3 id="tq-summary-title">Resolved sample</h3>
+    <dl id="tq-summary-kv" class="kv"></dl>
+  </section>
+
+  <section id="tq-result" class="panel hidden">
+    <div id="tq-result-body"></div>
+  </section>
+
+  <section id="tq-explain" class="panel hidden">
+    <h3>How the selected logic pairs</h3>
+    <div id="tq-explain-body"></div>
+    <p class="hint">Sourced from <code>pairing_strategies.py</code> &mdash; see that module for the authoritative rules.</p>
   </section>
 </main>
 
