@@ -25,6 +25,11 @@ services:
       KEYCLOAK_URL: http://localhost:8080
       # Shared secret the smile-listener sends as X-NATS-Token.
       NATS_INGEST_TOKEN: dev-syzygy-nats-token
+      # Dev CRF output dir, bind-mounted to the host (./crf_output_dev)
+      # so host-side tests can assert on the generated CRF files.
+      CRF_OUTPUT_DIR: /app/crf_output_dev
+    volumes:
+      - ./crf_output_dev:/app/crf_output_dev
     # Note: podman-compose concatenates list-valued keys across compose
     # files, so the base file's healthcheck (probing 8000) cannot be
     # overridden here. In dev the container app serves 8123 and therefore
@@ -66,9 +71,13 @@ services:
       - syzygy-dev
     restart: "no"
 
-  # Standalone smile-client consumer: one durable consumer on the wildcard
-  # MDB_STREAM.server.cpt-gateway.> receives all three cmo subjects and
-  # POSTs each message to the app's internal ingest endpoint.
+  # Standalone smile-client consumers: one durable per client family,
+  # both in a single process (see listener/run.py). The legacy consumer
+  # on MDB_STREAM.server.cpt-gateway.> receives all three cmo subjects;
+  # the tempo consumer on MDB_STREAM.consumers.tempo.> receives the
+  # cohort subjects. Separate durables, so JetStream fans the stream out
+  # independently (each keeps its own redelivery position). Each POSTs
+  # its messages to the app's internal ingest endpoint.
   smile-listener:
     build: ./listener
     command: ["python", "/app/run.py"]
@@ -76,6 +85,8 @@ services:
       NATS_URL: nats://nats:4222
       NATS_FILTER_SUBJECT: "MDB_STREAM.server.cpt-gateway.>"
       NATS_DURABLE: "syzygy"
+      NATS_TEMPO_FILTER_SUBJECT: "MDB_STREAM.consumers.tempo.>"
+      NATS_TEMPO_DURABLE: "syzygy-tmp"
       SYZYGY_APP_URL: http://app:8123
       SYZYGY_NATS_TOKEN: dev-syzygy-nats-token
     depends_on:
