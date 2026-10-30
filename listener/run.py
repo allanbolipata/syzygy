@@ -32,6 +32,9 @@ import signal
 
 from smile_client.smile_client import SmileClient
 
+import nats_publisher
+import smile_bridge
+
 logger = logging.getLogger("smile_listener")
 
 # Backoff for restarting a dead consumer task (doubles per failure).
@@ -41,6 +44,11 @@ RESTART_MAX_DELAY_S = 60.0
 # cancelling whatever is still stuck (e.g. a client mid-connect when the
 # stop signal landed).
 SHUTDOWN_GRACE_S = 10.0
+
+
+def _env_flag(name: str) -> bool:
+    """Read a truthy env flag (default off)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _build_config(
@@ -159,11 +167,63 @@ async def _supervise(
         delay = min(delay * 2, RESTART_MAX_DELAY_S)
 
 
+async def _sleep_unless_shutdown(shutdown: asyncio.Event, seconds: float) -> None:
+    """Sleep ``seconds`` unless the shutdown event fires first."""
+    try:
+        await asyncio.wait_for(shutdown.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
+def _tempo_js_context(tempo: SmileClient):
+    """The tempo client's current JetStream context, or None if not connected.
+
+    The client sets ``nc`` only once inside start_consuming, and a reconnect
+    swaps in a fresh connection, so this is re-read at call time rather than
+    captured once.
+    """
+    nc = getattr(tempo, "nc", None)
+    return nc.jetstream() if nc is not None else None
+
+
+async def _flusher_loop(tempo: SmileClient, shutdown: asyncio.Event) -> None:
+    """Background outbox flusher (gated by COHORT_PUBLISH_ENABLED, default off).
+
+    Polls the app's publish-outbox, republishes each pending report to the
+    result subject, and marks the row published — the retry path for a
+    fast-path publish that failed in smile_bridge. Runs alongside the
+    consumers in this process and borrows the tempo client's JetStream
+    connection (it holds no NATS connection of its own). A cycle that cannot
+    connect, or whose publish/mark fails, simply leaves the rows pending and
+    retries on the next poll (interval: COHORT_FLUSH_INTERVAL, default 30s).
+    """
+    app_url = os.environ["SYZYGY_APP_URL"]
+    interval = float(os.environ.get("COHORT_FLUSH_INTERVAL", "30"))
+    logger.info("outbox flusher started (interval=%.0fs)", interval)
+    while not shutdown.is_set():
+        js_context = _tempo_js_context(tempo)
+        if js_context is not None:
+            try:
+                published = await nats_publisher.flush_pending(js_context, app_url)
+            except Exception:
+                logger.exception("outbox flush cycle failed")
+                published = 0
+            if published:
+                logger.info("outbox flusher published %d row(s)", published)
+        await _sleep_unless_shutdown(shutdown, interval)
+    logger.info("outbox flusher stopped")
+
+
 async def _run() -> None:
     legacy = SmileClient(build_config())
     tempo = SmileClient(build_tempo_config())
     shutdown = asyncio.Event()
     _install_signals(asyncio.get_running_loop(), shutdown, (legacy, tempo))
+
+    # Hand the tempo client's JetStream context to the bridge (fast-path
+    # publish). The bridge holds no NATS connection of its own; the provider
+    # is re-read at publish time so a reconnect (a fresh nc) is picked up.
+    smile_bridge.set_js_context_provider(lambda: _tempo_js_context(tempo))
 
     # One task per client in one loop; the supervisors keep the clients
     # independent — a failure of one must not kill the other.
@@ -175,6 +235,14 @@ async def _run() -> None:
         _supervise("tempo", tempo, tempo.filter_subject, shutdown),
         name="smile-listener-tempo",
     )
+    # Optional outbox flusher (COHORT_PUBLISH_ENABLED, default off): retries
+    # any report the fast-path publish could not deliver.
+    flusher_task = None
+    if _env_flag("COHORT_PUBLISH_ENABLED"):
+        flusher_task = asyncio.create_task(
+            _flusher_loop(tempo, shutdown),
+            name="smile-listener-flusher",
+        )
     try:
         await shutdown.wait()
     finally:
@@ -184,9 +252,10 @@ async def _run() -> None:
         # message iterators so they cannot sit blocked in `async for`.
         for client in (legacy, tempo):
             await client._disconnect()
-        done, pending = await asyncio.wait(
-            [legacy_task, tempo_task], timeout=SHUTDOWN_GRACE_S
-        )
+        tasks = [legacy_task, tempo_task]
+        if flusher_task is not None:
+            tasks.append(flusher_task)
+        done, pending = await asyncio.wait(tasks, timeout=SHUTDOWN_GRACE_S)
         for task in pending:
             logger.warning(
                 "consumer task %s still running; cancelling it", task.get_name()

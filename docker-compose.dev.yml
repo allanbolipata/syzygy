@@ -8,6 +8,12 @@
 # / KEYCLOAK_CLIENT_SECRET at external services.
 name: syzygy
 
+# ONE place the cohort result subject lives: a single YAML alias feeds both
+# the app's nats_cohort_result_subject (via NATS_COHORT_RESULT_SUBJECT) and the
+# smile-listener's NATS_RESULT_SUBJECT, so a rename touches one line.
+# Placeholder pending the meeting agreement.
+x-cohort-result-subject: &cohort_result_subject "MDB_STREAM.consumers.tempo.cohort-result"
+
 services:
   app:
     # The dev database sits on the shared network as `db`. The host-side
@@ -28,6 +34,8 @@ services:
       # Dev CRF output dir, bind-mounted to the host (./crf_output_dev)
       # so host-side tests can assert on the generated CRF files.
       CRF_OUTPUT_DIR: /app/crf_output_dev
+      # Cohort result subject (one alias, see x-cohort-result-subject).
+      NATS_COHORT_RESULT_SUBJECT: *cohort_result_subject
     volumes:
       - ./crf_output_dev:/app/crf_output_dev
     # Note: podman-compose concatenates list-valued keys across compose
@@ -89,6 +97,9 @@ services:
       NATS_TEMPO_DURABLE: "syzygy-tmp"
       SYZYGY_APP_URL: http://app:8123
       SYZYGY_NATS_TOKEN: dev-syzygy-nats-token
+      # Cohort result subject (one alias, see x-cohort-result-subject); the
+      # flusher's fast-path + retry publish target.
+      NATS_RESULT_SUBJECT: *cohort_result_subject
     depends_on:
       nats-init:
         condition: service_completed_successfully

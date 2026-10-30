@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY smile_client/ /app/smile_client/
 COPY smile_bridge.py /app/smile_bridge.py
+COPY nats_publisher.py /app/nats_publisher.py
 COPY run.py /app/run.py
 COPY init_nats_stream.py /app/init_nats_stream.py
 
