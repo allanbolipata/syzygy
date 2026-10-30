@@ -1,0 +1,9 @@
+#endUsers:analyst1@example.org,analyst2@example.org
+#pmUsers:pm1@example.org
+#projectTitle:Full Cohort Study
+#projectSubtitle:All four id fields on every sample
+#type:MSKWESRP
+#TUMOR_ID	NORMAL_ID
+C-PPPP16-X001-d01	C-PPPP16-X001-n01
+C-PPPP17-X002-d02	C-PPPP17-X002-n02
+C-PPPP18-X003-d03	C-PPPP18-X003-n03
