@@ -19,6 +19,7 @@ from routers.nats_ingest import router as nats_ingest_router
 from routers.patients import router as patients_router
 from routers.pairing_logic import router as pairing_logic_router
 from routers.pairings import router as pairings_router
+from routers.publish_outbox import router as publish_outbox_router
 from routers.requests import router as requests_router
 from routers.samples import router as samples_router
 
@@ -94,6 +95,10 @@ app.include_router(
 # Token-auth is handled inside the endpoint (shared X-NATS-Token), not via
 # the Keycloak dependency; the app itself never connects to NATS.
 app.include_router(nats_ingest_router, prefix="/v1")
+# Internal publish-outbox drain endpoint for the listener-side flusher
+# (same shared X-NATS-Token as ingest; the app itself never connects to
+# NATS).
+app.include_router(publish_outbox_router, prefix="/v1")
 app.include_router(
     bait_sets_router, prefix="/v1", dependencies=[Depends(get_current_user)]
 )

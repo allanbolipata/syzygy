@@ -147,6 +147,24 @@ class BaitSet(Base):
         return self.pairing_logic_obj.name if self.pairing_logic_obj is not None else ""
 
 
+class PendingNatsPublish(Base):
+    """Outbox row for a NATS publish the listener could not complete.
+
+    The listener acks every inbound message unconditionally, so a failed
+    publish is recorded here instead of dropped; the listener-side
+    flusher drains these rows (oldest first) and stamps ``published_at``
+    once the republish lands (routers/publish_outbox.py)."""
+
+    __tablename__ = "pending_nats_publishes"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cohort_id: Mapped[str] = mapped_column(sa.String(255), index=True)
+    subject: Mapped[str] = mapped_column(sa.String(255))
+    report_json: Mapped[str] = mapped_column(sa.Text)
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
+    published_at: Mapped[Optional[datetime]] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+
 class AllowedUser(Base):
     """Keycloak users allowed to log in (allow-list for auth, maintained
     ahead of the Keycloak integration)."""
