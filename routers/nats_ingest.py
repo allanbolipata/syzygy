@@ -53,8 +53,14 @@ def ingest_nats(
     result = dispatch(db, body.subject, body.payload)
     if result["status"] == "error":
         raise HTTPException(status_code=422, detail=result["detail"])
-    return {
+    response: Dict[str, Any] = {
         "subject": body.subject,
         "status": result["status"],
         "detail": result["detail"],
     }
+    # Cohort handlers carry the validation report for the listener's
+    # fast-path publish (listener/smile_bridge.py reads body["report"] on
+    # 2xx); pass it through verbatim.
+    if "report" in result:
+        response["report"] = result["report"]
+    return response
