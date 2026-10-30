@@ -1,0 +1,90 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema",
+    "title": "cohort request obj",
+    "description": "Cohort request validation report",
+    "type": "object",
+    "properties": {
+        "cohortId": {
+            "type": "string",
+            "description": "Cohort identifier"
+        },
+        "jsonSchemaValidated": {
+            "type": "boolean",
+            "description": "Submitted cohort request json schema validation result. If false, reach out to SMILE/Voyager"
+        },
+        "passesCheck": {
+            "type": "boolean",
+            "description": "Submitted cohort request passes all checks (no problem samples, endusers, pmusers)."
+        },
+        "endUsers":{
+            "type":"array",
+            "description":"Invalid end users",
+            "items": {
+                "type": "string"
+            }
+        },
+        "pmUsers":{
+            "type":"array",
+            "description":"Invalid PM users",
+            "items": {
+                "type": "string"
+            }
+        },
+        "samples":{
+            "type":"array",
+            "description": "List of samples preventing TEMPO processing",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "primaryId": {
+                        "type":"string",
+                        "description": "Stable tumor sample IGO identifier",
+                        "pattern": "^\\d{5}(?:_[A-Z]*)?(?:_\\d+){0,6}$"
+                    },
+                    "cmoId": {
+                        "type":"string",
+                        "description": "Tumor sample CMO identifier"
+                    },
+                    "conflictReason": {
+                        "type":"string",
+                        "description": "Conflicts reason"
+                    },
+                    "unpairedReason": {
+                        "type":"string",
+                        "description": "Reason the tumor is unpaired"
+                    },
+                    "tumorNotFound": {
+                        "type":"boolean",
+                        "description": "Tumor not found in Voyager. Further investigation warranted"
+                    },
+                    "normalCmoId": {
+                        "type":"string",
+                        "description": "Normal sample CMO identifier"
+                    },
+                    "normalPrimaryId": {
+                        "type":"string",
+                        "description": "Stable normal sample IGO identifier",
+                        "pattern": "^\\d{5}(?:_[A-Z]*)?(?:_\\d+){0,6}$"
+                    }
+                },
+                "anyOf": [
+                    {
+                        "required": ["primaryId","cmoId","conflictReason"]
+                    },
+                    {
+                        "required": ["primaryId","cmoId","unpairedReason"]
+                    },
+                    {
+                        "required": ["primaryId","cmoId","tumorNotFound"]
+                    },
+                    {
+                        "required": ["primaryId","cmoId","normalPrimaryId","normalCmoId"]
+                    }
+                ]
+            },
+            "uniqueItems": true
+        }
+    },
+    "required":["cohortId","passesCheck","jsonSchemaValidated"],
+    "additionalProperties":false
+}
