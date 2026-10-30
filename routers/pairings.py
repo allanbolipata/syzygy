@@ -3,7 +3,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db, settings
@@ -15,7 +15,13 @@ from pairing_service import (
     trigger_pairing_for_unpaired_tumors,
 )
 from pairing_strategies import get_pairing_strategy
-from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal, TriggerAllRead
+from schemas import (
+    PairingRead,
+    PairingTriggerCreate,
+    SampleRead,
+    TumorOrNormal,
+    TriggerAllRead,
+)
 
 
 router = APIRouter(prefix="/pairing", tags=["pairings"])
@@ -109,6 +115,47 @@ def list_pairings(
         stmt = stmt.where(PairingTable.created_date <= created_before)
     # Stable ordering so limit/offset pagination is deterministic.
     stmt = stmt.order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    return db.scalars(stmt).all()
+
+
+@router.get("/unmatched/", response_model=list[SampleRead])
+def list_unmatched_dmp_samples(
+    pairing_logic_name: str,
+    limit: Optional[int] = Query(None, ge=1),
+    offset: Optional[int] = Query(None, ge=0),
+    db: Session = Depends(get_db),
+):
+    """DMP samples that have no latest pairing under the given logic.
+
+    The DMP report lists every DMP sample; unpaired ones are shown with
+    the opposite side's columns empty. The Pairs UI used to download the
+    whole DMP sample population and diff it client-side against the
+    pairings (hundreds of sequential requests against a ~280k-row table
+    per load); the set difference is computed here in one query instead.
+    Same per-logic, latest-only semantics as the pairing list itself.
+    """
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    stmt = (
+        select(Sample)
+        .where(Sample.sample_type == "DMP", ~paired)
+        .order_by(Sample.created_date.desc(), Sample.id.desc())
+    )
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:

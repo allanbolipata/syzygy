@@ -1200,6 +1200,12 @@ const pairsState = {
   selected: {},
   // Split-panel filter groups that the user collapsed (default: expanded).
   groupCollapsed: {},
+  // Display pagination for the pair table. The full row set can be in the
+  // hundreds of thousands (the DMP report lists every DMP sample); rendering
+  // all of it to the DOM hangs the tab, so only one page is rendered at a
+  // time. The download still covers every row, not just the visible page.
+  page: 0,
+  pageSize: 50,
 };
 
 function isDmpLogic(logicName) {
@@ -1297,16 +1303,28 @@ function renderPairsTable() {
   $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) =>
     `<th${dmp && DMP_LEGEND[c.key] ? ` title="${esc(DMP_LEGEND[c.key])}"` : ""}>${esc(c.header)}</th>`
   ).join("")}</tr>`;
-  $("#pairs-table tbody").innerHTML = pairsState.rows
+  // Render only the current page (see pairsState.pageSize). The row array
+  // keeps the full set in memory for the download.
+  const total = pairsState.rows.length;
+  const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
+  if (pairsState.page > maxPage) pairsState.page = maxPage;
+  const start = pairsState.page * pairsState.pageSize;
+  const slice = pairsState.rows.slice(start, start + pairsState.pageSize);
+  $("#pairs-table tbody").innerHTML = slice
     .map((r) => `<tr>${cols.map((c) => `<td>${esc(c.text(r))}</td>`).join("")}</tr>`).join("");
+  $("#pr-prev").disabled = pairsState.page === 0;
+  $("#pr-next").disabled = pairsState.page >= maxPage;
   const matched = pairsState.rows.filter((r) => r.tumor && r.normal).length;
-  const empty = pairsState.rows.length === 0 || cols.length === 0;
+  const empty = total === 0 || cols.length === 0;
   $("#pr-empty").classList.toggle("hidden", !empty);
+  const paging = total > pairsState.pageSize
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + slice.length} of ${total})`
+    : "";
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
     : dmp
-      ? `${pairsState.rows.length} rows: ${matched} matched, ${pairsState.rows.length - matched} unmatched`
-      : `${pairsState.rows.length} pair${pairsState.rows.length === 1 ? "" : "s"}`;
+      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${paging}`
+      : `${total} pair${total === 1 ? "" : "s"}${paging}`;
   $("#pr-download").disabled = empty;
   // Legend (and header tooltips) only for the legacy DMP column set.
   $("#pr-legend").classList.toggle("hidden", !dmp);
@@ -1317,47 +1335,50 @@ function renderPairsTable() {
   }
 }
 
+/* Abort controller for the in-flight pair load; a new load (tab click,
+ * logic change) cancels the previous one so scans can't pile up on the
+ * server. */
+let pairsAbort = null;
+
 async function loadPairs() {
   const logic = $("#pr-logic").value;
   if (!logic) return;
+  if (pairsAbort) pairsAbort.abort();
+  pairsAbort = new AbortController();
+  const signal = pairsAbort.signal;
   try {
     pairsState.logic = logic;
-    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
-    if (isDmpLogic(logic)) await appendUnmatchedDmpSamples();
+    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`, { signal });
+    if (isDmpLogic(logic)) await appendUnmatchedDmpSamples(signal);
+    pairsState.page = 0;
     renderPrGroups();
     renderPairsTable();
   } catch (e) {
+    if (e && e.name === "AbortError") return; // superseded by a newer load
     banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
   }
 }
 
 /* DMP report: the legacy export lists every DMP sample, so DMP samples
  * without a pairing yet are appended as rows with the opposite-side
- * columns left empty. */
-async function appendUnmatchedDmpSamples() {
-  const paired = new Set();
-  for (const r of pairsState.rows) {
-    paired.add(r.tumor.id);
-    paired.add(r.normal.id);
+ * columns left empty. The unmatched set is computed server-side (one
+ * query) — the old client-side diff had to download the entire DMP
+ * sample population in pages of 1000. */
+async function appendUnmatchedDmpSamples(signal) {
+  const unmatched = await api(
+    `/pairing/unmatched/?${new URLSearchParams({ pairing_logic_name: pairsState.logic })}`,
+    { signal }
+  );
+  for (const s of unmatched) {
+    pairsState.rows.push({
+      tumor: s.tumor_or_normal === "TUMOR" ? s : null,
+      normal: s.tumor_or_normal === "NORMAL" ? s : null,
+      pairing_logic: pairsState.logic,
+      trigger_type: null,
+      mismatched_keys: [],
+      created_date: s.created_date,
+    });
   }
-  const extra = [];
-  const page = 1000;
-  for (let offset = 0; ; offset += page) {
-    const batch = await api(`/sample/?${new URLSearchParams({ sample_type: "DMP", limit: String(page), offset: String(offset) })}`);
-    for (const s of batch) {
-      if (paired.has(s.id)) continue;
-      extra.push({
-        tumor: s.tumor_or_normal === "TUMOR" ? s : null,
-        normal: s.tumor_or_normal === "NORMAL" ? s : null,
-        pairing_logic: pairsState.logic,
-        trigger_type: null,
-        mismatched_keys: [],
-        created_date: s.created_date,
-      });
-    }
-    if (batch.length < page) break;
-  }
-  pairsState.rows = pairsState.rows.concat(extra);
 }
 
 function downloadPairs() {
@@ -1380,6 +1401,19 @@ function downloadPairs() {
 
 $("#pr-logic").addEventListener("change", loadPairs);
 $("#pr-download").addEventListener("click", downloadPairs);
+$("#pr-prev").addEventListener("click", () => {
+  if (pairsState.page > 0) {
+    pairsState.page--;
+    renderPairsTable();
+  }
+});
+$("#pr-next").addEventListener("click", () => {
+  const maxPage = Math.max(0, Math.ceil(pairsState.rows.length / pairsState.pageSize) - 1);
+  if (pairsState.page < maxPage) {
+    pairsState.page++;
+    renderPairsTable();
+  }
+});
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
 $("#pr-groupby").addEventListener("change", renderPrGroups);
 $("#pr-groups").addEventListener("change", (e) => {
