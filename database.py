@@ -39,6 +39,19 @@ class Settings(BaseSettings):
         "MDB_STREAM.server.cpt-gateway.cmo-sample-update"
     )
 
+    # NATS cohort (TEMPO) subjects
+    nats_cohort_submit_subject: str = (
+        "MDB_STREAM.consumers.tempo.new-cohort-submit"
+    )
+    nats_cohort_update_subject: str = (
+        "MDB_STREAM.consumers.tempo.cohort-update"
+    )
+    nats_cohort_result_subject: str = (
+        "MDB_STREAM.consumers.tempo.cohort-result"
+    )
+    crf_output_dir: str = "./crf_output"
+    cohort_publish_enabled: bool = False
+
 
 settings = Settings()
 
