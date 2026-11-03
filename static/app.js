@@ -105,11 +105,23 @@ function pushNav() {
 }
 
 function showView(name) {
+  const prev = currentViewName();
+  const isPairs = name === "pairs";
+  if (prev && prev !== "pairs" && isPairs) {
+    // Entering the Pair Report: drop any stale search so the user always
+    // lands on the full list for the current logic.
+    resetPrSearch();
+  }
+  if (prev === "pairs" && !isPairs) {
+    // Leaving the Pair Report: clear the search too, so returning later
+    // doesn't resurrect a filter over freshly loaded rows.
+    resetPrSearch();
+  }
   document.querySelectorAll(".tab[data-tab]").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === name)
   );
-  document.querySelectorAll("main.view").forEach((v) =>
-    v.classList.toggle("hidden", v.id !== `view-${name}`)
+  document.querySelectorAll("main.view").forEach((el) =>
+    el.classList.toggle("hidden", el.id !== `view-${name}`)
   );
   pushNav();
 }
@@ -324,7 +336,7 @@ async function loadLogics() {
     $("#tq-logic").innerHTML = logics.map((l) =>
       `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
-    updateDmpTriggerButton();
+    renderPrLogicExplainer();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -1102,17 +1114,17 @@ function pairDate(v) {
  * columns and form the default selection, so the default view and export
  * are unchanged. ``text`` maps a PairingRead row to the column's value. */
 const PAIR_COLUMNS = [
-  { key: "tumor_primary_id", header: "TUMOR_SAMPLE", group: "Tumor sample", text: (r) => r.tumor.primary_id },
-  { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id },
+  { key: "tumor_primary_id", header: "TUMOR_SAMPLE", group: "Tumor sample", text: (r) => r.tumor.primary_id, link: (r) => sampleLink(r.tumor) },
+  { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id, link: (r) => sampleLink(r.normal) },
   { key: "tumor_bait_set", header: "BAIT_SET", group: "Tumor sample", text: (r) => r.tumor.bait_set || "" },
-  { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "" },
+  { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "", link: (r) => patientLink(r.tumor && r.tumor.patient__cmo) },
   { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "" },
   { key: "tumor_anon_id", header: "TUMOR_ANON_ID", group: "Tumor sample", text: (r) => r.tumor.anon_id || "" },
-  { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name) },
+  { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name), link: (r) => sampleLink(r.tumor) },
   { key: "tumor_role", header: "TUMOR_ROLE", group: "Tumor sample", text: (r) => r.tumor.tumor_or_normal || "" },
   { key: "tumor_sample_type", header: "TUMOR_SAMPLE_TYPE", group: "Tumor sample", text: (r) => r.tumor.sample_type || "" },
   { key: "tumor_gene_panel", header: "TUMOR_GENE_PANEL", group: "Tumor sample", text: (r) => r.tumor.gene_panel || "" },
-  { key: "tumor_request_id", header: "TUMOR_REQUEST_ID", group: "Tumor sample", text: (r) => r.tumor.request_id || "" },
+  { key: "tumor_request_id", header: "TUMOR_REQUEST_ID", group: "Tumor sample", text: (r) => r.tumor.request_id || "", link: (r) => requestLink(r.tumor && r.tumor.request_id) },
   { key: "tumor_run_mode", header: "TUMOR_RUN_MODE", group: "Tumor sample", text: (r) => r.tumor.run_mode || "" },
   { key: "tumor_file_group", header: "TUMOR_FILE_GROUP", group: "Tumor sample", text: (r) => r.tumor.file_group || "" },
   { key: "tumor_preservation", header: "TUMOR_PRESERVATION", group: "Tumor sample", text: (r) => pairText(r.tumor.preservation) },
@@ -1122,14 +1134,14 @@ const PAIR_COLUMNS = [
   { key: "tumor_errors", header: "TUMOR_ERRORS", group: "Tumor sample", text: (r) => (r.tumor.errors || []).join("; ") },
   { key: "tumor_id", header: "TUMOR_ID", group: "Tumor sample", text: (r) => r.tumor.id },
   { key: "normal_bait_set", header: "NORMAL_BAIT_SET", group: "Normal sample", text: (r) => r.normal.bait_set || "" },
-  { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "" },
+  { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "", link: (r) => patientLink(r.normal && r.normal.patient__cmo) },
   { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "" },
   { key: "normal_anon_id", header: "NORMAL_ANON_ID", group: "Normal sample", text: (r) => r.normal.anon_id || "" },
-  { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name) },
+  { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name), link: (r) => sampleLink(r.normal) },
   { key: "normal_role", header: "NORMAL_ROLE", group: "Normal sample", text: (r) => r.normal.tumor_or_normal || "" },
   { key: "normal_sample_type", header: "NORMAL_SAMPLE_TYPE", group: "Normal sample", text: (r) => r.normal.sample_type || "" },
   { key: "normal_gene_panel", header: "NORMAL_GENE_PANEL", group: "Normal sample", text: (r) => r.normal.gene_panel || "" },
-  { key: "normal_request_id", header: "NORMAL_REQUEST_ID", group: "Normal sample", text: (r) => r.normal.request_id || "" },
+  { key: "normal_request_id", header: "NORMAL_REQUEST_ID", group: "Normal sample", text: (r) => r.normal.request_id || "", link: (r) => requestLink(r.normal && r.normal.request_id) },
   { key: "normal_run_mode", header: "NORMAL_RUN_MODE", group: "Normal sample", text: (r) => r.normal.run_mode || "" },
   { key: "normal_file_group", header: "NORMAL_FILE_GROUP", group: "Normal sample", text: (r) => r.normal.file_group || "" },
   { key: "normal_preservation", header: "NORMAL_PRESERVATION", group: "Normal sample", text: (r) => pairText(r.normal.preservation) },
@@ -1164,7 +1176,7 @@ function dmpNameParts(name) {
   return [parts[parts.length - 2], parts[parts.length - 1]];
 }
 const DMP_COLUMNS = [
-  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: (r) => (r.tumor ? r.tumor.primary_id : "") },
+  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: (r) => (r.tumor ? r.tumor.primary_id : ""), link: (r) => sampleLink(r.tumor) },
   { key: "patient", header: "patient", group: "Tumor", text: (r) => (r.tumor ? r.tumor.patient__dmp || "" : "") },
   { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[0] : "") },
   { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[1] : "") },
@@ -1173,7 +1185,7 @@ const DMP_COLUMNS = [
   { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: (r) => (r.tumor ? (r.normal ? "Matched" : "Unmatched") : "") },
   { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: () => DMP_PLACEHOLDER },
   { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "coverage") },
-  { key: "normal_sample", header: "normal_sample", group: "Normal", text: (r) => (r.normal ? r.normal.primary_id : "") },
+  { key: "normal_sample", header: "normal_sample", group: "Normal", text: (r) => (r.normal ? r.normal.primary_id : ""), link: (r) => sampleLink(r.normal) },
   { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: (r) => (r.normal ? (r.normal.anon_id || "") : "") },
   { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: (r) => (r.normal ? dmpNameParts(r.normal.primary_id)[1] : "") },
   { key: "pool_id", header: "pool_id", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "project_name") },
@@ -1215,6 +1227,12 @@ const pairsState = {
   // time. The download still covers every row, not just the visible page.
   page: 0,
   pageSize: 50,
+  // View-scoped search (#pr-search): lowercased substring matched
+  // client-side against the already-loaded rows (no server round-trip).
+  // Applied in renderPairsTable() and downloadPairs() so the table and the
+  // export always cover the same set. Cleared on view enter/leave and on
+  // logic change so a stale filter never carries into new rows.
+  query: "",
 };
 
 function isDmpLogic(logicName) {
@@ -1241,21 +1259,10 @@ function selectedPairColumns() {
   return columnsForLogic(logic).filter((c) => selectionFor(logic).has(c.key));
 }
 
-/* Groups for the left split-panel filter.
- *  - "side": the active logic's columns, grouped by side (Tumor / Normal /
- *    Pairing for the standard set; Tumor / Normal for DMP).
- *  - "logic": one group per pairing logic (ARGOS, TEMPO, ACCESS, DMP, ...),
- *    each carrying that logic's full column set. */
+/* Groups for the left split-panel filter: the selected (active) logic's
+ * columns, grouped by side (Tumor / Normal / Pairing for the standard set;
+ * Tumor / Normal for DMP). The panel never enumerates the other logics. */
 function pairReportGroups() {
-  const mode = $("#pr-groupby").value;
-  if (mode === "logic") {
-    return PAIRING_LOGICS.map((l) => ({
-      key: `logic:${l.name}`,
-      label: l.name,
-      logic: l.name,
-      columns: columnsForLogic(l.name),
-    }));
-  }
   const logic = activeLogicName();
   if (!logic) return [];
   const bySide = new Map();
@@ -1291,7 +1298,7 @@ function renderPrGroups() {
       </div>
       <div class="pr-group-body${collapsed ? " hidden" : ""}">
         ${g.columns.map((c) =>
-          `<label class="col-check"><input type="checkbox" data-prcol="${esc(c.key)}" data-prlogic="${esc(g.logic)}"${sel.has(c.key) ? " checked" : ""}>${esc(c.header)}</label>`
+          `<label class="col-check"><input type="checkbox" data-prcol="${esc(c.key)}" data-prlogic="${esc(g.logic)}"${sel.has(c.key) ? " checked" : ""}><span class="col-check-label">${esc(c.header)}</span></label>`
         ).join("")}
       </div>
     </div>`;
@@ -1305,6 +1312,53 @@ function renderPrGroups() {
   }
 }
 
+/* View-scoped search (#pr-search): the lowercased query matches a row when
+ * ANY searchable field on EITHER side contains it (case-insensitive).
+ * Unpaired rows (one side null, e.g. appended DMP samples) are searched on
+ * the side that is present. */
+const PAIR_SEARCH_FIELDS = ["patient__cmo", "patient__dmp", "cmo_sample_name", "primary_id", "bait_set"];
+
+function pairMatchesQuery(r, q) {
+  for (const side of [r.tumor, r.normal]) {
+    if (!side) continue;
+    for (const f of PAIR_SEARCH_FIELDS) {
+      const v = side[f];
+      if (v !== null && v !== undefined && String(v).toLowerCase().includes(q)) return true;
+    }
+  }
+  return false;
+}
+
+/* Rows visible under the active search query (all loaded rows when there is
+ * no query). Shared by renderPairsTable() and downloadPairs() so the
+ * export covers exactly what the table shows. */
+function visiblePairRows() {
+  const q = pairsState.query;
+  return q ? pairsState.rows.filter((r) => pairMatchesQuery(r, q)) : pairsState.rows;
+}
+
+/* Clickable identifier cells in the pair table. A column model may
+ * declare an optional ``link`` that resolves a row to a navigation
+ * target: a sample (its Matches & Overrides page), a patient (the
+ * Patients view) or a request (the Requests view). The cell renders as
+ * the app's standard nav-link only when the target resolves and the cell
+ * has a value; otherwise it stays plain text. Sample links carry the
+ * row's sample id; the #pairs-table click handler below resolves the full
+ * sample object from pairsState.rows (openMatchesFor needs more than the
+ * id — e.g. bait_set for logic preselection). */
+const sampleLink = (s) => (s && s.id != null ? { kind: "sample", id: s.id } : null);
+const patientLink = (id) => (id ? { kind: "patient", id } : null);
+const requestLink = (id) => (id ? { kind: "request", id } : null);
+
+function pairCellHtml(r, c) {
+  const raw = c.text(r);
+  const link = c.link ? c.link(r) : null;
+  if (!link || pairText(raw) === "") return `<td>${esc(raw)}</td>`;
+  const attr = link.kind === "sample" ? "data-sample-id"
+    : link.kind === "patient" ? "data-nav-patient" : "data-nav-request";
+  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
+}
+
 function renderPairsTable() {
   const logic = activeLogicName();
   const dmp = isDmpLogic(logic);
@@ -1313,27 +1367,42 @@ function renderPairsTable() {
     `<th${dmp && DMP_LEGEND[c.key] ? ` title="${esc(DMP_LEGEND[c.key])}"` : ""}>${esc(c.header)}</th>`
   ).join("")}</tr>`;
   // Render only the current page (see pairsState.pageSize). The row array
-  // keeps the full set in memory for the download.
-  const total = pairsState.rows.length;
+  // keeps the full set in memory for the download; pagination and the count
+  // operate on the search-filtered set (visiblePairRows()).
+  const full = pairsState.rows.length;
+  const rows = visiblePairRows();
+  const total = rows.length;
   const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
   if (pairsState.page > maxPage) pairsState.page = maxPage;
   const start = pairsState.page * pairsState.pageSize;
-  const slice = pairsState.rows.slice(start, start + pairsState.pageSize);
+  const slice = rows.slice(start, start + pairsState.pageSize);
   $("#pairs-table tbody").innerHTML = slice
-    .map((r) => `<tr>${cols.map((c) => `<td>${esc(c.text(r))}</td>`).join("")}</tr>`).join("");
+    .map((r) => `<tr>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`).join("");
   $("#pr-prev").disabled = pairsState.page === 0;
   $("#pr-next").disabled = pairsState.page >= maxPage;
-  const matched = pairsState.rows.filter((r) => r.tumor && r.normal).length;
+  // Keep the skip-to-page input in sync with Prev/Next: the input shows
+  // the 1-based page; "of N" shows the last page (always >= 1).
+  const totalPages = maxPage + 1;
+  const pageInput = $("#pr-page");
+  pageInput.max = totalPages;
+  pageInput.value = pairsState.page + 1;
+  $("#pr-page-of").textContent = `of ${totalPages}`;
+  pageInput.disabled = total === 0;
+  const matched = rows.filter((r) => r.tumor && r.normal).length;
   const empty = total === 0 || cols.length === 0;
-  $("#pr-empty").classList.toggle("hidden", !empty);
+  const emptyEl = $("#pr-empty");
+  emptyEl.classList.toggle("hidden", !empty);
+  emptyEl.textContent =
+    pairsState.query && full > 0 ? "No pairs match this search." : "No current pairs for this logic.";
+  const filteredNote = pairsState.query && total !== full ? ` (filtered from ${full})` : "";
   const paging = total > pairsState.pageSize
     ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + slice.length} of ${total})`
     : "";
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
     : dmp
-      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${paging}`
-      : `${total} pair${total === 1 ? "" : "s"}${paging}`;
+      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${filteredNote}${paging}`
+      : `${total} pair${total === 1 ? "" : "s"}${filteredNote}${paging}`;
   $("#pr-download").disabled = empty;
   // Legend (and header tooltips) only for the legacy DMP column set.
   $("#pr-legend").classList.toggle("hidden", !dmp);
@@ -1362,6 +1431,7 @@ async function loadPairs() {
     pairsState.page = 0;
     renderPrGroups();
     renderPairsTable();
+    loadPrOverviewStats();
   } catch (e) {
     if (e && e.name === "AbortError") return; // superseded by a newer load
     banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
@@ -1393,12 +1463,15 @@ async function appendUnmatchedDmpSamples(signal) {
 function downloadPairs() {
   if (!pairsState.logic) return;
   const cols = selectedPairColumns();
-  if (cols.length === 0 || pairsState.rows.length === 0) return;
+  // Export exactly the rows the table shows (the active search filter
+  // applied, not the full unfiltered set).
+  const rows = visiblePairRows();
+  if (cols.length === 0 || rows.length === 0) return;
   const tsv = $("#pr-format").value === "tsv";
   const sep = tsv ? "\t" : ",";
   const cell = (v) => (!tsv && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v.replace(/[\t\r\n]/g, " "));
-  const rows = [cols.map((c) => c.header), ...pairsState.rows.map((r) => cols.map((c) => c.text(r)))];
-  const text = rows.map((r) => r.map(cell).join(sep)).join("\n") + "\n";
+  const data = [cols.map((c) => c.header), ...rows.map((r) => cols.map((c) => c.text(r)))];
+  const text = data.map((r) => r.map(cell).join(sep)).join("\n") + "\n";
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([text], { type: tsv ? "text/tab-separated-values" : "text/csv" }));
   a.download = `pairs_${pairsState.logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
@@ -1409,16 +1482,17 @@ function downloadPairs() {
 }
 
 /* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
- * with its DMP normal (same patient__dmp and gene panel). The button is
- * shown only for the active DMP logic; manual pairing of DMP samples
- * happens under the other logics (e.g. ARGOS). */
+ * with its DMP normal (same patient__dmp and gene panel). Invoked from the
+ * overview header's Run pairing button when the selected logic is a DMP
+ * logic; manual pairing of DMP samples happens under the other logics
+ * (e.g. ARGOS). */
 async function runDmpPairing() {
-  const btn = $("#pr-run-dmp");
+  const btn = $("#pr-run");
   btn.disabled = true;
-  $("#pr-dmp-status").textContent = "Pairing…";
+  $("#pr-run-status").textContent = "Pairing…";
   try {
     const r = await api("/pairing/trigger-dmp", { method: "POST" });
-    $("#pr-dmp-status").textContent =
+    $("#pr-run-status").textContent =
       `paired ${r.paired} · unpaired ${r.unpaired} · ` +
       `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
     banner("ok", `DMP pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
@@ -1431,20 +1505,111 @@ async function runDmpPairing() {
   }
 }
 
-/* Show/hide the DMP trigger button per selected logic (DMP logic only). */
-function updateDmpTriggerButton() {
-  const logic = $("#pr-logic").value;
-  const l = PAIRING_LOGICS.find((x) => x.name === logic);
-  const show = isDmpLogic(logic) && !!l && !!l.active;
-  $("#pr-run-dmp").classList.toggle("hidden", !show);
-  if (!show) $("#pr-dmp-status").textContent = "";
+/* Overview-header Run pairing button for the selected logic: DMP goes to
+ * the DMP trigger; any other logic to the per-logic backfill (POST
+ * /pairing/trigger-all?pairing_logic_name=, confirm first — it records
+ * pairings). Result lands in #pr-run-status. */
+async function runPrPairing() {
+  const logic = activeLogicName();
+  if (!logic) return;
+  if (isDmpLogic(logic)) {
+    await runDmpPairing();
+    return;
+  }
+  const msg =
+    `Run pairing for ${logic}?\n\n` +
+    "This records a new pairing for every unpaired tumor under this logic. " +
+    "Existing pairings are kept.";
+  if (!confirm(msg)) return;
+  const btn = $("#pr-run");
+  btn.disabled = true;
+  $("#pr-run-status").textContent = "Pairing…";
+  try {
+    const r = await api(`/pairing/trigger-all?pairing_logic_name=${encodeURIComponent(logic)}`);
+    $("#pr-run-status").textContent =
+      `scanned ${r.scanned} · paired ${r.paired} · ` +
+      `unpaired ${r.unpaired} · already ${r.already_paired}`;
+    banner("ok", `Pairing complete for ${logic}: ${r.paired} paired, ${r.unpaired} unpaired`, true);
+    await loadPairs();
+  } catch (e) {
+    banner("error", `Run pairing failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* GET /pairing/evaluate/?pairing_logic_name= — read-only dry-run over the
+ * selected logic's backfill scope; renders "N of M would pair" plus the
+ * outcome breakdown in #pr-evaluate-result. Never records pairings. */
+async function evaluatePrPairing() {
+  const logic = activeLogicName();
+  if (!logic) return;
+  const btn = $("#pr-evaluate");
+  const out = $("#pr-evaluate-result");
+  btn.disabled = true;
+  out.textContent = "Evaluating…";
+  try {
+    const r = await api(`/pairing/evaluate/?pairing_logic_name=${encodeURIComponent(logic)}`);
+    let html = `${r.would_pair} of ${r.scope_total} would pair · ${r.already_paired} already paired · ${r.would_stay_unpaired} would stay unpaired`;
+    if (r.missing_patient__dmp > 0) {
+      html += ` · ${r.missing_patient__dmp} missing patient__dmp`;
+    }
+    out.innerHTML = html;
+  } catch (e) {
+    banner("error", `Evaluate failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* Overview-header blurb for the selected logic: the strategy's explainer
+ * from TRY_EXPLAINERS (same copy as the Try tab), with a short default
+ * line naming the logic when the strategy has no entry. */
+function renderPrLogicExplainer() {
+  const el = $("#pr-logic-explain");
+  const logicName = activeLogicName();
+  if (!el || !logicName) return;
+  const logic = PAIRING_LOGICS.find((l) => l.name === logicName);
+  const explainer = logic && TRY_EXPLAINERS[logic.strategy_name];
+  el.innerHTML = explainer || `<p>${esc(logicName)}: no explainer available for this logic.</p>`;
+}
+
+/* Paired / Unpaired strip for the selected logic. Paired counts the
+ * report rows with both sides (same rule as the DMP count line in
+ * #pr-count); Unpaired comes from the per-logic unmatched-count endpoint. */
+async function loadPrOverviewStats() {
+  const el = $("#pr-overview-stats");
+  const logic = activeLogicName();
+  if (!el || !logic) return;
+  const paint = (unpairedHtml) => {
+    const paired = pairsState.rows.filter((r) => r.tumor && r.normal).length;
+    el.innerHTML =
+      `<span class="pr-stat">Paired <strong>${paired}</strong></span>` +
+      `<span class="pr-stat">Unpaired ${unpairedHtml}</span>`;
+  };
+  paint("<strong>…</strong>");
+  try {
+    const r = await api(`/pairing/unmatched-count/?pairing_logic_name=${encodeURIComponent(logic)}`);
+    if (activeLogicName() === logic) paint(`<strong>${r.unpaired}</strong>`);
+  } catch (e) {
+    if (activeLogicName() === logic) paint("<strong>—</strong>");
+  }
 }
 
 $("#pr-logic").addEventListener("change", () => {
-  updateDmpTriggerButton();
+  // Sync the state before re-rendering: activeLogicName() prefers
+  // pairsState.logic, which loadPairs() only updates once its fetch
+  // starts — the blurb would otherwise keep the previous logic's text.
+  pairsState.logic = $("#pr-logic").value;
+  $("#pr-run-status").textContent = "";
+  $("#pr-evaluate-result").textContent = "";
+  // A stale filter would otherwise carry into the new logic's rows.
+  resetPrSearch();
+  renderPrLogicExplainer();
   loadPairs();
 });
-$("#pr-run-dmp").addEventListener("click", runDmpPairing);
+$("#pr-run").addEventListener("click", runPrPairing);
+$("#pr-evaluate").addEventListener("click", evaluatePrPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
   if (pairsState.page > 0) {
@@ -1453,14 +1618,50 @@ $("#pr-prev").addEventListener("click", () => {
   }
 });
 $("#pr-next").addEventListener("click", () => {
-  const maxPage = Math.max(0, Math.ceil(pairsState.rows.length / pairsState.pageSize) - 1);
+  const maxPage = Math.max(0, Math.ceil(visiblePairRows().length / pairsState.pageSize) - 1);
   if (pairsState.page < maxPage) {
     pairsState.page++;
     renderPairsTable();
   }
 });
+/* Skip-to-page: type a number (1-based) and press Enter, or let the
+ * input commit on blur/change. Out-of-range values clamp to
+ * [1, totalPages]; renderPairsTable() re-syncs the input and Prev/Next. */
+function goPrPage() {
+  const totalPages = Math.max(1, Math.ceil(visiblePairRows().length / pairsState.pageSize));
+  const target = parseInt($("#pr-page").value, 10);
+  if (Number.isNaN(target)) return; // blank input: next render re-syncs it
+  pairsState.page = Math.min(totalPages - 1, Math.max(0, target - 1));
+  renderPairsTable();
+}
+$("#pr-page").addEventListener("change", goPrPage);
+$("#pr-page").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") goPrPage();
+});
+/* Clear the Pair Report search box and its state. Called when the view is
+ * entered/left (see showView) and when the pairing logic changes, so a
+ * stale filter never carries into a new logic's rows. */
+function resetPrSearch() {
+  const box = $("#pr-search");
+  if (box && box.value) box.value = "";
+  if (pairsState.query) {
+    pairsState.query = "";
+    pairsState.page = 0;
+  }
+}
+/* View-scoped search: filter the already-loaded rows client-side as the
+ * user types (no server round-trip). Debounced so typing over the
+ * hundreds-of-thousands DMP set doesn't re-render on every keystroke. */
+let prSearchTimer = null;
+$("#pr-search").addEventListener("input", () => {
+  clearTimeout(prSearchTimer);
+  prSearchTimer = setTimeout(() => {
+    pairsState.query = $("#pr-search").value.trim().toLowerCase();
+    pairsState.page = 0;
+    renderPairsTable();
+  }, 150);
+});
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
-$("#pr-groupby").addEventListener("change", renderPrGroups);
 $("#pr-groups").addEventListener("change", (e) => {
   const t = e.target;
   if (!t.dataset) return;
@@ -1514,6 +1715,27 @@ $("#pr-cols-all").addEventListener("click", () =>
 $("#pr-cols-none").addEventListener("click", () => setSelectionForActive([]));
 $("#pr-cols-default").addEventListener("click", () =>
   setSelectionForActive([...defaultSelectionFor(activeLogicName())]));
+
+/* Identifier links in the pair table: same delegation pattern as the
+ * Matches view — patient/request spans navigate via the existing helpers,
+ * a sample span resolves the full sample object from the loaded rows and
+ * opens its Matches & Overrides page. */
+$("#pairs-table").addEventListener("click", (e) => {
+  const el = e.target.closest("[data-nav-patient],[data-nav-request],[data-sample-id]");
+  if (!el) return;
+  if (el.dataset.navPatient != null) return navigateToPatient(el.dataset.navPatient);
+  if (el.dataset.navRequest != null) return navigateToRequest(el.dataset.navRequest);
+  if (el.dataset.sampleId != null) {
+    const id = String(el.dataset.sampleId);
+    const row = pairsState.rows.find(
+      (r) => (r.tumor && String(r.tumor.id) === id) || (r.normal && String(r.normal.id) === id)
+    );
+    const sample = row && ((row.tumor && String(row.tumor.id) === id ? row.tumor : null)
+      || (row.normal && String(row.normal.id) === id ? row.normal : null));
+    if (sample) return openMatchesFor(sample);
+  }
+});
+
 renderPrGroups();
 
 /* ---------- try pairing view (dry run) ---------- */

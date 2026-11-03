@@ -195,6 +195,42 @@ class DmpTriggerRead(BaseModel):
     new_pairings: list[PairingRead]
 
 
+class EvaluateRead(BaseModel):
+    """Dry-run pairing preview for one logic (GET /pairing/evaluate/).
+
+    Read-only: counts what a backfill for the logic WOULD do without
+    writing anything. ``scope_total`` is the logic's unpaired tumor scope
+    (the backfill scope) and
+    ``already_paired + would_pair + would_stay_unpaired == scope_total``.
+    ``missing_patient__dmp`` (DMP logics only) is a subset of
+    ``would_stay_unpaired``: DMP tumors without a ``patient__dmp`` that
+    can never match.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    logic: str
+    scope_total: int
+    already_paired: int
+    would_pair: int
+    would_stay_unpaired: int
+    missing_patient__dmp: int = 0
+
+
+class UnmatchedCountRead(BaseModel):
+    """Per-logic unpaired count (GET /pairing/unmatched-count/).
+
+    DMP: unpaired DMP samples (tumor or normal), mirroring GET
+    /pairing/unmatched/. Any other logic: the logic's unpaired tumor
+    population (the backfill scope).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    pairing_logic: str
+    unpaired: int
+
+
 class PossibleMatchCandidate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

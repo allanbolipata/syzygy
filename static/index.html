@@ -219,6 +219,22 @@
 <main id="view-pairs" class="view hidden">
   <section class="panel">
     <h2>Pair Report</h2>
+    <section class="pr-overview">
+      <div class="pr-overview-row">
+        <label class="pr-overview-sel">
+          pairing logic
+          <select id="pr-logic"></select>
+        </label>
+        <span id="pr-overview-stats" class="pr-stats"></span>
+        <span class="pr-overview-actions">
+          <button type="button" id="pr-run" class="primary">Run pairing</button>
+          <button type="button" id="pr-evaluate" title="Dry-run: how many unpaired samples would pair. Read-only — nothing is recorded.">Evaluate</button>
+        </span>
+      </div>
+      <p id="pr-run-status" class="hint"></p>
+      <p id="pr-evaluate-result" class="hint"></p>
+      <div id="pr-logic-explain" class="pr-explain"></div>
+    </section>
     <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the legacy DMP export columns.</p>
     <div class="pr-split" id="pr-split">
       <aside class="pr-panel" id="pr-panel">
@@ -227,13 +243,7 @@
           <button type="button" class="linkbtn" id="pr-panel-collapse" title="Collapse filter panel">&lsaquo;</button>
         </div>
         <div class="pr-panel-body" id="pr-panel-body">
-          <label>group by
-            <select id="pr-groupby">
-              <option value="side">Tumor / Normal</option>
-              <option value="logic">Pair logic / Strategy</option>
-            </select>
-          </label>
-          <p class="hint">A group header toggles every column in its group. The table and export update live.</p>
+          <p class="hint">The selected logic's columns, grouped by side. A group header toggles every column in its group. The table and export update live.</p>
           <div id="pr-groups"></div>
           <div class="pr-panel-actions">
             <button type="button" class="small" id="pr-cols-all">All</button>
@@ -245,11 +255,9 @@
       <button type="button" class="pr-panel-open hidden" id="pr-panel-open" title="Show filter panel">&rsaquo;</button>
       <div class="pr-main">
         <div class="filters">
-          <label>pairing logic
-            <select id="pr-logic"></select>
+          <label>search
+            <input type="search" id="pr-search" placeholder="Search pairs…" title="Filter the loaded pairs by patient, DMP patient, sample name, primary ID, or bait set">
           </label>
-          <button type="button" id="pr-run-dmp" class="small hidden" title="Pair every unpaired DMP tumor with its DMP normal (DMP logic only — automatic pairing)">Run DMP pairing</button>
-          <span id="pr-dmp-status" class="hint"></span>
           <label>format
             <select id="pr-format">
               <option value="csv">CSV</option>
@@ -259,6 +267,12 @@
           <button id="pr-download" disabled>Download</button>
           <button type="button" id="pr-prev" disabled title="Previous page">&lsaquo;</button>
           <button type="button" id="pr-next" disabled title="Next page">&rsaquo;</button>
+          <span class="pr-pager">
+            <label>page
+              <input id="pr-page" type="number" min="1" max="1" disabled title="Jump to page (Enter to go)">
+            </label>
+            <span id="pr-page-of" class="hint">of 1</span>
+          </span>
           <span id="pr-count" class="hint"></span>
         </div>
         <details class="pr-legend hidden" id="pr-legend">
