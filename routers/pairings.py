@@ -1,21 +1,41 @@
+"""Pairing endpoints.
+
+DMP tumors pair with their own DMP normals (same ``patient__dmp`` and gene
+panel) automatically via ``POST /pairing/trigger-dmp`` under the DMP
+pairing logic. DMP samples are also pairable manually, but only under the
+other logics (e.g. ARGOS) — ``POST /pairing/trigger`` refuses the DMP
+strategy, which is reserved for the automatic trigger.
+"""
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
+    count_unpaired,
+    evaluate_logic,
     find_logic_by_name,
     resolve_pairing_logic,
+    trigger_dmp_pairing,
     trigger_pairing,
     trigger_pairing_for_unpaired_tumors,
 )
-from pairing_strategies import get_pairing_strategy
-from schemas import PairingRead, PairingTriggerCreate, TumorOrNormal, TriggerAllRead
+from pairing_strategies import get_pairing_strategy, strategies
+from schemas import (
+    DmpTriggerRead,
+    EvaluateRead,
+    PairingRead,
+    PairingTriggerCreate,
+    SampleRead,
+    TumorOrNormal,
+    TriggerAllRead,
+    UnmatchedCountRead,
+)
 
 
 router = APIRouter(prefix="/pairing", tags=["pairings"])
@@ -116,6 +136,47 @@ def list_pairings(
     return db.scalars(stmt).all()
 
 
+@router.get("/unmatched/", response_model=list[SampleRead])
+def list_unmatched_dmp_samples(
+    pairing_logic_name: str,
+    limit: Optional[int] = Query(None, ge=1),
+    offset: Optional[int] = Query(None, ge=0),
+    db: Session = Depends(get_db),
+):
+    """DMP samples that have no latest pairing under the given logic.
+
+    The DMP report lists every DMP sample; unpaired ones are shown with
+    the opposite side's columns empty. The Pairs UI used to download the
+    whole DMP sample population and diff it client-side against the
+    pairings (hundreds of sequential requests against a ~280k-row table
+    per load); the set difference is computed here in one query instead.
+    Same per-logic, latest-only semantics as the pairing list itself.
+    """
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    stmt = (
+        select(Sample)
+        .where(Sample.sample_type == "DMP", ~paired)
+        .order_by(Sample.created_date.desc(), Sample.id.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset is not None:
+        stmt = stmt.offset(offset)
+    return db.scalars(stmt).all()
+
+
 @router.post("/trigger", response_model=PairingRead)
 def trigger_pairing_endpoint(
     payload: PairingTriggerCreate,
@@ -135,6 +196,15 @@ def trigger_pairing_endpoint(
         raise HTTPException(
             status_code=400,
             detail="pairing_logic_id or pairing_logic_name is required",
+        )
+    if strategies.get(pairing_logic.strategy_name) is strategies["dmp"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The DMP strategy is automatic: DMP tumors pair with their "
+                "own DMP normals via POST /pairing/trigger-dmp. Pair this "
+                "sample under another logic (e.g. ARGOS) instead."
+            ),
         )
 
     pairing = trigger_pairing(
@@ -157,13 +227,64 @@ def trigger_pairing_endpoint(
 
 
 @router.post("/trigger-all", response_model=TriggerAllRead)
-def trigger_all_pairings_endpoint(db: Session = Depends(get_db)) -> dict:
+def trigger_all_pairings_endpoint(
+    pairing_logic_name: Optional[str] = None,
+    db: Session = Depends(get_db),
+) -> dict:
     """Backfill pairings for every tumor that has no latest pairing yet.
 
     Occasional bulk operation (e.g. after a bulk ingest): each tumor's
     pairing logic is resolved from its assigned bait set, DMP tumors
-    (manual pairing only) and tumors with no assigned or inactive logic
-    are skipped and counted, and existing pairings are never touched.
+    (paired automatically under the DMP logic) and tumors with no
+    assigned or inactive logic are skipped and counted, and existing
+    pairings are never touched.
     New pairings are recorded with ``trigger_type="automatic"``.
+
+    With ``pairing_logic_name`` the backfill is scoped to that one
+    non-DMP logic (counts cover that scope only); without the param the
+    all-logics behavior is unchanged. DMP still runs via ``POST
+    /trigger-dmp``.
     """
-    return trigger_pairing_for_unpaired_tumors(db)
+    return trigger_pairing_for_unpaired_tumors(db, logic_name=pairing_logic_name)
+
+
+@router.post("/trigger-dmp", response_model=DmpTriggerRead)
+def trigger_dmp_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+    """Run automatic DMP pairing under the DMP pairing logic.
+
+    Every unpaired DMP tumor is paired with its DMP normal (same
+    ``patient__dmp`` and gene panel) via the DMP strategy. Existing
+    pairings are never modified or replaced. DMP tumors without a
+    ``patient__dmp`` value cannot be matched and are reported in
+    ``missing_patient__dmp``.
+    """
+    return trigger_dmp_pairing(db)
+
+
+@router.get("/unmatched-count/", response_model=UnmatchedCountRead)
+def unmatched_count_endpoint(
+    pairing_logic_name: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Per-logic unpaired count for the Pairing overview summary strip.
+
+    DMP: mirrors ``GET /unmatched/`` (every unpaired DMP sample). Any
+    other logic: the logic's unpaired tumor population — the same scope
+    a backfill for that logic would consider. Read-only.
+    """
+    return count_unpaired(db, pairing_logic_name)
+
+
+@router.get("/evaluate/", response_model=EvaluateRead)
+def evaluate_pairing_endpoint(
+    pairing_logic_name: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Dry-run: how many of this logic's unpaired tumors would pair.
+
+    Strictly read-only — nothing is written. Over the logic's backfill
+    scope, ``already_paired + would_pair + would_stay_unpaired ==
+    scope_total``; ``missing_patient__dmp`` (DMP only) is a subset of
+    ``would_stay_unpaired``.
+    """
+    return evaluate_logic(db, pairing_logic_name)

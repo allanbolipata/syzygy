@@ -9,3 +9,5 @@ venv/
 docs/audit/
 scripts/.beagle_ground_truth.json
 AUDIT.md
+.DS_Store
+crf_output_dev/

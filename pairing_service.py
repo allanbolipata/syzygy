@@ -3,13 +3,13 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import PairingLogic, PairingTable, Sample, utcnow
-from bait_sets import resolve_bait_set_logic
-from pairing_strategies import get_pairing_strategy
+from models import BaitSet, PairingLogic, PairingTable, Sample, utcnow
+from bait_sets import classify_bait_set, resolve_bait_set_logic
+from pairing_strategies import get_pairing_strategy, strategies
 from schemas import TumorOrNormal
 
 
@@ -232,11 +232,13 @@ def trigger_pairing_for_normal(
 
 
 def _is_dmp_sample(sample: Sample) -> bool:
-    """Provenance flag for DMP-ingested samples (manual pairing only)."""
+    """Provenance flag for DMP-ingested samples."""
     return str(sample.sample_type or "").strip().upper() == "DMP"
 
 
-def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
+def trigger_pairing_for_unpaired_tumors(
+    db: Session, logic_name: Optional[str] = None
+) -> dict:
     """Backfill pairings for every tumor that has no latest pairing yet.
 
     Intended as an occasional bulk operation (POST /pairing/trigger-all),
@@ -244,17 +246,36 @@ def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
     at ingest time. Each tumor's pairing logic is resolved from its
     assigned bait set (``bait_sets.resolve_bait_set_logic``), and:
 
-    * DMP tumors are skipped (manual pairing only);
+    * DMP tumors are skipped (paired automatically under the DMP logic);
     * tumors whose bait set has no assigned logic, or whose logic is not
       active, are skipped (never paired under a wrong or disabled logic);
     * tumors that already have a latest pairing under their resolved
       logic are left untouched — ``trigger_pairing`` with ``automatic``
       short-circuits on it, so nothing existing is ever replaced.
 
+    With ``logic_name`` the backfill is scoped to that one non-DMP logic:
+    only tumors whose bait-set-resolved logic is the requested logic are
+    scanned (the DMP group is out of scope entirely) and the returned
+    counts cover that scope only. Without it, every active logic runs
+    exactly as before. The DMP logic cannot be requested (400) — it has
+    its own trigger (POST /pairing/trigger-dmp).
+
     New pairings are recorded with ``trigger_type="automatic"``. Returns a
     summary dict: per-outcome counts (summing to ``scanned``) plus the
     newly created pairings in ``new_pairings``.
     """
+    scoped_logic: Optional[PairingLogic] = None
+    if logic_name is not None:
+        scoped_logic = find_logic_by_name(db, logic_name)
+        if scoped_logic is None:
+            raise HTTPException(status_code=404, detail="Pairing logic not found")
+        if strategies.get(scoped_logic.strategy_name) is strategies["dmp"]:
+            raise HTTPException(
+                status_code=400,
+                detail="The DMP logic runs via POST /pairing/trigger-dmp",
+            )
+        _ensure_active(scoped_logic)
+
     tumors = db.scalars(
         select(Sample).where(Sample.tumor_or_normal == TumorOrNormal.TUMOR.value)
     ).all()
@@ -269,17 +290,28 @@ def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
     new_pairings: list[PairingTable] = []
 
     for tumor in tumors:
-        scanned += 1
-        if _is_dmp_sample(tumor):
-            skipped_dmp += 1
-            continue
-        logic = resolve_bait_set_logic(db, tumor.bait_set)
-        if logic is None:
-            skipped_no_logic += 1
-            continue
-        if not logic.active:
-            skipped_inactive_logic += 1
-            continue
+        if scoped_logic is not None:
+            if _is_dmp_sample(tumor):
+                # DMP group is out of scope for a non-DMP per-logic run.
+                continue
+            logic = resolve_bait_set_logic(db, tumor.bait_set)
+            if logic is None or logic.id != scoped_logic.id:
+                # Another logic's tumor (or no logic): outside this run's
+                # scope, not part of the returned counts.
+                continue
+            scanned += 1
+        else:
+            scanned += 1
+            if _is_dmp_sample(tumor):
+                skipped_dmp += 1
+                continue
+            logic = resolve_bait_set_logic(db, tumor.bait_set)
+            if logic is None:
+                skipped_no_logic += 1
+                continue
+            if not logic.active:
+                skipped_inactive_logic += 1
+                continue
         if _get_latest_pairing(db, tumor.id, logic.id) is not None:
             already_paired += 1
             continue
@@ -299,6 +331,246 @@ def trigger_pairing_for_unpaired_tumors(db: Session) -> dict:
         "skipped_no_logic": skipped_no_logic,
         "skipped_inactive_logic": skipped_inactive_logic,
         "new_pairings": new_pairings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Automatic DMP pairing (POST /pairing/trigger-dmp)
+# ---------------------------------------------------------------------------
+
+#: Name of the pairing logic under which DMP samples pair automatically.
+#: The DMP strategy is strictly DMP-group scoped (DMP tumor <-> DMP normal,
+#: same patient__dmp and gene panel), so running it in bulk can only create
+#: DMP-DMP pairings and never touches other sample groups.
+DMP_LOGIC_NAME = "DMP"
+
+
+def trigger_dmp_pairing(db: Session) -> dict:
+    """Bulk automatic DMP pairing under the DMP pairing logic.
+
+    Every unpaired DMP tumor is paired with its best DMP normal (same
+    ``patient__dmp`` and gene panel) via the DMP strategy. Existing pairings
+    are never modified: a tumor that already has a latest pairing under the
+    DMP logic is skipped, whatever that pairing's trigger type is.
+
+    Returns ``{"pairing_logic", "scanned", "already_paired",
+    "missing_patient__dmp", "paired", "unpaired", "new_pairings"}`` where
+    the four outcome counts sum to ``scanned``. DMP tumors without
+    ``patient__dmp`` cannot match (the strategy is patient-scoped) and are
+    reported in ``missing_patient__dmp``.
+
+    Raises ``HTTPException(400)`` when no active pairing logic named
+    "DMP" exists: the trigger has nothing to run against.
+    """
+    logic = find_logic_by_name(db, DMP_LOGIC_NAME)
+    if logic is None or not logic.active:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No active pairing logic named '{DMP_LOGIC_NAME}': the DMP "
+                "pairing trigger has nothing to run against."
+            ),
+        )
+
+    # Tumors already carrying a latest pairing under this logic — one query
+    # instead of a lookup per tumor.
+    already_paired_ids = set(
+        db.scalars(
+            select(PairingTable.tumor_id).where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+            )
+        ).all()
+    )
+
+    tumors = db.scalars(
+        select(Sample).where(
+            Sample.sample_type == "DMP",
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+        )
+    ).all()
+
+    scanned = already_paired = missing_patient = paired = unpaired = 0
+    new_pairings: list[PairingTable] = []
+    for tumor in tumors:
+        scanned += 1
+        if tumor.id in already_paired_ids:
+            already_paired += 1
+            continue
+        if not (tumor.patient__dmp or "").strip():
+            missing_patient += 1
+            continue
+        pairing = trigger_pairing(db, tumor, logic, "automatic")
+        if pairing is None:
+            unpaired += 1
+        else:
+            paired += 1
+            new_pairings.append(pairing)
+
+    return {
+        "pairing_logic": logic.name,
+        "scanned": scanned,
+        "already_paired": already_paired,
+        "missing_patient__dmp": missing_patient,
+        "paired": paired,
+        "unpaired": unpaired,
+        "new_pairings": new_pairings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pairing overview: evaluate (dry-run) and per-logic unpaired count
+# ---------------------------------------------------------------------------
+
+
+def _is_dmp_strategy(logic: PairingLogic) -> bool:
+    return strategies.get(logic.strategy_name) is strategies["dmp"]
+
+
+def _logic_bait_set_names(db: Session, logic: PairingLogic) -> list[str]:
+    """Lower-cased bait-set names whose samples pair under ``logic``.
+
+    The union of registered ``bait_sets`` rows assigned to the logic and
+    unregistered sample bait names the classification rules map to it —
+    the same scope ``resolve_bait_set_logic`` computes per tumor, but
+    read-only: unlike that helper it never registers a new bait set.
+    """
+    names: set[str] = set()
+    for name in db.scalars(
+        select(BaitSet.bait_set).where(BaitSet.pairing_logic_id == logic.id)
+    ).all():
+        if name and name.strip():
+            names.add(name.strip().lower())
+    for name in db.scalars(
+        select(Sample.bait_set)
+        .where(Sample.bait_set.isnot(None))
+        .distinct()
+    ).all():
+        if name and name.strip() and classify_bait_set(name) == logic.name:
+            names.add(name.strip().lower())
+    return sorted(names)
+
+
+def _logic_tumor_scope(db: Session, logic: PairingLogic) -> list[Sample]:
+    """The tumors a backfill for ``logic`` would consider (read-only).
+
+    DMP: the DMP-group tumors. Any other logic: non-DMP tumors whose
+    bait set resolves to the logic (see ``_logic_bait_set_names``).
+    """
+    if _is_dmp_strategy(logic):
+        stmt = select(Sample).where(
+            Sample.sample_type == "DMP",
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+        )
+    else:
+        names = _logic_bait_set_names(db, logic)
+        if not names:
+            return []
+        stmt = select(Sample).where(
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            func.upper(func.coalesce(Sample.sample_type, "")) != "DMP",
+            func.lower(Sample.bait_set).in_(names),
+        )
+    return list(db.scalars(stmt).all())
+
+
+def evaluate_logic(db: Session, logic_name: str) -> dict:
+    """Read-only dry-run of a backfill for one pairing logic.
+
+    Counts, over the logic's unpaired tumor scope (the same scope
+    ``trigger_pairing_for_unpaired_tumors`` backfills): how many are
+    already paired, how many *would* pair (the strategy's
+    ``select_latest_normal`` finds a normal) and how many would stay
+    unpaired. Performs no writes of any kind — in particular no
+    ``PairingTable`` rows and no bait-set registrations.
+
+    ``missing_patient__dmp`` (DMP logics only) counts the DMP tumors in
+    scope that carry no ``patient__dmp``; those are a subset of
+    ``would_stay_unpaired``. For any logic,
+    ``already_paired + would_pair + would_stay_unpaired == scope_total``.
+    """
+    logic = find_logic_by_name(db, logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    _ensure_active(logic)
+    is_dmp = _is_dmp_strategy(logic)
+    strategy = get_pairing_strategy(logic)
+
+    scope = _logic_tumor_scope(db, logic)
+    already_paired_ids = set(
+        db.scalars(
+            select(PairingTable.tumor_id).where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+            )
+        ).all()
+    )
+
+    already_paired = would_pair = would_stay_unpaired = missing_patient = 0
+    for tumor in scope:
+        if tumor.id in already_paired_ids:
+            already_paired += 1
+            continue
+        if is_dmp and not (tumor.patient__dmp or "").strip():
+            # Mirrors trigger_dmp_pairing's pre-filter: a DMP tumor
+            # without a P- id can never match.
+            missing_patient += 1
+            would_stay_unpaired += 1
+            continue
+        selection = strategy.select_latest_normal(db, tumor, logic)
+        if selection.normal is None:
+            would_stay_unpaired += 1
+        else:
+            would_pair += 1
+
+    return {
+        "logic": logic.name,
+        "scope_total": len(scope),
+        "already_paired": already_paired,
+        "would_pair": would_pair,
+        "would_stay_unpaired": would_stay_unpaired,
+        "missing_patient__dmp": missing_patient,
+    }
+
+
+def count_unpaired(db: Session, logic_name: str) -> dict:
+    """Per-logic unpaired count for the Pairing overview summary strip.
+
+    DMP: every DMP sample (tumor or normal, mirroring
+    ``GET /pairing/unmatched/``) with no latest DMP-logic pairing. Any
+    other logic: the logic's unpaired tumor population (the backfill
+    scope, see ``_logic_tumor_scope``). Read-only.
+    """
+    logic = find_logic_by_name(db, logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    if _is_dmp_strategy(logic):
+        stmt = select(func.count()).select_from(Sample).where(
+            Sample.sample_type == "DMP", ~paired
+        )
+    else:
+        names = _logic_bait_set_names(db, logic)
+        if not names:
+            return {"pairing_logic": logic.name, "unpaired": 0}
+        stmt = select(func.count()).select_from(Sample).where(
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            func.upper(func.coalesce(Sample.sample_type, "")) != "DMP",
+            func.lower(Sample.bait_set).in_(names),
+            ~paired,
+        )
+    return {
+        "pairing_logic": logic.name,
+        "unpaired": int(db.scalar(stmt) or 0),
     }
 
 

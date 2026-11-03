@@ -16,6 +16,13 @@ Postgres-only (the local development database).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# Make the repo root importable when run as a plain script
+# (``python scripts/migrate_patient_columns.py``): sys.path[0] is this
+# file's directory, not the repo root, so ``from database import ...``
+# would fail without this.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import create_engine, text
 
