@@ -13,14 +13,29 @@ and stable ordering.
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from models import Base, PairingLogic, PairingTable, Sample
-from routers.pairings import REPORT_MAX_PAGE_SIZE, pairing_report
+from routers.pairings import (
+    REPORT_DEFAULT_PAGE_SIZE,
+    REPORT_MAX_PAGE_SIZE,
+    pairing_report,
+    export_pair_report,
+    _iter_paired_export_rows,
+    _iter_unmatched_export_rows,
+    _resolve_export_columns,
+    _csv_line,
+    DMP_EXPORT_COLUMNS,
+    PAIR_EXPORT_COLUMNS,
+    DMP_DEFAULT_EXPORT_KEYS,
+    PAIR_DEFAULT_EXPORT_KEYS,
+)
 from schemas import TumorOrNormal
 
 BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -485,3 +500,165 @@ def test_q_treats_like_wildcards_as_literals(db):
     for q in ("%", "_"):
         result = pairing_report("DMP", 1, 50, db, q=q)
         assert result.total == 0, q
+
+
+# --- (f) server-side export (GET /pairing/export/) -------------------------
+#
+# The client holds only one page (T4), so the Download button fetches the
+# full searched set from the server. The endpoint streams CSV/TSV (one
+# StreamingResponse, keyset-batched), with the same q filter as the report
+# endpoint (T5) and the report column model as its header.
+
+@pytest.fixture()
+def export_stream(db, engine, monkeypatch):
+    """Point the export's stream session at the in-memory test engine.
+
+    The endpoint validates with the request session but streams through its
+    own session (the request session may be closed before the body finishes);
+    redirecting that factory makes the stream see the fixture data.
+    """
+    monkeypatch.setattr(
+        "routers.pairings._open_stream_session", sessionmaker(bind=engine)
+    )
+
+
+def _export_lines(logic, db, q=None, columns=None, fmt="csv"):
+    """Call the endpoint and return the non-empty lines of its body.
+
+    The fixture data is flushed, not committed, and the stream session
+    shares the single StaticPool connection — committing first makes the
+    data visible to the stream and safe against the stream session's
+    close-rollback on that shared connection.
+
+    Starlette wraps the sync generator in an async iterator (threadpool),
+    so the response must be drained with asyncio.
+    """
+    db.commit()
+    resp = export_pair_report(logic, q=q, columns=columns, fmt=fmt, db=db)
+
+    async def _drain():
+        return "".join([chunk async for chunk in resp.body_iterator])
+
+    return [line for line in asyncio.run(_drain()).splitlines() if line]
+
+
+def test_export_returns_csv_content_type(db, export_stream):
+    logic = _logic(db, "DMP", "dmp")
+    tumor = _sample(db, "T0", "DMP", TumorOrNormal.TUMOR.value, BASE_DATE)
+    normal = _sample(db, "N0", "DMP", TumorOrNormal.NORMAL.value, BASE_DATE)
+    _pairing(db, logic, tumor, normal, BASE_DATE)
+
+    resp = export_pair_report("DMP", q=None, columns=None, fmt="csv", db=db)
+    assert resp.media_type == "text/csv"
+    assert "pairs_DMP.csv" in resp.headers["content-disposition"]
+
+    resp = export_pair_report("DMP", q=None, columns=None, fmt="tsv", db=db)
+    assert resp.media_type == "text/tab-separated-values"
+    assert "pairs_DMP.tsv" in resp.headers["content-disposition"]
+
+    # An invalid fmt is rejected up front (clean 4xx, not a broken stream).
+    with pytest.raises(HTTPException) as exc:
+        export_pair_report("DMP", q=None, columns=None, fmt="xlsx", db=db)
+    assert exc.value.status_code == 400
+
+
+def test_export_streams_full_set_not_one_page(db, export_stream):
+    logic = _logic(db, "ARGOS", "argos")
+    # 55 latest pairings — more than one report page of 50 — proves the
+    # export streams the FULL set, not the client's single page.
+    for i in range(55):
+        tumor = _sample(db, f"T{i:02d}", "IMPACT", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"N{i:02d}", "IMPACT", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+
+    lines = _export_lines("ARGOS", db)
+    assert len(lines) == 1 + 55  # header + every paired row
+    assert len(lines) - 1 > REPORT_DEFAULT_PAGE_SIZE
+    # Non-DMP logic: paired rows only, no unmatched section.
+    assert all(row.split(",")[:2] for row in lines[1:])
+
+
+def test_export_respects_q_filter(db, export_stream):
+    _search_fixture(db)  # 2 latest pairings (A, B) + 1 unmatched DMP row (U)
+
+    # Unfiltered export: header + all 3 rows.
+    lines = _export_lines(
+        "DMP", db, columns="tumor_primary_id,normal_primary_id"
+    )
+    assert len(lines) == 1 + 3
+
+    # q narrows the export to the matching rows — same filter as the report
+    # endpoint: ALPHA picks row A (the matched pair); UNMATCHED picks the
+    # one-sided unmatched row (tumor side empty).
+    lines = _export_lines("DMP", db, q="ALPHA",
+                          columns="tumor_primary_id,normal_primary_id")
+    assert len(lines) == 1 + 1
+    assert lines[1] == "PRI-A,PRI-A-N"
+
+    lines = _export_lines("DMP", db, q="UNMATCHED",
+                          columns="tumor_primary_id,normal_primary_id")
+    assert len(lines) == 1 + 1
+    assert lines[1] == ",PRI-U"
+
+    # A no-match query streams only the header.
+    lines = _export_lines("DMP", db, q="ZZZ-NOMATCH",
+                          columns="tumor_primary_id,normal_primary_id")
+    assert len(lines) == 1
+
+
+def test_export_includes_dmp_unmatched_rows(db, export_stream):
+    logic = _logic(db, "DMP", "dmp")
+    for i in range(2):
+        tumor = _sample(db, f"T{i}", "DMP", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"N{i}", "DMP", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    # Two DMP samples with no pairing — one-sided rows (T3 shape).
+    for i in range(2):
+        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
+                BASE_DATE + timedelta(hours=1, minutes=i))
+
+    lines = _export_lines("DMP", db)
+    assert len(lines) == 1 + 4  # header + 2 paired + 2 unmatched
+    header = lines[0].split(",")
+    t_idx = header.index("tumor_sample")
+    n_idx = header.index("normal_sample")
+    m_idx = header.index("tumor_matched")
+    data = [line.split(",") for line in lines[1:]]
+    # Paired rows lead (both sides present, marked Matched).
+    for row in data[:2]:
+        assert row[t_idx] and row[n_idx] and row[m_idx] == "Matched"
+    # Unmatched rows follow: sample on its natural (normal) side, the
+    # tumor-side cells empty — matching the report's row shape.
+    for row in data[2:]:
+        assert row[t_idx] == "" and row[m_idx] == ""
+        assert row[n_idx] in ("U0", "U1")
+
+
+def test_export_header_columns_match_report_model(db, export_stream):
+    _logic(db, "DMP", "dmp")
+    _logic(db, "ARGOS", "argos")
+
+    # DMP logic defaults to the DMP report columns, in model order (the
+    # frontend DMP_COLUMNS). An empty logic still yields just the header.
+    lines = _export_lines("DMP", db, fmt="tsv")
+    assert len(lines) == 1
+    assert lines[0].split("\t") == [c["header"] for c in DMP_EXPORT_COLUMNS]
+
+    # Non-DMP logic defaults to the pair report's default subset.
+    lines = _export_lines("ARGOS", db)
+    assert lines[0] == "TUMOR_SAMPLE,NORMAL_SAMPLE,BAIT_SET"
+
+    # An explicit columns param selects exactly those columns, in order.
+    lines = _export_lines("ARGOS", db,
+                          columns="normal_primary_id,tumor_primary_id")
+    assert lines[0] == "NORMAL_SAMPLE,TUMOR_SAMPLE"
+
+    # Unknown column keys are rejected up front (clean 400).
+    with pytest.raises(HTTPException) as exc:
+        export_pair_report("ARGOS", q=None, columns="no_such_column",
+                           fmt="csv", db=db)
+    assert exc.value.status_code == 400

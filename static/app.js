@@ -1555,26 +1555,48 @@ async function consumePrPrefetch(page) {
   return await prPrefetch.promise; // null on silent failure → caller re-fetches
 }
 
-function downloadPairs() {
-  if (!pairsState.logic) return;
+/* Export the FULL searched set from the server (GET /pairing/export/), not
+ * just the page the browser holds — server-side pagination means the client
+ * only ever has one page. The server owns the merge, the search filter (q)
+ * and the checked column set; the response streams to disk via a blob. */
+async function downloadPairs() {
+  const logic = pairsState.logic;
+  if (!logic) return;
   const cols = selectedPairColumns();
-  // Export exactly the rows the table shows (the current server page, with
-  // the active search filter applied — server-side pagination means there
-  // is no full in-memory set to export).
-  const rows = visiblePairRows();
-  if (cols.length === 0 || rows.length === 0) return;
+  if (cols.length === 0) return;
   const tsv = $("#pr-format").value === "tsv";
-  const sep = tsv ? "\t" : ",";
-  const cell = (v) => (!tsv && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v.replace(/[\t\r\n]/g, " "));
-  const data = [cols.map((c) => c.header), ...rows.map((r) => cols.map((c) => c.text(r)))];
-  const text = data.map((r) => r.map(cell).join(sep)).join("\n") + "\n";
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: tsv ? "text/tab-separated-values" : "text/csv" }));
-  a.download = `pairs_${pairsState.logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(a.href);
+  const params = new URLSearchParams({
+    pairing_logic_name: logic,
+    fmt: tsv ? "tsv" : "csv",
+    columns: cols.map((c) => c.key).join(","),
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  const btn = $("#pr-download");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(API + "/pairing/export/?" + params);
+    let detail = null;
+    if (!res.ok) {
+      try { const b = await res.json(); detail = b && b.detail; } catch (_) { /* not JSON */ }
+      if (res.status === 401) location.href = "/login";
+      else if (res.status === 403) location.href = "/login?error=" + encodeURIComponent(detail || "Not allowed");
+      throw new Error((typeof detail === "string" ? detail : JSON.stringify(detail)) || `Export failed: ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `pairs_${logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    banner("error", `Export failed: ${esc(e.message)}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 /* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor

@@ -6,15 +6,18 @@ pairing logic. DMP samples are also pairable manually, but only under the
 other logics (e.g. ARGOS) — ``POST /pairing/trigger`` refuses the DMP
 strategy, which is reserved for the automatic trigger.
 """
-from datetime import datetime
+import json
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from database import get_db, settings
+from database import SessionLocal, get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
     _is_dmp_strategy,
@@ -475,6 +478,402 @@ def pairing_report(
             rows.append(_unmatched_row(s, logic))
 
     return PairingReportRead(rows=rows, total=total)
+
+
+# ---------------------------------------------------------------------------
+# Pair Report server-side download/export (T6).
+#
+# The Pair Report table holds only one server page (T4), so the old
+# client-side "download the loaded set" only exported the visible page.
+# The export is computed server-side and STREAMED: the merged list (latest
+# paired rows, then — DMP logics only — the unmatched DMP rows) is fetched
+# in keyset batches (created_date desc, id desc), never materialized whole,
+# and rendered to CSV/TSV one line at a time. Cell formatting mirrors the
+# frontend table renderers (pairText / pairDate / dmpMetaText) so the file
+# matches what the user sees.
+# ---------------------------------------------------------------------------
+
+# Rows fetched per SQL round-trip while streaming the export. Keyset
+# pagination (not OFFSET) means this stays O(1) in memory regardless of the
+# logic's row count (DMP: ~284k samples / ~111k pairs).
+EXPORT_BATCH_SIZE = 500
+
+# DMP columns whose value is not derivable from the imported sample — the
+# frontend renders these with this placeholder (app.js DMP_PLACEHOLDER).
+DMP_PLACEHOLDER = "—"
+
+
+def _s(v) -> str:
+    """Mirror the frontend ``x || ""`` for a scalar cell: null -> "", enums
+    yield their value, everything else stringifies."""
+    if v is None:
+        return ""
+    if isinstance(v, Enum):
+        return str(v.value)
+    return str(v)
+
+
+def _pair_text(v) -> str:
+    """Mirror the frontend ``pairText``: how the table renders a possibly
+    list / JSON / null sample field — arrays join with ", " (recursively),
+    objects JSON-stringify, null/empty -> ""."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_pair_text(x) for x in v)
+    if isinstance(v, dict):
+        return json.dumps(v, separators=(",", ":"))
+    if isinstance(v, Enum):
+        return str(v.value)
+    return str(v)
+
+
+def _pair_date(v) -> str:
+    """Mirror the frontend ``pairDate``: UTC minute precision
+    ("YYYY-MM-DD HH:mm"); null -> "". A string passes through untouched."""
+    if not v:
+        return ""
+    if isinstance(v, str):
+        return v
+    try:
+        return v.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (AttributeError, ValueError):
+        return str(v)
+
+
+def _dmp_name_parts(primary_id: str) -> list:
+    """Mirror the frontend ``dmpNameParts``: split a DMP primary ID on "-";
+    return [second-to-last, last] (["",""] if fewer than two parts)."""
+    parts = (primary_id or "").split("-")
+    if len(parts) < 2:
+        return ["", ""]
+    return [parts[-2], parts[-1]]
+
+
+def _dmp_meta(sample, key: str) -> str:
+    """Mirror the frontend ``dmpMetaText``: read additional_metadata[key];
+    null sample / non-dict metadata / missing key -> ""."""
+    if sample is None:
+        return ""
+    meta = sample.additional_metadata
+    if not isinstance(meta, dict):
+        meta = {}
+    v = meta.get(key)
+    if v is None:
+        return ""
+    return str(v)
+
+
+def _t_attr(f):
+    return lambda r: _s(getattr(r.tumor, f)) if r.tumor is not None else ""
+
+
+def _n_attr(f):
+    return lambda r: _s(getattr(r.normal, f)) if r.normal is not None else ""
+
+
+def _t_text(f):
+    return lambda r: _pair_text(getattr(r.tumor, f)) if r.tumor is not None else ""
+
+
+def _n_text(f):
+    return lambda r: _pair_text(getattr(r.normal, f)) if r.normal is not None else ""
+
+
+def _t_date(f):
+    return lambda r: _pair_date(getattr(r.tumor, f)) if r.tumor is not None else ""
+
+
+def _n_date(f):
+    return lambda r: _pair_date(getattr(r.normal, f)) if r.normal is not None else ""
+
+
+def _t_errs(f):
+    return lambda r: "; ".join(getattr(r.tumor, f) or []) if r.tumor is not None else ""
+
+
+def _n_errs(f):
+    return lambda r: "; ".join(getattr(r.normal, f) or []) if r.normal is not None else ""
+
+
+# Python mirror of app.js PAIR_COLUMNS: the report column model for a
+# (non-DMP) logic, same order, with text renderers that reproduce the table
+# display (c.text).
+PAIR_EXPORT_COLUMNS = [
+    {"key": "tumor_primary_id", "header": "TUMOR_SAMPLE", "text": _t_attr("primary_id")},
+    {"key": "normal_primary_id", "header": "NORMAL_SAMPLE", "text": _n_attr("primary_id")},
+    {"key": "tumor_bait_set", "header": "BAIT_SET", "text": _t_attr("bait_set")},
+    {"key": "tumor_patient__cmo", "header": "TUMOR_PATIENT__CMO", "text": _t_attr("patient__cmo")},
+    {"key": "tumor_patient__dmp", "header": "TUMOR_PATIENT__DMP", "text": _t_attr("patient__dmp")},
+    {"key": "tumor_anon_id", "header": "TUMOR_ANON_ID", "text": _t_attr("anon_id")},
+    {"key": "tumor_cmo_sample_name", "header": "TUMOR_CMO_SAMPLE_NAME", "text": _t_text("cmo_sample_name")},
+    {"key": "tumor_role", "header": "TUMOR_ROLE", "text": _t_attr("tumor_or_normal")},
+    {"key": "tumor_sample_type", "header": "TUMOR_SAMPLE_TYPE", "text": _t_attr("sample_type")},
+    {"key": "tumor_gene_panel", "header": "TUMOR_GENE_PANEL", "text": _t_attr("gene_panel")},
+    {"key": "tumor_request_id", "header": "TUMOR_REQUEST_ID", "text": _t_attr("request_id")},
+    {"key": "tumor_run_mode", "header": "TUMOR_RUN_MODE", "text": _t_attr("run_mode")},
+    {"key": "tumor_file_group", "header": "TUMOR_FILE_GROUP", "text": _t_attr("file_group")},
+    {"key": "tumor_preservation", "header": "TUMOR_PRESERVATION", "text": _t_text("preservation")},
+    {"key": "tumor_sample_origin", "header": "TUMOR_SAMPLE_ORIGIN", "text": _t_text("sample_origin")},
+    {"key": "tumor_sequencing_date", "header": "TUMOR_SEQUENCING_DATE", "text": _t_date("sequencing_date")},
+    {"key": "tumor_additional_metadata", "header": "TUMOR_ADDITIONAL_METADATA", "text": _t_text("additional_metadata")},
+    {"key": "tumor_errors", "header": "TUMOR_ERRORS", "text": _t_errs("errors")},
+    {"key": "tumor_id", "header": "TUMOR_ID", "text": _t_attr("id")},
+    {"key": "normal_bait_set", "header": "NORMAL_BAIT_SET", "text": _n_attr("bait_set")},
+    {"key": "normal_patient__cmo", "header": "NORMAL_PATIENT__CMO", "text": _n_attr("patient__cmo")},
+    {"key": "normal_patient__dmp", "header": "NORMAL_PATIENT__DMP", "text": _n_attr("patient__dmp")},
+    {"key": "normal_anon_id", "header": "NORMAL_ANON_ID", "text": _n_attr("anon_id")},
+    {"key": "normal_cmo_sample_name", "header": "NORMAL_CMO_SAMPLE_NAME", "text": _n_text("cmo_sample_name")},
+    {"key": "normal_role", "header": "NORMAL_ROLE", "text": _n_attr("tumor_or_normal")},
+    {"key": "normal_sample_type", "header": "NORMAL_SAMPLE_TYPE", "text": _n_attr("sample_type")},
+    {"key": "normal_gene_panel", "header": "NORMAL_GENE_PANEL", "text": _n_attr("gene_panel")},
+    {"key": "normal_request_id", "header": "NORMAL_REQUEST_ID", "text": _n_attr("request_id")},
+    {"key": "normal_run_mode", "header": "NORMAL_RUN_MODE", "text": _n_attr("run_mode")},
+    {"key": "normal_file_group", "header": "NORMAL_FILE_GROUP", "text": _n_attr("file_group")},
+    {"key": "normal_preservation", "header": "NORMAL_PRESERVATION", "text": _n_text("preservation")},
+    {"key": "normal_sample_origin", "header": "NORMAL_SAMPLE_ORIGIN", "text": _n_text("sample_origin")},
+    {"key": "normal_sequencing_date", "header": "NORMAL_SEQUENCING_DATE", "text": _n_date("sequencing_date")},
+    {"key": "normal_additional_metadata", "header": "NORMAL_ADDITIONAL_METADATA", "text": _n_text("additional_metadata")},
+    {"key": "normal_errors", "header": "NORMAL_ERRORS", "text": _n_errs("errors")},
+    {"key": "normal_id", "header": "NORMAL_ID", "text": _n_attr("id")},
+    {"key": "pairing_logic", "header": "PAIRING_LOGIC", "text": lambda r: r.pairing_logic or ""},
+    {"key": "trigger_type", "header": "TRIGGER_TYPE", "text": lambda r: r.trigger_type or ""},
+    {"key": "mismatched_keys", "header": "MISMATCHED_KEYS", "text": lambda r: "; ".join(r.mismatched_keys or [])},
+    {"key": "created_date", "header": "CREATED_DATE", "text": lambda r: _pair_date(r.created_date)},
+]
+
+# Python mirror of app.js DMP_COLUMNS: the DMP logic's report column model
+# (legacy beagle DMP filemetadata layout), same order and text renderers.
+DMP_EXPORT_COLUMNS = [
+    {"key": "tumor_sample", "header": "tumor_sample", "text": lambda r: (r.tumor.primary_id or "") if r.tumor is not None else ""},
+    {"key": "patient", "header": "patient", "text": lambda r: (r.tumor.patient__dmp or "") if r.tumor is not None else ""},
+    {"key": "tumor_idx", "header": "tumor_idx", "text": lambda r: _dmp_name_parts(r.tumor.primary_id)[0] if r.tumor is not None else ""},
+    {"key": "tumor_IM_ver", "header": "tumor_IM_ver", "text": lambda r: _dmp_name_parts(r.tumor.primary_id)[1] if r.tumor is not None else ""},
+    {"key": "tumor_bamname", "header": "tumor_bamname", "text": lambda r: (r.tumor.anon_id or "") if r.tumor is not None else ""},
+    {"key": "tumor_group", "header": "tumor_group", "text": lambda r: DMP_PLACEHOLDER},
+    {"key": "tumor_matched", "header": "tumor_matched", "text": lambda r: ("Matched" if r.normal is not None else "Unmatched") if r.tumor is not None else ""},
+    {"key": "tumor_bam_exists", "header": "tumor_bam_exists", "text": lambda r: DMP_PLACEHOLDER},
+    {"key": "tumor_bam_coverage", "header": "tumor_bam_coverage", "text": lambda r: _dmp_meta(r.tumor, "coverage")},
+    {"key": "normal_sample", "header": "normal_sample", "text": lambda r: (r.normal.primary_id or "") if r.normal is not None else ""},
+    {"key": "normal_bamname", "header": "normal_bamname", "text": lambda r: (r.normal.anon_id or "") if r.normal is not None else ""},
+    {"key": "normal_IM_ver", "header": "normal_IM_ver", "text": lambda r: _dmp_name_parts(r.normal.primary_id)[1] if r.normal is not None else ""},
+    {"key": "pool_id", "header": "pool_id", "text": lambda r: _dmp_meta(r.tumor, "project_name")},
+    {"key": "normal_bam_exists", "header": "normal_bam_exists", "text": lambda r: DMP_PLACEHOLDER},
+    {"key": "normal_bam_coverage", "header": "normal_bam_coverage", "text": lambda r: _dmp_meta(r.normal, "coverage")},
+]
+
+# The frontend default column sets (app.js PAIR_DEFAULT_KEYS / DMP_COLUMNS).
+PAIR_DEFAULT_EXPORT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"]
+DMP_DEFAULT_EXPORT_KEYS = [
+    "tumor_sample", "patient", "tumor_idx", "tumor_IM_ver", "tumor_bamname",
+    "tumor_group", "tumor_matched", "tumor_bam_exists", "tumor_bam_coverage",
+    "normal_sample", "normal_bamname", "normal_IM_ver", "pool_id",
+    "normal_bam_exists", "normal_bam_coverage",
+]
+
+_EXPORT_COLUMNS_BY_KEY = {c["key"]: c for c in PAIR_EXPORT_COLUMNS}
+_EXPORT_COLUMNS_BY_KEY.update({c["key"]: c for c in DMP_EXPORT_COLUMNS})
+
+
+def _resolve_export_columns(logic: PairingLogic, columns: Optional[str]) -> list:
+    """Resolve the requested export columns (comma-separated keys) into an
+    ordered list of column defs, or the logic's default set when omitted /
+    blank. Unknown keys are a 400."""
+    keys = None
+    if columns is not None:
+        keys = [k.strip() for k in columns.split(",") if k.strip()]
+    if not keys:
+        keys = DMP_DEFAULT_EXPORT_KEYS if _is_dmp_strategy(logic) else PAIR_DEFAULT_EXPORT_KEYS
+    defs = []
+    for k in keys:
+        c = _EXPORT_COLUMNS_BY_KEY.get(k)
+        if c is None:
+            raise HTTPException(status_code=400, detail=f"Unknown export column: {k}")
+        defs.append(c)
+    return defs
+
+
+def _escape_cell(value: str, sep: str) -> str:
+    """Mirror the frontend cell escaping: TSV never quotes (control chars
+    blanked); CSV quotes only when the field holds the separator, a quote,
+    or a newline, doubling internal quotes; tab/CR/LF never survive."""
+    if sep == "\t":
+        return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    if '"' in value or sep in value or "\n" in value:
+        return '"' + value.replace('"', '""') + '"'
+    return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _csv_line(cells: list, sep: str) -> str:
+    return sep.join(_escape_cell(c, sep) for c in cells) + "\n"
+
+
+def _iter_paired_export_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+    """Stream every latest paired row for the logic in report order
+    (created_date desc, id desc) via keyset pagination, so the full set is
+    never materialized. Same predicate as _report_paired_page (incl. the q
+    either-side search); the keyset cursor replaces OFFSET."""
+    base_stmt = (
+        select(PairingTable)
+        .options(
+            joinedload(PairingTable.tumor),
+            joinedload(PairingTable.normal),
+            joinedload(PairingTable.pairing_logic_obj),
+        )
+        .where(PairingTable.pairing_logic_id == logic.id, PairingTable.latest.is_(True))
+        .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+    )
+    if q is not None:
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        base_stmt = base_stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True)
+        base_stmt = base_stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id, isouter=True)
+        base_stmt = base_stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+    last_created = None
+    last_id = None
+    while True:
+        stmt = base_stmt.limit(EXPORT_BATCH_SIZE)
+        if last_created is not None:
+            stmt = stmt.where(
+                or_(
+                    PairingTable.created_date < last_created,
+                    and_(PairingTable.created_date == last_created, PairingTable.id < last_id),
+                )
+            )
+        batch = list(db.scalars(stmt).all())
+        if not batch:
+            break
+        for p in batch:
+            yield _paired_row(p)
+        if len(batch) < EXPORT_BATCH_SIZE:
+            break
+        last_created = batch[-1].created_date
+        last_id = batch[-1].id
+
+
+def _iter_unmatched_export_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+    """Stream every unmatched DMP row for the logic in report order via
+    keyset pagination. Same predicate as _report_unmatched_page (DMP samples
+    with no latest pairing under the logic, plus the q search)."""
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    base = [Sample.sample_type == "DMP", ~paired]
+    if q is not None:
+        base.append(or_(*_search_conds(Sample, q)))
+    last_created = None
+    last_id = None
+    while True:
+        stmt = (
+            select(Sample)
+            .where(*base)
+            .order_by(Sample.created_date.desc(), Sample.id.desc())
+            .limit(EXPORT_BATCH_SIZE)
+        )
+        if last_created is not None:
+            stmt = stmt.where(
+                or_(
+                    Sample.created_date < last_created,
+                    and_(Sample.created_date == last_created, Sample.id < last_id),
+                )
+            )
+        batch = list(db.scalars(stmt).all())
+        if not batch:
+            break
+        for s in batch:
+            yield _unmatched_row(s, logic)
+        if len(batch) < EXPORT_BATCH_SIZE:
+            break
+        last_created = batch[-1].created_date
+        last_id = batch[-1].id
+
+
+def _sanitize_filename(name: str) -> str:
+    """Mirror the frontend filename sanitize (/[^\\w.-]+/g -> "_")."""
+    import re
+    return re.sub(r"[^\w.-]+", "_", name or "")
+
+
+def _open_stream_session() -> Session:
+    """Own session for the export stream.
+
+    The request-scoped session (``get_db``) may be closed before a streaming
+    body has finished sending, so the generator opens and closes its own
+    session. Module-level so tests can point it at the in-memory engine.
+    """
+    return SessionLocal()
+
+
+@router.get("/export/")
+def export_pair_report(
+    pairing_logic_name: str = Query(..., description="Pairing logic name"),
+    q: Optional[str] = Query(
+        None,
+        description="Case-insensitive literal substring on any of the report "
+        "search fields, on either side — same filter as /pairing/report/ (T5)",
+    ),
+    columns: Optional[str] = Query(
+        None,
+        description="Comma-separated report column keys to export; defaults to "
+        "the logic's default column set when omitted",
+    ),
+    fmt: str = Query("csv", description="csv or tsv"),
+    db: Session = Depends(get_db),
+):
+    """Stream the FULL merged Pair Report list for a logic as CSV/TSV.
+
+    The client holds only one page (T4), so the Download/Export button fetches
+    this endpoint for the searched set instead of exporting the loaded page.
+    Rows are produced in report order (latest paired rows, then — DMP logics
+    only — the unmatched DMP rows with the tumor/CMO columns empty), in the
+    same cell format the table displays. Keyset pagination keeps memory flat
+    for large logics.
+    """
+    # Validate the logic, search, format, and column set up front so the
+    # response is a clean 4xx rather than a broken stream.
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    if q is not None:
+        q = q.strip().lower() or None
+    fmt = (fmt or "").strip().lower()
+    if fmt not in ("csv", "tsv"):
+        raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'tsv'")
+    col_defs = _resolve_export_columns(logic, columns)
+    is_dmp = _is_dmp_strategy(logic)
+    logic_id = logic.id
+    filename = "pairs_" + _sanitize_filename(pairing_logic_name) + (".csv" if fmt == "csv" else ".tsv")
+
+    sep = "," if fmt == "csv" else "\t"
+    media_type = "text/csv" if fmt == "csv" else "text/tab-separated-values"
+
+    def gen():
+        db = _open_stream_session()
+        try:
+            logic = db.get(PairingLogic, logic_id)
+            if logic is None:
+                return
+            yield _csv_line([c["header"] for c in col_defs], sep)
+            for row in _iter_paired_export_rows(db, logic, q):
+                yield _csv_line([c["text"](row) for c in col_defs], sep)
+            if is_dmp:
+                for row in _iter_unmatched_export_rows(db, logic, q):
+                    yield _csv_line([c["text"](row) for c in col_defs], sep)
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        gen(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/trigger", response_model=PairingRead)
