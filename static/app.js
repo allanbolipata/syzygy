@@ -1214,24 +1214,30 @@ const DMP_LEGEND = {
 const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
 const pairsState = {
+  // The current page of the report only. Pagination is server-side
+  // (GET /pairing/report/), so the browser never holds the full set.
   rows: [],
+  // Server total row count for the loaded logic (all pages combined).
+  total: 0,
   logic: null,
   // Per-logic selected column keys (each logic has its own column set and
   // its own selection, so ARGOS choices never affect DMP and vice versa).
   selected: {},
   // Split-panel filter groups that the user collapsed (default: expanded).
   groupCollapsed: {},
-  // Display pagination for the pair table. The full row set can be in the
-  // hundreds of thousands (the DMP report lists every DMP sample); rendering
-  // all of it to the DOM hangs the tab, so only one page is rendered at a
-  // time. The download still covers every row, not just the visible page.
+  // Server-side pagination: 0-based index of the page currently displayed.
+  // Next/Prev/jump fetch the requested page from /pairing/report/ (see
+  // loadReportPage) rather than slicing a full in-memory set. The download
+  // covers the current page, not the whole set.
   page: 0,
   pageSize: 50,
   // View-scoped search (#pr-search): lowercased substring matched
-  // client-side against the already-loaded rows (no server round-trip).
-  // Applied in renderPairsTable() and downloadPairs() so the table and the
-  // export always cover the same set. Cleared on view enter/leave and on
-  // logic change so a stale filter never carries into new rows.
+  // client-side against the loaded rows (no server round-trip). With
+  // server-side pagination this filters the current page, not the full set
+  // (T5 moves search to the server). Applied in renderPairsTable() and
+  // downloadPairs() so the table and the export always cover the same set.
+  // Cleared on view enter/leave and on logic change so a stale filter never
+  // carries into new rows.
   query: "",
   // Server-sourced "Paired" count for the loaded logic (from
   // /pairing/unmatched-count/): the logic's latest rows with both
@@ -1336,8 +1342,10 @@ function pairMatchesQuery(r, q) {
 }
 
 /* Rows visible under the active search query (all loaded rows when there is
- * no query). Shared by renderPairsTable() and downloadPairs() so the
- * export covers exactly what the table shows. */
+ * no query). pairsState.rows holds the current server page only, so a search
+ * filters that page (interim — T5 moves search to the server). Shared by
+ * renderPairsTable() and downloadPairs() so the export covers exactly what
+ * the table shows. */
 function visiblePairRows() {
   const q = pairsState.query;
   return q ? pairsState.rows.filter((r) => pairMatchesQuery(r, q)) : pairsState.rows;
@@ -1372,17 +1380,16 @@ function renderPairsTable() {
   $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) =>
     `<th${dmp && DMP_LEGEND[c.key] ? ` title="${esc(DMP_LEGEND[c.key])}"` : ""}>${esc(c.header)}</th>`
   ).join("")}</tr>`;
-  // Render only the current page (see pairsState.pageSize). The row array
-  // keeps the full set in memory for the download; pagination and the count
-  // operate on the search-filtered set (visiblePairRows()).
+  // The browser holds only the current server page (pairsState.rows); the
+  // page indicator and the row count come from the server total
+  // (pairsState.total). A search filter narrows the current page (interim —
+  // T5 moves search to the server).
   const full = pairsState.rows.length;
   const rows = visiblePairRows();
-  const total = rows.length;
+  const total = pairsState.total;
   const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
-  if (pairsState.page > maxPage) pairsState.page = maxPage;
   const start = pairsState.page * pairsState.pageSize;
-  const slice = rows.slice(start, start + pairsState.pageSize);
-  $("#pairs-table tbody").innerHTML = slice
+  $("#pairs-table tbody").innerHTML = rows
     .map((r) => `<tr>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`).join("");
   $("#pr-prev").disabled = pairsState.page === 0;
   $("#pr-next").disabled = pairsState.page >= maxPage;
@@ -1397,18 +1404,19 @@ function renderPairsTable() {
   // Matched: the server count (pairsState.pairedCount, from
   // /pairing/unmatched-count/) once it has landed and no search filter
   // narrows the table — until then, and while filtering, fall back to
-  // the in-memory rows.
+  // the current page's rows.
   const matched = !pairsState.query && pairsState.pairedCount != null
     ? pairsState.pairedCount
     : rows.filter((r) => r.tumor && r.normal).length;
-  const empty = total === 0 || cols.length === 0;
+  const empty = rows.length === 0 || cols.length === 0;
   const emptyEl = $("#pr-empty");
   emptyEl.classList.toggle("hidden", !empty);
   emptyEl.textContent =
     pairsState.query && full > 0 ? "No pairs match this search." : "No current pairs for this logic.";
-  const filteredNote = pairsState.query && total !== full ? ` (filtered from ${full})` : "";
+  const filteredNote = pairsState.query && rows.length !== full
+    ? ` (search: ${rows.length} of ${full} on this page)` : "";
   const paging = total > pairsState.pageSize
-    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + slice.length} of ${total})`
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${Math.min(start + pairsState.pageSize, total)} of ${total})`
     : "";
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
@@ -1446,112 +1454,125 @@ function hidePrLoading() {
   if (el) el.classList.add("hidden");
 }
 
-async function loadPairs() {
-  const logic = $("#pr-logic").value;
+async function loadReportPage(page) {
+  const logic = pairsState.logic;
   if (!logic) return;
   if (pairsAbort) pairsAbort.abort();
   pairsAbort = new AbortController();
   const signal = pairsAbort.signal;
   // True only while THIS load is the active one. A newer load replaces
-  // pairsAbort (and thus owns the loading indicator + overview stats) and
-  // aborts this load's signal, so a stale load must not repaint or clear the
-  // spinner the newer load is showing.
+  // pairsAbort (and thus owns the loading indicator) and aborts this
+  // load's signal, so a stale load must not repaint or clear the spinner
+  // the newer load is showing.
   const active = () => signal === pairsAbort.signal;
-  const isDmp = isDmpLogic(logic);
-  pairsState.logic = logic;
-  // The previous logic's server count is stale until the new one lands.
-  pairsState.pairedCount = null;
-  // Clear any stale indicator a prior/superseded load left behind before this
-  // load shows its own: the spinner is owned by the newest load only, so a load
-  // that finished without hiding it can't keep it up once a newer load takes
-  // over.
+  // Spinner lifecycle invariant: hide any stale indicator at entry, show
+  // ours, and hide in `finally` so every exit path is covered.
   hidePrLoading();
+  if (active()) showPrLoading(`Loading page ${page + 1}\u2026`);
   try {
-    // Start the (large, DMP-only) unmatched-set fetch in parallel with the
-    // smaller paired-rows fetch; the two queries are independent. Paint the
-    // paired rows as soon as they land so page 1 appears without waiting for
-    // the whole DMP population to transfer.
-    const unmatchedPromise = isDmp
-      ? api(`/pairing/unmatched/?${new URLSearchParams({ pairing_logic_name: logic })}`, { signal })
-      : null;
-    if (unmatchedPromise) unmatchedPromise.catch(() => {}); // no unhandled rejection if we bail early
-
-    // Paired rows: show, fetch, paint page 1, then turn the spinner off.
-    if (active()) showPrLoading("Loading pairs…");
+    // Serve from the next-page prefetch when it has already landed for
+    // this exact logic/query/page; otherwise fetch for real. A failed
+    // prefetch resolves to null and falls through to the real fetch,
+    // which surfaces the error.
+    let data = null;
     try {
-      pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`, { signal });
+      data = await consumePrPrefetch(page);
+      if (!data) {
+        data = await api(`/pairing/report/?${new URLSearchParams({
+          pairing_logic_name: logic,
+          page: String(page + 1),
+          page_size: String(pairsState.pageSize),
+        })}`, { signal });
+      }
     } catch (e) {
-      if (e && e.name === "AbortError") return; // superseded by a newer load
-      // Paired rows failed: cancel the in-flight unmatched fetch (it shares this
-      // signal) so we don't leave a large DMP query running for nothing, then
-      // report the failure.
-      pairsAbort.abort();
-      hidePrLoading();
-      banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      if (e && e.name !== "AbortError") {
+        hidePrLoading();
+        banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      }
       return;
     }
-    pairsState.page = 0;
+    // Only the active load may mutate shared state: a superseded load's
+    // page must not paint over the newer load's rows.
+    if (!active()) return;
+    pairsState.rows = data.rows;
+    pairsState.total = data.total;
+    pairsState.page = page;
     renderPrGroups();
-    renderPairsTable(); // page 1 (paired rows) is on screen now
-    // The paired rows are on screen — the report no longer looks frozen, so the
-    // "Loading pairs…" indicator is done. Hide it here (not only at the very
-    // end) so a stall after the paint can't strand it; the unmatched phase
-    // below shows its own spinner if it runs.
-    if (active()) hidePrLoading();
-
-    // DMP unmatched rows: show, resolve the parallel fetch, append.
-    if (unmatchedPromise) {
-      if (active()) showPrLoading("Loading unmatched samples…");
-      try {
-        const unmatched = await unmatchedPromise;
-        // Only the active load may mutate shared state: a superseded load's
-        // stale DMP set must not be appended to the newer load's rows.
-        if (active()) {
-          appendUnmatchedDmpRows(unmatched);
-          renderPairsTable(); // counts + unmatched rows fill in
-        }
-      } catch (e) {
-        if (e && e.name !== "AbortError") banner("error", `Failed to load unmatched samples: ${esc(e.message)}`, true);
-      } finally {
-        // The unmatched phase is over (resolved, errored, or superseded).
-        if (active()) hidePrLoading();
-      }
-    }
-
-    if (active()) loadPrOverviewStats();
+    renderPairsTable();
+    if (page === 0) loadPrOverviewStats();
+    // The page is on screen: quietly fetch N+1 so "Next" is instant.
+    prefetchNextPrPage(page);
   } finally {
-    // Invariant: whenever THIS load is still the newest, its spinner is hidden
-    // no matter how the body exited — normal completion, a fetch error, or a
-    // superseded early return. This backstop guarantees the "Loading pairs…" /
-    // "Loading unmatched samples…" indicators can never strand.
+    // Invariant: whenever THIS load is still the newest, its spinner is
+    // hidden no matter how the body exited — completion, a fetch error,
+    // or a superseded early return.
     if (active()) hidePrLoading();
   }
 }
 
-/* DMP report: the legacy export lists every DMP sample, so DMP samples
- * without a pairing yet are appended as rows with the opposite-side
- * columns left empty. The unmatched set is computed server-side (one
- * query) — the old client-side diff had to download the entire DMP
- * sample population in pages of 1000. loadPairs() fetches this set in
- * parallel with the paired rows and hands the result here. */
-function appendUnmatchedDmpRows(unmatched) {
-  for (const s of unmatched) {
-    pairsState.rows.push({
-      tumor: s.tumor_or_normal === "TUMOR" ? s : null,
-      normal: s.tumor_or_normal === "NORMAL" ? s : null,
-      pairing_logic: pairsState.logic,
-      trigger_type: null,
-      mismatched_keys: [],
-      created_date: s.created_date,
-    });
+async function loadPairs() {
+  const logic = $("#pr-logic").value;
+  if (!logic) return;
+  // A fresh load (init, tab re-entry, logic change, post-pairing refresh)
+  // starts at page 1; any cached prefetch belongs to the previous
+  // logic/query and is dropped.
+  invalidatePrPrefetch();
+  pairsState.logic = logic;
+  // The previous logic's server count is stale until the new one lands.
+  pairsState.pairedCount = null;
+  await loadReportPage(0);
+}
+
+/* Next-page prefetch: after a page paints, quietly fetch page N+1 and
+ * cache it so "Next" renders instantly. One slot, keyed by
+ * logic|query|page — a logic change or a search (which call
+ * invalidatePrPrefetch) can never serve a stale page, and a settled but
+ * superseded result is simply dropped. Prefetch failures are silent: a
+ * real page turn re-fetches and surfaces the error. */
+let prPrefetch = null; // { key, page, abort, promise, data }
+function prPrefetchKey() {
+  return `${pairsState.logic}|${pairsState.query}|${pairsState.pageSize}`;
+}
+function invalidatePrPrefetch() {
+  if (prPrefetch) {
+    prPrefetch.abort.abort(); // cancel the in-flight fetch, if any
+    prPrefetch = null;
   }
+}
+function prefetchNextPrPage(page) {
+  const maxPage = Math.max(0, Math.ceil(pairsState.total / pairsState.pageSize) - 1);
+  const next = page + 1;
+  if (next > maxPage) return; // already on the last page
+  const key = `${prPrefetchKey()}|${next}`;
+  if (prPrefetch && prPrefetch.key === key) return; // in flight or cached
+  invalidatePrPrefetch();
+  const ctrl = new AbortController();
+  const entry = { key, page: next, abort: ctrl, data: null, promise: null };
+  entry.promise = api(`/pairing/report/?${new URLSearchParams({
+    pairing_logic_name: pairsState.logic,
+    page: String(next + 1),
+    page_size: String(pairsState.pageSize),
+  })}`, { signal: ctrl.signal })
+    .then((data) => {
+      if (prPrefetch === entry) entry.data = data; // else superseded: drop
+      return data;
+    })
+    .catch(() => null); // silent; a real turn re-fetches
+  prPrefetch = entry;
+}
+async function consumePrPrefetch(page) {
+  if (!prPrefetch || prPrefetch.page !== page) return null;
+  if (prPrefetch.key !== `${prPrefetchKey()}|${page}`) return null;
+  if (prPrefetch.data) return prPrefetch.data;
+  return await prPrefetch.promise; // null on silent failure → caller re-fetches
 }
 
 function downloadPairs() {
   if (!pairsState.logic) return;
   const cols = selectedPairColumns();
-  // Export exactly the rows the table shows (the active search filter
-  // applied, not the full unfiltered set).
+  // Export exactly the rows the table shows (the current server page, with
+  // the active search filter applied — server-side pagination means there
+  // is no full in-memory set to export).
   const rows = visiblePairRows();
   if (cols.length === 0 || rows.length === 0) return;
   const tsv = $("#pr-format").value === "tsv";
@@ -1690,8 +1711,8 @@ async function loadPrOverviewStats() {
 
 $("#pr-logic").addEventListener("change", () => {
   // Sync the state before re-rendering: activeLogicName() prefers
-  // pairsState.logic, which loadPairs() only updates once its fetch
-  // starts — the blurb would otherwise keep the previous logic's text.
+  // pairsState.logic, which loadPairs() sets when it runs — the blurb
+  // would otherwise keep the previous logic's text.
   pairsState.logic = $("#pr-logic").value;
   $("#pr-run-status").textContent = "";
   $("#pr-evaluate-result").textContent = "";
@@ -1704,27 +1725,27 @@ $("#pr-run").addEventListener("click", runPrPairing);
 $("#pr-evaluate").addEventListener("click", evaluatePrPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
-  if (pairsState.page > 0) {
-    pairsState.page--;
-    renderPairsTable();
-  }
+  if (pairsState.page > 0) loadReportPage(pairsState.page - 1);
 });
 $("#pr-next").addEventListener("click", () => {
-  const maxPage = Math.max(0, Math.ceil(visiblePairRows().length / pairsState.pageSize) - 1);
-  if (pairsState.page < maxPage) {
-    pairsState.page++;
-    renderPairsTable();
-  }
+  const maxPage = Math.max(0, Math.ceil(pairsState.total / pairsState.pageSize) - 1);
+  if (pairsState.page < maxPage) loadReportPage(pairsState.page + 1);
 });
 /* Skip-to-page: type a number (1-based) and press Enter, or let the
  * input commit on blur/change. Out-of-range values clamp to
  * [1, totalPages]; renderPairsTable() re-syncs the input and Prev/Next. */
 function goPrPage() {
-  const totalPages = Math.max(1, Math.ceil(visiblePairRows().length / pairsState.pageSize));
+  const totalPages = Math.max(1, Math.ceil(pairsState.total / pairsState.pageSize));
   const target = parseInt($("#pr-page").value, 10);
   if (Number.isNaN(target)) return; // blank input: next render re-syncs it
-  pairsState.page = Math.min(totalPages - 1, Math.max(0, target - 1));
-  renderPairsTable();
+  const page = Math.min(totalPages - 1, Math.max(0, target - 1));
+  // Same page (or a blank/clamped-identical value): just re-sync the input,
+  // no server round-trip.
+  if (page === pairsState.page) {
+    renderPairsTable();
+  } else {
+    loadReportPage(page);
+  }
 }
 $("#pr-page").addEventListener("change", goPrPage);
 $("#pr-page").addEventListener("keydown", (e) => {
@@ -1738,18 +1759,22 @@ function resetPrSearch() {
   if (box && box.value) box.value = "";
   if (pairsState.query) {
     pairsState.query = "";
-    pairsState.page = 0;
+    // The query change voids any cached prefetch (its key includes the
+    // query). The page index is a SERVER page, not a position in a filtered
+    // set, so it is left alone — the currently loaded page stays loaded.
+    invalidatePrPrefetch();
   }
 }
-/* View-scoped search: filter the already-loaded rows client-side as the
- * user types (no server round-trip). Debounced so typing over the
- * hundreds-of-thousands DMP set doesn't re-render on every keystroke. */
+/* View-scoped search: filter the current page client-side as the user types
+ * (no server round-trip). Interim behavior — with server-side pagination the
+ * query narrows the loaded page, not the full set; T5 moves search to the
+ * server. Debounced so typing doesn't re-render on every keystroke. */
 let prSearchTimer = null;
 $("#pr-search").addEventListener("input", () => {
   clearTimeout(prSearchTimer);
   prSearchTimer = setTimeout(() => {
     pairsState.query = $("#pr-search").value.trim().toLowerCase();
-    pairsState.page = 0;
+    invalidatePrPrefetch(); // cached prefetch was fetched for the old query
     renderPairsTable();
   }, 150);
 });
