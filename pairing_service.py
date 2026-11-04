@@ -534,16 +534,35 @@ def evaluate_logic(db: Session, logic_name: str) -> dict:
 
 
 def count_unpaired(db: Session, logic_name: str) -> dict:
-    """Per-logic unpaired count for the Pairing overview summary strip.
+    """Per-logic paired/unpaired counts for the Pairing overview strip.
 
-    DMP: every DMP sample (tumor or normal, mirroring
-    ``GET /pairing/unmatched/``) with no latest DMP-logic pairing. Any
-    other logic: the logic's unpaired tumor population (the backfill
-    scope, see ``_logic_tumor_scope``). Read-only.
+    ``paired``: the logic's latest report rows where both the tumor
+    and the normal sides are present — the server-side form of the
+    Pair Report's "Paired" strip value (the report row rule
+    ``r.tumor && r.normal``). ``unpaired``: DMP: every DMP sample
+    (tumor or normal, mirroring ``GET /pairing/unmatched/``) with no
+    latest DMP-logic pairing. Any other logic: the logic's unpaired
+    tumor population (the backfill scope, see ``_logic_tumor_scope``).
+    Read-only.
     """
     logic = find_logic_by_name(db, logic_name)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
+    # "Paired" strip value: this logic's latest rows with both sides
+    # present (the explicit null guards state the report row rule).
+    paired_count = int(
+        db.scalar(
+            select(func.count())
+            .select_from(PairingTable)
+            .where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+                PairingTable.tumor_id.isnot(None),
+                PairingTable.normal_id.isnot(None),
+            )
+        )
+        or 0
+    )
     paired = exists(
         select(PairingTable.id).where(
             or_(
@@ -561,7 +580,7 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
     else:
         names = _logic_bait_set_names(db, logic)
         if not names:
-            return {"pairing_logic": logic.name, "unpaired": 0}
+            return {"pairing_logic": logic.name, "unpaired": 0, "paired": paired_count}
         stmt = select(func.count()).select_from(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
             func.upper(func.coalesce(Sample.sample_type, "")) != "DMP",
@@ -571,6 +590,7 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
     return {
         "pairing_logic": logic.name,
         "unpaired": int(db.scalar(stmt) or 0),
+        "paired": paired_count,
     }
 
 

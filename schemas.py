@@ -218,17 +218,21 @@ class EvaluateRead(BaseModel):
 
 
 class UnmatchedCountRead(BaseModel):
-    """Per-logic unpaired count (GET /pairing/unmatched-count/).
+    """Per-logic paired/unpaired counts (GET /pairing/unmatched-count/).
 
-    DMP: unpaired DMP samples (tumor or normal), mirroring GET
-    /pairing/unmatched/. Any other logic: the logic's unpaired tumor
-    population (the backfill scope).
+    ``paired``: the logic's latest report rows where both the tumor
+    and the normal sides are present — the server-side form of the
+    Pair Report's "Paired" strip value. ``unpaired``: DMP: unpaired
+    DMP samples (tumor or normal), mirroring GET /pairing/unmatched/.
+    Any other logic: the logic's unpaired tumor population (the
+    backfill scope).
     """
 
     model_config = ConfigDict(from_attributes=True)
 
     pairing_logic: str
     unpaired: int
+    paired: int
 
 
 class PossibleMatchCandidate(BaseModel):

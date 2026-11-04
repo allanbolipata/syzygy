@@ -3326,3 +3326,40 @@ def test_unmatched_count_endpoint(db):
 
     assert result["pairing_logic"] == "UC-EP"
     assert result["unpaired"] == 1
+
+
+def test_unmatched_count_paired_counts_latest_both_sides_rows(db):
+    """``paired`` counts this logic's latest report rows where both
+    sides are present — the Pair Report's ``r.tumor && r.normal`` rule.
+    The schema makes tumor_id/normal_id NOT NULL, so every row carries
+    both sides; the rule therefore selects exactly the logic's latest
+    rows. Stale rows and other logics' rows do not count."""
+    logic = _bait_logic(db, name="PC-L", bait="BAIT-PC")
+    # Two latest rows for this logic: both count toward paired.
+    t1 = _sample(db, "PC-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC1", bait_set="BAIT-PC")
+    n1 = _sample(db, "PC-N-1", patient__cmo="PATIENT-PC1", bait_set="BAIT-PC")
+    _make_pairing(db, t1, n1, logic)
+    t2 = _sample(db, "PC-T-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC2", bait_set="BAIT-PC")
+    n2 = _sample(db, "PC-N-2", patient__cmo="PATIENT-PC2", bait_set="BAIT-PC")
+    _make_pairing(db, t2, n2, logic)
+    # A stale (non-latest) both-sides row: not counted.
+    t3 = _sample(db, "PC-T-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC3", bait_set="BAIT-PC")
+    n3 = _sample(db, "PC-N-3", patient__cmo="PATIENT-PC3", bait_set="BAIT-PC")
+    _make_pairing(db, t3, n3, logic, latest=False)
+    # Another logic's latest row: not counted for this logic.
+    other = _bait_logic(db, name="PC-O", bait="BAIT-PCO")
+    t4 = _sample(db, "PC-T-4", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC4", bait_set="BAIT-PCO")
+    n4 = _sample(db, "PC-N-4", patient__cmo="PATIENT-PC4", bait_set="BAIT-PCO")
+    _make_pairing(db, t4, n4, other)
+
+    result = count_unpaired(db, "PC-L")
+
+    assert result["pairing_logic"] == "PC-L"
+    assert result["paired"] == 2
+    # Backward compatible: unpaired is still the logic's unpaired tumor
+    # population (t1 and t2 have latest rows; t3 has none).
+    assert result["unpaired"] == 1

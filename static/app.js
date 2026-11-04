@@ -1233,6 +1233,12 @@ const pairsState = {
   // export always cover the same set. Cleared on view enter/leave and on
   // logic change so a stale filter never carries into new rows.
   query: "",
+  // Server-sourced "Paired" count for the loaded logic (from
+  // /pairing/unmatched-count/): the logic's latest rows with both
+  // sides present. null until the count lands; #pr-count falls back
+  // to the in-memory rows meanwhile (and whenever a search filter
+  // narrows the table, which the server count doesn't cover).
+  pairedCount: null,
 };
 
 function isDmpLogic(logicName) {
@@ -1388,7 +1394,13 @@ function renderPairsTable() {
   pageInput.value = pairsState.page + 1;
   $("#pr-page-of").textContent = `of ${totalPages}`;
   pageInput.disabled = total === 0;
-  const matched = rows.filter((r) => r.tumor && r.normal).length;
+  // Matched: the server count (pairsState.pairedCount, from
+  // /pairing/unmatched-count/) once it has landed and no search filter
+  // narrows the table — until then, and while filtering, fall back to
+  // the in-memory rows.
+  const matched = !pairsState.query && pairsState.pairedCount != null
+    ? pairsState.pairedCount
+    : rows.filter((r) => r.tumor && r.normal).length;
   const empty = total === 0 || cols.length === 0;
   const emptyEl = $("#pr-empty");
   emptyEl.classList.toggle("hidden", !empty);
@@ -1447,6 +1459,8 @@ async function loadPairs() {
   const active = () => signal === pairsAbort.signal;
   const isDmp = isDmpLogic(logic);
   pairsState.logic = logic;
+  // The previous logic's server count is stale until the new one lands.
+  pairsState.pairedCount = null;
   // Clear any stale indicator a prior/superseded load left behind before this
   // load shows its own: the spinner is owned by the newest load only, so a load
   // that finished without hiding it can't keep it up once a newer load takes
@@ -1647,25 +1661,30 @@ function renderPrLogicExplainer() {
   el.innerHTML = explainer || `<p>${esc(logicName)}: no explainer available for this logic.</p>`;
 }
 
-/* Paired / Unpaired strip for the selected logic. Paired counts the
- * report rows with both sides (same rule as the DMP count line in
- * #pr-count); Unpaired comes from the per-logic unmatched-count endpoint. */
+/* Paired / Unpaired strip for the selected logic. Both numbers come
+ * from the per-logic unmatched-count endpoint: Paired = the logic's
+ * latest report rows with both sides present (same rule as the DMP
+ * count line in #pr-count), Unpaired = its unpaired population. */
 async function loadPrOverviewStats() {
   const el = $("#pr-overview-stats");
   const logic = activeLogicName();
   if (!el || !logic) return;
-  const paint = (unpairedHtml) => {
-    const paired = pairsState.rows.filter((r) => r.tumor && r.normal).length;
+  const paint = (pairedHtml, unpairedHtml) => {
     el.innerHTML =
-      `<span class="pr-stat">Paired <strong>${paired}</strong></span>` +
+      `<span class="pr-stat">Paired ${pairedHtml}</span>` +
       `<span class="pr-stat">Unpaired ${unpairedHtml}</span>`;
   };
-  paint("<strong>…</strong>");
+  paint("<strong>…</strong>", "<strong>…</strong>");
   try {
     const r = await api(`/pairing/unmatched-count/?pairing_logic_name=${encodeURIComponent(logic)}`);
-    if (activeLogicName() === logic) paint(`<strong>${r.unpaired}</strong>`);
+    if (activeLogicName() === logic) {
+      // The server count also drives #pr-count's "matched" figure.
+      pairsState.pairedCount = r.paired;
+      renderPairsTable();
+      paint(`<strong>${r.paired}</strong>`, `<strong>${r.unpaired}</strong>`);
+    }
   } catch (e) {
-    if (activeLogicName() === logic) paint("<strong>—</strong>");
+    if (activeLogicName() === logic) paint("<strong>—</strong>", "<strong>—</strong>");
   }
 }
 
