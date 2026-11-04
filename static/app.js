@@ -1228,16 +1228,15 @@ const pairsState = {
   // Server-side pagination: 0-based index of the page currently displayed.
   // Next/Prev/jump fetch the requested page from /pairing/report/ (see
   // loadReportPage) rather than slicing a full in-memory set. The download
-  // covers the current page, not the whole set.
+  // is server-side too (GET /pairing/export/) and covers the FULL searched
+  // set, not just the current page.
   page: 0,
   pageSize: 50,
-  // View-scoped search (#pr-search): lowercased substring matched
-  // client-side against the loaded rows (no server round-trip). With
-  // server-side pagination this filters the current page, not the full set
-  // (T5 moves search to the server). Applied in renderPairsTable() and
-  // downloadPairs() so the table and the export always cover the same set.
-  // Cleared on view enter/leave and on logic change so a stale filter never
-  // carries into new rows.
+  // View-scoped search (#pr-search): sent to the server as the q param on
+  // GET /pairing/report/ (and /pairing/export/), so it filters the FULL
+  // merged list, not just the loaded page. Stored trimmed + lowercased
+  // (the form the server matches in). Cleared on view enter/leave and on
+  // logic change so a stale filter never carries into new rows.
   query: "",
   // Server-sourced "Paired" count for the loaded logic (from
   // /pairing/unmatched-count/): the logic's latest rows with both
@@ -1324,15 +1323,6 @@ function renderPrGroups() {
   }
 }
 
-/* Rows visible in the Pair Report table. Free-text search is
- * server-side (the `q` param on GET /pairing/report/), so the current
- * server page IS the searched set and is rendered as-is. Shared by
- * renderPairsTable() and downloadPairs() so the export covers exactly
- * what the table shows. */
-function visiblePairRows() {
-  return pairsState.rows;
-}
-
 /* Clickable identifier cells in the pair table. A column model may
  * declare an optional ``link`` that resolves a row to a navigation
  * target: a sample (its Matches & Overrides page), a patient (the
@@ -1364,10 +1354,9 @@ function renderPairsTable() {
   ).join("")}</tr>`;
   // The browser holds only the current server page (pairsState.rows); the
   // page indicator and the row count come from the server total
-  // (pairsState.total). A search filter narrows the current page (interim —
-  // T5 moves search to the server).
-  const full = pairsState.rows.length;
-  const rows = visiblePairRows();
+  // (pairsState.total). A search query filters the FULL merged list
+  // server-side (the q param), so rows is already the searched set.
+  const rows = pairsState.rows;
   const total = pairsState.total;
   const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
   const start = pairsState.page * pairsState.pageSize;
@@ -1394,17 +1383,15 @@ function renderPairsTable() {
   const emptyEl = $("#pr-empty");
   emptyEl.classList.toggle("hidden", !empty);
   emptyEl.textContent =
-    pairsState.query && full > 0 ? "No pairs match this search." : "No current pairs for this logic.";
-  const filteredNote = pairsState.query && rows.length !== full
-    ? ` (search: ${rows.length} of ${full} on this page)` : "";
+    pairsState.query ? "No pairs match this search." : "No current pairs for this logic.";
   const paging = total > pairsState.pageSize
     ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${Math.min(start + pairsState.pageSize, total)} of ${total})`
     : "";
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
     : dmp
-      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${filteredNote}${paging}`
-      : `${total} pair${total === 1 ? "" : "s"}${filteredNote}${paging}`;
+      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${paging}`
+      : `${total} pair${total === 1 ? "" : "s"}${paging}`;
   $("#pr-download").disabled = empty;
   // Legend (and header tooltips) only for the legacy DMP column set.
   $("#pr-legend").classList.toggle("hidden", !dmp);
