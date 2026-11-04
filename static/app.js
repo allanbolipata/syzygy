@@ -1447,6 +1447,11 @@ async function loadPairs() {
   const active = () => signal === pairsAbort.signal;
   const isDmp = isDmpLogic(logic);
   pairsState.logic = logic;
+  // Clear any stale indicator a prior/superseded load left behind before this
+  // load shows its own: the spinner is owned by the newest load only, so a load
+  // that finished without hiding it can't keep it up once a newer load takes
+  // over.
+  hidePrLoading();
   try {
     // Start the (large, DMP-only) unmatched-set fetch in parallel with the
     // smaller paired-rows fetch; the two queries are independent. Paint the
@@ -1456,38 +1461,56 @@ async function loadPairs() {
       ? api(`/pairing/unmatched/?${new URLSearchParams({ pairing_logic_name: logic })}`, { signal })
       : null;
     if (unmatchedPromise) unmatchedPromise.catch(() => {}); // no unhandled rejection if we bail early
+
+    // Paired rows: show, fetch, paint page 1, then turn the spinner off.
     if (active()) showPrLoading("Loading pairs…");
-    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`, { signal });
+    try {
+      pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`, { signal });
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // superseded by a newer load
+      // Paired rows failed: cancel the in-flight unmatched fetch (it shares this
+      // signal) so we don't leave a large DMP query running for nothing, then
+      // report the failure.
+      pairsAbort.abort();
+      hidePrLoading();
+      banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      return;
+    }
     pairsState.page = 0;
     renderPrGroups();
     renderPairsTable(); // page 1 (paired rows) is on screen now
-  } catch (e) {
-    if (e && e.name === "AbortError") return; // superseded by a newer load
-    // Paired rows failed: cancel the in-flight unmatched fetch (it shares this
-    // signal) so we don't leave a large DMP query running for nothing, then
-    // report the failure.
-    pairsAbort.abort();
-    hidePrLoading();
-    banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
-    return;
-  }
-  if (unmatchedPromise) {
-    try {
+    // The paired rows are on screen — the report no longer looks frozen, so the
+    // "Loading pairs…" indicator is done. Hide it here (not only at the very
+    // end) so a stall after the paint can't strand it; the unmatched phase
+    // below shows its own spinner if it runs.
+    if (active()) hidePrLoading();
+
+    // DMP unmatched rows: show, resolve the parallel fetch, append.
+    if (unmatchedPromise) {
       if (active()) showPrLoading("Loading unmatched samples…");
-      const unmatched = await unmatchedPromise;
-      // Only the active load may mutate shared state: a superseded load's
-      // stale DMP set must not be appended to the newer load's rows.
-      if (active()) {
-        appendUnmatchedDmpRows(unmatched);
-        renderPairsTable(); // counts + unmatched rows fill in
+      try {
+        const unmatched = await unmatchedPromise;
+        // Only the active load may mutate shared state: a superseded load's
+        // stale DMP set must not be appended to the newer load's rows.
+        if (active()) {
+          appendUnmatchedDmpRows(unmatched);
+          renderPairsTable(); // counts + unmatched rows fill in
+        }
+      } catch (e) {
+        if (e && e.name !== "AbortError") banner("error", `Failed to load unmatched samples: ${esc(e.message)}`, true);
+      } finally {
+        // The unmatched phase is over (resolved, errored, or superseded).
+        if (active()) hidePrLoading();
       }
-    } catch (e) {
-      if (e && e.name !== "AbortError") banner("error", `Failed to load unmatched samples: ${esc(e.message)}`, true);
     }
-  }
-  if (active()) {
-    hidePrLoading();
-    loadPrOverviewStats();
+
+    if (active()) loadPrOverviewStats();
+  } finally {
+    // Invariant: whenever THIS load is still the newest, its spinner is hidden
+    // no matter how the body exited — normal completion, a fetch error, or a
+    // superseded early return. This backstop guarantees the "Loading pairs…" /
+    // "Loading unmatched samples…" indicators can never strand.
+    if (active()) hidePrLoading();
   }
 }
 
