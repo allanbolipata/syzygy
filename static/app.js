@@ -1418,23 +1418,76 @@ function renderPairsTable() {
  * server. */
 let pairsAbort = null;
 
+/* Pair Report load indicator (#pr-loading in the toolbar). Shown while the
+ * paired rows and, for DMP, the large unmatched set are in flight so a big
+ * load doesn't look frozen. Callers guard it with the is-active check so a
+ * superseded load never hides the spinner the newer load is showing. */
+function showPrLoading(text) {
+  const el = $("#pr-loading");
+  if (!el) return;
+  const label = el.querySelector(".pr-loading-text");
+  if (label) label.textContent = text;
+  el.classList.remove("hidden");
+}
+function hidePrLoading() {
+  const el = $("#pr-loading");
+  if (el) el.classList.add("hidden");
+}
+
 async function loadPairs() {
   const logic = $("#pr-logic").value;
   if (!logic) return;
   if (pairsAbort) pairsAbort.abort();
   pairsAbort = new AbortController();
   const signal = pairsAbort.signal;
+  // True only while THIS load is the active one. A newer load replaces
+  // pairsAbort (and thus owns the loading indicator + overview stats) and
+  // aborts this load's signal, so a stale load must not repaint or clear the
+  // spinner the newer load is showing.
+  const active = () => signal === pairsAbort.signal;
+  const isDmp = isDmpLogic(logic);
+  pairsState.logic = logic;
   try {
-    pairsState.logic = logic;
+    // Start the (large, DMP-only) unmatched-set fetch in parallel with the
+    // smaller paired-rows fetch; the two queries are independent. Paint the
+    // paired rows as soon as they land so page 1 appears without waiting for
+    // the whole DMP population to transfer.
+    const unmatchedPromise = isDmp
+      ? api(`/pairing/unmatched/?${new URLSearchParams({ pairing_logic_name: logic })}`, { signal })
+      : null;
+    if (unmatchedPromise) unmatchedPromise.catch(() => {}); // no unhandled rejection if we bail early
+    if (active()) showPrLoading("Loading pairs…");
     pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`, { signal });
-    if (isDmpLogic(logic)) await appendUnmatchedDmpSamples(signal);
     pairsState.page = 0;
     renderPrGroups();
-    renderPairsTable();
-    loadPrOverviewStats();
+    renderPairsTable(); // page 1 (paired rows) is on screen now
   } catch (e) {
     if (e && e.name === "AbortError") return; // superseded by a newer load
+    // Paired rows failed: cancel the in-flight unmatched fetch (it shares this
+    // signal) so we don't leave a large DMP query running for nothing, then
+    // report the failure.
+    pairsAbort.abort();
+    hidePrLoading();
     banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+    return;
+  }
+  if (unmatchedPromise) {
+    try {
+      if (active()) showPrLoading("Loading unmatched samples…");
+      const unmatched = await unmatchedPromise;
+      // Only the active load may mutate shared state: a superseded load's
+      // stale DMP set must not be appended to the newer load's rows.
+      if (active()) {
+        appendUnmatchedDmpRows(unmatched);
+        renderPairsTable(); // counts + unmatched rows fill in
+      }
+    } catch (e) {
+      if (e && e.name !== "AbortError") banner("error", `Failed to load unmatched samples: ${esc(e.message)}`, true);
+    }
+  }
+  if (active()) {
+    hidePrLoading();
+    loadPrOverviewStats();
   }
 }
 
@@ -1442,12 +1495,9 @@ async function loadPairs() {
  * without a pairing yet are appended as rows with the opposite-side
  * columns left empty. The unmatched set is computed server-side (one
  * query) — the old client-side diff had to download the entire DMP
- * sample population in pages of 1000. */
-async function appendUnmatchedDmpSamples(signal) {
-  const unmatched = await api(
-    `/pairing/unmatched/?${new URLSearchParams({ pairing_logic_name: pairsState.logic })}`,
-    { signal }
-  );
+ * sample population in pages of 1000. loadPairs() fetches this set in
+ * parallel with the paired rows and hands the result here. */
+function appendUnmatchedDmpRows(unmatched) {
   for (const s of unmatched) {
     pairsState.rows.push({
       tumor: s.tumor_or_normal === "TUMOR" ? s : null,
