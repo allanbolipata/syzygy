@@ -187,13 +187,59 @@ REPORT_DEFAULT_PAGE_SIZE = 50
 REPORT_MAX_PAGE_SIZE = 200
 
 
+# Sample fields the Pair Report free-text search (``q``) matches against —
+# the former client-side search fields (app.js PAIR_SEARCH_FIELDS). A row
+# matches when ANY of these is a case-insensitive substring match on
+# EITHER side (tumor or normal); a NULL side simply never matches, the
+# same as the client skipping null fields.
+REPORT_SEARCH_FIELDS = (
+    "patient__cmo",
+    "patient__dmp",
+    "cmo_sample_name",
+    "primary_id",
+    "bait_set",
+)
+
+
+def _search_pattern(q: str) -> str:
+    """ILIKE pattern for a LITERAL case-insensitive substring.
+
+    The client searched with ``String(value).toLowerCase().includes(q)`` —
+    a plain substring — so ``%`` and ``_`` in the query are ordinary
+    characters, not LIKE wildcards.
+    """
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _search_conds(entity, q: str) -> list:
+    """The five ILIKE conditions for one side (a Sample entity or alias)."""
+    pattern = _search_pattern(q)
+    return [
+        getattr(entity, field).ilike(pattern, escape="\\")
+        for field in REPORT_SEARCH_FIELDS
+    ]
+
+
+def _either_side_conds(tumor_alias, normal_alias, q: str):
+    """OR'd match on any search field of EITHER side.
+
+    Each side's conditions reference its own aliased Sample so the two
+    sides never collide in one WHERE clause; columns of a NULL side
+    compare to NULL (no match), exactly like the old client-side filter.
+    """
+    return or_(*_search_conds(tumor_alias, q), *_search_conds(normal_alias, q))
+
+
 def _report_paired_page(
-    db: Session, logic: PairingLogic, offset: int, limit: int
+    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None
 ) -> list[PairingTable]:
     """One slice of the logic's latest paired rows, in report order.
 
     Same predicate and ordering as ``GET /pairing/`` (latest rows,
     ``created_date desc, id desc``) so page boundaries are stable.
+    With ``q``, the slice is restricted to rows the query matches on
+    either side (NULL sides never match — the client-side semantics).
     """
     stmt = (
         select(PairingTable)
@@ -210,16 +256,61 @@ def _report_paired_page(
         .offset(offset)
         .limit(limit)
     )
+    if q is not None:
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        stmt = stmt.join(
+            tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True
+        )
+        stmt = stmt.join(
+            normal_alias, PairingTable.normal_id == normal_alias.id, isouter=True
+        )
+        stmt = stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
     return list(db.scalars(stmt).all())
 
 
+def _report_paired_total(
+    db: Session, logic: PairingLogic, q: str
+) -> int:
+    """SQL COUNT of the logic's latest paired rows matching the query.
+
+    Same predicate as ``_report_paired_page`` with ``q``, so the count
+    and the served pages always cover the same filtered set.
+    """
+    tumor_alias = aliased(Sample)
+    normal_alias = aliased(Sample)
+    return int(
+        db.scalar(
+            select(func.count(PairingTable.id))
+            .select_from(PairingTable)
+            .join(
+                tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True
+            )
+            .join(
+                normal_alias,
+                PairingTable.normal_id == normal_alias.id,
+                isouter=True,
+            )
+            .where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+                _either_side_conds(tumor_alias, normal_alias, q),
+            )
+        )
+        or 0
+    )
+
+
 def _report_unmatched_page(
-    db: Session, logic: PairingLogic, offset: int, limit: int
+    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None
 ) -> list[Sample]:
     """One slice of the unmatched DMP rows, in report order.
 
     Same predicate and ordering as ``GET /pairing/unmatched/``: DMP samples
     with no latest pairing under the logic, ``created_date desc, id desc``.
+    With ``q``, restricted to samples any report search field matches —
+    an unmatched row carries the sample on one side only (the other side
+    is null), so the "either side" search reduces to its own fields.
     """
     paired = exists(
         select(PairingTable.id).where(
@@ -238,17 +329,22 @@ def _report_unmatched_page(
         .offset(offset)
         .limit(limit)
     )
+    if q is not None:
+        stmt = stmt.where(or_(*_search_conds(Sample, q)))
     return list(db.scalars(stmt).all())
 
 
-def _report_unmatched_total(db: Session, logic: PairingLogic) -> int:
+def _report_unmatched_total(
+    db: Session, logic: PairingLogic, q: Optional[str] = None
+) -> int:
     """SQL COUNT of the unmatched DMP rows for the logic.
 
     Uses the exact ``~paired`` predicate that ``_report_unmatched_page``
     serves rows with, so the count equals the number of rows the endpoint
     would actually return (DMP samples with no latest pairing under the
     logic). Unlike ``count_unpaired``'s ``unpaired``, this never falls back
-    to a total-minus-paired estimate, so ``total`` stays exact.
+    to a total-minus-paired estimate, so ``total`` stays exact. With ``q``,
+    narrowed to the same search the page rows are filtered by.
     """
     paired = exists(
         select(PairingTable.id).where(
@@ -260,14 +356,10 @@ def _report_unmatched_total(db: Session, logic: PairingLogic) -> int:
             PairingTable.pairing_logic_id == logic.id,
         )
     )
-    return (
-        db.scalar(
-            select(func.count(Sample.id)).where(
-                Sample.sample_type == "DMP", ~paired
-            )
-        )
-        or 0
-    )
+    stmt = select(func.count(Sample.id)).where(Sample.sample_type == "DMP", ~paired)
+    if q is not None:
+        stmt = stmt.where(or_(*_search_conds(Sample, q)))
+    return db.scalar(stmt) or 0
 
 
 def _paired_row(p: PairingTable) -> PairingReportRowRead:
@@ -303,6 +395,16 @@ def pairing_report(
         description="Rows per page (clamped to at most 200).",
     ),
     db: Session = Depends(get_db),
+    q: Optional[str] = Query(
+        None,
+        description=(
+            "Free-text search: case-insensitive substring matched against "
+            "the report's search fields (patient CMO, DMP patient, sample "
+            "name, primary ID, bait set) on either side of a row. Filters "
+            "the FULL merged list; total and pagination reflect the "
+            "filtered set."
+        ),
+    ),
 ):
     """One page of the merged Pair Report list for the logic.
 
@@ -314,6 +416,11 @@ def pairing_report(
     with a SQL COUNT (never materializing the whole unmatched set in memory),
     so the client can compute the page count.
 
+    With ``q`` (free-text search), both sections are restricted to rows the
+    query matches on either side — the server-side form of the former
+    client-side ``pairMatchesQuery`` — and ``total`` becomes the count of the
+    filtered list, so pages and counts reflect the search.
+
     ``page`` is 1-based; ``page_size`` defaults to 50 and is clamped to
     ``[1, 200]``. Ordering is stable and deterministic: paired rows are
     ordered by (created_date desc, id desc) — the ``GET /pairing/`` ordering
@@ -323,17 +430,26 @@ def pairing_report(
     logic = find_logic_by_name(db, pairing_logic_name)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
+    # Normalize q to the form the old client-side filter compared in
+    # (trimmed, lowercased); blank means "no filter", like the client's
+    # falsy-q branch.
+    if q is not None:
+        q = q.strip().lower() or None
 
     # paired section: the logic's latest rows with both sides present
-    # (count_unpaired's "paired" counts exactly these).
-    paired_total = count_unpaired(db, pairing_logic_name)["paired"]
+    # (count_unpaired's "paired" counts exactly these); with a query,
+    # count the matching subset instead.
+    if q is None:
+        paired_total = count_unpaired(db, pairing_logic_name)["paired"]
+    else:
+        paired_total = _report_paired_total(db, logic, q)
     # unmatched section (DMP logics only): count it with the SAME predicate
     # the rows are served with. We do NOT reuse count_unpaired's "unpaired"
     # here: for a bait-set-less DMP logic it falls back to
     # total-minus-paired, which can overcount and would make "total" drift
     # from the rows actually returned.
     if _is_dmp_strategy(logic):
-        unmatched_total = _report_unmatched_total(db, logic)
+        unmatched_total = _report_unmatched_total(db, logic, q)
     else:
         unmatched_total = 0
     total = paired_total + unmatched_total
@@ -348,14 +464,14 @@ def pairing_report(
     # the boundary; fetch the part of each section it covers.
     if offset < paired_total:
         take = min(limit, paired_total - offset)
-        for p in _report_paired_page(db, logic, offset, take):
+        for p in _report_paired_page(db, logic, offset, take, q=q):
             rows.append(_paired_row(p))
     remaining = limit - len(rows)
     if remaining > 0 and unmatched_total > 0:
         # The slice has reached the unmatched section; its local offset is
         # 0 when the slice started inside the paired section.
         unmatched_offset = max(0, offset - paired_total)
-        for s in _report_unmatched_page(db, logic, unmatched_offset, remaining):
+        for s in _report_unmatched_page(db, logic, unmatched_offset, remaining, q=q):
             rows.append(_unmatched_row(s, logic))
 
     return PairingReportRead(rows=rows, total=total)

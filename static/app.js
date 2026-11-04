@@ -1324,31 +1324,13 @@ function renderPrGroups() {
   }
 }
 
-/* View-scoped search (#pr-search): the lowercased query matches a row when
- * ANY searchable field on EITHER side contains it (case-insensitive).
- * Unpaired rows (one side null, e.g. appended DMP samples) are searched on
- * the side that is present. */
-const PAIR_SEARCH_FIELDS = ["patient__cmo", "patient__dmp", "cmo_sample_name", "primary_id", "bait_set"];
-
-function pairMatchesQuery(r, q) {
-  for (const side of [r.tumor, r.normal]) {
-    if (!side) continue;
-    for (const f of PAIR_SEARCH_FIELDS) {
-      const v = side[f];
-      if (v !== null && v !== undefined && String(v).toLowerCase().includes(q)) return true;
-    }
-  }
-  return false;
-}
-
-/* Rows visible under the active search query (all loaded rows when there is
- * no query). pairsState.rows holds the current server page only, so a search
- * filters that page (interim — T5 moves search to the server). Shared by
- * renderPairsTable() and downloadPairs() so the export covers exactly what
- * the table shows. */
+/* Rows visible in the Pair Report table. Free-text search is
+ * server-side (the `q` param on GET /pairing/report/), so the current
+ * server page IS the searched set and is rendered as-is. Shared by
+ * renderPairsTable() and downloadPairs() so the export covers exactly
+ * what the table shows. */
 function visiblePairRows() {
-  const q = pairsState.query;
-  return q ? pairsState.rows.filter((r) => pairMatchesQuery(r, q)) : pairsState.rows;
+  return pairsState.rows;
 }
 
 /* Clickable identifier cells in the pair table. A column model may
@@ -1454,6 +1436,20 @@ function hidePrLoading() {
   if (el) el.classList.add("hidden");
 }
 
+/* URLSearchParams for GET /pairing/report/: the 1-based page and size,
+ * plus the active free-text search query (trimmed + lowercased, the
+ * form the server matches in; omitted when empty). One helper so the
+ * page fetch and the next-page prefetch always send identical params. */
+function reportPageParams(logic, page, pageSize) {
+  const params = new URLSearchParams({
+    pairing_logic_name: logic,
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  return params;
+}
 async function loadReportPage(page) {
   const logic = pairsState.logic;
   if (!logic) return;
@@ -1478,11 +1474,7 @@ async function loadReportPage(page) {
     try {
       data = await consumePrPrefetch(page);
       if (!data) {
-        data = await api(`/pairing/report/?${new URLSearchParams({
-          pairing_logic_name: logic,
-          page: String(page + 1),
-          page_size: String(pairsState.pageSize),
-        })}`, { signal });
+        data = await api(`/pairing/report/?${reportPageParams(logic, page + 1, pairsState.pageSize)}`, { signal });
       }
     } catch (e) {
       if (e && e.name !== "AbortError") {
@@ -1548,11 +1540,7 @@ function prefetchNextPrPage(page) {
   invalidatePrPrefetch();
   const ctrl = new AbortController();
   const entry = { key, page: next, abort: ctrl, data: null, promise: null };
-  entry.promise = api(`/pairing/report/?${new URLSearchParams({
-    pairing_logic_name: pairsState.logic,
-    page: String(next + 1),
-    page_size: String(pairsState.pageSize),
-  })}`, { signal: ctrl.signal })
+  entry.promise = api(`/pairing/report/?${reportPageParams(pairsState.logic, next + 1, pairsState.pageSize)}`, { signal: ctrl.signal })
     .then((data) => {
       if (prPrefetch === entry) entry.data = data; // else superseded: drop
       return data;
@@ -1765,18 +1753,21 @@ function resetPrSearch() {
     invalidatePrPrefetch();
   }
 }
-/* View-scoped search: filter the current page client-side as the user types
- * (no server round-trip). Interim behavior — with server-side pagination the
- * query narrows the loaded page, not the full set; T5 moves search to the
- * server. Debounced so typing doesn't re-render on every keystroke. */
+/* View-scoped search: send the query to the server (GET /pairing/report/?q=)
+ * so it filters the FULL merged list, not just the loaded page. Debounced so
+ * typing doesn't issue a request per keystroke. A new/changed query resets
+ * to page 1 and refetches; #pr-count / #pr-page-of then reflect the server's
+ * filtered total (the same renderPairsTable path as any page fetch). */
 let prSearchTimer = null;
 $("#pr-search").addEventListener("input", () => {
   clearTimeout(prSearchTimer);
   prSearchTimer = setTimeout(() => {
-    pairsState.query = $("#pr-search").value.trim().toLowerCase();
+    const q = $("#pr-search").value.trim().toLowerCase();
+    if (q === pairsState.query) return; // unchanged: nothing to refetch
+    pairsState.query = q;
     invalidatePrPrefetch(); // cached prefetch was fetched for the old query
-    renderPairsTable();
-  }, 150);
+    loadReportPage(0); // server-side search starts at page 1
+  }, 250);
 });
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
 $("#pr-groups").addEventListener("change", (e) => {
