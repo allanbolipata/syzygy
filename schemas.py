@@ -235,6 +235,48 @@ class UnmatchedCountRead(BaseModel):
     paired: int
 
 
+class PairingReportRowRead(BaseModel):
+    """One row of the merged Pair Report list (``GET /pairing/report/``).
+
+    A paired row carries the pairing's identity (``id``, ``pairing_logic_id``,
+    ``tumor_id``, ``normal_id``) and both sides. An unmatched DMP row (DMP
+    logics only) carries the sample on its natural side (``tumor`` if the
+    sample is TUMOR, otherwise ``normal``), leaves the other side null, and
+    carries no pairing identity at all — mirroring the frontend
+    ``appendUnmatchedDmpRows`` field mapping.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: Optional[UUID] = None
+    pairing_logic_id: Optional[UUID] = None
+    pairing_logic: str
+    tumor_id: Optional[UUID] = None
+    normal_id: Optional[UUID] = None
+    tumor: Optional[SampleRead] = None
+    normal: Optional[SampleRead] = None
+    trigger_type: Optional[str] = None
+    mismatched_keys: Optional[list[str]] = None
+    notes: Optional[list[str]] = None
+    created_date: datetime
+    modified_date: Optional[datetime] = None
+    latest: Optional[bool] = None
+
+
+class PairingReportRead(BaseModel):
+    """One page of the merged Pair Report list (``GET /pairing/report/``).
+
+    ``rows`` is the requested page (at most ``page_size`` items) of the
+    logic's merged report — its latest paired rows, followed by (DMP logics
+    only) the unmatched DMP samples rendered as rows. ``total`` is the count
+    of the full merged list, so the client can page without fetching the
+    whole thing.
+    """
+
+    rows: list[PairingReportRowRead]
+    total: int
+
+
 class PossibleMatchCandidate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

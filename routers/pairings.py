@@ -11,12 +11,13 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
+    _is_dmp_strategy,
     count_unpaired,
     evaluate_logic,
     find_logic_by_name,
@@ -30,6 +31,8 @@ from schemas import (
     DmpTriggerRead,
     EvaluateRead,
     PairingRead,
+    PairingReportRead,
+    PairingReportRowRead,
     PairingTriggerCreate,
     SampleRead,
     TumorOrNormal,
@@ -175,6 +178,187 @@ def list_unmatched_dmp_samples(
     if offset is not None:
         stmt = stmt.offset(offset)
     return db.scalars(stmt).all()
+
+
+# Pair Report server-side pagination. Default page size matches the
+# client's previous page size; the max clamps a single response so a
+# client can't request an unbounded page.
+REPORT_DEFAULT_PAGE_SIZE = 50
+REPORT_MAX_PAGE_SIZE = 200
+
+
+def _report_paired_page(
+    db: Session, logic: PairingLogic, offset: int, limit: int
+) -> list[PairingTable]:
+    """One slice of the logic's latest paired rows, in report order.
+
+    Same predicate and ordering as ``GET /pairing/`` (latest rows,
+    ``created_date desc, id desc``) so page boundaries are stable.
+    """
+    stmt = (
+        select(PairingTable)
+        .options(
+            joinedload(PairingTable.tumor),
+            joinedload(PairingTable.normal),
+            joinedload(PairingTable.pairing_logic_obj),
+        )
+        .where(
+            PairingTable.pairing_logic_id == logic.id,
+            PairingTable.latest.is_(True),
+        )
+        .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(db.scalars(stmt).all())
+
+
+def _report_unmatched_page(
+    db: Session, logic: PairingLogic, offset: int, limit: int
+) -> list[Sample]:
+    """One slice of the unmatched DMP rows, in report order.
+
+    Same predicate and ordering as ``GET /pairing/unmatched/``: DMP samples
+    with no latest pairing under the logic, ``created_date desc, id desc``.
+    """
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    stmt = (
+        select(Sample)
+        .where(Sample.sample_type == "DMP", ~paired)
+        .order_by(Sample.created_date.desc(), Sample.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(db.scalars(stmt).all())
+
+
+def _report_unmatched_total(db: Session, logic: PairingLogic) -> int:
+    """SQL COUNT of the unmatched DMP rows for the logic.
+
+    Uses the exact ``~paired`` predicate that ``_report_unmatched_page``
+    serves rows with, so the count equals the number of rows the endpoint
+    would actually return (DMP samples with no latest pairing under the
+    logic). Unlike ``count_unpaired``'s ``unpaired``, this never falls back
+    to a total-minus-paired estimate, so ``total`` stays exact.
+    """
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    return (
+        db.scalar(
+            select(func.count(Sample.id)).where(
+                Sample.sample_type == "DMP", ~paired
+            )
+        )
+        or 0
+    )
+
+
+def _paired_row(p: PairingTable) -> PairingReportRowRead:
+    """Map a latest pairing row to a report row (both sides present)."""
+    return PairingReportRowRead.model_validate(p)
+
+
+def _unmatched_row(s: Sample, logic: PairingLogic) -> PairingReportRowRead:
+    """Map an unmatched DMP sample to a report row.
+
+    Mirrors the frontend ``appendUnmatchedDmpRows``: the sample goes on its
+    natural side (``tumor`` if TUMOR, else ``normal``), the other side is
+    null, ``mismatched_keys`` is an empty list, and no pairing identity is
+    set.
+    """
+    is_tumor = s.tumor_or_normal == TumorOrNormal.TUMOR.value
+    return PairingReportRowRead(
+        pairing_logic=logic.name,
+        tumor=s if is_tumor else None,
+        normal=None if is_tumor else s,
+        mismatched_keys=[],
+        created_date=s.created_date,
+    )
+
+
+@router.get("/report/", response_model=PairingReportRead)
+def pairing_report(
+    pairing_logic_name: str,
+    page: int = Query(1, ge=1, description="1-based page number."),
+    page_size: int = Query(
+        REPORT_DEFAULT_PAGE_SIZE,
+        ge=1,
+        description="Rows per page (clamped to at most 200).",
+    ),
+    db: Session = Depends(get_db),
+):
+    """One page of the merged Pair Report list for the logic.
+
+    Returns ``{"rows": [...], "total": int}``. The merged list is the
+    logic's latest paired rows (both sides present), followed by — DMP
+    logics only — the unmatched DMP samples rendered as rows with the sample
+    on its natural side (``tumor`` if TUMOR, otherwise ``normal``) and the
+    other side null. ``total`` is the count of the FULL merged list, computed
+    with a SQL COUNT (never materializing the whole unmatched set in memory),
+    so the client can compute the page count.
+
+    ``page`` is 1-based; ``page_size`` defaults to 50 and is clamped to
+    ``[1, 200]``. Ordering is stable and deterministic: paired rows are
+    ordered by (created_date desc, id desc) — the ``GET /pairing/`` ordering
+    — then unmatched DMP rows by (created_date desc, id desc), so page
+    boundaries never shift between repeated requests for the same logic.
+    """
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+
+    # paired section: the logic's latest rows with both sides present
+    # (count_unpaired's "paired" counts exactly these).
+    paired_total = count_unpaired(db, pairing_logic_name)["paired"]
+    # unmatched section (DMP logics only): count it with the SAME predicate
+    # the rows are served with. We do NOT reuse count_unpaired's "unpaired"
+    # here: for a bait-set-less DMP logic it falls back to
+    # total-minus-paired, which can overcount and would make "total" drift
+    # from the rows actually returned.
+    if _is_dmp_strategy(logic):
+        unmatched_total = _report_unmatched_total(db, logic)
+    else:
+        unmatched_total = 0
+    total = paired_total + unmatched_total
+
+    offset = (page - 1) * page_size
+    limit = min(page_size, REPORT_MAX_PAGE_SIZE)
+
+    rows: list[PairingReportRowRead] = []
+    # The merged list is [paired rows [0, paired_total)) followed by
+    # [unmatched rows [paired_total, total)). The requested slice
+    # [offset, offset + limit) falls entirely within one section or straddles
+    # the boundary; fetch the part of each section it covers.
+    if offset < paired_total:
+        take = min(limit, paired_total - offset)
+        for p in _report_paired_page(db, logic, offset, take):
+            rows.append(_paired_row(p))
+    remaining = limit - len(rows)
+    if remaining > 0 and unmatched_total > 0:
+        # The slice has reached the unmatched section; its local offset is
+        # 0 when the slice started inside the paired section.
+        unmatched_offset = max(0, offset - paired_total)
+        for s in _report_unmatched_page(db, logic, unmatched_offset, remaining):
+            rows.append(_unmatched_row(s, logic))
+
+    return PairingReportRead(rows=rows, total=total)
 
 
 @router.post("/trigger", response_model=PairingRead)
