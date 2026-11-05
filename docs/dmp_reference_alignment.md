@@ -177,6 +177,15 @@ three count lines. All are computed from the final 15-column frame, with
 - `# of unmatched tumors:` = **row count of rows with
   `tumor_matched != "Matched"`** (computed over all rows).
 
+**5/8 implementation note (response contract).** `GET /pairing/report/`
+for DMP logics adds `summary: {patients, tn_pairs, unmatched_tumors}`
+(ints, keys renamed from the log labels) and `warnings` (section e),
+computed over the **full** 15-column pair frame — latest paired rows
+then unmatched DMP tumor rows, the same cells the DMP export renders —
+so they are **independent of the requested page and of the `q` search**
+(`q` filters rows only). Non-DMP logics leave both fields `null`
+(existing contract unchanged).
+
 ---
 
 ## e. The 5 QC warnings
@@ -217,6 +226,29 @@ Additional notes:
 - The log line for warning 2 reads `# of patients with multiple normals for a
   given tumor:` but the counted unit is distinct `tumor_bamname` values
   (label as implemented; formula as in the table).
+
+**5/8 implementation notes (response contract).**
+- `GET /pairing/report/` for DMP logics adds
+  `warnings: {matched_tumors_without_normal,
+  tumor_samples_with_multiple_ambiguous_normals, samples_with_bams_missing,
+  low_coverage_tumors, low_coverage_normals}` — one list per bucket of the
+  affected samples' `primary_id`s (the sample names the reference files
+  would list: the tumor side, plus the normal side where the reference
+  writes both columns).
+- **Empty buckets are present as empty lists** — the reference writes a
+  file only when non-empty, but the response shape is fixed (the 6/8
+  frontend renders all five buckets unconditionally).
+- Bucket lists are in **pair-frame order** (latest paired rows
+  created-desc, then unmatched rows created-desc), with each affected
+  sample listed **once** (first occurrence). The reference files are the
+  flagged ROWS written verbatim (no `unique()`), so a sample appearing on
+  several flagged rows is repeated there; the response shape is a sample
+  list, so it dedupes.
+- Warning 2 in syzygy: pairing rows are unique per (tumor record,
+  logic), so "a tumor_bamname on >1 row" arises from **multiple tumor
+  records sharing the same `tumor_bamname`** (e.g. duplicated DMP tumor
+  records), not from one record fanned out. The formula (count over
+  matched rows, list over all rows) is unchanged.
 
 ---
 
@@ -321,15 +353,19 @@ contract the syzygy analogues are: `patient` = `patient__dmp`,
 tumor/normal split (`tumor_or_normal`); this section fixes only the column
 names and derivations that the strategy and report consume.
 
-### 5/8 flag (summary counts)
+### 5/8 flag (summary counts) — resolved by 5/8
 
 The reference summary counts (d) consume `tumor_matched == "Matched"` —
 the DMP-program `matched_tag`, which is **absent from real syzygy records**.
-5/8 must therefore compute the counts from the **pairing-derived** match
-status produced by 3/8 (matched = tumor row has ≥1 normal after both
-tiers; unmatched-tumor count = tumor rows with no normal), not from any
-stored field. Flagged for stakeholder review before 5/8 finalizes the
-summary counts.
+5/8 consumes the final `tumor_matched` cell of the pair frame as 4/8
+defines it — an explicit record `matched_tag` when present, else the
+**pairing-derived** status (matched = the row has a normal; unmatched-tumor
+rows = no normal). In practice, since no real record carries a
+`matched_tag` today, the counts are computed from the pairing-derived
+status; an explicit tag, when the DMP program ever supplies one, takes
+precedence (the reference consumes `tumor_matched` as-is, so both halves
+are reference-faithful). The stakeholder-review flag on real
+`matched_tag` values remains open for 7/8 conformance.
 
 ---
 
