@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     dev_auth_token: str = ""
     dev_auth_email: str = "dev-admin@syzygy.local"
 
+    # Optional read-only beagle DB (the restored beagle dump — local data,
+    # never in production) used ONLY to resolve the DMP pair file's
+    # bam_exists column (docs/dmp_reference_alignment.md section f, the
+    # sanctioned deviation from the reference's BAM-mirror scan): a
+    # sample's file record with a non-empty path -> 1, else 0. Unset or
+    # unreachable -> bam_exists 0 (unresolvable -> 0).
+    beagle_database_url: Optional[str] = None
+
     # NATS ingest (internal endpoint used by the standalone smile-listener;
     # the app itself never connects to NATS). Fail-closed: an empty token
     # (the default) DISABLES the endpoint — every request is rejected 403.

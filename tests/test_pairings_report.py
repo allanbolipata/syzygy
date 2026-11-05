@@ -1,13 +1,12 @@
 """Tests for the server-side Pair Report endpoint (GET /pairing/report/).
 
 The endpoint returns one page of the *merged* report list (paired rows,
-then — for DMP logics — the unmatched DMP samples rendered as
-one-sided rows) plus the full-list ``total`` computed in SQL. The
-frontend used to build this merge client-side (app.js
-``appendUnmatchedDmpRows``): the unmatched DMP sample fills its natural
-side (TUMOR -> tumor, NORMAL -> normal) and the opposite side is null.
-These tests pin the total, page boundaries, the DMP vs non-DMP split,
-and stable ordering.
+then — for DMP logics — the unmatched DMP TUMORS rendered as one-sided
+rows: the reference pair file is tumor-driven, so unpaired DMP normals
+never appear) plus the full-list ``total`` computed in SQL. The frontend
+used to build this merge client-side (app.js ``appendUnmatchedDmpRows``).
+These tests pin the total, page boundaries, the DMP vs non-DMP split, and
+stable ordering.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -84,12 +83,42 @@ def _logic(db, name, strategy_name):
     return logic
 
 
-def _pairing(db, logic, tumor, normal, created):
+# The reference's 15-column pair file, names and order verbatim (spec c;
+# bam-mirror-tools/scripts/pair_tumor_with_normal.R write.table).
+DMP_REF_PAIR_COLUMNS = [
+    "tumor_sample", "patient", "tumor_idx", "tumor_IM_ver", "tumor_bamname",
+    "tumor_group", "tumor_matched", "tumor_bam_exists", "tumor_bam_coverage",
+    "normal_sample", "normal_bamname", "normal_IM_ver", "pool_id",
+    "normal_bam_exists", "normal_bam_coverage",
+]
+
+
+def _dmp_sample(db, primary_id, tumor, created, patient_dmp=None, anon_id=None, meta=None):
+    """A DMP sample carrying the reference-format fields the 4/8 value
+    tests exercise (patient__dmp, anon_id, additional_metadata)."""
+    s = Sample(
+        primary_id=primary_id,
+        cmo_sample_name=f"CMO_{primary_id}",
+        gene_panel="AC1",
+        sample_type="DMP",
+        tumor_or_normal=tumor,
+        patient__dmp=patient_dmp,
+        anon_id=anon_id,
+        additional_metadata=meta,
+        created_date=created,
+    )
+    db.add(s)
+    db.flush()
+    return s
+
+
+def _pairing(db, logic, tumor, normal, created, multi_pair: bool = False):
     p = PairingTable(
         tumor_id=tumor.id,
         normal_id=normal.id,
         pairing_logic_id=logic.id,
         latest=True,
+        multi_pair=multi_pair,
         trigger_type="automatic",
         created_date=created,
     )
@@ -117,10 +146,14 @@ def test_total_is_paired_plus_unmatched_dmp(db):
         normal = _sample(db, f"N{i}", "DMP", TumorOrNormal.NORMAL.value,
                          BASE_DATE + timedelta(minutes=i))
         _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
-    # Three DMP samples with no latest pairing -> 3 unmatched rows.
+    # Three DMP TUMORS with no latest pairing -> 3 unmatched rows (4/8:
+    # the pair file is tumor-driven).
     for i in range(3):
-        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
+        _sample(db, f"U{i}", "DMP", TumorOrNormal.TUMOR.value,
                 BASE_DATE + timedelta(hours=1, minutes=i))
+    # An unpaired DMP NORMAL: not part of the pair file, not counted.
+    _sample(db, "UN", "DMP", TumorOrNormal.NORMAL.value,
+            BASE_DATE + timedelta(hours=2))
 
     result = pairing_report("DMP", 1, 50, db, q=None)
     # total is the full merged count (2 paired + 3 unmatched), SQL-derived.
@@ -145,8 +178,10 @@ def test_total_excludes_superseded_pairings(db):
     db.flush()
 
     result = pairing_report("DMP", 1, 50, db, q=None)
-    # 1 latest paired row + normal_a (no longer referenced) unmatched = 2.
-    assert result.total == 2
+    # 1 latest paired row. normal_a's pairing is superseded, but it is an
+    # unpaired NORMAL and the pair file is tumor-driven (4/8), so it does
+    # not count at all.
+    assert result.total == 1
 
 
 # --- (b) page boundaries with a small page_size -----------------------------
@@ -162,9 +197,9 @@ def test_page_boundaries_dmp(db):
                          BASE_DATE + timedelta(minutes=i))
         paired.append(_pairing(db, logic, tumor, normal,
                                BASE_DATE + timedelta(minutes=i)))
-    # 4 unmatched DMP samples, newest first: U3 (newest) -> U0 (oldest).
+    # 4 unmatched DMP TUMORS, newest first: U3 (newest) -> U0 (oldest).
     for i in range(4):
-        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
+        _sample(db, f"U{i}", "DMP", TumorOrNormal.TUMOR.value,
                 BASE_DATE + timedelta(hours=1, minutes=i))
 
     assert pairing_report("DMP", 1, 30, db, q=None).total == 7
@@ -196,9 +231,10 @@ def test_page_boundaries_dmp(db):
     # Merged order is paired-first, each section by created_date desc: the
     # newest paired row leads page 1, the newest unmatched row leads page 2.
     assert page1.rows[0].tumor_id == _pairing_by_tumor(db, "PT2").tumor_id
-    # The fixture's unmatched samples are NORMAL, so the row's sample sits
-    # on the normal side (the pairing FK normal_id stays null by design).
-    assert page2.rows[0].normal is not None and page2.rows[0].tumor is None
+    # The fixture's unmatched samples are TUMORS (4/8: the pair file is
+    # tumor-driven), so the row's sample sits on the tumor side (the
+    # pairing FK normal_id stays null by design).
+    assert page2.rows[0].tumor is not None and page2.rows[0].normal is None
 
 
 def _pairing_by_tumor(db, tumor_primary):
@@ -214,8 +250,9 @@ def test_page_straddles_paired_into_unmatched(db):
         normal = _sample(db, f"PN{i}", "DMP", TumorOrNormal.NORMAL.value,
                          BASE_DATE + timedelta(minutes=i))
         _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    # 2 unmatched DMP TUMORS (4/8: the pair file is tumor-driven).
     for i in range(2):
-        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
+        _sample(db, f"U{i}", "DMP", TumorOrNormal.TUMOR.value,
                 BASE_DATE + timedelta(hours=1, minutes=i))
 
     # page_size 4 > 3 paired rows: page 1 must hold 3 paired + 1 unmatched.
@@ -231,23 +268,35 @@ def test_page_straddles_paired_into_unmatched(db):
 # --- (c) DMP includes unmatched; non-DMP does not ---------------------------
 
 def test_dmp_includes_unmatched_rows(db):
+    """4/8: the DMP unmatched section is tumor rows only — an unpaired DMP
+    NORMAL never appears (stakeholder: tumor rows only, as
+    bam-mirror-tools does); an unpaired DMP TUMOR appears as a tumor-side
+    row (normal null)."""
     logic = _logic(db, "DMP", "dmp")
     tumor = _sample(db, "T0", "DMP", TumorOrNormal.TUMOR.value, BASE_DATE)
     normal = _sample(db, "N0", "DMP", TumorOrNormal.NORMAL.value, BASE_DATE)
     _pairing(db, logic, tumor, normal, BASE_DATE)
-    for i in range(2):
-        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
-                BASE_DATE + timedelta(minutes=10 + i))
+    unmatched_tumor = _sample(db, "UT", "DMP", TumorOrNormal.TUMOR.value,
+                              BASE_DATE + timedelta(minutes=10))
+    unmatched_normal = _sample(db, "UN", "DMP", TumorOrNormal.NORMAL.value,
+                               BASE_DATE + timedelta(minutes=11))
 
     result = pairing_report("DMP", 1, 50, db, q=None)
-    assert result.total == 3
-    # The 2 unmatched DMP samples appear as normal-side rows (tumor null).
-    unmatched = [r for r in result.rows if r.tumor is None and r.normal is not None]
-    assert len(unmatched) == 2
+    assert result.total == 2  # 1 paired + 1 unmatched tumor (normal excluded)
+
+    # The paired row is two-sided; the unmatched row is tumor-side only.
+    # (Unmatched rows carry no pairing identity — the sample object holds
+    # the id.)
+    u_row = next(r for r in result.rows
+                 if r.tumor is not None and r.tumor.id == unmatched_tumor.id)
+    assert u_row.tumor is not None and u_row.normal is None
+    # No normal-side-only row exists (the unpaired normal is absent).
+    for r in result.rows:
+        assert r.tumor is not None and r.tumor.id != unmatched_normal.id
+        assert r.normal is None or r.normal.id != unmatched_normal.id
     # Unmatched rows carry the logic name and an empty mismatch list.
-    for r in unmatched:
-        assert r.pairing_logic == "DMP"
-        assert r.mismatched_keys == []
+    assert u_row.pairing_logic == "DMP"
+    assert u_row.mismatched_keys == []
 
 
 def test_non_dmp_excludes_unmatched_rows(db):
@@ -282,8 +331,9 @@ def test_ordering_stable_across_repeated_calls(db):
         normal = _sample(db, f"PN{i}", "DMP", TumorOrNormal.NORMAL.value,
                          BASE_DATE + timedelta(minutes=i))
         _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    # 3 unmatched DMP TUMORS (4/8: the pair file is tumor-driven).
     for i in range(3):
-        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
+        _sample(db, f"U{i}", "DMP", TumorOrNormal.TUMOR.value,
                 BASE_DATE + timedelta(hours=1, minutes=i))
 
     first = pairing_report("DMP", 1, 50, db, q=None)
@@ -311,10 +361,10 @@ def test_unknown_logic_404(db):
 
 def test_page_size_clamped_to_max(db):
     logic = _logic(db, "DMP", "dmp")
-    # 250 unmatched DMP samples: requesting page_size 500 must clamp to
+    # 250 unmatched DMP TUMORS: requesting page_size 500 must clamp to
     # REPORT_MAX_PAGE_SIZE rows, while total still reports the full count.
     for i in range(250):
-        _sample(db, f"U{i:03d}", "DMP", TumorOrNormal.NORMAL.value,
+        _sample(db, f"U{i:03d}", "DMP", TumorOrNormal.TUMOR.value,
                 BASE_DATE + timedelta(minutes=i))
 
     result = pairing_report("DMP", 1, 500, db, q=None)
@@ -353,13 +403,14 @@ def _full_sample(db, primary_id, sample_type, tumor, created,
 
 def _search_fixture(db):
     """A DMP logic with two latest pairings (rows A and B, newest B first)
-    and one unmatched DMP sample (U) on the NORMAL side. Every row has
-    distinct values in all five search fields, so any value unique to one
-    row selects exactly that row.
+    and one unmatched DMP TUMOR (U): the pair file is tumor-driven (4/8),
+    so the unmatched row carries its sample on the tumor side. Every row
+    has distinct values in all five search fields, so any value unique to
+    one row selects exactly that row.
 
     Row A (oldest):   tumor CMO-ALPHA / normal CMO-BRAVO
     Row B (newest):   tumor CMO-DELTA / normal CMO-CHARLIE
-    Unmatched (U):    normal side only, CMO-UNMATCHED
+    Unmatched (U):    tumor side only, CMO-UNMATCHED
     """
     logic = _logic(db, "DMP", "dmp")
     at = _full_sample(db, "PRI-A", "DMP", TumorOrNormal.TUMOR.value,
@@ -374,7 +425,7 @@ def _search_fixture(db):
                       BASE_DATE + timedelta(minutes=1),
                       "CMO-CHARLIE", "DMP-CHARLIE", "CSB-CHARLIE", "BSET-7")
     _pairing(db, logic, bt, bn, BASE_DATE + timedelta(minutes=1))
-    u = _full_sample(db, "PRI-U", "DMP", TumorOrNormal.NORMAL.value,
+    u = _full_sample(db, "PRI-U", "DMP", TumorOrNormal.TUMOR.value,
                      BASE_DATE + timedelta(hours=1),
                      "CMO-UNMATCHED", "DMP-UNMATCHED", "CSU-UNMATCHED", "BSET-4")
     return logic, at, an, bt, bn, u
@@ -432,23 +483,23 @@ def test_q_no_match_returns_empty(db):
     assert result.rows == []
 
 
-def test_q_unmatched_dmp_matches_via_normal_side_only(db):
+def test_q_unmatched_dmp_row_is_tumor_side(db):
     logic, at, an, bt, bn, u = _search_fixture(db)
-    # The unmatched row has a NULL tumor side: a value that exists only on
-    # a paired row's tumor side must NOT return the unmatched row (a null
-    # side never matches, same as the client skipping null fields).
-    result = pairing_report("DMP", 1, 50, db, q="CMO-DELTA")
+    # The unmatched row has a NULL normal side (4/8: tumor rows only): a
+    # value that exists only on a paired row's normal side must NOT return
+    # the unmatched row (a null side never matches).
+    result = pairing_report("DMP", 1, 50, db, q="CMO-CHARLIE")
     assert result.total == 1
     assert result.rows[0].tumor is not None and result.rows[0].normal is not None
-    # The unmatched row IS found via its own (normal-side) fields and comes
-    # back as a one-sided row (tumor null, sample on the normal side).
+    # The unmatched row IS found via its own (tumor-side) fields and comes
+    # back as a one-sided row (tumor set, normal null).
     result = pairing_report("DMP", 1, 50, db, q="DMP-UNMATCHED")
     assert result.total == 1
     row = result.rows[0]
-    assert row.tumor is None and row.normal is not None
+    assert row.tumor is not None and row.normal is None
     # Unmatched rows carry no pairing identity (T3 contract: the sample id
     # lives on the side object itself).
-    assert row.normal.id == u.id
+    assert row.tumor.id == u.id
 
 
 def test_q_paginates_over_filtered_set(db):
@@ -463,7 +514,7 @@ def test_q_paginates_over_filtered_set(db):
                               BASE_DATE + timedelta(minutes=i),
                               None, None, f"CN-{i}", None)
         _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
-    _full_sample(db, "U", "DMP", TumorOrNormal.NORMAL.value,
+    _full_sample(db, "U", "DMP", TumorOrNormal.TUMOR.value,
                  BASE_DATE + timedelta(hours=1),
                  "CMO-SHARED-3", None, "CU", None)
 
@@ -487,9 +538,9 @@ def test_q_paginates_over_filtered_set(db):
     ]
     assert len(keys) == 3 and len(set(keys)) == 3
     # Merged order is preserved: paired rows (newest first) lead, then the
-    # unmatched row.
+    # unmatched DMP TUMOR row (tumor set, normal null — 4/8).
     assert all(r.tumor is not None and r.normal is not None for r in p1.rows)
-    assert p2.rows[0].tumor is None and p2.rows[0].normal is not None
+    assert p2.rows[0].tumor is not None and p2.rows[0].normal is None
 
 
 def test_q_treats_like_wildcards_as_literals(db):
@@ -581,72 +632,95 @@ def test_export_streams_full_set_not_one_page(db, export_stream):
 
 
 def test_export_respects_q_filter(db, export_stream):
-    _search_fixture(db)  # 2 latest pairings (A, B) + 1 unmatched DMP row (U)
+    _search_fixture(db)  # 2 latest pairings (A, B) + 1 unmatched DMP tumor (U)
 
+    # 4/8: DMP accepts only the pair file's 15 columns as export keys —
+    # tumor_sample/normal_sample are the pair-file names for the sample ids.
     # Unfiltered export: header + all 3 rows.
-    lines = _export_lines(
-        "DMP", db, columns="tumor_primary_id,normal_primary_id"
-    )
+    lines = _export_lines("DMP", db, columns="tumor_sample,normal_sample")
     assert len(lines) == 1 + 3
 
     # q narrows the export to the matching rows — same filter as the report
     # endpoint: ALPHA picks row A (the matched pair); UNMATCHED picks the
-    # one-sided unmatched row (tumor side empty).
+    # one-sided unmatched tumor row, whose normal side renders as the
+    # reference's NA.
     lines = _export_lines("DMP", db, q="ALPHA",
-                          columns="tumor_primary_id,normal_primary_id")
+                          columns="tumor_sample,normal_sample")
     assert len(lines) == 1 + 1
     assert lines[1] == "PRI-A,PRI-A-N"
 
     lines = _export_lines("DMP", db, q="UNMATCHED",
-                          columns="tumor_primary_id,normal_primary_id")
+                          columns="tumor_sample,normal_sample")
     assert len(lines) == 1 + 1
-    assert lines[1] == ",PRI-U"
+    assert lines[1] == "PRI-U,NA"
 
     # A no-match query streams only the header.
     lines = _export_lines("DMP", db, q="ZZZ-NOMATCH",
-                          columns="tumor_primary_id,normal_primary_id")
+                          columns="tumor_sample,normal_sample")
     assert len(lines) == 1
 
 
-def test_export_includes_dmp_unmatched_rows(db, export_stream):
+def test_export_dmp_pair_file_is_tumor_rows_only(db, export_stream):
+    """4/8: the DMP export is the reference pair file — every DMP tumor
+    gets a row (paired or not); an unpaired DMP NORMAL never appears
+    (stakeholder: tumor rows only, as bam-mirror-tools does)."""
     logic = _logic(db, "DMP", "dmp")
     for i in range(2):
-        tumor = _sample(db, f"T{i}", "DMP", TumorOrNormal.TUMOR.value,
-                        BASE_DATE + timedelta(minutes=i))
-        normal = _sample(db, f"N{i}", "DMP", TumorOrNormal.NORMAL.value,
-                         BASE_DATE + timedelta(minutes=i))
+        tumor = _dmp_sample(db, f"P-000000{i + 1}-T01-IM6",
+                            TumorOrNormal.TUMOR.value,
+                            BASE_DATE + timedelta(minutes=i),
+                            patient_dmp=f"P-000000{i + 1}")
+        normal = _dmp_sample(db, f"P-000000{i + 1}-N01-IM6",
+                             TumorOrNormal.NORMAL.value,
+                             BASE_DATE + timedelta(minutes=i),
+                             patient_dmp=f"P-000000{i + 1}")
         _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
-    # Two DMP samples with no pairing — one-sided rows (T3 shape).
-    for i in range(2):
-        _sample(db, f"U{i}", "DMP", TumorOrNormal.NORMAL.value,
-                BASE_DATE + timedelta(hours=1, minutes=i))
+    # One unpaired DMP TUMOR (appears) and one unpaired DMP NORMAL (absent).
+    _dmp_sample(db, "P-0000099-T01-IM6", TumorOrNormal.TUMOR.value,
+                BASE_DATE + timedelta(hours=1), patient_dmp="P-0000099")
+    _dmp_sample(db, "P-0000098-N01-IM6", TumorOrNormal.NORMAL.value,
+                BASE_DATE + timedelta(hours=1, minutes=1),
+                patient_dmp="P-0000098")
 
-    lines = _export_lines("DMP", db)
-    assert len(lines) == 1 + 4  # header + 2 paired + 2 unmatched
-    header = lines[0].split(",")
+    lines = _export_lines("DMP", db, fmt="tsv")
+    assert len(lines) == 1 + 3  # header + 2 paired + 1 unmatched tumor
+    header = lines[0].split("\t")
     t_idx = header.index("tumor_sample")
     n_idx = header.index("normal_sample")
-    m_idx = header.index("tumor_matched")
-    data = [line.split(",") for line in lines[1:]]
-    # Paired rows lead (both sides present, marked Matched).
-    for row in data[:2]:
-        assert row[t_idx] and row[n_idx] and row[m_idx] == "Matched"
-    # Unmatched rows follow: sample on its natural (normal) side, the
-    # tumor-side cells empty — matching the report's row shape.
-    for row in data[2:]:
-        assert row[t_idx] == "" and row[m_idx] == ""
-        assert row[n_idx] in ("U0", "U1")
+    nb_idx = header.index("normal_bamname")
+    nver_idx = header.index("normal_IM_ver")
+    nbe_idx = header.index("normal_bam_exists")
+    ncov_idx = header.index("normal_bam_coverage")
+    data = [line.split("\t") for line in lines[1:]]
+    # Paired rows lead (newest first), both sides present.
+    assert [d[t_idx] for d in data[:2]] == ["P-0000002-T01-IM6",
+                                            "P-0000001-T01-IM6"]
+    for d in data[:2]:
+        assert d[n_idx] == d[t_idx].replace("-T01-", "-N01-")
+        # No bamname/anon_id/coverage in the fixture -> NA; beagle DB unset
+        # -> bam_exists unresolvable -> 0.
+        assert d[nb_idx] == "NA" and d[ncov_idx] == "NA" and d[nbe_idx] == "0"
+    # The unmatched tumor row: normal side NA except normal_IM_ver, which
+    # is backfilled with the tumor's own IM_ver (reference fill rule).
+    u = data[2]
+    assert u[t_idx] == "P-0000099-T01-IM6"
+    assert u[n_idx] == "NA" and u[nb_idx] == "NA"
+    assert u[nbe_idx] == "NA" and u[ncov_idx] == "NA"
+    assert u[nver_idx] == "IM6"
+    # The unpaired DMP normal never appears in the pair file.
+    assert all("P-0000098" not in line for line in lines)
 
 
 def test_export_header_columns_match_report_model(db, export_stream):
     _logic(db, "DMP", "dmp")
     _logic(db, "ARGOS", "argos")
 
-    # DMP logic defaults to the DMP report columns, in model order (the
-    # frontend DMP_COLUMNS). An empty logic still yields just the header.
+    # DMP logic defaults to the reference's 15-column pair file — names
+    # and order verbatim (4/8, spec c). An empty logic still yields just
+    # the header.
     lines = _export_lines("DMP", db, fmt="tsv")
     assert len(lines) == 1
-    assert lines[0].split("\t") == [c["header"] for c in DMP_EXPORT_COLUMNS]
+    assert lines[0].split("\t") == DMP_REF_PAIR_COLUMNS
 
     # Non-DMP logic defaults to the pair report's default subset.
     lines = _export_lines("ARGOS", db)
@@ -656,9 +730,205 @@ def test_export_header_columns_match_report_model(db, export_stream):
     lines = _export_lines("ARGOS", db,
                           columns="normal_primary_id,tumor_primary_id")
     assert lines[0] == "NORMAL_SAMPLE,TUMOR_SAMPLE"
+    # DMP accepts pair-file columns only, in the requested order (4/8).
+    lines = _export_lines("DMP", db, columns="pool_id,tumor_sample")
+    assert lines[0] == "pool_id,tumor_sample"
+    # ... and a pair-report key is a 400 for a DMP logic.
+    with pytest.raises(HTTPException) as exc:
+        export_pair_report("DMP", q=None, columns="tumor_primary_id",
+                           fmt="csv", db=db)
+    assert exc.value.status_code == 400
 
     # Unknown column keys are rejected up front (clean 400).
     with pytest.raises(HTTPException) as exc:
         export_pair_report("ARGOS", q=None, columns="no_such_column",
                            fmt="csv", db=db)
     assert exc.value.status_code == 400
+
+
+# --- (g) DMP pair-file values: the 2/8 remap contract (4/8) -----------------
+
+
+def test_export_dmp_ambiguous_tumor_multiple_rows(db, export_stream):
+    """An ambiguous tumor (two latest pairs under the 3/8 no-winner
+    fan-out) yields one row per (tumor, normal) pair, exactly as stored."""
+    logic = _logic(db, "DMP", "dmp")
+    tumor = _dmp_sample(db, "P-0000010-T01-IM6", TumorOrNormal.TUMOR.value,
+                        BASE_DATE, patient_dmp="P-0000010")
+    n1 = _dmp_sample(db, "P-0000010-N01-IM6", TumorOrNormal.NORMAL.value,
+                     BASE_DATE, patient_dmp="P-0000010")
+    n2 = _dmp_sample(db, "P-0000010-N02-IM6", TumorOrNormal.NORMAL.value,
+                     BASE_DATE + timedelta(minutes=1),
+                     patient_dmp="P-0000010")
+    _pairing(db, logic, tumor, n1, BASE_DATE, multi_pair=True)
+    _pairing(db, logic, tumor, n2, BASE_DATE + timedelta(minutes=1),
+             multi_pair=True)
+
+    lines = _export_lines("DMP", db, columns="tumor_sample,normal_sample")
+    assert len(lines) == 1 + 2
+    rows = [line.split(",") for line in lines[1:]]
+    assert all(r[0] == "P-0000010-T01-IM6" for r in rows)
+    assert {r[1] for r in rows} == {"P-0000010-N01-IM6",
+                                    "P-0000010-N02-IM6"}
+
+
+def test_export_dmp_values_per_remap_contract(db, export_stream):
+    """Cell values follow the 2/8 remap contract: bamname over anon_id,
+    explicit pool_id over project_name, patient__dmp, idx/ver parsed from
+    the name, coverage as-is, matched from the pairing result when the
+    record carries no matched_tag."""
+    logic = _logic(db, "DMP", "dmp")
+    # Newest pair: explicit bamname + explicit pool_id both win.
+    tumor = _dmp_sample(
+        db, "P-0000020-T01-IM7", TumorOrNormal.TUMOR.value,
+        BASE_DATE + timedelta(minutes=1),
+        patient_dmp="P-0000020", anon_id="ANON-T",
+        meta={"bamname": "BAMX-T", "pool_id": "POOL-7",
+              "project_name": "PROJECT-7", "coverage": 687})
+    normal = _dmp_sample(
+        db, "P-0000020-N01-IM7", TumorOrNormal.NORMAL.value,
+        BASE_DATE + timedelta(minutes=1),
+        patient_dmp="P-0000020", anon_id="ANON-N",
+        meta={"coverage": 452})
+    _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=1))
+    # Older pair: no bamname (and no anon_id -> NA), no pool_id (the
+    # project_name fallback applies), no coverage.
+    tumor2 = _dmp_sample(
+        db, "P-0000021-T01-IM6", TumorOrNormal.TUMOR.value,
+        BASE_DATE, patient_dmp="P-0000021",
+        meta={"project_name": "PROJECT-9"})
+    normal2 = _dmp_sample(db, "P-0000021-N01-IM6",
+                          TumorOrNormal.NORMAL.value,
+                          BASE_DATE, patient_dmp="P-0000021")
+    _pairing(db, logic, tumor2, normal2, BASE_DATE)
+
+    lines = _export_lines("DMP", db, fmt="tsv")
+    header = lines[0].split("\t")
+    by = {h: i for i, h in enumerate(header)}
+    d1 = lines[1].split("\t")  # newest first: the P-0000020 pair
+    d2 = lines[2].split("\t")
+    assert d1[by["tumor_sample"]] == "P-0000020-T01-IM7"
+    assert d1[by["patient"]] == "P-0000020"
+    assert d1[by["tumor_idx"]] == "T01" and d1[by["tumor_IM_ver"]] == "IM7"
+    assert d1[by["tumor_bamname"]] == "BAMX-T"    # bamname beats anon_id
+    assert d1[by["normal_bamname"]] == "ANON-N"   # anon_id fallback
+    assert d1[by["tumor_group"]] == "NA"          # no source in the format
+    assert d1[by["tumor_matched"]] == "Matched"   # pairing-derived fallback
+    assert d1[by["tumor_bam_coverage"]] == "687"
+    assert d1[by["normal_bam_coverage"]] == "452"
+    assert d1[by["pool_id"]] == "POOL-7"          # explicit pool_id wins
+    assert d1[by["normal_IM_ver"]] == "IM7"
+    # beagle DB unset -> bam_exists unresolvable -> 0
+    assert d1[by["tumor_bam_exists"]] == "0" and d1[by["normal_bam_exists"]] == "0"
+    # Fallback pair: no bamname/anon_id -> NA, project_name -> pool_id.
+    assert d2[by["tumor_bamname"]] == "NA"
+    assert d2[by["pool_id"]] == "PROJECT-9"
+    assert d2[by["tumor_bam_coverage"]] == "NA"
+
+
+def test_export_dmp_normal_im_ver_backfills_tumor_ver_when_missing(
+        db, export_stream):
+    """Reference fill rule (pair_tumor_with_normal.R): normal_IM_ver is
+    the normal's ver when it has one, else the tumor's own IM_ver —
+    applied to paired rows as well as unmatched ones."""
+    logic = _logic(db, "DMP", "dmp")
+    tumor = _dmp_sample(db, "P-0000060-T01-IM6", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=1),
+                        patient_dmp="P-0000060")
+    # Normal whose name carries no version segment (ver parse -> NA).
+    normal = _dmp_sample(db, "P-0000060-N01", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=1),
+                         patient_dmp="P-0000060")
+    _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=1))
+
+    lines = _export_lines("DMP", db, fmt="tsv")
+    header = lines[0].split("\t")
+    by = {h: i for i, h in enumerate(header)}
+    data = lines[1].split("\t")
+    assert data[by["tumor_IM_ver"]] == "IM6"
+    assert data[by["normal_IM_ver"]] == "IM6"  # backfilled, not NA
+
+
+def test_export_dmp_matched_flag_is_data_not_computed(db, export_stream):
+    """tumor_matched carries the record's matched_tag verbatim (spec g):
+    a tumor unmatched in syzygy whose DMP record says Matched still
+    exports Matched — the flag is data, not a pairing-derived boolean."""
+    _logic(db, "DMP", "dmp")
+    _dmp_sample(db, "P-0000030-T01-IM6", TumorOrNormal.TUMOR.value,
+                BASE_DATE, patient_dmp="P-0000030",
+                meta={"matched_tag": "Matched", "project_name": "P1"})
+
+    lines = _export_lines("DMP", db, fmt="tsv")
+    header = lines[0].split("\t")
+    data = lines[1].split("\t")
+    by = {h: i for i, h in enumerate(header)}
+    assert data[by["tumor_sample"]] == "P-0000030-T01-IM6"
+    assert data[by["tumor_matched"]] == "Matched"  # from the record
+    assert data[by["normal_IM_ver"]] == "IM6"      # backfill rule
+    assert data[by["normal_bam_exists"]] == "NA"   # unmatched: NA, not 0
+
+
+class _StubBeagleCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _StubBeagleConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, *args, **kwargs):
+        return _StubBeagleCursor(self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _StubBeagleEngine:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def connect(self):
+        return _StubBeagleConn(self._rows)
+
+
+def test_export_dmp_bam_exists_from_beagle_record(db, export_stream, monkeypatch):
+    """bam_exists derives from the sample's beagle file record (spec f):
+    non-empty path -> 1, empty/absent -> 0, resolved per export batch."""
+    import routers.pairings as pairings
+    monkeypatch.setattr(
+        pairings.settings, "beagle_database_url",
+        "postgresql+psycopg2://beagle:beagle@localhost/beagle",
+    )
+    monkeypatch.setattr(
+        pairings, "_beagle_engine_cache",
+        _StubBeagleEngine(
+            [("P-0000040-T01-IM6", True), ("P-0000040-N01-IM6", False)]
+        ),
+    )
+    logic = _logic(db, "DMP", "dmp")
+    tumor = _dmp_sample(db, "P-0000040-T01-IM6", TumorOrNormal.TUMOR.value,
+                        BASE_DATE, patient_dmp="P-0000040")
+    normal = _dmp_sample(db, "P-0000040-N01-IM6", TumorOrNormal.NORMAL.value,
+                         BASE_DATE, patient_dmp="P-0000040")
+    _pairing(db, logic, tumor, normal, BASE_DATE)
+
+    lines = _export_lines("DMP", db, fmt="tsv")
+    header = lines[0].split("\t")
+    data = lines[1].split("\t")
+    by = {h: i for i, h in enumerate(header)}
+    assert data[by["tumor_bam_exists"]] == "1"  # non-empty path -> 1
+    assert data[by["normal_bam_exists"]] == "0"  # empty path -> 0
+
+
+def test_bam_exists_map_empty_when_beagle_unset(monkeypatch):
+    import routers.pairings as pairings
+    monkeypatch.setattr(pairings.settings, "beagle_database_url", None)
+    monkeypatch.setattr(pairings, "_beagle_engine_cache", None)
+    assert pairings._beagle_bam_exists_map({"P-1-T01-IM6"}) == {}
