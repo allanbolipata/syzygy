@@ -1158,58 +1158,106 @@ const PAIR_COLUMNS = [
 const PAIR_DEFAULT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"];
 const PAIR_GROUPS = ["Tumor sample", "Normal sample", "Pairing"];
 
-/* Legacy DMP export columns: the exact headers and order of the beagle DMP
- * filemetadata export, no additions or removals. Values come from the DMP
- * sample record (primary_id / patient__dmp / anon_id) plus its
- * additional_metadata (coverage, project_name). */
-const DMP_PLACEHOLDER = "\u2014"; // "—" — columns whose source is not available yet
-function dmpMetaText(sample, key) {
-  const meta = (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
-  const v = meta[key];
-  return v === null || v === undefined ? "" : String(v);
+/* DMP pair-report columns: the reference's 15-column pair file (spec
+ * docs/dmp_reference_alignment.md, section c). Values are derived from the
+ * row's tumor/normal records exactly as dmp_translator.remap_dmp_record +
+ * the router's _dmp_pair_cells derive them server-side, so the table
+ * matches the CSV/TSV export. Genuinely absent values render the
+ * reference's NA sentinel — never a placeholder. */
+const DMP_NA = "NA";
+/* The reference's name parse: "P-0000001-T01-IM7" -> patient "P-0000001",
+ * idx "T01", ver "IM7". */
+const DMP_NAME_RE = /(P-\d+)-(\w+)-(\w+)/;
+function dmpMeta(sample) {
+  return (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
 }
-/* Second-to-last / last dash-separated segments of a DMP sample name,
- * e.g. "P-0000001-T01-IM7" -> ["T01", "IM7"]; blank when unparseable. */
-function dmpNameParts(name) {
-  const parts = String(name || "").split("-");
-  if (parts.length < 2) return ["", ""];
-  return [parts[parts.length - 2], parts[parts.length - 1]];
+/* Faithful port of dmp_translator.remap_dmp_record (T2/8): the key fields
+ * of a DMP sample record, with the reference's fallbacks. */
+function remapDmpRecord(sample) {
+  const name = sample ? String(sample.primary_id || "") : "";
+  const m = DMP_NAME_RE.exec(name);
+  const meta = dmpMeta(sample);
+  const pick = (v) => (v === null || v === undefined ? "" : String(v));
+  return {
+    idx: m ? m[2] : "",
+    ver: m ? m[3] : "",
+    bamname: pick(meta.bamname) || pick(sample && sample.anon_id),
+    group: pick(meta.group),
+    coverage: pick(meta.coverage),
+    matched: pick(meta.matched_tag),
+    pool_id: pick(meta.pool_id) || pick(meta.project_name),
+    patient: pick(sample && sample.patient__dmp) || (m ? m[1] : ""),
+  };
 }
+/* The reference's 15 cells for one report row (a port of the router's
+ * _dmp_pair_cells, T4/8). The normal side is NA when the tumor is
+ * unmatched — except normal_IM_ver, which the backend backfills from
+ * the tumor's version. *_bam_exists is resolved server-side from beagle
+ * file records for the export only; it is not in the report payload, so
+ * the table shows NA for both. */
+function dmpCells(r) {
+  const t = r.tumor;
+  const n = r.normal || null;
+  const tr = remapDmpRecord(t);
+  const nr = n ? remapDmpRecord(n) : null;
+  const na = DMP_NA;
+  return {
+    tumor_sample: (t && t.primary_id) ? String(t.primary_id) : na,
+    patient: tr.patient || na,
+    tumor_idx: tr.idx || na,
+    tumor_IM_ver: tr.ver || na,
+    tumor_bamname: tr.bamname || na,
+    tumor_group: tr.group || na,
+    tumor_matched: tr.matched || (n ? "Matched" : "Unmatched"),
+    tumor_bam_exists: na,
+    tumor_bam_coverage: tr.coverage || na,
+    normal_sample: (n && n.primary_id) ? String(n.primary_id) : na,
+    normal_bamname: nr ? (nr.bamname || na) : na,
+    // The reference backfills the tumor's IM_ver whenever the normal's is
+    // missing — on unmatched rows AND on paired rows whose normal name
+    // carries no version segment (mirrors _dmp_pair_cells' `or`).
+    normal_IM_ver: (nr && nr.ver) || tr.ver || na,
+    pool_id: tr.pool_id || na,
+    normal_bam_exists: na,
+    normal_bam_coverage: nr ? (nr.coverage || na) : na,
+  };
+}
+const dmpText = (key) => (r) => dmpCells(r)[key];
 const DMP_COLUMNS = [
-  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: (r) => (r.tumor ? r.tumor.primary_id : ""), link: (r) => sampleLink(r.tumor) },
-  { key: "patient", header: "patient", group: "Tumor", text: (r) => (r.tumor ? r.tumor.patient__dmp || "" : "") },
-  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[0] : "") },
-  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[1] : "") },
-  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: (r) => (r.tumor ? r.tumor.anon_id || "" : "") },
-  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: () => DMP_PLACEHOLDER },
-  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: (r) => (r.tumor ? (r.normal ? "Matched" : "Unmatched") : "") },
-  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: () => DMP_PLACEHOLDER },
-  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "coverage") },
-  { key: "normal_sample", header: "normal_sample", group: "Normal", text: (r) => (r.normal ? r.normal.primary_id : ""), link: (r) => sampleLink(r.normal) },
-  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: (r) => (r.normal ? (r.normal.anon_id || "") : "") },
-  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: (r) => (r.normal ? dmpNameParts(r.normal.primary_id)[1] : "") },
-  { key: "pool_id", header: "pool_id", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "project_name") },
-  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: () => DMP_PLACEHOLDER },
-  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: (r) => dmpMetaText(r.normal, "coverage") },
+  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: dmpText("tumor_sample"), link: (r) => sampleLink(r.tumor) },
+  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient") },
+  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: dmpText("tumor_idx") },
+  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: dmpText("tumor_IM_ver") },
+  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: dmpText("tumor_bamname") },
+  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: dmpText("tumor_group") },
+  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: dmpText("tumor_matched") },
+  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: dmpText("tumor_bam_exists") },
+  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: dmpText("tumor_bam_coverage") },
+  { key: "normal_sample", header: "normal_sample", group: "Normal", text: dmpText("normal_sample"), link: (r) => sampleLink(r.normal) },
+  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: dmpText("normal_bamname") },
+  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: dmpText("normal_IM_ver") },
+  { key: "pool_id", header: "pool_id", group: "Tumor", text: dmpText("pool_id") },
+  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: dmpText("normal_bam_exists") },
+  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: dmpText("normal_bam_coverage") },
 ];
-/* Where each legacy DMP column comes from (shown in the "About these
- * columns" panel and as tooltips on the column headers). */
+/* Where each DMP column comes from (shown in the "About these columns"
+ * panel and as tooltips on the column headers). */
 const DMP_LEGEND = {
-  tumor_sample: "DMP sample name (primary_id), e.g. P-0000001-T01-IM7",
-  patient: "patient__dmp: the DMP \u201cP-\u201d patient id",
-  tumor_idx: "Sample name, second-to-last dash segment (e.g. T01); blank when unparseable",
-  tumor_IM_ver: "Sample name, last dash segment (e.g. IM7); blank when unparseable",
-  tumor_bamname: "anon_id: the DMP anonymous sample id",
-  tumor_group: "Placeholder: source not yet available",
-  tumor_matched: "\u201cMatched\u201d when a normal is paired to this DMP sample, else \u201cUnmatched\u201d",
-  tumor_bam_exists: "Placeholder: source not yet available",
-  tumor_bam_coverage: "coverage from the DMP record's additional_metadata",
-  normal_sample: "Paired normal's sample name (primary_id)",
-  normal_bamname: "Paired normal's anon_id",
-  normal_IM_ver: "Paired normal's name, last dash segment",
-  pool_id: "project_name from the tumor-side DMP record's additional_metadata",
-  normal_bam_exists: "Placeholder: source not yet available",
-  normal_bam_coverage: "coverage from the paired normal's additional_metadata",
+  tumor_sample: "The DMP tumor's sample name (primary_id)",
+  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name",
+  tumor_idx: "Tumor index parsed from the sample name (second-to-last dash segment, e.g. T01); NA when unparseable",
+  tumor_IM_ver: "IM version parsed from the sample name (last dash segment, e.g. IM7); NA when unparseable",
+  tumor_bamname: "bamname from the DMP record's additional_metadata; falls back to anon_id",
+  tumor_group: "group from the DMP record's additional_metadata; NA when the record has none",
+  tumor_matched: "matched_tag from the DMP record; otherwise Matched / Unmatched from the pairing",
+  tumor_bam_exists: "Whether beagle has a BAM record for the tumor; resolved server-side for the export, NA in the table",
+  tumor_bam_coverage: "coverage from the DMP record's additional_metadata; NA when absent",
+  normal_sample: "The paired DMP normal's sample name (primary_id); NA when the tumor is unmatched",
+  normal_bamname: "The paired normal's bamname (additional_metadata, fallback anon_id); NA when the tumor is unmatched",
+  normal_IM_ver: "IM version parsed from the paired normal's name; backfilled from the tumor's version when the normal's is missing; NA otherwise",
+  pool_id: "pool_id from the DMP record's additional_metadata; falls back to project_name",
+  normal_bam_exists: "Whether beagle has a BAM record for the normal; resolved server-side for the export, NA in the table",
+  normal_bam_coverage: "coverage from the paired normal's additional_metadata; NA when absent or the tumor is unmatched",
 };
 const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
@@ -1244,6 +1292,13 @@ const pairsState = {
   // to the in-memory rows meanwhile (and whenever a search filter
   // narrows the table, which the server count doesn't cover).
   pairedCount: null,
+  // DMP only: the report response's reference summary counts
+  // ({patients, tn_pairs, unmatched_tumors}) and 5 QC warning buckets
+  // (T5/8) — computed server-side over the FULL pair frame, identical
+  // on every page and independent of the search query. null for
+  // non-DMP logics and until the first DMP page lands.
+  dmpSummary: null,
+  dmpWarnings: null,
 };
 
 function isDmpLogic(logicName) {
@@ -1360,8 +1415,22 @@ function renderPairsTable() {
   const total = pairsState.total;
   const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
   const start = pairsState.page * pairsState.pageSize;
+  // DMP: an ambiguous tumor legitimately appears on one row per candidate
+  // normal — flag the repeated rows with a subtle cue so they read as
+  // one tumor fanned out, not as duplicated data.
+  const tumorCounts = new Map();
+  if (dmp) {
+    for (const r of rows) {
+      const id = r.tumor && r.tumor.primary_id;
+      if (id) tumorCounts.set(id, (tumorCounts.get(id) || 0) + 1);
+    }
+  }
   $("#pairs-table tbody").innerHTML = rows
-    .map((r) => `<tr>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`).join("");
+    .map((r) => {
+      const tid = r.tumor && r.tumor.primary_id;
+      const repeat = dmp && tid && (tumorCounts.get(tid) || 0) > 1;
+      return `<tr${repeat ? ` class="pr-dmp-repeat" title="Tumor appears on ${tumorCounts.get(tid)} rows: multiple candidate normals (ambiguous match)"` : ""}>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`;
+    }).join("");
   $("#pr-prev").disabled = pairsState.page === 0;
   $("#pr-next").disabled = pairsState.page >= maxPage;
   // Keep the skip-to-page input in sync with Prev/Next: the input shows
@@ -1376,9 +1445,18 @@ function renderPairsTable() {
   // /pairing/unmatched-count/) once it has landed and no search filter
   // narrows the table — until then, and while filtering, fall back to
   // the current page's rows.
-  const matched = !pairsState.query && pairsState.pairedCount != null
-    ? pairsState.pairedCount
-    : rows.filter((r) => r.tumor && r.normal).length;
+  let matched;
+  if (pairsState.query) {
+    // A search narrows the set server-side, but the reference counts
+    // cover the FULL frame — while filtering, use the page's rows.
+    matched = rows.filter((r) => r.tumor && r.normal).length;
+  } else if (dmp && pairsState.dmpSummary) {
+    matched = pairsState.dmpSummary.tn_pairs;
+  } else if (pairsState.pairedCount != null) {
+    matched = pairsState.pairedCount;
+  } else {
+    matched = rows.filter((r) => r.tumor && r.normal).length;
+  }
   const empty = rows.length === 0 || cols.length === 0;
   const emptyEl = $("#pr-empty");
   emptyEl.classList.toggle("hidden", !empty);
@@ -1393,13 +1471,48 @@ function renderPairsTable() {
       ? `${total} rows: ${matched} matched, ${total - matched} unmatched${paging}`
       : `${total} pair${total === 1 ? "" : "s"}${paging}`;
   $("#pr-download").disabled = empty;
-  // Legend (and header tooltips) only for the legacy DMP column set.
+  // Legend (and header tooltips) only for the DMP column set.
   $("#pr-legend").classList.toggle("hidden", !dmp);
   if (dmp) {
     $("#pr-legend-body").innerHTML = DMP_COLUMNS.map((c) =>
       `<tr><td>${esc(c.header)}</td><td>${esc(DMP_LEGEND[c.key] || "")}</td></tr>`
     ).join("");
   }
+  renderDmpWarnings();
+}
+
+/* DMP QC warnings (T5/8): the 5 reference buckets, each expandable,
+ * from the report response's warnings field — computed over the FULL
+ * pair frame, so the buckets stay constant across pages and searches.
+ * Hidden (and cleared) for non-DMP logics. */
+const DMP_WARNING_BUCKETS = [
+  { key: "matched_tumors_without_normal", label: "Matched tumors without a normal" },
+  { key: "tumor_samples_with_multiple_ambiguous_normals", label: "Tumors with multiple ambiguous normals" },
+  { key: "samples_with_bams_missing", label: "Samples with BAMs missing" },
+  { key: "low_coverage_tumors", label: "Low-coverage tumors" },
+  { key: "low_coverage_normals", label: "Low-coverage normals" },
+];
+function renderDmpWarnings() {
+  const warnEl = $("#pr-dmp-warnings");
+  if (!warnEl) return;
+  if (!isDmpLogic(activeLogicName()) || !pairsState.dmpWarnings) {
+    warnEl.classList.add("hidden");
+    warnEl.innerHTML = "";
+    return;
+  }
+  const w = pairsState.dmpWarnings;
+  warnEl.classList.remove("hidden");
+  warnEl.innerHTML =
+    `<p class="pr-dmp-warnings-title">QC warnings <span class="hint">— full report, not just this page</span></p>` +
+    DMP_WARNING_BUCKETS.map((b) => {
+      const samples = w[b.key] || [];
+      return `<details class="pr-warn-bucket">
+  <summary>${esc(b.label)} <span class="pr-warn-count">${samples.length}</span></summary>
+  ${samples.length
+    ? `<ul class="pr-warn-list">${samples.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`
+    : `<p class="hint">None.</p>`}
+</details>`;
+    }).join("");
 }
 
 /* Abort controller for the in-flight pair load; a new load (tab click,
@@ -1476,6 +1589,10 @@ async function loadReportPage(page) {
     pairsState.rows = data.rows;
     pairsState.total = data.total;
     pairsState.page = page;
+    // DMP: the response carries the reference summary/warnings on every
+    // page (identical, page/q independent) — keep the latest.
+    pairsState.dmpSummary = data.summary || null;
+    pairsState.dmpWarnings = data.warnings || null;
     renderPrGroups();
     renderPairsTable();
     if (page === 0) loadPrOverviewStats();
@@ -1499,6 +1616,10 @@ async function loadPairs() {
   pairsState.logic = logic;
   // The previous logic's server count is stale until the new one lands.
   pairsState.pairedCount = null;
+  // Same for the DMP extras: the previous logic's summary/warnings must
+  // not linger when a new (or non-DMP) logic is selected.
+  pairsState.dmpSummary = null;
+  pairsState.dmpWarnings = null;
   await loadReportPage(0);
 }
 
@@ -1679,14 +1800,25 @@ function renderPrLogicExplainer() {
   el.innerHTML = explainer || `<p>${esc(logicName)}: no explainer available for this logic.</p>`;
 }
 
-/* Paired / Unpaired strip for the selected logic. Both numbers come
- * from the per-logic unmatched-count endpoint: Paired = the logic's
- * latest report rows with both sides present (same rule as the DMP
- * count line in #pr-count), Unpaired = its unpaired population. */
+/* Counts strip for the selected logic (#pr-overview-stats). Non-DMP
+ * logics: Paired / Unpaired from the per-logic unmatched-count endpoint
+ * (Paired = the logic's latest report rows with both sides present,
+ * Unpaired = its unpaired population). DMP: the reference's 3 summary
+ * counts from the report response's summary field (computed over the
+ * FULL pair frame, independent of page and search). */
 async function loadPrOverviewStats() {
   const el = $("#pr-overview-stats");
   const logic = activeLogicName();
   if (!el || !logic) return;
+  if (isDmpLogic(logic)) {
+    const s = pairsState.dmpSummary;
+    el.innerHTML = s
+      ? `<span class="pr-stat"># of patients <strong>${s.patients}</strong></span>` +
+        `<span class="pr-stat"># of Tumor-Normal pairs <strong>${s.tn_pairs}</strong></span>` +
+        `<span class="pr-stat"># of unmatched tumors <strong>${s.unmatched_tumors}</strong></span>`
+      : `<span class="pr-stat">summary <strong>…</strong></span>`;
+    return;
+  }
   const paint = (pairedHtml, unpairedHtml) => {
     el.innerHTML =
       `<span class="pr-stat">Paired ${pairedHtml}</span>` +
