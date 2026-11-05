@@ -2903,6 +2903,7 @@ def _dmp_sample(
     patient__dmp,
     tumor_or_normal=TumorOrNormal.NORMAL.value,
     gene_panel="PANEL-A",
+    additional_metadata=None,
 ):
     sample = _sample(
         db,
@@ -2913,6 +2914,8 @@ def _dmp_sample(
         gene_panel=gene_panel,
     )
     sample.patient__dmp = patient__dmp
+    if additional_metadata is not None:
+        sample.additional_metadata = additional_metadata
     db.commit()
     db.refresh(sample)
     return sample
@@ -2965,7 +2968,10 @@ def test_trigger_dmp_requires_same_dmp_patient(db):
     assert result["new_pairings"] == []
 
 
-def test_trigger_dmp_requires_same_gene_panel(db):
+def test_trigger_dmp_gene_panel_is_not_a_key(db):
+    # DMP Reference Alignment 3/8: gene_panel is NO LONGER a pairing key
+    # (the reference joins never use it) — a same-patient cross-panel
+    # pair still matches (here via the shared IM_ver in the names).
     _dmp_logic(db)
     _dmp_sample(
         db, "P-0000004-T1-X1", "P-0000004", TumorOrNormal.TUMOR.value,
@@ -2975,8 +2981,8 @@ def test_trigger_dmp_requires_same_gene_panel(db):
 
     result = trigger_dmp_pairing(db)
 
-    assert result["paired"] == 0
-    assert result["unpaired"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
 
 
 def test_trigger_dmp_reports_missing_patient_dmp(db):
@@ -3236,8 +3242,16 @@ def test_evaluate_logic_readonly_does_not_register_bait(db):
 
 def test_evaluate_dmp_logic(db):
     _dmp_logic(db)
-    _dmp_sample(db, "P-EV-1-T1-X1", "P-EV-1", TumorOrNormal.TUMOR.value)
-    _dmp_sample(db, "P-EV-1-N1-X1", "P-EV-1")
+    # P-EV-1: a same-pool tumor + normal (pool key — the names carry no
+    # P-\d+ IM_ver, so tier 1 is the only possible tier).
+    _dmp_sample(
+        db, "P-EV-1-T1-X1", "P-EV-1", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "EVP"},
+    )
+    _dmp_sample(
+        db, "P-EV-1-N1-X1", "P-EV-1",
+        additional_metadata={"project_name": "EVP"},
+    )
     _dmp_sample(db, "P-EV-2-T1-X1", None, TumorOrNormal.TUMOR.value)  # no P- id
     _dmp_sample(db, "P-EV-3-T1-X1", "P-EV-3", TumorOrNormal.TUMOR.value)  # no normal
     # A normal-only DMP sample is out of the tumor scope.
@@ -3299,11 +3313,25 @@ def test_unmatched_count_dmp_mirrors_unmatched_endpoint(db):
     """DMP: every unpaired DMP sample (tumor or normal), mirroring
     GET /pairing/unmatched/ — paired samples are excluded."""
     _dmp_logic(db)
-    _dmp_sample(db, "P-UC-1-T1-X1", "P-UC-1", TumorOrNormal.TUMOR.value)
-    # Cross-panel: gene_panel is a hard key, so this normal never matches.
-    _dmp_sample(db, "P-UC-1-N1-X1", "P-UC-1", gene_panel="PANEL-B")
-    _dmp_sample(db, "P-UC-2-T1-X1", "P-UC-2", TumorOrNormal.TUMOR.value)
-    _dmp_sample(db, "P-UC-2-N1-X1", "P-UC-2")
+    # P-UC-1: cross-pool AND different IM_ver → no tier-1 match and no
+    # tier-2 rescue; both samples stay unpaired.
+    _dmp_sample(
+        db, "P-UC-1-T1-X1", "P-UC-1", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    _dmp_sample(
+        db, "P-UC-1-N1-X9", "P-UC-1",
+        additional_metadata={"project_name": "POOL-B"},
+    )
+    # P-UC-2: same pool → paired.
+    _dmp_sample(
+        db, "P-UC-2-T1-X1", "P-UC-2", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    _dmp_sample(
+        db, "P-UC-2-N1-X1", "P-UC-2",
+        additional_metadata={"project_name": "POOL-A"},
+    )
     trigger_dmp_pairing(db)  # pairs P-UC-2 only
 
     result = count_unpaired(db, "DMP")
