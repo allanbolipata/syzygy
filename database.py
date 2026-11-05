@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     nats_sample_update_subject: str = (
         "MDB_STREAM.server.cpt-gateway.cmo-sample-update"
     )
+    # DMP sample records from the dmp-gateway service: the JSON record in
+    # the exact syzygy DB record format (docs/dmp_reference_alignment.md,
+    # section f) — upserted as-is via dmp_translator.to_dmp_sample_kwargs.
+    nats_dmp_sample_subject: str = (
+        "MDB_STREAM.server.dmp-gateway.dmp-sample"
+    )
 
 
 settings = Settings()

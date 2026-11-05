@@ -222,17 +222,25 @@ Additional notes:
 
 ## f. Syzygy ↔ reference mapping
 
+**Data flow (stakeholder correction, 2026-11-04):** the DMP data arrives from a
+service via NATS as a JSON message **in the exact format we already store in
+the syzygy DB** (the DMP record format — `sample, anon_id, patient, coverage,
+project_name, …`). We will NOT receive key-file-shaped data; the key file is
+replaced by this message. The reference-column remap below (e.g. `pool_id` ←
+`project_name`) is done **within syzygy at pairing/report time**, not at
+ingest. Ingest stores the record as-is.
+
 | reference field | syzygy source | mapping rule |
 |---|---|---|
 | `sample` | `Sample.primary_id` (`sample__dmp` column) | 1:1. The import promotes `metadata.sample` to the sample row and excludes it from `additional_metadata` (`EXCLUDED_DMP_KEYS`). |
-| `patient` | `Sample.patient__dmp` (from `metadata.patient.dmp`) | Same `P-…` value the reference parses out of the sample name; syzygy stores it as its own field. |
-| `idx` / `ver` (IM_ver) | not stored today | Reference derives them in Perl from the sample name (`(P-\d+)-(\w+)-(\w+)`). Tickets 2/8 or 3/8 decide: store at ingest vs. derive at pairing. 3/8's rescue tier needs `ver` = last dash-segment of the sample name. |
-| `bamname` | `Sample.anon_id` (from `metadata.anon_id`) | **Stand-in**: no `bamname` key exists in beagle DMP records. An explicit `bamname` in the incoming payload takes precedence over `anon_id`. (The beagle file record's `.bam` `file_name` is not imported today and is not the source of truth for this field.) |
-| `group` | not present in DMP records | No beagle equivalent. Optional payload field (2/8); carried through to `tumor_group` untouched. |
-| `pool_id` | `additional_metadata.project_name` | **Stakeholder-confirmed rename of `project_name`**: keep reading `pool_id` from `additional_metadata.project_name` as the fallback; an explicit `pool_id` in the incoming payload takes precedence. Beagle records contain no `pool_id` key (verified in the fixture). |
+| `patient` | `Sample.patient__dmp` (from `metadata.patient.dmp`) | Syzygy stores it as its own field and treats it as **authoritative** (it is also the DMP pairing key). The reference parses the same value out of the sample name; 2/8's fixture audit found the two can diverge in dev data — see section g, caveat 1. |
+| `idx` / `ver` (IM_ver) | not stored today | Reference derives them in Perl from the sample name (`(P-\d+)-(\w+)-(\w+)`). Derived at pairing time from the sample name (in-syzygy remap, not ingest). 3/8's rescue tier needs `ver` = last dash-segment of the sample name. |
+| `bamname` | `Sample.anon_id` (from `metadata.anon_id`) | **Stand-in**: no `bamname` key exists in beagle DMP records. An explicit `bamname` in a record, if ever present, takes precedence over `anon_id` (the known format does not carry one). (The beagle file record's `.bam` `file_name` is not imported today and is not the source of truth for this field.) |
+| `group` | not present in DMP records | No beagle equivalent; absent from the record format (verified in fixture). 2/8 documents it as a gap with the fallback for the `tumor_group` column. |
+| `pool_id` | `additional_metadata.project_name` | **Stakeholder-confirmed rename of `project_name`** — remapped within syzygy: `pool_id` = `additional_metadata.project_name`; an explicit `pool_id` in a record, if ever present, takes precedence (the known format does not carry one). Beagle records contain no `pool_id` key (verified in the fixture). |
 | `coverage` | `additional_metadata.coverage` (numeric in the fixture) | Stored as-is from `metadata.coverage` (not in `EXCLUDED_DMP_KEYS`). Reference treats it as a string end-to-end until the R `as.numeric` cast; syzygy stores JSON numeric. |
-| `matched_tag` → `is_matched` → `tumor_matched` | not present in DMP records | **A DMP-program value, not derivable from pairing.** Must arrive with the incoming payload / key-file ingest (2/8). Open item for 2/8: default when the field is absent. |
-| `bam_exists` | not present; not computed today | **The one sanctioned deviation.** Reference: Perl checks the BAM path exists in the mirror (`bamname` ∈ mirror listing). Syzygy equivalent: the sample's beagle file record (`file_system.filemetadata` → `file_system.file`) has a **non-empty `path`** → `1`, else `0`. The import currently selects only `fm.metadata` and never joins the file record, so 2/8 must add this derivation at ingest. |
+| `matched_tag` → `is_matched` → `tumor_matched` | not present in DMP records | **A DMP-program value, not derivable from pairing.** Absent from the record format — a gap; 2/8 documents the fallback and flags it for 5/8 before the summary counts that consume it are finalized. |
+| `bam_exists` | not present; not computed today | **The one sanctioned deviation.** Reference: Perl checks the BAM path exists in the mirror (`bamname` ∈ mirror listing). Syzygy equivalent: the sample's beagle file record (`file_system.filemetadata` → `file_system.file`) has a **non-empty `path`** → `1`, else `0`. The import currently selects only `fm.metadata` and never joins the file record; the file record is already in the DB from the beagle dump, so this is a read-time derivation computed at pairing/report time (2/8 documents it). |
 
 ### Current state (for context — changed by tickets 3/8–5/8)
 
@@ -243,6 +251,85 @@ group on **`(patient__dmp, gene_panel)`** (case-insensitive) and picks a
 no `pool_id` tier, no IM_ver rescue, no ambiguous-match fan-out, and
 produces no summary/QC output. The reference behavior specified in b–e above
 is what tickets 3/8–5/8 implement.
+
+---
+
+## g. Reference-column remap (in-Syzygy)
+
+**When and where.** Ingest (NATS `dmp-gateway.dmp-sample` subject and the
+beagle dump import) stores the record as-is via
+`dmp_translator.to_dmp_sample_kwargs` — mapped keys become Sample columns,
+everything else lands in `additional_metadata`. The remap onto the
+reference 12-column key-file schema (section a) is applied **at pairing/
+report time**, never at ingest, and **no code path parses or accepts a
+key-file-shaped payload** (there is none — see the section f data-flow
+note). One implementation is shared by the two-tier strategy (ticket 3/8)
+and the Pair Report (ticket 4/8):
+
+```python
+dmp_translator.remap_dmp_record(sample, bam_exists: int = 0) -> dict
+```
+
+It returns the 12 reference columns (in section a order, `DMP_REF_COLUMNS`)
+for one stored DMP `Sample` row.
+
+### Column contract
+
+| # | reference column | syzygy source | rule |
+|---|---|---|---|
+| 1 | `sample` | `Sample.primary_id` | 1:1. |
+| 2 | `patient` | `Sample.patient__dmp` | Stored column wins (it is also the DMP pairing key); if NULL, parse `(P-\d+)-(\w+)-(\w+)` from `primary_id` and use the `P-…` group (the reference's own derivation). See caveat 1. |
+| 3 | `idx` | parsed from `primary_id` | Group 2 of `(P-\d+)-(\w+)-(\w+)` (e.g. `T01`); `""` when the name does not parse. Not stored as a column — derived here, at pairing/report time. |
+| 4 | `ver` | parsed from `primary_id` | Group 3 — the **IM_ver** used by the R rescue tier; `""` when unparseable. 3/8's rescue tier joins on this value. |
+| 5 | `bamname` | `additional_metadata.bamname`, else `Sample.anon_id` | Explicit `bamname` wins if ever present (absent in the known format); `anon_id` is the documented stand-in (f). |
+| 6 | `bprefix` | parsed from `bamname` | Group 1 of `(\w+)-(\w+)`; `""` when no match. |
+| 7 | `bsuffix` | parsed from `bamname` | Group 2 of `(\w+)-(\w+)`; `""` when no match. **Not a tumor/normal signal in syzygy** — see caveat 2. |
+| 8 | `group` | `additional_metadata.group` if ever present | **Gap** (audited absent — 0/8 fixture records, and no such key in `.beagle_ground_truth.example.json` DMP rows). An explicit value passes through untouched (as the reference carries it); otherwise `None` and the report renders `NA` in the `tumor_group` column. |
+| 9 | `bam_exists` | caller-resolved; helper parameter `bam_exists` (default `0`) | **The one sanctioned deviation** (f/audit): the reference checks the BAM path against the mirror listing. Syzygy has no file table, so the value is resolved from the beagle file record (non-empty `path` → `1`, else `0`) by the consumer that can reach it, and passed in; unresolvable → `0`. |
+| 10 | `coverage` | `additional_metadata.coverage` | As-is (JSON numeric in the known format); `None` means NA and must not be coerced to `0` — the reference's warning 4 treats missing coverage as a distinct case. |
+| 11 | `pool_id` | `additional_metadata.pool_id`, else `additional_metadata.project_name` | Explicit `pool_id` wins if ever present (absent in the known format); `project_name` is the stakeholder-confirmed rename. |
+| 12 | `is_matched` | `additional_metadata.matched_tag` if ever present | **Gap** (audited absent — a DMP-program flag, not lab metadata). An explicit `matched_tag` passes through (the reference's raw value); otherwise `None`, and 3/8 derives match status from the pairing result — a tumor is *matched* iff the strategy output gives it at least one normal after both tiers. 4/8 renders that status. |
+
+### Caveats (2/8 fixture audit, `/Users/bolipatc/dev/beagle/file_system/fixtures/DMP_data.json`)
+
+1. **`patient` divergence.** For 3 of the 4 distinct DMP samples in the
+   fixture, the stored `patient__dmp` differs from the sample-name prefix
+   (e.g. sample `P-0000002-T01-IM6` carries `patient__dmp = P-0000001`;
+   the 4 samples map to only 2 patients). Syzygy treats the stored
+   `patient__dmp` as authoritative so the report's patient column and the
+   strategy's pairing key agree; the name parse is a NULL-column fallback
+   only. **Flagged for stakeholder review**: confirm whether production
+   records preserve name-prefix == `patient.dmp` (it affects 5/8's
+   patient-level summary counts).
+2. **`bsuffix` is not a T/N signal here.** Real `anon_id` values are
+   8-letter tokens with no dash (all 8 fixture records), so
+   `(\w+)-(\w+)` never matches and `bprefix`/`bsuffix` are `""` for
+   known-format records. The reference splits tumors/normals on
+   `bsuffix` ∈ {"T","N"}; syzygy must split on `tumor_or_normal`
+   (derived from `type` at ingest) and must not use `bsuffix`.
+3. **`group` and `matched_tag` are gaps** — audited absent from the record
+   format. The helper never invents values for them (pass-through of an
+   explicit field, else `None`).
+
+### Pairing context for 3/8
+
+The reference (b) joins tier 1 on `(patient, pool_id)` and the tier-2
+rescue on `(patient, IM_ver)`, retaining every tumor row. Under this
+contract the syzygy analogues are: `patient` = `patient__dmp`,
+`pool_id` = `project_name`, `IM_ver` = the last dash-segment of
+`primary_id` (helper column `ver`). 3/8 owns the two-tier shape and the
+tumor/normal split (`tumor_or_normal`); this section fixes only the column
+names and derivations that the strategy and report consume.
+
+### 5/8 flag (summary counts)
+
+The reference summary counts (d) consume `tumor_matched == "Matched"` —
+the DMP-program `matched_tag`, which is **absent from real syzygy records**.
+5/8 must therefore compute the counts from the **pairing-derived** match
+status produced by 3/8 (matched = tumor row has ≥1 normal after both
+tiers; unmatched-tumor count = tumor rows with no normal), not from any
+stored field. Flagged for stakeholder review before 5/8 finalizes the
+summary counts.
 
 ---
 
@@ -265,12 +352,12 @@ the fixture) and `file_name`. Sources checked: `dmp_translator.py`,
 | reference field | present in syzygy DMP `additional_metadata` today? | current source | gap |
 |---|---|---|---|
 | `sample` | No — promoted out of `additional_metadata` by `EXCLUDED_DMP_KEYS` | `metadata.sample` → `Sample.primary_id` (`sample__dmp` column) | None for identity. Reference additionally derives `patient`/`idx`/`IM_ver` from the name; syzygy stores `patient__dmp` but not `idx`/`IM_ver` (see `patient`/`idx` rows). |
-| `bamname` | No — no such key in beagle DMP metadata | Stand-in: `metadata.anon_id` → `Sample.anon_id` column (all 8 fixture records carry `anon_id`) | No `bamname` key anywhere in the record; explicit `bamname` payload field (2/8) takes precedence over the `anon_id` stand-in. The `.bam` file record `file_name` is not imported. |
-| `group` | No — no such key in beagle DMP metadata | None | No source today; optional payload field (2/8). |
-| `pool_id` | No — no `pool_id` key (verified: absent from all 8 fixture records) | Fallback: `metadata.project_name` → `additional_metadata.project_name` (present in all 8 fixture records) | Stakeholder-confirmed rename `pool_id` = `project_name`; explicit `pool_id` payload field (2/8) takes precedence over the `project_name` fallback. |
+| `bamname` | No — no such key in beagle DMP metadata | Stand-in: `metadata.anon_id` → `Sample.anon_id` column (all 8 fixture records carry `anon_id`) | No `bamname` key anywhere in the record; an explicit `bamname`, if ever present, takes precedence over the `anon_id` stand-in (absent in the known format). The `.bam` file record `file_name` is not imported. |
+| `group` | No — no such key in beagle DMP metadata | None | No source today; gap documented by 2/8 (with fallback for the `tumor_group` column). |
+| `pool_id` | No — no `pool_id` key (verified: absent from all 8 fixture records) | Fallback: `metadata.project_name` → `additional_metadata.project_name` (present in all 8 fixture records) | Stakeholder-confirmed rename `pool_id` = `project_name`, remapped within syzygy at pairing/report time; an explicit `pool_id`, if ever present, takes precedence (absent in the known format). |
 | `coverage` | Yes | `metadata.coverage` → `additional_metadata.coverage` (numeric in the fixture, e.g. `687`); not in `EXCLUDED_DMP_KEYS` | None at the data level. Reference keeps it a string until the R `as.numeric` cast; syzygy stores JSON numeric — fine, cast on read. |
-| `matched_tag` | No — no such key in beagle DMP metadata (it is a DMP-program flag, not lab metadata) | None | No source today; must come from the incoming payload / key-file ingest (2/8). Default-when-absent is an open 2/8 decision. |
-| `bam_exists` | No — not in metadata and not computed anywhere in syzygy today | None (the import SQL selects only `fm.metadata`; the linked `file` record's `path` is never read) | Sanctioned derivation: `filemetadata` → `file` has non-empty `path` → `1` else `0`. 2/8 must add the file-record join at ingest. |
+| `matched_tag` | No — no such key in beagle DMP metadata (it is a DMP-program flag, not lab metadata) | None | No source today; gap — 2/8 documents the fallback and flags it for 5/8. |
+| `bam_exists` | No — not in metadata and not computed anywhere in syzygy today | None (the import SQL selects only `fm.metadata`; the linked `file` record's `path` is never read) | Sanctioned derivation: `filemetadata` → `file` has non-empty `path` → `1` else `0`, computed at pairing/report time from the file record already in the DB (2/8 documents it). |
 
 ---
 
