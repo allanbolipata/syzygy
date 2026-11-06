@@ -2903,6 +2903,7 @@ def _dmp_sample(
     patient__dmp,
     tumor_or_normal=TumorOrNormal.NORMAL.value,
     gene_panel="PANEL-A",
+    additional_metadata=None,
 ):
     sample = _sample(
         db,
@@ -2913,6 +2914,8 @@ def _dmp_sample(
         gene_panel=gene_panel,
     )
     sample.patient__dmp = patient__dmp
+    if additional_metadata is not None:
+        sample.additional_metadata = additional_metadata
     db.commit()
     db.refresh(sample)
     return sample
@@ -2940,7 +2943,12 @@ def test_trigger_dmp_pairs_dmp_tumor_with_dmp_normal(db):
     )
 
 
-def test_trigger_dmp_picks_deterministic_normal_on_tie(db):
+def test_trigger_dmp_fans_out_one_row_per_matching_normal(db):
+    # DMP Reference Alignment 3/8: no winner. Two same-patient normals
+    # (no pool -> tier-1 skipped, tier-2 IM_ver rescue; both carry ver X1)
+    # yield ONE PAIRING ROW PER NORMAL. ``new_pairings`` carries the
+    # deterministic representative row (first in primary_id order) — not a
+    # chosen winner; the other matched row still exists in the table.
     _dmp_logic(db)
     _dmp_sample(db, "P-0000002-T1-X1", "P-0000002", TumorOrNormal.TUMOR.value)
     later = _dmp_sample(db, "P-0000002-N2-X1", "P-0000002")
@@ -2948,9 +2956,18 @@ def test_trigger_dmp_picks_deterministic_normal_on_tie(db):
 
     result = trigger_dmp_pairing(db)
 
-    (pairing,) = result["new_pairings"]
-    assert pairing.normal_id == first.id  # min primary_id wins
-    assert later.id != pairing.normal_id
+    assert result["paired"] == 1
+    (rep,) = result["new_pairings"]
+    assert rep.normal_id == first.id  # representative: first in primary_id order
+    rows = db.scalars(
+        select(PairingTable).where(
+            PairingTable.pairing_logic_id == db.scalar(
+                select(PairingLogic.id).where(PairingLogic.name == "DMP")
+            )
+        )
+    ).all()
+    assert len(rows) == 2  # one row per matching normal, neither suppressed
+    assert {r.normal_id for r in rows} == {first.id, later.id}
 
 
 def test_trigger_dmp_requires_same_dmp_patient(db):
@@ -2965,7 +2982,10 @@ def test_trigger_dmp_requires_same_dmp_patient(db):
     assert result["new_pairings"] == []
 
 
-def test_trigger_dmp_requires_same_gene_panel(db):
+def test_trigger_dmp_gene_panel_is_not_a_key(db):
+    # DMP Reference Alignment 3/8: gene_panel is NO LONGER a pairing key
+    # (the reference joins never use it) — a same-patient cross-panel
+    # pair still matches (here via the shared IM_ver in the names).
     _dmp_logic(db)
     _dmp_sample(
         db, "P-0000004-T1-X1", "P-0000004", TumorOrNormal.TUMOR.value,
@@ -2975,8 +2995,8 @@ def test_trigger_dmp_requires_same_gene_panel(db):
 
     result = trigger_dmp_pairing(db)
 
-    assert result["paired"] == 0
-    assert result["unpaired"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
 
 
 def test_trigger_dmp_reports_missing_patient_dmp(db):
@@ -3236,8 +3256,16 @@ def test_evaluate_logic_readonly_does_not_register_bait(db):
 
 def test_evaluate_dmp_logic(db):
     _dmp_logic(db)
-    _dmp_sample(db, "P-EV-1-T1-X1", "P-EV-1", TumorOrNormal.TUMOR.value)
-    _dmp_sample(db, "P-EV-1-N1-X1", "P-EV-1")
+    # P-EV-1: a same-pool tumor + normal (pool key — the names carry no
+    # P-\d+ IM_ver, so tier 1 is the only possible tier).
+    _dmp_sample(
+        db, "P-EV-1-T1-X1", "P-EV-1", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "EVP"},
+    )
+    _dmp_sample(
+        db, "P-EV-1-N1-X1", "P-EV-1",
+        additional_metadata={"project_name": "EVP"},
+    )
     _dmp_sample(db, "P-EV-2-T1-X1", None, TumorOrNormal.TUMOR.value)  # no P- id
     _dmp_sample(db, "P-EV-3-T1-X1", "P-EV-3", TumorOrNormal.TUMOR.value)  # no normal
     # A normal-only DMP sample is out of the tumor scope.
@@ -3299,11 +3327,25 @@ def test_unmatched_count_dmp_mirrors_unmatched_endpoint(db):
     """DMP: every unpaired DMP sample (tumor or normal), mirroring
     GET /pairing/unmatched/ — paired samples are excluded."""
     _dmp_logic(db)
-    _dmp_sample(db, "P-UC-1-T1-X1", "P-UC-1", TumorOrNormal.TUMOR.value)
-    # Cross-panel: gene_panel is a hard key, so this normal never matches.
-    _dmp_sample(db, "P-UC-1-N1-X1", "P-UC-1", gene_panel="PANEL-B")
-    _dmp_sample(db, "P-UC-2-T1-X1", "P-UC-2", TumorOrNormal.TUMOR.value)
-    _dmp_sample(db, "P-UC-2-N1-X1", "P-UC-2")
+    # P-UC-1: cross-pool AND different IM_ver → no tier-1 match and no
+    # tier-2 rescue; both samples stay unpaired.
+    _dmp_sample(
+        db, "P-UC-1-T1-X1", "P-UC-1", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    _dmp_sample(
+        db, "P-UC-1-N1-X9", "P-UC-1",
+        additional_metadata={"project_name": "POOL-B"},
+    )
+    # P-UC-2: same pool → paired.
+    _dmp_sample(
+        db, "P-UC-2-T1-X1", "P-UC-2", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    _dmp_sample(
+        db, "P-UC-2-N1-X1", "P-UC-2",
+        additional_metadata={"project_name": "POOL-A"},
+    )
     trigger_dmp_pairing(db)  # pairs P-UC-2 only
 
     result = count_unpaired(db, "DMP")
@@ -3325,4 +3367,41 @@ def test_unmatched_count_endpoint(db):
     result = unmatched_count_endpoint(pairing_logic_name="UC-EP", db=db)
 
     assert result["pairing_logic"] == "UC-EP"
+    assert result["unpaired"] == 1
+
+
+def test_unmatched_count_paired_counts_latest_both_sides_rows(db):
+    """``paired`` counts this logic's latest report rows where both
+    sides are present — the Pair Report's ``r.tumor && r.normal`` rule.
+    The schema makes tumor_id/normal_id NOT NULL, so every row carries
+    both sides; the rule therefore selects exactly the logic's latest
+    rows. Stale rows and other logics' rows do not count."""
+    logic = _bait_logic(db, name="PC-L", bait="BAIT-PC")
+    # Two latest rows for this logic: both count toward paired.
+    t1 = _sample(db, "PC-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC1", bait_set="BAIT-PC")
+    n1 = _sample(db, "PC-N-1", patient__cmo="PATIENT-PC1", bait_set="BAIT-PC")
+    _make_pairing(db, t1, n1, logic)
+    t2 = _sample(db, "PC-T-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC2", bait_set="BAIT-PC")
+    n2 = _sample(db, "PC-N-2", patient__cmo="PATIENT-PC2", bait_set="BAIT-PC")
+    _make_pairing(db, t2, n2, logic)
+    # A stale (non-latest) both-sides row: not counted.
+    t3 = _sample(db, "PC-T-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC3", bait_set="BAIT-PC")
+    n3 = _sample(db, "PC-N-3", patient__cmo="PATIENT-PC3", bait_set="BAIT-PC")
+    _make_pairing(db, t3, n3, logic, latest=False)
+    # Another logic's latest row: not counted for this logic.
+    other = _bait_logic(db, name="PC-O", bait="BAIT-PCO")
+    t4 = _sample(db, "PC-T-4", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC4", bait_set="BAIT-PCO")
+    n4 = _sample(db, "PC-N-4", patient__cmo="PATIENT-PC4", bait_set="BAIT-PCO")
+    _make_pairing(db, t4, n4, other)
+
+    result = count_unpaired(db, "PC-L")
+
+    assert result["pairing_logic"] == "PC-L"
+    assert result["paired"] == 2
+    # Backward compatible: unpaired is still the logic's unpaired tumor
+    # population (t1 and t2 have latest rows; t3 has none).
     assert result["unpaired"] == 1

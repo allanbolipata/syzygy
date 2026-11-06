@@ -19,7 +19,11 @@ def build_config() -> dict:
     config = {
         "NATS_URL": os.environ["NATS_URL"],
         "NATS_FILTER_SUBJECT": os.environ.get(
-            "NATS_FILTER_SUBJECT", "MDB_STREAM.server.cpt-gateway.>"
+            # Broad by default: the cmo subjects and the DMP sample
+            # subject live under different second-level tokens
+            # (cpt-gateway vs dmp-gateway), so one wildcard covers both.
+            "NATS_FILTER_SUBJECT",
+            "MDB_STREAM.server.>",
         ),
         "NATS_DURABLE": os.environ.get("NATS_DURABLE", "syzygy"),
         "CLIENT_TIMEOUT": float(os.environ.get("CLIENT_TIMEOUT", "3600")),
@@ -52,7 +56,7 @@ def main() -> None:
             "will reject every message this listener sends"
         )
     # The subscribe subject and the consumer's filter subject are the same
-    # wildcard, so one durable consumer receives all three cmo subjects.
+    # wildcard, so one durable consumer receives all cmo and dmp subjects.
     subject = config["NATS_FILTER_SUBJECT"]
     client = SmileClient(config)
     asyncio.run(client.start_consuming(subject, None))

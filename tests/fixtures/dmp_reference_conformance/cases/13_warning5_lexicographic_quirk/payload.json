@@ -1,0 +1,66 @@
+[
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000001",
+      "metadata": {
+        "sample": "P-7000014-T01-IM6",
+        "type": "T",
+        "patient": {
+          "dmp": "P-7000014"
+        },
+        "anon_id": "AT14T-T",
+        "project_name": "POOL14",
+        "coverage": 600
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000002",
+      "metadata": {
+        "sample": "P-7000014-N01-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000014"
+        },
+        "anon_id": "AT14N-N",
+        "project_name": "POOL14",
+        "coverage": 100
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000003",
+      "metadata": {
+        "sample": "P-7000014-T02-IM7",
+        "type": "T",
+        "patient": {
+          "dmp": "P-7000014"
+        },
+        "anon_id": "AT14T2-T",
+        "project_name": "POOL14C",
+        "coverage": 600
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000004",
+      "metadata": {
+        "sample": "P-7000014-N02-IM7",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000014"
+        },
+        "anon_id": "AT14N2-N",
+        "project_name": "POOL14D",
+        "coverage": 45
+      }
+    }
+  }
+]

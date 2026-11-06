@@ -345,3 +345,21 @@ footer {
   animation: pr-spin 0.8s linear infinite;
 }
 @keyframes pr-spin { to { transform: rotate(360deg); } }
+
+/* DMP QC warning buckets (T5/8): expandable per-bucket sample lists,
+ * shown below the legend for DMP logics only. */
+.pr-dmp-warnings {
+  margin: 0.6rem 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.45rem 0.8rem 0.6rem;
+}
+.pr-dmp-warnings-title { margin: 0 0 0.3rem; font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+.pr-warn-bucket { margin: 0.3rem 0; }
+.pr-warn-bucket summary { cursor: pointer; font-size: 0.85rem; }
+.pr-warn-count { margin-left: 0.3rem; color: #b45309; font-weight: 600; }
+.pr-warn-list { margin: 0.35rem 0 0.2rem; padding-left: 1.25rem; }
+.pr-warn-list li { font-size: 0.8rem; font-family: ui-monospace, monospace; }
+/* Subtle cue: DMP rows where the same tumor repeats (an ambiguous match
+ * fanned out onto one row per candidate normal). */
+#pairs-table tbody tr.pr-dmp-repeat td { background: rgba(180, 83, 9, 0.08); }

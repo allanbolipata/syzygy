@@ -1,0 +1,18 @@
+[
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000001",
+      "metadata": {
+        "sample": "P-7000013-N01-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000013"
+        },
+        "anon_id": "AT13N-N",
+        "project_name": "POOL13",
+        "coverage": 588
+      }
+    }
+  }
+]

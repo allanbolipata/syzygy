@@ -39,10 +39,18 @@ Registered strategies:
     pairing.tsv) retained unconditionally, then patient-wide matching on
     bait_set (case-insensitive) and run-mode bucket. Gene panel and
     sample_type are not keys; there is no request cascade or pooled tier.
-  * ``dmp`` — DMP-group-only pairing (Syzygy-only; beagle has no DMP
-    pairing logic): matches a DMP tumor to a DMP normal on
-    (patient__dmp, gene_panel); never crosses into LIMS or pooled
-    samples.
+  * ``dmp`` — DMP-group-only pairing aligned with the reference
+    ``pair_tumor_with_normal.R`` (docs/dmp_reference_alignment.md,
+    section b): two tiers, no winner selection — every matching
+    (tumor, normal) pair is a row. Tier 1 matches a DMP tumor to every
+    DMP normal on (patient, pool_id); tumors with no tier-1 match are
+    rescued by tier 2, matching on (patient, IM_ver). Keys are the
+    in-syzygy remap of the reference columns (spec g): patient =
+    ``patient__dmp`` (stored column wins, name parse is the NULL-column
+    fallback), pool_id = ``additional_metadata.pool_id`` else
+    ``project_name``, IM_ver = the last dash-segment of the sample name.
+    Comparison is exact (case-sensitive). gene_panel is no longer a
+    pairing key. Never crosses into LIMS or pooled samples.
   * ``ACCESS`` — alias for ``default``.
   * ``IMPACT`` — alias for ``argos`` (IMPACT is the assay the ARGOS
     pipeline sequences; see ``PAIRING_LOGIC_ALIASES`` in
@@ -59,9 +67,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Protocol, Sequence
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from dmp_translator import remap_dmp_record
 from models import PairingLogic, PairingTable, PooledMachine, Sample
 from schemas import TumorOrNormal
 
@@ -263,6 +272,10 @@ class PairingStrategy(Protocol):
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool
 
+    # True for strategies whose output is a set of (tumor, normal) rows —
+    # one per match — rather than a single winner per tumor (DMP).
+    MULTI_PAIR: bool
+
     def matches(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
     ) -> bool:
@@ -303,6 +316,20 @@ class PairingStrategy(Protocol):
     ) -> List[Sample]:
         ...
 
+    def select_matching_normals(
+        self,
+        db: Session,
+        tumor: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        """Every normal this strategy would pair ``tumor`` with.
+
+        Single-winner strategies: ``[winner]`` or ``[]``. Multi-pair
+        strategies (DMP): the full fan-out row set — one entry per
+        matched normal, so an ambiguous tumor yields several.
+        """
+        ...
+
     def with_config(self, config: dict) -> "PairingStrategy":
         ...
 
@@ -341,6 +368,10 @@ class DefaultPairingStrategy:
     HARD_KEYS: tuple = ("patient__cmo", "gene_panel", "bait_set")
     # Whether the strategy offers a pooled-normal tier (argos does).
     HAS_POOLED_TIER: bool = False
+    # Whether the strategy emits one row per (tumor, normal) match
+    # instead of a single winner (DMP — docs/dmp_reference_alignment.md,
+    # section b).
+    MULTI_PAIR: bool = False
 
     def __init__(self, config: Optional[dict] = None):
         self.config = dict(config or {})
@@ -508,6 +539,16 @@ class DefaultPairingStrategy:
         )
         stmt = select(Sample).where(*conds)
         return list(db.scalars(stmt).all())
+
+    def select_matching_normals(
+        self,
+        db: Session,
+        tumor: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        """Single-winner default: the winner alone, or nothing."""
+        selection = self.select_latest_normal(db, tumor, logic)
+        return [selection.normal] if selection.normal is not None else []
 
 
 for name in ("ACCESS",):
@@ -1007,77 +1048,138 @@ class TempoPairingStrategy(DefaultPairingStrategy):
 
 @register_pairing_strategy("dmp")
 class DmpPairingStrategy(DefaultPairingStrategy):
-    """DMP pairing strategy (Syzygy-only — beagle has no DMP
-    tumor->normal pairing logic).
+    """DMP pairing strategy aligned with the reference
+    ``pair_tumor_with_normal.R`` (docs/dmp_reference_alignment.md,
+    sections b and g).
 
     Automatic DMP pairing is strictly within the DMP samples group
     (``sample_type == "DMP"``): it never touches LIMS samples, pooled
     normals, or cross-group DMP<->LIMS pairs (those stay manual under
     the argos strategy).
 
-    Matching keys (hard, compared case-insensitively):
-      * ``patient__dmp`` (the "P-" patient id) — must be non-null and
-        equal on both sides; this is the patient key for DMP pairing;
-      * ``gene_panel`` — one P- patient can carry both IMPACT and
-        ACCESS DMP samples, so cross-assay T/N pairing is invalid.
+    Two-tier pairing with NO winner selection — the reference's
+    left_join fan-out: every matching (tumor, normal) pair becomes its
+    own pairing row.
 
-    Tumor vs. normal is enforced by the service exactly like every
-    other strategy (``trigger_pairing`` rejects non-TUMOR input and the
-    cascade queries only opposite-type candidates), so the checks here
-    do not re-test it.
+    * **Tier 1 — pool match.** Every DMP normal whose remapped
+      ``patient`` equals the tumor's AND whose ``pool_id`` equals the
+      tumor's (both non-empty — a missing/NA key never matches, as in
+      dplyr). A tumor with K same-pool normals yields K rows.
+    * **Tier 2 — IM_ver rescue.** ONLY for tumors with no tier-1
+      match: every DMP normal whose remapped ``patient`` equals the
+      tumor's AND whose ``ver`` (the IM_ver, the last dash-segment of
+      the sample name) equals the tumor's. A tumor whose name carries
+      no IM_ver has no tier-2 match.
 
-    Gates: preservation — DMP samples carry no preservation data
-    (``preservation`` and ``sample_origin`` are both None), so the
-    both-empty rule (Rule C) marks the gate "not considered" and it
-    always passes; it is deliberately not implemented. run_mode — N/A
-    for DMP, not gated.
+    A normal may appear in several rows: it matches every applicable
+    tumor (it is shared across same-pool tumors) and appears once per
+    match under an ambiguous tumor.
 
-    Multiple candidates: when a DMP tumor has several matching DMP
-    normals, the winner is deterministic — the first in ``primary_id``
-    (string) order. This reuses the argos/default selection mechanism
-    (``_select_in_candidates`` picking via ``_latest``) with the
-    ordering key changed from sequencing date to primary_id.
+    Keys — the in-syzygy remap of the reference columns (spec g), one
+    implementation shared with the Pair Report (ticket 4/8) via
+    ``dmp_translator.remap_dmp_record``:
+      * patient = ``patient__dmp``; when the stored column is NULL the
+        reference's name parse is the fallback (``(P-\\d+)-...``);
+      * pool_id = ``additional_metadata.pool_id`` falling back to
+        ``additional_metadata.project_name``;
+      * ver = the IM_ver, the last dash-segment of the sample name.
+    Comparison is exact (case-sensitive), as in the R joins — syzygy's
+    former case-insensitive DMP matching is retired. ``gene_panel`` is
+    no longer a pairing key (the reference joins do not use it; it
+    stays stored, and ARGOS cross-logic matching is untouched).
 
     Per-logic config keys: none.
     """
 
-    HARD_KEYS: tuple = ("patient__dmp", "gene_panel")
+    HARD_KEYS: tuple = ()
     HAS_POOLED_TIER: bool = False
+    MULTI_PAIR: bool = True
 
     @staticmethod
     def _is_dmp(sample: Sample) -> bool:
         return str(sample.sample_type or "").strip().upper() == "DMP"
 
-    def mismatch_reasons(
-        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
-    ) -> List[str]:
-        # The dmp cascade is DMP-group only: a pair with either side
-        # outside the group (LIMS, pooled normal) can never be selected
-        # under this logic and stays manual under argos.
-        if not (self._is_dmp(tumor) and self._is_dmp(normal)):
-            return ["not a DMP sample"]
-        return self._base_mismatch_reasons(tumor, normal)
+    # -- join keys (spec g) ----------------------------------------------
 
-    def _candidate_conditions(self, sample: Sample) -> List:
-        """Opposite-type, same-patient, same-panel DMP-group candidates
-        for one side of a pair."""
-        role = (
-            TumorOrNormal.NORMAL.value
-            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
-            else TumorOrNormal.TUMOR.value
+    def pairing_keys(self, sample: Sample) -> dict:
+        """The reference join keys for one sample (spec g).
+
+        Empty string = NA: a missing key never matches (dplyr
+        semantics). Also used by the service for the patient-scope
+        count in ``trigger_dmp_pairing``.
+        """
+        rec = remap_dmp_record(sample)
+        return {
+            "patient": rec["patient"] or "",
+            "pool_id": rec["pool_id"] or "",
+            "ver": rec["ver"] or "",
+        }
+
+    def _same_patient_dmp(
+        self, db: Session, role: str, patient: str
+    ) -> List[Sample]:
+        """DMP samples of ``role`` whose remapped patient equals ``patient``.
+
+        SQL scopes on the stored column (plus NULL-column rows, whose
+        patient comes from the reference name parse); the remap filter
+        finishes the job in Python, because the remapped key is not a
+        single SQL predicate.
+        """
+        stmt = (
+            select(Sample)
+            .where(
+                Sample.tumor_or_normal == role,
+                func.trim(func.upper(Sample.sample_type)) == "DMP",
+                or_(
+                    Sample.patient__dmp == patient,
+                    Sample.patient__dmp.is_(None),
+                ),
+            )
+            .order_by(Sample.primary_id)
         )
         return [
-            Sample.tumor_or_normal == role,
-            func.trim(func.upper(Sample.sample_type)) == "DMP",
-            _key_condition(Sample.patient__dmp, sample.patient__dmp),
-            _key_condition(Sample.gene_panel, sample.gene_panel),
+            s
+            for s in db.scalars(stmt).all()
+            if self.pairing_keys(s)["patient"] == patient
         ]
 
-    @staticmethod
-    def _latest(candidates: Sequence[Sample]) -> Sample:
-        # Deterministic winner: first candidate in primary_id (string)
-        # order.
-        return min(candidates, key=lambda s: str(s.primary_id))
+    def _tier1_normals(self, db: Session, tumor: Sample) -> List[Sample]:
+        """The tumor's tier-1 row set: same-patient, same-pool normals."""
+        keys = self.pairing_keys(tumor)
+        if not keys["patient"] or not keys["pool_id"]:
+            return []
+        return [
+            n
+            for n in self._same_patient_dmp(
+                db, TumorOrNormal.NORMAL.value, keys["patient"]
+            )
+            if self.pairing_keys(n)["pool_id"] == keys["pool_id"]
+        ]
+
+    # -- selection ---------------------------------------------------------
+
+    def select_matching_normals(
+        self,
+        db: Session,
+        tumor: Sample,
+        logic: Optional[PairingLogic] = None,
+    ) -> List[Sample]:
+        """The tumor's full row set: tier-1 normals, else the tier-2
+        (IM_ver rescue) normals, else nothing."""
+        if not self._is_dmp(tumor) or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
+            return []
+        keys = self.pairing_keys(tumor)
+        if not keys["patient"]:
+            return []
+        tier1 = self._tier1_normals(db, tumor)
+        if tier1:
+            return tier1
+        if not keys["ver"]:
+            return []
+        candidates = self._same_patient_dmp(
+            db, TumorOrNormal.NORMAL.value, keys["patient"]
+        )
+        return [n for n in candidates if self.pairing_keys(n)["ver"] == keys["ver"]]
 
     def select_latest_normal(
         self,
@@ -1085,28 +1187,112 @@ class DmpPairingStrategy(DefaultPairingStrategy):
         tumor: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> NormalSelection:
-        # DMP-group only: a non-DMP tumor has no DMP counterpart, and a
-        # DMP tumor without a P- id cannot be patient__dmp-scoped.
+        """A representative selection for single-winner plumbing.
+
+        The DMP strategy emits one row per match (no winner); this
+        method exists so notes and candidate views keep working: it
+        returns a deterministic representative — the first matched
+        normal in ``primary_id`` order — with notes describing the full
+        set.
+        """
         if not self._is_dmp(tumor):
             return NormalSelection(
                 None,
                 ["tumor is not a DMP sample: dmp pairing is DMP-group only"],
             )
-        if tumor.patient__dmp is None:
+        if tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
+            return NormalSelection(None, ["tumor is not a tumor sample"])
+        keys = self.pairing_keys(tumor)
+        if not keys["patient"]:
             return NormalSelection(
                 None,
                 [
-                    "patient__dmp missing: "
-                    "dmp pairing is patient__dmp-scoped"
+                    "patient__dmp missing (and no P- id in the sample name): "
+                    "dmp pairing is patient-scoped"
                 ],
             )
-        candidates = db.scalars(
-            select(Sample).where(*self._candidate_conditions(tumor))
-        ).all()
-        picked, tier_notes = self._select_in_candidates(
-            tumor, candidates, "dmp", self.mismatch_reasons
+        normals = self.select_matching_normals(db, tumor, logic)
+        if not normals:
+            notes = [
+                "no DMP normal matches under the two-tier rule "
+                "(docs/dmp_reference_alignment.md, section b)"
+            ]
+            if keys["pool_id"]:
+                notes.append(
+                    f"tier 1: no same-pool DMP normal (pool_id={keys['pool_id']})"
+                )
+            if keys["ver"]:
+                notes.append(
+                    f"tier 2 (IM_ver rescue): no same-IM_ver DMP normal "
+                    f"(IM_ver={keys['ver']})"
+                )
+            else:
+                notes.append(
+                    "tier 2 (IM_ver rescue): the tumor name carries no IM_ver"
+                )
+            return NormalSelection(None, notes)
+        winner = min(normals, key=lambda s: str(s.primary_id))
+        return NormalSelection(
+            winner,
+            [
+                f"tier=dmp: {len(normals)} normal(s) matched; no winner "
+                "selection — one pairing row per match; representative "
+                f"(first in primary_id order): {winner.primary_id}"
+            ],
         )
-        return NormalSelection(picked, tier_notes)
+
+    # -- matching verdicts --------------------------------------------------
+
+    def mismatch_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
+        """Empty when the pair is a row of the tumor's two-tier row set.
+
+        Tier 1 (same pool) always matches. Otherwise the pair matches
+        only via tier 2 — same IM_ver — AND only when the tumor has no
+        tier-1 normal at all (rescue eligibility is a property of the
+        tumor's tier-1 set, not of the pair). Tier-2 eligibility needs
+        the tumor's tier-1 set, i.e. the database; without one the
+        verdict is conservatively "does not match".
+        """
+        if not (self._is_dmp(tumor) and self._is_dmp(normal)):
+            return ["not a DMP sample"]
+        tk = self.pairing_keys(tumor)
+        nk = self.pairing_keys(normal)
+        if not tk["patient"] or not nk["patient"] or tk["patient"] != nk["patient"]:
+            return [
+                f"patient__dmp mismatch ({tk['patient'] or '—'} vs "
+                f"{nk['patient'] or '—'})"
+            ]
+        if tk["pool_id"] and tk["pool_id"] == nk["pool_id"]:
+            return []  # tier-1 (pool) match
+        pool_reason = (
+            f"pool_id mismatch ({tk['pool_id'] or '—'} vs {nk['pool_id'] or '—'})"
+        )
+        if tk["ver"] == nk["ver"]:
+            if not tk["ver"]:
+                # Both NA: dplyr never joins NA keys — no rescue possible.
+                return [pool_reason, "IM_ver missing on both: no tier-2 rescue possible"]
+            # Equal and non-empty: the rescue applies iff the tumor has
+            # no tier-1 normal at all.
+            if db is None:
+                return [
+                    pool_reason,
+                    "IM_ver matches but tier-2 eligibility needs the tumor's "
+                    "tier-1 set (no database session)",
+                ]
+            if self._tier1_normals(db, tumor):
+                return [
+                    pool_reason,
+                    "IM_ver matches but tier-2 rescue not applicable: the "
+                    "tumor has same-pool normals",
+                ]
+            return []
+        if not tk["ver"] or not nk["ver"]:
+            return [pool_reason, "IM_ver missing: no tier-2 rescue possible"]
+        return [pool_reason, f"IM_ver mismatch ({tk['ver']} vs {nk['ver']})"]
+
+    # -- normal-side backfill scope ------------------------------------------
 
     def select_matching_tumors(
         self,
@@ -1114,14 +1300,22 @@ class DmpPairingStrategy(DefaultPairingStrategy):
         normal: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> List[Sample]:
-        # A non-DMP normal (LIMS) has no DMP-group counterpart, and a
-        # DMP normal without a P- id cannot be patient__dmp-scoped.
-        if not self._is_dmp(normal) or normal.patient__dmp is None:
+        """DMP tumors the normal can enter the row set of.
+
+        The reference is tumor-driven; this is the mirror scope for the
+        normal-side backfill (``trigger_pairing_for_normal``): every
+        same-patient DMP tumor. Each tumor's row set is then recomputed
+        by ``select_matching_normals``, which decides whether this
+        normal actually belongs to it.
+        """
+        if not self._is_dmp(normal) or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             return []
-        tumors = db.scalars(
-            select(Sample).where(*self._candidate_conditions(normal))
-        ).all()
-        return [t for t in tumors if not self.mismatch_reasons(t, normal)]
+        keys = self.pairing_keys(normal)
+        if not keys["patient"]:
+            return []
+        return self._same_patient_dmp(db, TumorOrNormal.TUMOR.value, keys["patient"])
+
+    # -- candidate view (Sample Pairing UI) ------------------------------------
 
     def candidate_scope(
         self,
@@ -1129,17 +1323,21 @@ class DmpPairingStrategy(DefaultPairingStrategy):
         sample: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> List[Sample]:
-        # The dmp cascade is strictly DMP-group only: a non-DMP sample
-        # (or a DMP sample without a P- id) has no cascade candidates
-        # here — cross-group DMP<->LIMS pairing stays manual under
-        # argos, not here.
-        if not self._is_dmp(sample) or sample.patient__dmp is None:
+        """Same-patient DMP samples of the opposite type — the reach of
+        both tiers. A non-DMP sample, or a DMP sample without a
+        remapped patient, has no scope here (cross-group pairing stays
+        manual under argos, not here)."""
+        if not self._is_dmp(sample):
             return []
-        return list(
-            db.scalars(
-                select(Sample).where(*self._candidate_conditions(sample))
-            ).all()
+        keys = self.pairing_keys(sample)
+        if not keys["patient"]:
+            return []
+        role = (
+            TumorOrNormal.NORMAL.value
+            if sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+            else TumorOrNormal.TUMOR.value
         )
+        return self._same_patient_dmp(db, role, keys["patient"])
 
 
 # Strategy-name aliases: a PairingLogic row may reference a strategy by

@@ -63,16 +63,33 @@ def resolve_pairing_logic(
     return logic
 
 
+def _get_latest_pairings(
+    db: Session, tumor_id: UUID, pairing_logic_id: UUID
+) -> list[PairingTable]:
+    """All latest rows for (tumor, logic), newest first.
+
+    Single-winner logics have at most one (the unique partial index
+    enforces it); multi_pair logics (DMP fan-out) have one per matched
+    normal.
+    """
+    return list(
+        db.scalars(
+            select(PairingTable)
+            .where(
+                PairingTable.tumor_id == tumor_id,
+                PairingTable.pairing_logic_id == pairing_logic_id,
+                PairingTable.latest == True,
+            )
+            .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+        ).all()
+    )
+
+
 def _get_latest_pairing(
     db: Session, tumor_id: UUID, pairing_logic_id: UUID
 ) -> Optional[PairingTable]:
-    return db.scalar(
-        select(PairingTable).where(
-            PairingTable.tumor_id == tumor_id,
-            PairingTable.pairing_logic_id == pairing_logic_id,
-            PairingTable.latest == True,
-        )
-    )
+    rows = _get_latest_pairings(db, tumor_id, pairing_logic_id)
+    return rows[0] if rows else None
 
 
 def _create_pairing(
@@ -83,6 +100,7 @@ def _create_pairing(
     trigger_type: Optional[str] = None,
     mismatched_keys: Optional[list] = None,
     notes: Optional[list] = None,
+    multi_pair: bool = False,
 ) -> PairingTable:
     pairing = PairingTable(
         tumor_id=tumor.id,
@@ -92,12 +110,29 @@ def _create_pairing(
         trigger_type=trigger_type,
         mismatched_keys=mismatched_keys,
         notes=notes,
+        multi_pair=multi_pair,
     )
     db.add(pairing)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        if multi_pair:
+            # Fan-out rows: the pair-scoped unique index is what
+            # collided (a duplicate (tumor, normal, logic) latest row)
+            # — the tumor-scoped index exempts multi_pair rows, so the
+            # single-winner fallback does not apply.
+            existing = db.scalar(
+                select(PairingTable).where(
+                    PairingTable.tumor_id == tumor.id,
+                    PairingTable.normal_id == normal.id,
+                    PairingTable.pairing_logic_id == pairing_logic.id,
+                    PairingTable.latest == True,
+                )
+            )
+            if existing is not None:
+                return existing
+            raise
         existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
         if existing is not None:
             return existing
@@ -111,6 +146,99 @@ def _mark_stale(existing: PairingTable) -> None:
     existing.modified_date = utcnow()
 
 
+def _multi_pair_representative(db: Session, existing: list[PairingTable]) -> PairingTable:
+    """The row reported for a multi_pair row set: the one whose normal
+    has the smallest primary_id — stable across re-triggers."""
+    normals = db.scalars(
+        select(Sample).where(Sample.id.in_({r.normal_id for r in existing}))
+    ).all()
+    rep = min(normals, key=lambda s: str(s.primary_id))
+    return next(r for r in existing if r.normal_id == rep.id)
+
+
+def _trigger_multi_pair(
+    db: Session,
+    strategy,
+    tumor: Sample,
+    pairing_logic: PairingLogic,
+    trigger_type: str,
+    normal_id: Optional[UUID],
+    strict: bool,
+) -> Optional[PairingTable]:
+    """The multi_pair (DMP) branch of ``trigger_pairing``: one row per
+    match, no winner (docs/dmp_reference_alignment.md, section b).
+
+    The tumor's latest row set is the strategy's full match set
+    (two-tier: same-pool first, else same-IM_ver rescue). An override
+    (``normal_id``) replaces the row set with the single pinned row,
+    mirroring the single-winner override. Returns the representative
+    row (first in primary_id order) or None.
+    """
+    existing = _get_latest_pairings(db, tumor.id, pairing_logic.id)
+
+    if normal_id is not None:
+        normal = db.get(Sample, normal_id)
+        if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
+            raise HTTPException(status_code=404, detail="Normal sample not found")
+        reasons = strategy.mismatch_reasons(tumor, normal, db)
+        if strict and reasons:
+            raise HTTPException(
+                status_code=400,
+                detail="Normal sample does not match tumor: " + "; ".join(reasons),
+            )
+        pinned = [r for r in existing if r.normal_id == normal.id]
+        if pinned:
+            return pinned[0]
+        for row in existing:
+            _mark_stale(row)
+        result = _create_pairing(
+            db,
+            tumor,
+            normal,
+            pairing_logic,
+            trigger_type=trigger_type,
+            mismatched_keys=reasons or None,
+            multi_pair=True,
+        )
+        # Race guard: a concurrent commit may have created this pair.
+        if result.normal_id != normal.id:
+            raise HTTPException(
+                status_code=409,
+                detail="Pairing conflict: a different pairing was created concurrently",
+            )
+        return result
+
+    if trigger_type == "automatic" and existing:
+        return _multi_pair_representative(db, existing)
+
+    normals = strategy.select_matching_normals(db, tumor, pairing_logic)
+    if not normals:
+        return None
+
+    existing_ids = {row.normal_id for row in existing}
+    if existing_ids == {n.id for n in normals}:
+        rep = min(normals, key=lambda s: str(s.primary_id))
+        return next(r for r in existing if r.normal_id == rep.id)
+
+    for row in existing:
+        _mark_stale(row)
+    selection_notes = strategy.select_latest_normal(db, tumor, pairing_logic).notes
+    created: list[PairingTable] = []
+    for normal in sorted(normals, key=lambda s: str(s.primary_id)):
+        created.append(
+            _create_pairing(
+                db,
+                tumor,
+                normal,
+                pairing_logic,
+                trigger_type=trigger_type,
+                notes=selection_notes or None,
+                multi_pair=True,
+            )
+        )
+    return created[0]
+
+
 def trigger_pairing(
     db: Session,
     tumor: Sample,
@@ -119,7 +247,9 @@ def trigger_pairing(
     normal_id: Optional[UUID] = None,
     strict: bool = False,
 ) -> Optional[PairingTable]:
-    """Create (or return) the current pairing for a tumor.
+    """Create (or return) the current pairing rows for a tumor.
+
+    Single-winner logics (default/argos/tempo):
 
     * ``normal_id`` given — override semantics: the pinned normal is paired
       even when matching keys differ, and the mismatches are recorded in
@@ -130,7 +260,18 @@ def trigger_pairing(
     * ``manual`` without ``normal_id`` — always re-run the strategy
       cascade; a different winner replaces the current pairing.
 
-    Returns None when the cascade finds no matching normal.
+    Multi-pair logics (DMP — one row per matched normal, no winner):
+
+    * ``normal_id`` given — the override replaces the row set with the
+      single pinned row (mismatches recorded as above; strict rejects).
+    * ``automatic`` — return the existing row set unchanged if one
+      exists, otherwise create one row per strategy match.
+    * ``manual`` — re-run the strategy; a changed row set is replaced
+      (old rows retired, no duplicates).
+
+    Returns a pairing row (the representative — first in primary_id
+    order — for multi-pair logics), or None when the cascade finds no
+    matching normal.
     """
     if tumor is None or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
         return None
@@ -138,6 +279,11 @@ def trigger_pairing(
         return None
 
     strategy = get_pairing_strategy(pairing_logic)
+    if getattr(strategy, "MULTI_PAIR", False):
+        return _trigger_multi_pair(
+            db, strategy, tumor, pairing_logic, trigger_type, normal_id, strict
+        )
+
     existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
 
     if normal_id is not None:
@@ -195,11 +341,18 @@ def trigger_pairing_for_normal(
     normal: Sample,
     pairing_logic: Optional[PairingLogic],
 ) -> None:
-    """Auto-pair a normal sample against tumors that have no pairing yet.
+    """Auto-pair a normal sample against its matching tumors.
 
-    No-op for pooled normals: with a null patient__cmo no tumor matches, so
-    pooled normals enter pairing only when a tumor's cascade reaches the
-    pooled tier.
+    Single-winner logics: tumors that have no pairing yet are paired to
+    the normal. No-op for pooled normals: with a null patient__cmo no
+    tumor matches, so pooled normals enter pairing only when a tumor's
+    cascade reaches the pooled tier.
+
+    Multi-pair logics (DMP): the reference is tumor-driven; this is its
+    mirror — every same-patient DMP tumor's row set is recomputed, and
+    a changed set is replaced cleanly (old rows retired, no
+    duplicates), so a normal-side ingest produces exactly the rows the
+    tumor-side pass would.
     """
     if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
         return
@@ -207,6 +360,27 @@ def trigger_pairing_for_normal(
         return
 
     strategy = get_pairing_strategy(pairing_logic)
+
+    if getattr(strategy, "MULTI_PAIR", False):
+        for tumor in strategy.select_matching_tumors(db, normal, pairing_logic):
+            existing = _get_latest_pairings(db, tumor.id, pairing_logic.id)
+            normals = strategy.select_matching_normals(db, tumor, pairing_logic)
+            if {n.id for n in normals} == {row.normal_id for row in existing}:
+                continue
+            for row in existing:
+                _mark_stale(row)
+            selection_notes = strategy.select_latest_normal(db, tumor, pairing_logic).notes
+            for candidate in sorted(normals, key=lambda s: str(s.primary_id)):
+                _create_pairing(
+                    db,
+                    tumor,
+                    candidate,
+                    pairing_logic,
+                    trigger_type="automatic",
+                    notes=selection_notes or None,
+                    multi_pair=True,
+                )
+        return
 
     tumors = strategy.select_matching_tumors(db, normal, pairing_logic)
     for tumor in tumors:
@@ -339,24 +513,27 @@ def trigger_pairing_for_unpaired_tumors(
 # ---------------------------------------------------------------------------
 
 #: Name of the pairing logic under which DMP samples pair automatically.
-#: The DMP strategy is strictly DMP-group scoped (DMP tumor <-> DMP normal,
-#: same patient__dmp and gene panel), so running it in bulk can only create
-#: DMP-DMP pairings and never touches other sample groups.
+#: The DMP strategy is strictly DMP-group scoped (DMP tumor <-> DMP
+#: normal, two-tier same-pool / same-IM_ver matching), so running it in
+#: bulk can only create DMP-DMP pairings and never touches other sample
+#: groups.
 DMP_LOGIC_NAME = "DMP"
 
 
 def trigger_dmp_pairing(db: Session) -> dict:
     """Bulk automatic DMP pairing under the DMP pairing logic.
 
-    Every unpaired DMP tumor is paired with its best DMP normal (same
-    ``patient__dmp`` and gene panel) via the DMP strategy. Existing pairings
-    are never modified: a tumor that already has a latest pairing under the
-    DMP logic is skipped, whatever that pairing's trigger type is.
+    Every unpaired DMP tumor is paired with every matching DMP normal
+    under the two-tier rule (same patient, same pool first; else same
+    IM_ver rescue) — one row per match, no winner. Existing pairings
+    are never modified: a tumor that already has a latest pairing under
+    the DMP logic is skipped, whatever that pairing's trigger type is.
 
     Returns ``{"pairing_logic", "scanned", "already_paired",
     "missing_patient__dmp", "paired", "unpaired", "new_pairings"}`` where
-    the four outcome counts sum to ``scanned``. DMP tumors without
-    ``patient__dmp`` cannot match (the strategy is patient-scoped) and are
+    the four outcome counts sum to ``scanned``. DMP tumors with no
+    resolvable patient (neither ``patient__dmp`` nor a ``P-`` id in the
+    sample name) cannot match (the strategy is patient-scoped) and are
     reported in ``missing_patient__dmp``.
 
     Raises ``HTTPException(400)`` when no active pairing logic named
@@ -392,12 +569,20 @@ def trigger_dmp_pairing(db: Session) -> dict:
 
     scanned = already_paired = missing_patient = paired = unpaired = 0
     new_pairings: list[PairingTable] = []
+    strategy = get_pairing_strategy(logic)
+    strategy_keys = getattr(strategy, "pairing_keys", None)
     for tumor in tumors:
         scanned += 1
         if tumor.id in already_paired_ids:
             already_paired += 1
             continue
-        if not (tumor.patient__dmp or "").strip():
+        # Patient resolvable = stored patient__dmp or the reference's
+        # name-parse fallback (the strategy's remapped key, spec g).
+        if strategy_keys is not None:
+            has_patient = bool(strategy_keys(tumor)["patient"])
+        else:
+            has_patient = bool((tumor.patient__dmp or "").strip())
+        if not has_patient:
             missing_patient += 1
             continue
         pairing = trigger_pairing(db, tumor, logic, "automatic")
@@ -479,14 +664,15 @@ def evaluate_logic(db: Session, logic_name: str) -> dict:
 
     Counts, over the logic's unpaired tumor scope (the same scope
     ``trigger_pairing_for_unpaired_tumors`` backfills): how many are
-    already paired, how many *would* pair (the strategy's
-    ``select_latest_normal`` finds a normal) and how many would stay
-    unpaired. Performs no writes of any kind — in particular no
-    ``PairingTable`` rows and no bait-set registrations.
+    already paired, how many *would* pair (the strategy finds at least
+    one matching normal) and how many would stay unpaired. Performs no
+    writes of any kind — in particular no ``PairingTable`` rows and no
+    bait-set registrations.
 
     ``missing_patient__dmp`` (DMP logics only) counts the DMP tumors in
-    scope that carry no ``patient__dmp``; those are a subset of
-    ``would_stay_unpaired``. For any logic,
+    scope whose patient is not resolvable — neither ``patient__dmp``
+    nor a ``P-`` id in the sample name (the strategy's remapped key);
+    those are a subset of ``would_stay_unpaired``. For any logic,
     ``already_paired + would_pair + would_stay_unpaired == scope_total``.
     """
     logic = find_logic_by_name(db, logic_name)
@@ -511,12 +697,20 @@ def evaluate_logic(db: Session, logic_name: str) -> dict:
         if tumor.id in already_paired_ids:
             already_paired += 1
             continue
-        if is_dmp and not (tumor.patient__dmp or "").strip():
+        if is_dmp:
             # Mirrors trigger_dmp_pairing's pre-filter: a DMP tumor
-            # without a P- id can never match.
-            missing_patient += 1
-            would_stay_unpaired += 1
-            continue
+            # whose patient is not resolvable (no stored patient__dmp
+            # and no P- id in the name) can never match.
+            _keys = getattr(strategy, "pairing_keys", None)
+            _has_patient = (
+                bool(_keys(tumor)["patient"])
+                if _keys is not None
+                else bool((tumor.patient__dmp or "").strip())
+            )
+            if not _has_patient:
+                missing_patient += 1
+                would_stay_unpaired += 1
+                continue
         selection = strategy.select_latest_normal(db, tumor, logic)
         if selection.normal is None:
             would_stay_unpaired += 1
@@ -534,16 +728,35 @@ def evaluate_logic(db: Session, logic_name: str) -> dict:
 
 
 def count_unpaired(db: Session, logic_name: str) -> dict:
-    """Per-logic unpaired count for the Pairing overview summary strip.
+    """Per-logic paired/unpaired counts for the Pairing overview strip.
 
-    DMP: every DMP sample (tumor or normal, mirroring
-    ``GET /pairing/unmatched/``) with no latest DMP-logic pairing. Any
-    other logic: the logic's unpaired tumor population (the backfill
-    scope, see ``_logic_tumor_scope``). Read-only.
+    ``paired``: the logic's latest report rows where both the tumor
+    and the normal sides are present — the server-side form of the
+    Pair Report's "Paired" strip value (the report row rule
+    ``r.tumor && r.normal``). ``unpaired``: DMP: every DMP sample
+    (tumor or normal, mirroring ``GET /pairing/unmatched/``) with no
+    latest DMP-logic pairing. Any other logic: the logic's unpaired
+    tumor population (the backfill scope, see ``_logic_tumor_scope``).
+    Read-only.
     """
     logic = find_logic_by_name(db, logic_name)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
+    # "Paired" strip value: this logic's latest rows with both sides
+    # present (the explicit null guards state the report row rule).
+    paired_count = int(
+        db.scalar(
+            select(func.count())
+            .select_from(PairingTable)
+            .where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+                PairingTable.tumor_id.isnot(None),
+                PairingTable.normal_id.isnot(None),
+            )
+        )
+        or 0
+    )
     paired = exists(
         select(PairingTable.id).where(
             or_(
@@ -561,7 +774,7 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
     else:
         names = _logic_bait_set_names(db, logic)
         if not names:
-            return {"pairing_logic": logic.name, "unpaired": 0}
+            return {"pairing_logic": logic.name, "unpaired": 0, "paired": paired_count}
         stmt = select(func.count()).select_from(Sample).where(
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
             func.upper(func.coalesce(Sample.sample_type, "")) != "DMP",
@@ -571,6 +784,7 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
     return {
         "pairing_logic": logic.name,
         "unpaired": int(db.scalar(stmt) or 0),
+        "paired": paired_count,
     }
 
 
@@ -605,8 +819,13 @@ def possible_matches(
     argos strategy are always mismatches: DMP samples are
     manual-pairing only and are never auto-selected, so they are listed
     purely as override targets. Under the dmp strategy the candidate
-    scope is DMP-group only; matching DMP candidates are ``matched`` and
-    the winner carries ``would_be_selected``.
+    scope is DMP-group only; matching DMP candidates are ``matched``.
+
+    For a tumor input, ``would_be_selected`` marks the candidates that
+    would become pairing rows: the single winner under single-winner
+    strategies; under the multi_pair (DMP) strategy there is no winner,
+    so EVERY candidate in the tumor's two-tier row set is marked —
+    each one would get its own pairing row.
 
     ``other_matches`` is a bounded page of that scope (``limit``/``offset``,
     default ``DEFAULT_OTHER_MATCHES_LIMIT``); ``other_matches_total``
@@ -615,21 +834,20 @@ def possible_matches(
     without depending on the page. Each candidate that is not already a
     current match is evaluated with the strategy's ``mismatch_reasons``:
     ``matched`` is true when it would pass every matching key; otherwise
-    ``mismatched_keys`` lists the reasons it does not. For a tumor input,
-    ``would_be_selected`` marks the candidate the strategy's cascade would
-    pick. Used to support manual pairing (e.g. pinning a DMP normal via
+    ``mismatched_keys`` lists the reasons it does not. Used to support
+    manual pairing (e.g. pinning a DMP normal via
     POST /pairing/trigger).
     """
     strategy = get_pairing_strategy(logic)
     is_tumor = sample.tumor_or_normal == TumorOrNormal.TUMOR.value
 
     # Current matches: every latest pairing row with this sample on its
-    # side. A tumor has at most one (unique per tumor + logic); a normal
-    # matches 1-to-many, so it can carry several latest rows — one per
-    # distinct tumor currently paired to it.
+    # side. A single-winner tumor has at most one (unique per tumor +
+    # logic); a multi_pair (DMP) tumor has one per matched normal; a
+    # normal matches 1-to-many, so it can carry several latest rows —
+    # one per distinct tumor currently paired to it.
     if is_tumor:
-        row = _get_latest_pairing(db, sample.id, logic.id)
-        current_rows = [row] if row is not None else []
+        current_rows = _get_latest_pairings(db, sample.id, logic.id)
     else:
         current_rows = list(
             db.scalars(
@@ -666,11 +884,17 @@ def possible_matches(
     # tiers such as argos's pooled normals) — bounded by design.
     candidates = strategy.candidate_scope(db, sample, logic)
 
-    winner = (
-        strategy.select_latest_normal(db, sample, logic).normal
-        if is_tumor
-        else None
-    )
+    if is_tumor and getattr(strategy, "MULTI_PAIR", False):
+        # No winner under fan-out: every candidate in the tumor's
+        # two-tier row set would become its own pairing row.
+        would_selected_ids = {
+            n.id for n in strategy.select_matching_normals(db, sample, logic)
+        }
+    elif is_tumor:
+        winner = strategy.select_latest_normal(db, sample, logic).normal
+        would_selected_ids = {winner.id} if winner is not None else set()
+    else:
+        would_selected_ids = set()
 
     tier_rank = {"same_request": 0, "other_request": 1, "dmp": 2, "pooled": 3}
     others: list[dict] = []
@@ -697,7 +921,7 @@ def possible_matches(
                 "tier": tier,
                 "matched": not reasons,
                 "mismatched_keys": reasons or None,
-                "would_be_selected": winner is not None and cand.id == winner.id,
+                "would_be_selected": cand.id in would_selected_ids,
             }
         )
     others.sort(

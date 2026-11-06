@@ -1,0 +1,50 @@
+[
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000001",
+      "metadata": {
+        "sample": "P-7000002-T01-IM6",
+        "type": "T",
+        "patient": {
+          "dmp": "P-7000002"
+        },
+        "anon_id": "AT02T-T",
+        "project_name": "POOL2",
+        "coverage": 600
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000002",
+      "metadata": {
+        "sample": "P-7000002-N01-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000002"
+        },
+        "anon_id": "AT02N1-N",
+        "project_name": "POOL2",
+        "coverage": 588
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000003",
+      "metadata": {
+        "sample": "P-7000002-N02-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000002"
+        },
+        "anon_id": "AT02N2-N",
+        "project_name": "POOL2",
+        "coverage": 588
+      }
+    }
+  }
+]
