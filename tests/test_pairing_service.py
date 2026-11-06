@@ -2943,7 +2943,12 @@ def test_trigger_dmp_pairs_dmp_tumor_with_dmp_normal(db):
     )
 
 
-def test_trigger_dmp_picks_deterministic_normal_on_tie(db):
+def test_trigger_dmp_fans_out_one_row_per_matching_normal(db):
+    # DMP Reference Alignment 3/8: no winner. Two same-patient normals
+    # (no pool -> tier-1 skipped, tier-2 IM_ver rescue; both carry ver X1)
+    # yield ONE PAIRING ROW PER NORMAL. ``new_pairings`` carries the
+    # deterministic representative row (first in primary_id order) — not a
+    # chosen winner; the other matched row still exists in the table.
     _dmp_logic(db)
     _dmp_sample(db, "P-0000002-T1-X1", "P-0000002", TumorOrNormal.TUMOR.value)
     later = _dmp_sample(db, "P-0000002-N2-X1", "P-0000002")
@@ -2951,9 +2956,18 @@ def test_trigger_dmp_picks_deterministic_normal_on_tie(db):
 
     result = trigger_dmp_pairing(db)
 
-    (pairing,) = result["new_pairings"]
-    assert pairing.normal_id == first.id  # min primary_id wins
-    assert later.id != pairing.normal_id
+    assert result["paired"] == 1
+    (rep,) = result["new_pairings"]
+    assert rep.normal_id == first.id  # representative: first in primary_id order
+    rows = db.scalars(
+        select(PairingTable).where(
+            PairingTable.pairing_logic_id == db.scalar(
+                select(PairingLogic.id).where(PairingLogic.name == "DMP")
+            )
+        )
+    ).all()
+    assert len(rows) == 2  # one row per matching normal, neither suppressed
+    assert {r.normal_id for r in rows} == {first.id, later.id}
 
 
 def test_trigger_dmp_requires_same_dmp_patient(db):
