@@ -1,0 +1,66 @@
+[
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000001",
+      "metadata": {
+        "sample": "P-7000007-T01-IM6",
+        "type": "T",
+        "patient": {
+          "dmp": "P-7000007"
+        },
+        "anon_id": "AT07T-T",
+        "project_name": "POOL7",
+        "coverage": 45
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000002",
+      "metadata": {
+        "sample": "P-7000007-N01-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000007"
+        },
+        "anon_id": "AT07N-N",
+        "project_name": "POOL7",
+        "coverage": 588
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000003",
+      "metadata": {
+        "sample": "P-7000008-T01-IM6",
+        "type": "T",
+        "patient": {
+          "dmp": "P-7000008"
+        },
+        "anon_id": "AT08T-T",
+        "project_name": "POOL8",
+        "coverage": 600
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000004",
+      "metadata": {
+        "sample": "P-7000008-N01-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000008"
+        },
+        "anon_id": "AT08N-N",
+        "project_name": "POOL8",
+        "coverage": 45
+      }
+    }
+  }
+]

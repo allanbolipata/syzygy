@@ -1,0 +1,9 @@
+{
+  "matched_tumors_without_normal": [
+    "P-7000006-T01-IM6"
+  ],
+  "tumor_samples_with_multiple_ambiguous_normals": [],
+  "samples_with_bams_missing": [],
+  "low_coverage_tumors": [],
+  "low_coverage_normals": []
+}

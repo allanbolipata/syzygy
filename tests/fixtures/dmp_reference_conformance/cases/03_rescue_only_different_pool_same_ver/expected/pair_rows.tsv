@@ -1,0 +1,2 @@
+tumor_sample	patient	tumor_idx	tumor_IM_ver	tumor_bamname	tumor_group	tumor_matched	tumor_bam_exists	tumor_bam_coverage	normal_sample	normal_bamname	normal_IM_ver	pool_id	normal_bam_exists	normal_bam_coverage
+P-7000003-T01-IM6	P-7000003	T01	IM6	AT03T-T	GRP-DMP	Matched	1	600	P-7000003-N01-IM6	AT03N-N	IM6	POOL3A	1	588

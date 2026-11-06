@@ -1,0 +1,2 @@
+tumor_sample	patient	tumor_idx	tumor_IM_ver	tumor_bamname	tumor_group	tumor_matched	tumor_bam_exists	tumor_bam_coverage	normal_sample	normal_bamname	normal_IM_ver	pool_id	normal_bam_exists	normal_bam_coverage
+P-7000004-T01-IM7	P-7000004	T01	IM7	AT04T-T	GRP-DMP	Matched	1	600	P-7000004-N01-IM8	AT04N1-N	IM8	POOL4	1	588
