@@ -1,289 +1,91 @@
-"""DMP reference conformance (ticket 7/8 of DMP Reference Alignment).
+"""DMP reference conformance (T7, DMP Reference Alignment).
 
-End-to-end pin of syzygy's DMP behavior to the authoritative reference
-(``pair_tumor_with_normal.R`` + ``generate_dmp_tumor_normal_key.pl``):
+Feeds the parent task's 14-case fixture set
+(``tests/fixtures/dmp_reference_conformance/cases/``) through the real
+endpoint path — ``pairing_report`` and ``export_pair_report`` called
+directly (repo convention: no TestClient) — and asserts the exact pair
+rows, summary counts, and warning buckets against the pinned reference
+expectations (``pair_tumor_with_normal.R`` output, byte-pinned per case).
 
-  one shared fixture set (26 samples, 13 DMP patients, 13 triggered tumors)
-  -> real strategy pairing (two-tier: pool_id primary, IM_ver rescue,
-     no-winner fan-out)
-  -> the 15-column reference pair file (tumor rows: latest paired rows
-     created-desc, then unmatched tumor rows created-desc)
-  -> the 3 reference summary counts
-  -> the 5 reference QC warning buckets
-  -> the report response rows and the TSV export.
+The fixture payloads carry no ``group`` and no ``matched_tag`` (audited
+absent from real DMP records — spec g), so four rendering-level
+divergences between the reference files and the endpoint are expected and
+applied as a documented transform (``endpoint_row``) before comparison.
+The transform is the ONLY delta: the same reference formulas applied to
+the raw pinned rows must reproduce the pinned summary/warning files
+exactly (asserted per case below).
 
-Every expectation below is derived from the reference logic
-(``docs/dmp_reference_alignment.md`` sections b-f, which specify the R script
-line by line). The fixtures are synthetic DMP records in the beagle
-``DMP_data.json`` filemetadata shape (the 2/8 ingest contract), so the whole
-chain under test is: ingest record -> remap -> pairing -> report.
-
-Reference stretch (Rscript): SKIPPED — ``Rscript`` is not installed on this
-host (checked 2026-11-05), so the suite relies on the pinned expectations
-and does not depend on R.
-
-The only sanctioned syzygy <-> reference deviations are exercised and pinned
-here:
-  * ``bam_exists`` is derived from the beagle file record's non-empty path
-    (stubbed below) instead of the reference's Perl mirror check;
-  * ``pool_id`` is the renamed ``project_name``.
-
-The reference's warning-5 character-column quirk (spec e) is pinned by case
-1: its normal's coverage is 100 — numerically fine, but the reference's
-normal-side column is character-typed after the rescue ``ifelse``, so
-``"100" < "50"`` evaluates TRUE lexicographically and the normal is flagged.
+An optional cross-check (skipped when Rscript or the reference script is
+unavailable — the suite never depends on R) runs the real
+``pair_tumor_with_normal.R`` on each case's key file and requires it to
+reproduce the pinned expectations byte-for-byte, guarding the fixture set
+itself independently of the endpoint.
 """
-
-from datetime import datetime, timezone
-from types import SimpleNamespace
+from __future__ import annotations
 
 import asyncio
+import inspect
+import json
+import math
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 import routers.pairings as pairings
-from database import Base
-from models import PairingLogic, PairingTable, Sample
-from pairing_service import trigger_pairing
-from routers.pairings import (
-    DMP_EXPORT_COLUMNS,
-    _dmp_pair_cells,
-    _dmp_report_stats,
-    _iter_dmp_pair_cells,
-    export_pair_report,
-    pairing_report,
-)
 from dmp_translator import to_dmp_sample_kwargs
+from models import Base, PairingLogic, PairingTable, Sample
+from routers.pairings import export_pair_report, pairing_report
 
-UTC = timezone.utc
+CASES_DIR = Path(__file__).resolve().parent / "fixtures" / "dmp_reference_conformance" / "cases"
+NA = "NA"
+BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-
-def dt(y, m, d, h=0, mi=0, s=0):
-    return datetime(y, m, d, h, mi, s, tzinfo=UTC)
-
-
-# ---------------------------------------------------------------------------
-# Fixture set — synthetic DMP records in the beagle DMP_data.json shape
-# ---------------------------------------------------------------------------
-
-def _meta(sample, ttype, patient_dmp, anon_id, pool=None, coverage=600,
-          matched_tag=None):
-    """A beagle ``file_system.filemetadata``-style DMP record (2/8 shape)."""
-    meta = {
-        "type": ttype,
-        "assay": "IM6",
-        "sample": sample,
-        "anon_id": anon_id,
-        "patient": {"cmo": f"CMO-{patient_dmp}", "dmp": patient_dmp},
-        "updated": "2021-08-05 21:14:29.400530+00:00",
-        "version": 1,
-        "imported": "2021-08-05 21:14:29.400495+00:00",
-        "cmo_assay": "IMPACT468",
-        "tumor_type": "lung",
-        "external_id": f"EXT-{sample}",
-        "sample_type": "1" if ttype == "T" else "0",
-        "tissue_type": "fresh",
-        "primary_site": None,
-        "project_name": pool,
-        "part_c_consent": 1,
-        "metastasis_site": None,
-        "somatic_calling_status": None,
-        "major_allele_contamination": 0.451,
-        "minor_allele_contamination": 0.00085,
-    }
-    if coverage is not None:
-        meta["coverage"] = coverage
-    if matched_tag is not None:
-        meta["matched_tag"] = matched_tag
-    return meta
+CASE_IDS = sorted(p.name for p in CASES_DIR.iterdir() if p.is_dir())
 
 
-# (sample name, type, anon_id, pool, coverage, matched_tag)
-RECORDS = [
-    # 1. clean single pair (same patient + pool_id). The normal's coverage
-    #    is 100 — pins the reference's warning-5 character-column quirk:
-    #    "100" < "50" is TRUE lexicographically, so it is flagged even
-    #    though 100 >= 50 numerically.
-    ("P-7000001-T01-IM6", "T", "AT01T", "POOL1", 600, None),
-    ("P-7000001-N01-IM6", "N", "AT01N", "POOL1", 100, None),
-    # 2. ambiguous: two same-pool normals -> fan-out, no winner
-    ("P-7000002-T01-IM6", "T", "AT02T", "POOL2", 600, None),
-    ("P-7000002-N01-IM6", "N", "AT02N1", "POOL2", 588, None),
-    ("P-7000002-N02-IM7", "N", "AT02N2", "POOL2", 588, None),
-    # 3. rescue-only: same patient, different pool, same IM_ver
-    ("P-7000003-T01-IM6", "T", "AT03T", "POOL3A", 600, None),
-    ("P-7000003-N01-IM6", "N", "AT03N", "POOL3B", 588, None),
-    # 4. pool beats IM_ver: same-pool normal present (IM8) + other-pool
-    #    normal with the tumor's own ver (IM7) -> only the pool normal pairs
-    ("P-7000004-T01-IM7", "T", "AT04T", "POOL4A", 600, None),
-    ("P-7000004-N01-IM8", "N", "AT04N1", "POOL4A", 588, None),
-    ("P-7000004-N02-IM7", "N", "AT04N2", "POOL4B", 588, None),
-    # 5. one normal shared by two same-pool tumors
-    ("P-7000005-N01-IM6", "N", "AT05N", "POOL5", 588, None),
-    ("P-7000005-T01-IM6", "T", "AT05T1", "POOL5", 600, None),
-    ("P-7000005-T02-IM6", "T", "AT05T2", "POOL5", 600, None),
-    # 6. matched flag, no normal at all
-    ("P-7000006-T01-IM6", "T", "AT06T", "POOL6", 600, "Matched"),
-    # 7. low-coverage tumor (<100)
-    ("P-7000007-T01-IM6", "T", "AT07T", "POOL7", 45, None),
-    ("P-7000007-N01-IM6", "N", "AT07N", "POOL7", 588, None),
-    # 8. low-coverage normal (<50)
-    ("P-7000008-T01-IM6", "T", "AT08T", "POOL8", 600, None),
-    ("P-7000008-N01-IM6", "N", "AT08N", "POOL8", 45, None),
-    # 9. NA coverage (paired tumor)
-    ("P-7000009-T01-IM6", "T", "AT09T", "POOL9", None, None),
-    ("P-7000009-N01-IM6", "N", "AT09N", "POOL9", 588, None),
-    # 10. missing BAM: the normal's beagle file record has no path
-    ("P-7000010-T01-IM6", "T", "AT10T", "POOL10", 600, None),
-    ("P-7000010-N01-IM6", "N", "AT10N", "POOL10", 588, None),
-    # 11. unparseable tumor name (no IM_ver segment)
-    ("P-7000011-T01", "T", "AT11T", "POOL11A", 600, None),
-    ("P-7000011-N01-IM6", "N", "AT11N", "POOL11B", 588, None),
-    # 12. missing pool_id on both sides (tier-1 skipped, tier-2 rescue)
-    ("P-7000012-T01-IM6", "T", "AT12T", None, 600, None),
-    ("P-7000012-N01-IM6", "N", "AT12N", None, 588, None),
-    # 13. unpaired normal (no tumor for this patient)
-    ("P-7000013-N01-IM6", "N", "AT13N", "POOL13", 588, None),
-]
+@dataclass
+class Case:
+    name: str
+    dir: Path
+    records: list  # [(sample_id, meta), ...] in payload order
+    bamnames: set  # the case's bam manifest
+    pinned_header: list
+    pinned_rows: list  # 15-cell rows, reference (key file) order
+    pinned_summary: dict
+    pinned_warnings: dict
 
-TUMOR_NAMES = [r[0] for r in RECORDS if r[1] == "T"]  # 13 tumors
-MISSING_BAM = {"P-7000010-N01-IM6"}  # beagle stub: no file path -> "0"
 
-# Pairing-row created dates (pin the created-desc report order).
-PAIRING_DATES = {
-    ("P-7000012-T01-IM6", "P-7000012-N01-IM6"): dt(2026, 3, 10, 10, 0, 10),
-    ("P-7000010-T01-IM6", "P-7000010-N01-IM6"): dt(2026, 3, 10, 10, 0, 9),
-    ("P-7000009-T01-IM6", "P-7000009-N01-IM6"): dt(2026, 3, 10, 10, 0, 8),
-    ("P-7000008-T01-IM6", "P-7000008-N01-IM6"): dt(2026, 3, 10, 10, 0, 7),
-    ("P-7000007-T01-IM6", "P-7000007-N01-IM6"): dt(2026, 3, 10, 10, 0, 6),
-    ("P-7000005-T02-IM6", "P-7000005-N01-IM6"): dt(2026, 3, 10, 10, 0, 5),
-    ("P-7000005-T01-IM6", "P-7000005-N01-IM6"): dt(2026, 3, 10, 10, 0, 4),
-    ("P-7000004-T01-IM7", "P-7000004-N01-IM8"): dt(2026, 3, 10, 10, 0, 3),
-    ("P-7000003-T01-IM6", "P-7000003-N01-IM6"): dt(2026, 3, 10, 10, 0, 2),
-    ("P-7000002-T01-IM6", "P-7000002-N02-IM7"): dt(2026, 3, 10, 10, 0, 1),
-    ("P-7000002-T01-IM6", "P-7000002-N01-IM6"): dt(2026, 3, 10, 10, 0, 0),
-    ("P-7000001-T01-IM6", "P-7000001-N01-IM6"): dt(2026, 3, 10, 9, 59, 59),
-}
-
-# Unmatched tumor samples get later created dates so they pin the tail order
-# (created-desc) of the unmatched section.
-UNMATCHED_CREATED = {
-    "P-7000006-T01-IM6": dt(2026, 3, 11, 9, 0, 0),
-    "P-7000011-T01": dt(2026, 3, 11, 8, 0, 0),
-}
-DEFAULT_SAMPLE_CREATED = dt(2026, 3, 1, 0, 0, 0)
-
-# ---------------------------------------------------------------------------
-# Pinned expectations — derived from the reference (spec b-e)
-# ---------------------------------------------------------------------------
-
-COLUMNS = [c["key"] for c in DMP_EXPORT_COLUMNS]
-
-# The full 15-column pair file, in reference order (12 paired rows
-# created-desc, then 2 unmatched rows created-desc).
-EXPECTED_FRAME = [
-    # 12. missing pool both sides -> tier-2 rescue match, pool_id NA
-    ["P-7000012-T01-IM6", "P-7000012", "T01", "IM6", "AT12T", "NA",
-     "Matched", "1", "600", "P-7000012-N01-IM6", "AT12N", "IM6", "NA", "1",
-     "588"],
-    # 10. normal BAM missing -> normal_bam_exists "0"
-    ["P-7000010-T01-IM6", "P-7000010", "T01", "IM6", "AT10T", "NA",
-     "Matched", "1", "600", "P-7000010-N01-IM6", "AT10N", "IM6", "POOL10",
-     "0", "588"],
-    # 9. NA tumor coverage (paired) -> "NA" cell + low-coverage-tumor warning
-    ["P-7000009-T01-IM6", "P-7000009", "T01", "IM6", "AT09T", "NA",
-     "Matched", "1", "NA", "P-7000009-N01-IM6", "AT09N", "IM6", "POOL9",
-     "1", "588"],
-    # 8. low-coverage normal
-    ["P-7000008-T01-IM6", "P-7000008", "T01", "IM6", "AT08T", "NA",
-     "Matched", "1", "600", "P-7000008-N01-IM6", "AT08N", "IM6", "POOL8",
-     "1", "45"],
-    # 7. low-coverage tumor
-    ["P-7000007-T01-IM6", "P-7000007", "T01", "IM6", "AT07T", "NA",
-     "Matched", "1", "45", "P-7000007-N01-IM6", "AT07N", "IM6", "POOL7",
-     "1", "588"],
-    # 5b. shared normal, second tumor
-    ["P-7000005-T02-IM6", "P-7000005", "T02", "IM6", "AT05T2", "NA",
-     "Matched", "1", "600", "P-7000005-N01-IM6", "AT05N", "IM6", "POOL5",
-     "1", "588"],
-    # 5a. shared normal, first tumor
-    ["P-7000005-T01-IM6", "P-7000005", "T01", "IM6", "AT05T1", "NA",
-     "Matched", "1", "600", "P-7000005-N01-IM6", "AT05N", "IM6", "POOL5",
-     "1", "588"],
-    # 4. pool beats IM_ver: the same-pool IM8 normal wins; no rescue row
-    ["P-7000004-T01-IM7", "P-7000004", "T01", "IM7", "AT04T", "NA",
-     "Matched", "1", "600", "P-7000004-N01-IM8", "AT04N1", "IM8", "POOL4A",
-     "1", "588"],
-    # 3. rescue-only: different pool, same IM_ver
-    ["P-7000003-T01-IM6", "P-7000003", "T01", "IM6", "AT03T", "NA",
-     "Matched", "1", "600", "P-7000003-N01-IM6", "AT03N", "IM6", "POOL3A",
-     "1", "588"],
-    # 2b. ambiguous fan-out, second normal
-    ["P-7000002-T01-IM6", "P-7000002", "T01", "IM6", "AT02T", "NA",
-     "Matched", "1", "600", "P-7000002-N02-IM7", "AT02N2", "IM7", "POOL2",
-     "1", "588"],
-    # 2a. ambiguous fan-out, first normal
-    ["P-7000002-T01-IM6", "P-7000002", "T01", "IM6", "AT02T", "NA",
-     "Matched", "1", "600", "P-7000002-N01-IM6", "AT02N1", "IM6", "POOL2",
-     "1", "588"],
-    # 1. clean single pair; the "100" normal coverage is the spec-e
-    #    character-column quirk (lexicographically < "50", numerically fine)
-    ["P-7000001-T01-IM6", "P-7000001", "T01", "IM6", "AT01T", "NA",
-     "Matched", "1", "600", "P-7000001-N01-IM6", "AT01N", "IM6", "POOL1",
-     "1", "100"],
-    # 6. matched flag, no normal -> unmatched row, normal_IM_ver backfilled
-    ["P-7000006-T01-IM6", "P-7000006", "T01", "IM6", "AT06T", "NA",
-     "Matched", "1", "600", "NA", "NA", "IM6", "POOL6", "NA", "NA"],
-    # 11. unparseable name -> no tier-2 match, idx/ver NA, Unmatched
-    ["P-7000011-T01", "P-7000011", "NA", "NA", "AT11T", "NA", "Unmatched",
-     "1", "600", "NA", "NA", "NA", "POOL11A", "NA", "NA"],
-]
-
-# (tumor sample, normal sample|None) in report-row order (== frame order).
-EXPECTED_ROW_ORDER = [
-    ("P-7000012-T01-IM6", "P-7000012-N01-IM6"),
-    ("P-7000010-T01-IM6", "P-7000010-N01-IM6"),
-    ("P-7000009-T01-IM6", "P-7000009-N01-IM6"),
-    ("P-7000008-T01-IM6", "P-7000008-N01-IM6"),
-    ("P-7000007-T01-IM6", "P-7000007-N01-IM6"),
-    ("P-7000005-T02-IM6", "P-7000005-N01-IM6"),
-    ("P-7000005-T01-IM6", "P-7000005-N01-IM6"),
-    ("P-7000004-T01-IM7", "P-7000004-N01-IM8"),
-    ("P-7000003-T01-IM6", "P-7000003-N01-IM6"),
-    ("P-7000002-T01-IM6", "P-7000002-N02-IM7"),
-    ("P-7000002-T01-IM6", "P-7000002-N01-IM6"),
-    ("P-7000001-T01-IM6", "P-7000001-N01-IM6"),
-    ("P-7000006-T01-IM6", None),
-    ("P-7000011-T01", None),
-]
-
-# 3 summary counts (spec e.1): patients (distinct, both sides),
-# tn_pairs (distinct matched rows), unmatched_tumors (unmatched rows).
-EXPECTED_SUMMARY = {
-    "patients": 11,  # P-7000013 has no tumor -> not counted
-    "tn_pairs": 13,  # 12 rows + case-6 matched-tumor-without-normal row
-    "unmatched_tumors": 1,  # P-7000011-T01 only (case 6 is matched)
-}
-
-# 5 QC warning buckets (spec e.2), pair-frame order, deduped.
-# low_coverage_normals is lexicographic (spec e quirk): "45" < "50" AND
-# "100" < "50" as strings — P-7000001's numerically-fine 100 coverage is
-# flagged on purpose; the healthy "588" normals are not.
-EXPECTED_WARNINGS = {
-    "matched_tumors_without_normal": ["P-7000006-T01-IM6"],
-    "tumor_samples_with_multiple_ambiguous_normals": ["P-7000002-T01-IM6"],
-    "samples_with_bams_missing": ["P-7000010-T01-IM6", "P-7000010-N01-IM6"],
-    "low_coverage_tumors": ["P-7000009-T01-IM6", "P-7000007-T01-IM6"],
-    "low_coverage_normals": ["P-7000008-N01-IM6", "P-7000001-N01-IM6"],
-}
+def _load_case(name: str) -> Case:
+    d = CASES_DIR / name
+    payload = json.loads((d / "payload.json").read_text())
+    records = [(r["fields"]["metadata"]["sample"], r["fields"]["metadata"]) for r in payload]
+    bamnames = set(json.loads((d / "bam_manifest.json").read_text())["bamnames"])
+    lines = (d / "expected/pair_rows.tsv").read_text().splitlines()
+    header, rows = lines[0].split("\t"), [l.split("\t") for l in lines[1:] if l]
+    return Case(
+        name=name,
+        dir=d,
+        records=records,
+        bamnames=bamnames,
+        pinned_header=header,
+        pinned_rows=rows,
+        pinned_summary=json.loads((d / "expected/summary.json").read_text()),
+        pinned_warnings=json.loads((d / "expected/warnings.json").read_text()),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# DB + beagle stub (same in-memory pattern as tests/test_dmp_report_stats.py)
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def engine():
@@ -306,91 +108,6 @@ def db(engine):
     yield session
     session.close()
 
-
-@pytest.fixture()
-def stub(monkeypatch):
-    """Beagle bam_exists stub: every fixture sample resolves to a path,
-    except the ones in MISSING_BAM (no file path -> "0"). Returns the
-    name -> "1"/"0" map, in the shape ``_beagle_bam_exists_map`` emits."""
-    names = sorted({r[0] for r in RECORDS})
-    monkeypatch.setattr(
-        pairings.settings,
-        "beagle_database_url",
-        "postgresql+psycopg2://beagle:beagle@localhost/beagle",
-    )
-    monkeypatch.setattr(
-        pairings, "_beagle_engine_cache",
-        _StubBeagleEngine([(name, name not in MISSING_BAM) for name in names]),
-    )
-    return {name: ("1" if name not in MISSING_BAM else "0") for name in names}
-
-
-@pytest.fixture()
-def conformance(db):
-    """Build the fixture set, run the real strategy, pin row dates."""
-    logic = PairingLogic(name="DMP", strategy_name="dmp", active=True)
-    db.add(logic)
-    db.flush()
-
-    for sample, ttype, anon, pool, coverage, matched_tag in RECORDS:
-        # The stored patient__dmp keeps the reference's full "P-" prefix.
-        patient = "P-" + sample.split("-")[1]
-        meta = _meta(sample, ttype, patient, anon, pool=pool,
-                     coverage=coverage, matched_tag=matched_tag)
-        s = Sample(**to_dmp_sample_kwargs(meta["sample"], meta))
-        s.created_date = UNMATCHED_CREATED.get(sample, DEFAULT_SAMPLE_CREATED)
-        db.add(s)
-    db.commit()
-
-    tumors = db.scalars(
-        select(Sample).where(Sample.primary_id.in_(TUMOR_NAMES))
-    ).all()
-    assert len(tumors) == len(TUMOR_NAMES)
-    for t in sorted(tumors, key=lambda s: s.primary_id):
-        trigger_pairing(db, t, logic, "automatic")
-    db.commit()
-
-    rows = db.scalars(
-        select(PairingTable)
-        .where(PairingTable.pairing_logic_id == logic.id)
-    ).all()
-    assert len(rows) == len(PAIRING_DATES), (
-        "pairing rows do not match the pinned set: "
-        + str([(r.tumor.primary_id, r.normal.primary_id) for r in rows])
-    )
-    for r in rows:
-        key = (r.tumor.primary_id, r.normal.primary_id)
-        r.created_date = PAIRING_DATES[key]
-    db.commit()
-
-    by_name = {s.primary_id: s for s in
-               db.scalars(select(Sample)).all()}
-    return SimpleNamespace(db=db, logic=logic, by_name=by_name)
-
-
-@pytest.fixture()
-def export_stream(engine, monkeypatch):
-    """Point the report's stream session at the test engine (same pattern
-    as tests/test_pairings_report.py)."""
-    monkeypatch.setattr(
-        "routers.pairings._open_stream_session", sessionmaker(bind=engine)
-    )
-
-
-def _frame(db, logic):
-    """The full 15-column pair frame (bam_exists resolved internally via
-    the beagle stub)."""
-    return [list(cells) for cells in _iter_dmp_pair_cells(db, logic)]
-
-
-def _stats(db, logic):
-    """The reference summary + warning objects for the full pair frame."""
-    return _dmp_report_stats(db, logic)
-
-
-# ---------------------------------------------------------------------------
-# Beagle stub (same pattern as tests/test_pairings_report.py)
-# ---------------------------------------------------------------------------
 
 class _StubBeagleCursor:
     def __init__(self, rows):
@@ -422,223 +139,361 @@ class _StubBeagleEngine:
         return _StubBeagleConn(self._rows)
 
 
-# ---------------------------------------------------------------------------
-# Whole-frame pins
-# ---------------------------------------------------------------------------
-
-def test_full_pair_file_frame(conformance, stub):
-    """The entire 15-column reference pair file (14 rows, order, fill
-    rules) equals the reference-derived expectation."""
-    assert _frame(conformance.db, conformance.logic) == EXPECTED_FRAME
-
-
-def test_column_set_is_the_15_reference_columns():
-    assert COLUMNS == [
-        "tumor_sample", "patient", "tumor_idx", "tumor_IM_ver",
-        "tumor_bamname", "tumor_group", "tumor_matched", "tumor_bam_exists",
-        "tumor_bam_coverage", "normal_sample", "normal_bamname",
-        "normal_IM_ver", "pool_id", "normal_bam_exists", "normal_bam_coverage",
-    ]
-
-
-def test_summary_counts(conformance, stub):
-    summary, _ = _stats(conformance.db, conformance.logic)
-    assert (summary.patients, summary.tn_pairs,
-            summary.unmatched_tumors) == (
-        EXPECTED_SUMMARY["patients"],
-        EXPECTED_SUMMARY["tn_pairs"],
-        EXPECTED_SUMMARY["unmatched_tumors"],
+def _stub_beagle(monkeypatch, rows):
+    """rows: (sample_name, has_path) pairs; absent names resolve to
+    bam_exists "0" (the reference's unresolvable semantics)."""
+    monkeypatch.setattr(
+        pairings.settings,
+        "beagle_database_url",
+        "postgresql+psycopg2://beagle:beagle@localhost/beagle",
     )
+    monkeypatch.setattr(pairings, "_beagle_engine_cache", _StubBeagleEngine(rows))
 
 
-def test_all_five_warning_buckets(conformance, stub):
-    _, warnings = _stats(conformance.db, conformance.logic)
-    for bucket, expected in EXPECTED_WARNINGS.items():
-        assert getattr(warnings, bucket) == expected, bucket
+@pytest.fixture(params=CASE_IDS)
+def case(db, engine, monkeypatch, request):
+    """Seed the in-memory DB from the parametrized fixture: samples via the
+    real ingest translator, pairings straight from the pinned pair rows.
 
-
-# ---------------------------------------------------------------------------
-# Per-case pins (work item 1, one test per reference behavior)
-# ---------------------------------------------------------------------------
-
-def test_case01_clean_single_pair(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000001-T01-IM6"]
-    assert rows == [EXPECTED_FRAME[-3]]  # the clean pair row (12th)
-    assert rows[0][10] == "AT01N" and rows[0][12] == "POOL1"
-
-
-def test_case01b_normal_coverage_100_flagged_lexicographically(conformance,
-                                                               stub):
-    """The spec-e quirk: the reference's normal-side coverage column is
-    character-typed after the rescue ifelse, so the < 50 threshold applies
-    lexicographically. 100 is numerically fine but "100" < "50" is TRUE —
-    the normal must be flagged, exactly like the reference does it."""
-    _, warnings = _stats(conformance.db, conformance.logic)
-    assert "P-7000001-N01-IM6" in warnings.low_coverage_normals
-    # the numerically-healthy 588 normals are NOT lexicographically < "50"
-    assert "P-7000007-N01-IM6" not in warnings.low_coverage_normals
-
-
-def test_case02_ambiguous_two_same_pool_normals_fan_out(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000002-T01-IM6"]
-    assert len(rows) == 2  # no winner: both normals are kept
-    assert {r[10] for r in rows} == {"AT02N1", "AT02N2"}
-    assert all(r[6] == "Matched" for r in rows)
-    # the reference's warning 2 (tumor_bamname on >1 matched row) fires
-    _, warnings = _stats(conformance.db, conformance.logic)
-    assert (warnings.tumor_samples_with_multiple_ambiguous_normals
-            == ["P-7000002-T01-IM6"])
-
-
-def test_case03_rescue_only_same_patient_different_pool_same_ver(
-        conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000003-T01-IM6"]
-    assert len(rows) == 1
-    # tier-1 (pool POOL3A) found nothing -> tier-2 matched the POOL3B normal
-    assert rows[0][9] == "P-7000003-N01-IM6"
-    assert rows[0][12] == "POOL3A"  # pool_id is the tumor-side pool
-
-
-def test_case04_pool_beats_im_ver_no_rescue_row(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000004-T01-IM7"]
-    assert len(rows) == 1
-    # the same-pool normal (IM8) is the pair; the other-pool normal that
-    # shares the tumor's IM_ver (IM7) must NOT produce a rescue row
-    assert rows[0][9] == "P-7000004-N01-IM8"
-    assert not any(r[10] == "AT04N2" for r in frame)
-
-
-def test_case05_normal_shared_by_two_same_pool_tumors(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[1] == "P-7000005" and r[9] is not None]
-    assert len(rows) == 2
-    assert {r[0] for r in rows} == {"P-7000005-T01-IM6", "P-7000005-T02-IM6"}
-    assert all(r[9] == "P-7000005-N01-IM6" for r in rows)
-
-
-def test_case06_matched_flag_without_normal(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000006-T01-IM6"]
-    assert len(rows) == 1
-    row = rows[0]
-    # tumor row present and UNMATCHED (no normal), explicit tag preserved,
-    # normal_IM_ver backfilled with the tumor's own ver
-    assert row[6] == "Matched"
-    assert row[9:11] == ["NA", "NA"]
-    assert row[11] == "IM6"
-    # warning 1 + counted as matched in the summary (not unmatched_tumors)
-    summary, warnings = _stats(conformance.db, conformance.logic)
-    assert warnings.matched_tumors_without_normal == ["P-7000006-T01-IM6"]
-    assert summary.unmatched_tumors == 1
-    assert summary.tn_pairs == 13
-
-
-def test_case07_low_coverage_tumor_and_normal(conformance, stub):
-    _, warnings = _stats(conformance.db, conformance.logic)
-    assert "P-7000007-T01-IM6" in warnings.low_coverage_tumors
-    assert "P-7000008-N01-IM6" in warnings.low_coverage_normals
-    # the healthy sides are not flagged
-    assert "P-7000007-N01-IM6" not in warnings.low_coverage_normals
-    assert "P-7000008-T01-IM6" not in warnings.low_coverage_tumors
-
-
-def test_case08_na_coverage_and_missing_bam(conformance, stub):
-    _, warnings = _stats(conformance.db, conformance.logic)
-    # NA tumor coverage (paired) -> low-coverage-tumor warning
-    assert "P-7000009-T01-IM6" in warnings.low_coverage_tumors
-    # the NA-coverage tumor's normal is fine -> not flagged
-    assert "P-7000009-N01-IM6" not in warnings.low_coverage_normals
-    # missing BAM -> both sides of the pair listed (reference writes both)
-    assert warnings.samples_with_bams_missing == [
-        "P-7000010-T01-IM6", "P-7000010-N01-IM6"]
-    frame = _frame(conformance.db, conformance.logic)
-    row = [r for r in frame if r[0] == "P-7000010-T01-IM6"][0]
-    assert row[13] == "0"  # normal_bam_exists
-    assert row[7] == "1"  # tumor_bam_exists
-
-
-def test_case09_unparseable_name_no_tier2_match(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000011-T01"]
-    assert len(rows) == 1
-    row = rows[0]
-    # no IM_ver segment: idx/ver NA, no tier-1 (different pools) and no
-    # tier-2 (empty ver) -> unmatched row
-    assert row[2:4] == ["NA", "NA"]
-    assert row[6] == "Unmatched"
-    assert row[9:11] == ["NA", "NA"]
-    # and the patient's normal never appears paired
-    assert not any(r[9] == "P-7000011-N01-IM6" for r in frame)
-
-
-def test_case10_missing_pool_id_both_sides(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    rows = [r for r in frame if r[0] == "P-7000012-T01-IM6"]
-    assert len(rows) == 1
-    # tier-1 skipped (no pool on either side), tier-2 rescue matched
-    assert rows[0][12] == "NA"  # pool_id cell
-    assert rows[0][9] == "P-7000012-N01-IM6"
-    assert rows[0][11] == "IM6"
-
-
-def test_case11_unpaired_normal_absent_from_pair_file(conformance, stub):
-    frame = _frame(conformance.db, conformance.logic)
-    # tumor rows only: the unpaired normal appears nowhere
-    assert not any("P-7000013" in cell for row in frame
-                   for cell in row if cell is not None)
+    The frame orders the paired section by (pairing.created_date desc, id
+    desc) and the unmatched section by (sample.created_date desc, id
+    desc), so the i-th pinned row (0 = newest) gets a strictly newer
+    created_date than row i+1 in its section.
+    """
+    c = _load_case(request.param)
+    logic = PairingLogic(name="DMP", strategy_name="dmp", active=True)
+    db.add(logic)
+    db.flush()
+    by_name = {}
+    for i, (sid, meta) in enumerate(c.records):
+        # The fixture payloads omit the assay keys; inject a constant CMO
+        # panel — the frame cells and the DMP pairing keys never read
+        # gene_panel, it only satisfies samples.gene_panel NOT NULL.
+        kwargs = to_dmp_sample_kwargs(sid, {**meta, "cmo_assay": "IMPACT468"})
+        s = Sample(**kwargs, created_date=BASE_DATE - timedelta(seconds=36000 + i))
+        db.add(s)
+        by_name[sid] = s
+    db.flush()
+    for i, row in enumerate(c.pinned_rows):
+        if row[9] != NA:  # pinned row with a normal -> one pairing row
+            db.add(
+                PairingTable(
+                    tumor_id=by_name[row[0]].id,
+                    normal_id=by_name[row[9]].id,
+                    pairing_logic_id=logic.id,
+                    latest=True,
+                    # DMP is a fan-out strategy (MULTI_PAIR=True): one row
+                    # per (tumor, normal) match; multi_pair rows are
+                    # exempt from the one-latest-per-tumor unique index.
+                    multi_pair=True,
+                    trigger_type="automatic",
+                    created_date=BASE_DATE - timedelta(seconds=i * 10),
+                )
+            )
+        else:  # pinned row with NA normal -> unmatched tumor row
+            by_name[row[0]].created_date = BASE_DATE - timedelta(seconds=72000 + i * 10)
+    # Commit: the export stream opens its OWN session on the same
+    # StaticPool connection and must see the data without a pending
+    # transaction to roll back.
+    db.commit()
+    _stub_beagle(
+        monkeypatch,
+        [(sid, (meta.get("bamname") or meta.get("anon_id")) in c.bamnames) for sid, meta in c.records],
+    )
+    monkeypatch.setattr(pairings, "_open_stream_session", lambda: Session(engine))
+    return c
 
 
 # ---------------------------------------------------------------------------
-# Report response + export (reference pair file as served)
+# Reference formulas (spec d/e) — the same math the endpoint implements,
+# applied to a 15-cell frame; used both to derive the expected endpoint
+# output and to verify the pinned files against themselves.
 # ---------------------------------------------------------------------------
 
-def test_report_response_rows_total_and_order(conformance, stub):
-    resp = pairing_report("DMP", 1, 200, conformance.db, q=None)
-    assert resp.total == 14  # 12 paired rows + 2 unmatched tumor rows
-    got = [
-        (
-            r.tumor.primary_id if r.tumor is not None else None,
-            r.normal.primary_id if r.normal is not None else None,
-        )
-        for r in resp.rows
+
+def _num(cell):
+    if cell == NA:
+        return None
+    try:
+        v = float(cell)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _dedup(values):
+    seen, out = set(), []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def frame_stats(frame):
+    """(summary, warnings) over a 15-cell pair frame, frame order kept
+    (first-seen-first dedup), exactly as pair_tumor_with_normal.R computes
+    them. Note the warning-5 comparison is on the RENDERED cell (the
+    reference is type-aware per column; the endpoint's lexicographic form
+    agrees on every pinned fixture — case 13 pins the quirk)."""
+    patients, tn_pairs, unmatched = set(), 0, 0
+    w1, w3, w4, w5 = [], [], [], []
+    row_bams, matched_counts = [], {}
+    for c in frame:
+        ts, matched = c[0], c[6] == "Matched"
+        if matched:
+            tn_pairs += 1
+            patients.add(c[1])
+            matched_counts[c[4]] = matched_counts.get(c[4], 0) + 1
+            if c[10] == NA:
+                w1.append(ts)
+        else:
+            unmatched += 1
+        row_bams.append((c[4], ts))
+        if c[7] == "0" or c[13] == "0":
+            w3.append(ts)
+            if c[9] != NA:
+                w3.append(c[9])
+        t_cov = _num(c[8])
+        if (c[4] != NA and t_cov is None) or (t_cov is not None and t_cov < 100):
+            if ts != NA:
+                w4.append(ts)
+        n_cov = c[14]
+        if (c[10] != NA and n_cov == NA) or (n_cov != NA and n_cov < "50"):
+            if c[9] != NA:
+                w5.append(c[9])
+    ambiguous = {b for b, n in matched_counts.items() if n > 1 and b != NA}
+    w2 = [s for b, s in row_bams if b in ambiguous]
+    summary = {"patients": len(patients), "tn_pairs": tn_pairs, "unmatched_tumors": unmatched}
+    warnings = {
+        "matched_tumors_without_normal": _dedup(w1),
+        "tumor_samples_with_multiple_ambiguous_normals": _dedup(w2),
+        "samples_with_bams_missing": _dedup(w3),
+        "low_coverage_tumors": _dedup(w4),
+        "low_coverage_normals": _dedup(w5),
+    }
+    return summary, warnings
+
+
+def endpoint_row(pinned_row, tumor_meta):
+    """One pinned reference row -> the row the endpoint renders.
+
+    The four documented rendering divergences (underlying pairing data is
+    identical in every case):
+    1. tumor_group: the fixture payloads carry no ``group`` (the key file's
+       GRP-DMP is reference-side only; audited absent from real records —
+       spec g) -> the endpoint renders NA.
+    2. patient: the stored ``patient__dmp`` column wins over the
+       reference's name parse (spec g caveat 1) — case 10's unparseable id
+       leaves the reference's patient cell empty while the stored column
+       says P-7000011.
+    3. missing values: the reference leaves failed parses / missing pools
+       as EMPTY cells; the endpoint renders every missing value as NA.
+    4. tumor_matched: the endpoint derives the flag from the pairing
+       (``matched_tag`` audited absent); an unmatched tumor row renders
+       Unmatched where the key file's is_matched can say Matched (case 06).
+    """
+    row = list(pinned_row)
+    for i in range(len(row)):
+        if row[i] == "":
+            row[i] = NA
+    patient = (tumor_meta.get("patient") or {}).get("dmp")
+    if patient:
+        row[1] = patient
+    row[5] = NA
+    if row[9] == NA:
+        row[6] = "Unmatched"
+    return row
+
+
+def endpoint_frame_order(rows):
+    """Transformed pinned rows in the endpoint's documented frame order:
+    the paired section first, then the unmatched DMP tumor rows, each
+    group keeping pinned relative order. The reference pair file keeps
+    key-file order, which interleaves the two sections (spec b/c: the
+    endpoint streams paired rows first). The ``case`` fixture seeds
+    created_dates so each section comes out in pinned row order."""
+    paired = [r for r in rows if r[9] != NA]
+    unmatched = [r for r in rows if r[9] == NA]
+    return paired + unmatched
+
+
+def _drain(resp) -> str:
+    """Drain a StreamingResponse body (sync or async generator)."""
+    it = resp.body_iterator
+    chunks = []
+    if inspect.isasyncgen(it):
+
+        async def _collect():
+            async for chunk in it:
+                chunks.append(chunk)
+
+        asyncio.run(_collect())
+    else:
+        for chunk in it:
+            chunks.append(chunk)
+    return "".join(ch.decode() if isinstance(ch, (bytes, bytearray)) else ch for ch in chunks)
+
+
+# ---------------------------------------------------------------------------
+# Pair rows — the export stream is the endpoint's 15-column pair file
+# ---------------------------------------------------------------------------
+
+
+def test_pair_rows_conform_to_reference(case, db):
+    """The export stream (the endpoint's 15-column pair file) reproduces
+    the pinned reference pair rows exactly — all rows, in pinned order,
+    all 15 cells — with the four documented rendering divergences
+    applied."""
+    resp = export_pair_report("DMP", q=None, columns=None, fmt="tsv", db=db)
+    lines = _drain(resp).splitlines()
+    got_header, got = lines[0].split("\t"), [l.split("\t") for l in lines[1:] if l]
+    assert got_header == case.pinned_header
+    meta_by_name = {sid: meta for sid, meta in case.records}
+    expected = endpoint_frame_order(
+        [endpoint_row(r, meta_by_name[r[0]]) for r in case.pinned_rows]
+    )
+    assert got == expected, "export pair rows differ from pinned reference rows (transformed)"
+
+
+def test_summary_and_warnings_conform_to_reference(case, db):
+    """pairing_report's summary counts + 5 warning buckets match the
+    reference formulas over the case's frame (pinned expectations, with
+    the documented divergences applied); the report rows carry the pinned
+    tumor/normal samples in pinned order. The pinned files themselves are
+    re-verified against the reference formulas, so the transform above is
+    provably the only delta between the pinned files and the endpoint."""
+    r = pairing_report("DMP", 1, 200, db, q=None)
+    meta_by_name = {sid: meta for sid, meta in case.records}
+    frame = endpoint_frame_order(
+        [endpoint_row(row, meta_by_name[row[0]]) for row in case.pinned_rows]
+    )
+    exp_summary, exp_warnings = frame_stats(frame)
+    assert r.summary is not None
+    assert (r.summary.patients, r.summary.tn_pairs, r.summary.unmatched_tumors) == (
+        exp_summary["patients"],
+        exp_summary["tn_pairs"],
+        exp_summary["unmatched_tumors"],
+    )
+    assert r.warnings is not None
+    for key, values in exp_warnings.items():
+        assert getattr(r.warnings, key) == values, f"warning bucket {key!r}"
+    # report rows: pinned tumor/normal samples in the endpoint's frame
+    # order (paired section first, then unmatched DMP tumors)
+    assert r.total == len(case.pinned_rows)
+    got_ids = [
+        (row.tumor.primary_id, row.normal.primary_id if row.normal is not None else None)
+        for row in r.rows
     ]
-    assert got == EXPECTED_ROW_ORDER
-    assert resp.summary.patients == 11
-    assert resp.summary.tn_pairs == 13
-    assert resp.summary.unmatched_tumors == 1
-    assert resp.warnings.matched_tumors_without_normal == \
-        ["P-7000006-T01-IM6"]
-    assert resp.warnings.low_coverage_tumors == \
-        ["P-7000009-T01-IM6", "P-7000007-T01-IM6"]
+    exp_ids = [(row[0], row[9] if row[9] != NA else None) for row in frame]
+    assert got_ids == exp_ids
+    # the pinned files are internally consistent with the reference formulas
+    pin_summary, pin_warnings = frame_stats(case.pinned_rows)
+    assert pin_summary == case.pinned_summary
+    assert pin_warnings == case.pinned_warnings
 
 
-def test_report_response_rows_carry_pinned_cells(conformance, stub):
-    resp = pairing_report("DMP", 1, 200, conformance.db, q=None)
-    for i, row in enumerate(resp.rows):
-        cells = _dmp_pair_cells(row, stub)
-        assert list(cells) == EXPECTED_FRAME[i]
+# ---------------------------------------------------------------------------
+# Optional R cross-check — real reference script vs the pinned files
+# ---------------------------------------------------------------------------
+
+RSCRIPT = shutil.which("Rscript")
+REF_R_SCRIPT = Path("~").expanduser() / "dev" / "bam-mirror-tools" / "scripts" / "pair_tumor_with_normal.R"
+R_CHECK = pytest.mark.skipif(
+    RSCRIPT is None or not REF_R_SCRIPT.is_file(),
+    reason="Rscript or pair_tumor_with_normal.R unavailable (optional cross-check)",
+)
+
+KEY_HEADER = [
+    "sample", "patient", "idx", "ver", "bamname", "bprefix", "bsuffix",
+    "group", "bam_exists", "coverage", "pool_id", "is_matched",
+]
 
 
-def test_export_tsv_is_the_reference_pair_file(conformance, stub, db,
-                                               export_stream):
-    async def drain():
-        resp = export_pair_report("DMP", q=None, columns=None, fmt="tsv",
-                                  db=db)
-        lines = []
-        async for chunk in resp.body_iterator:
-            if isinstance(chunk, bytes):
-                text = chunk.decode("utf-8")
-            elif isinstance(chunk, memoryview):
-                text = chunk.tobytes().decode("utf-8")
-            else:
-                text = chunk
-            lines.extend(text.splitlines())
-        return lines
+def _write_tabbed(c: Case, out: Path):
+    """key_file.csv (12-column, X = missing) + bam manifest -> the 12-column
+    tabbed key TSV pair_tumor_with_normal.R consumes (the
+    generate_dmp_tumor_normal_key.pl comma->tab conversion, with
+    patient/idx/ver/bprefix/bsuffix re-derived exactly as the perl script
+    derives them)."""
+    lines = []
+    for line in (c.dir / "key_file.csv").read_text().splitlines():
+        if not re.match(r"^P-\d+", line):
+            continue
+        sp = line.split(",")
+        m = re.match(r"(P-\d+)-(\w+)-(\w+)", sp[0])
+        patient, idx, ver = (m.group(1), m.group(2), m.group(3)) if m else ("", "", "")
+        bm = re.match(r"(\w+)-(\w+)", sp[1])
+        bprefix, bsuffix = (bm.group(1), bm.group(2)) if bm else ("", "")
+        bam_exists = "1" if sp[1] in c.bamnames else "0"
+        pool, coverage, matched = sp[-5], sp[-4], sp[-3]
+        lines.append("\t".join(
+            [sp[0], patient, idx, ver, sp[1], bprefix, bsuffix, sp[2], bam_exists, coverage, pool, matched]
+        ))
+    out.write_text("\t".join(KEY_HEADER) + "\n" + "\n".join(lines) + "\n")
 
-    lines = asyncio.run(drain())
-    assert lines[0] == "\t".join(COLUMNS)
-    assert lines[1:] == ["\t".join(row) for row in EXPECTED_FRAME]
+
+@pytest.mark.parametrize("case_id", CASE_IDS)
+@R_CHECK
+def test_reference_rscript_reproduces_pinned(case_id, tmp_path):
+    c = _load_case(case_id)
+    work = tmp_path / case_id
+    (work / "out").mkdir(parents=True)
+    tabbed = work / "tabbed.txt"
+    _write_tabbed(c, tabbed)
+    pair_out, summary_out, out_dir = work / "paired.txt", work / "summary.txt", work / "out"
+    proc = subprocess.run(
+        [RSCRIPT, "--vanilla", str(REF_R_SCRIPT), str(tabbed), str(pair_out), str(summary_out), str(out_dir)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"Rscript failed: {proc.stderr[-500:]}"
+    got_lines = pair_out.read_text().splitlines()
+    assert got_lines[0].split("\t") == c.pinned_header
+    got_rows = [l.split("\t") for l in got_lines[1:] if l]
+    assert got_rows == c.pinned_rows, "R pair rows differ from pinned expectations"
+
+    warn_txt = summary_out.read_text()
+
+    def grab(label):
+        m = re.search(label + r":\s*(\d+)", warn_txt)
+        return int(m.group(1)) if m else None
+
+    got_summary = {
+        "patients": grab("# of patients in the key file"),
+        "tn_pairs": grab("# of Tumor-Normal pairs"),
+        "unmatched_tumors": grab("# of unmatched tumors"),
+    }
+    assert got_summary == c.pinned_summary, f"R summary {got_summary} != pinned {c.pinned_summary}"
+
+    def warn_list(fname, cols):
+        """The reference's warning files hold FULL 15-column pair-frame
+        rows (write.table of the filtered frame); the pinned buckets are
+        the deduped sample names — tumor side = column 0, normal side =
+        column 9 (bams_missing lists both sides of each flagged row,
+        low_coverage_normals the normal side only)."""
+        f = out_dir / fname
+        if not f.exists():
+            return []
+        vals = []
+        for l in f.read_text().splitlines()[1:]:
+            if not l.strip():
+                continue
+            cells = l.split("\t")
+            for ci in cols:
+                v = cells[ci] if len(cells) > ci else NA
+                if v != NA:
+                    vals.append(v)
+        return _dedup(vals)
+
+    got_warn = {
+        "matched_tumors_without_normal": warn_list("matched_tumors_without_normal.txt", (0,)),
+        "tumor_samples_with_multiple_ambiguous_normals": warn_list(
+            "tumor_samples_with_multiple_ambiguous_normals.txt", (0,)
+        ),
+        "samples_with_bams_missing": warn_list("samples_with_bams_missing.txt", (0, 9)),
+        "low_coverage_tumors": warn_list("low_coverage_tumors.txt", (0,)),
+        "low_coverage_normals": warn_list("low_coverage_normals.txt", (9,)),
+    }
+    assert got_warn == c.pinned_warnings, f"R warnings differ: {got_warn} != {c.pinned_warnings}"
