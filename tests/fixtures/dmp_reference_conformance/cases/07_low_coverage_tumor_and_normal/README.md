@@ -4,7 +4,7 @@ Low coverage: tumor <100 and normal <50.
 
 ## Pinned reference behavior
 
-P-7000007: tumor coverage 45 (<100 numeric) -> Warning 4 (low-coverage tumors). P-7000008: normal coverage 45 (<"50" lexicographic) -> Warning 5 (low-coverage normals). Both pairs match tier-1. 2 rows; tn_pairs=2.
+P-7000007: tumor coverage 45 (<100 numeric) -> Warning 4 (low-coverage tumors). P-7000008: normal coverage 45 (<50 numeric — no rescue row in this case, so normal_bam_coverage stays numeric) -> Warning 5 (low-coverage normals). Both pairs match tier-1. 2 rows; tn_pairs=2.
 
 ## Inputs
 - Samples (4):
@@ -44,8 +44,11 @@ normal_IM_ver, pool_id, normal_bam_exists, normal_bam_coverage).
 - `normal_IM_ver` backfill (R lines 63-64): where the tier-1 normal_IM_ver is
   NA, it is filled with `tumor_IM_ver`. For a tier-2 rescue the two are equal
   (the rescue joins on IM_ver); for a no-normal row it is the tumor's ver.
-- `normal_bam_coverage` is a CHARACTER column (the rescue ifelse mixes the
-  numeric normal coverage with the character rescued coverage, R lines 65-66)
-  — this is what makes Warning 5 lexicographic.
+- `normal_bam_coverage` (R lines 34, 65-66): numeric after the as.numeric
+  mutate; the rescue ifelse then adopts the type of the NON-NA argument, so
+  the column is CHARACTER only when this case's frame contains at least one
+  rescue match — which makes Warning 5's `< 50` a LEXICOGRAPHIC string
+  compare ("100" < "50" is TRUE). Frames with no rescue row keep the column
+  NUMERIC (Warning 5 numeric). Warning 4 (tumor) is always numeric.
 - Row order is the reference key-file (tumor input) order, fan-out consecutive
   per tumor — NOT syzygy's created-desc order.

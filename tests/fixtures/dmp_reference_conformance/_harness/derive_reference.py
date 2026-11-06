@@ -22,11 +22,17 @@ Reference semantics reproduced here (with the R/Perl lines they come from):
                   (patient, tumor_IM_ver == normal ver).
   * Backfill    : normal_IM_ver = ifelse(is.na(normal_IM_ver), tumor_IM_ver,
                   normal_IM_ver)  (R line 63-64).
-  * Type quirk  : normal_bam_coverage is numeric after R line 34, but the rescue
-                  ifelse (R line 65-66) mixes it with the *character* rescued
-                  coverage, so the final column is CHARACTER. That is exactly
-                  why warning 5 is a lexicographic string compare ("100" < "50"
-                  is TRUE) while warning 4 (tumor) stays numeric.
+  * Type quirk  : normal_bam_coverage is numeric after R line 34. The rescue
+                  ifelse (R line 65-66) then mixes it with the *character*
+                  rescued coverage, and R's ifelse adopts the type of the
+                  NON-NA argument. So the final column is CHARACTER only when
+                  the frame contains at least one rescue match (a non-NA
+                  rescued coverage); a frame with no rescue match keeps the
+                  column NUMERIC (verified against real R 4.6.2:
+                  ifelse(FALSE, NA_character_, 100) -> numeric 100). Warning 5
+                  therefore compares LEXICOGRAPHICALLY only in frames with a
+                  rescue match ("100" < "50" is TRUE there) and NUMERICALLY
+                  otherwise; warning 4 (tumor) is always numeric.
   * Row order   : tumor input (key-file) order, tier-1 fan-out then tier-2
                   fan-out consecutive per tumor. NOT syzygy's created-desc order.
 
@@ -218,10 +224,11 @@ def _backfill(row, rr):
 
     # R line 65-66: normal_bam_coverage = ifelse(is.na(normal_bam_coverage),
     #   rescued_normal_bam_coverage, normal_bam_coverage).
-    # The ifelse mixes the numeric normal_bam_coverage with the CHARACTER
-    # rescued coverage, so the column is CHARACTER. Matched rows: numeric ->
-    # char (R as.character(588.0) == '588', no trailing .0); rescued rows: the
-    # rescued char; unmatched: NA.
+    # The ifelse adopts the type of the NON-NA argument (module docstring,
+    # "Type quirk"): the column is CHARACTER iff the frame has >=1 rescue
+    # match, NUMERIC otherwise. Either way the cell is rendered here as a
+    # string (as.character semantics: 588.0 -> '588'); the warning stage
+    # re-parses it for the numeric compare when char_cov is False.
     if row["normal_bam_coverage"] is not None:
         normal_bam_coverage = _num_str(row["normal_bam_coverage"])
     elif rr is not None and rr["rescued_normal_bam_coverage"] is not None:
@@ -313,7 +320,13 @@ def pair(tabbed):
             for rr in rescue_rows:  # 1 row if no rescue, else K rescue rows
                 final.append(_backfill(row, rr))
 
-    return final, _summary(final), _warnings(final)
+    # R's ifelse (line 65-66) adopts the type of the NON-NA argument: the
+    # normal_bam_coverage column is CHARACTER iff some row of the rescue table
+    # carries a non-NA rescued coverage, i.e. the frame has >=1 rescue match.
+    char_cov = any(r["rescued_normal_bam_coverage"] is not None
+                   for r in samples_without_normal)
+
+    return final, _summary(final), _warnings(final, char_cov)
 
 
 def _summary(final):
@@ -340,12 +353,16 @@ def _dedup(items):
     return out
 
 
-def _warnings(final):
+def _warnings(final, char_cov):
     """R lines 96-165: the 5 QC warning buckets.
 
     Each bucket is a deduped list of sample names (matching the syzygy report's
     5/8 format): bucket 1/2/4 -> tumor_sample, bucket 5 -> normal_sample,
     bucket 3 -> tumor_sample then normal_sample for each flagged row.
+
+    char_cov: whether a rescue match promoted normal_bam_coverage to
+    CHARACTER (R ifelse takes the non-NA argument's type; see module
+    docstring "Type quirk"). Warning 5's `< 50` follows that column type.
     """
     # --- Warning 1: matched tumors with no normal (R lines 98-110) --------
     w1 = _dedup([r["tumor_sample"] for r in final
@@ -379,15 +396,19 @@ def _warnings(final):
     w4 = _dedup([r["tumor_sample"] for r in final if _tumor_low(r)])
 
     # --- Warning 5: low-coverage NORMALS (R lines 158-165) ----------------
-    # LEXICOGRAPHIC string compare — normal_bam_coverage is a CHARACTER column
-    # (see module docstring "Type quirk"). So "100" < "50" is TRUE and "9" <
-    # "50" is FALSE; this is the reference's documented quirk, mirrored here.
+    # The `< 50` compare follows the column type (module docstring "Type
+    # quirk"): LEXICOGRAPHIC when a rescue match promoted normal_bam_coverage
+    # to character ("100" < "50" is TRUE — the case-13 quirk), NUMERIC when
+    # the frame has no rescue match (then 9 < 50 is TRUE, unlike
+    # lexicographic "9" < "50" which is FALSE).
     def _normal_low(r):
         nb, nc = r["normal_bamname"], r["normal_bam_coverage"]
         if nb is not None and nc is None:
             return True
-        if nc is not None and str(nc) < "50":
-            return True
+        if nc is not None:
+            if char_cov:
+                return nc < "50"          # character column: lexicographic
+            return float(nc) < 50         # numeric column (no rescue match)
         return False
     w5 = _dedup([r["normal_sample"] for r in final
                  if _normal_low(r) and r["normal_sample"] is not None])

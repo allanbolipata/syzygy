@@ -1,6 +1,6 @@
 """Generator for the DMP reference-conformance fixture set.
 
-Defines the 13 required cases (+ 1 bonus quirk pin + 1 combined cross-
+Defines the 12 required cases (+ 1 bonus quirk pin + 1 combined cross-
 validation set) as beagle-shaped payloads + reference raw key files, then runs
 the faithful reference port (derive_reference.py) to derive and write each
 case's pinned expectations (15-column pair file, 3 summary counts, 5 warning
@@ -87,12 +87,18 @@ SAMPLES = [
     S("P-7000012-N01-IM6", "P-7000012", "N", "", "588", "AT12N-N", "Matched"),
     # P-7000013 — unpaired normal (no tumor)
     S("P-7000013-N01-IM6", "P-7000013", "N", "POOL13", "588", "AT13N-N", "Matched"),
-    # P-7000014 — BONUS: warning-5 lexicographic quirk (normal cov "100")
+    # P-7000014 — BONUS: warning-5 lexicographic quirk. The tier-1 pair's
+    # normal has coverage "100"; the rescue pair (T02 x N02, via IM7) gives
+    # the frame a non-NA rescued coverage, which makes R's rescue ifelse
+    # (type of the non-NA argument) promote normal_bam_coverage to CHARACTER
+    # for the whole frame — so "100" < "50" flags N01 lexicographically.
     S("P-7000014-T01-IM6", "P-7000014", "T", "POOL14", "600", "AT14T-T", "Matched"),
     S("P-7000014-N01-IM6", "P-7000014", "N", "POOL14", "100", "AT14N-N", "Matched"),
+    S("P-7000014-T02-IM7", "P-7000014", "T", "POOL14C", "600", "AT14T2-T", "Matched"),
+    S("P-7000014-N02-IM7", "P-7000014", "N", "POOL14D", "45", "AT14N2-N", "Matched"),
 ]
 
-# The 13 required cases (task t_40224000) + 1 bonus + 1 combined.
+# The 12 required cases (task t_40224000) + 1 bonus + 1 combined.
 CASES = [
     ("01", "clean_single_pair", ["P-7000001"],
      "Clean single pair.",
@@ -135,8 +141,9 @@ CASES = [
     ("07", "low_coverage_tumor_and_normal", ["P-7000007", "P-7000008"],
      "Low coverage: tumor <100 and normal <50.",
      "P-7000007: tumor coverage 45 (<100 numeric) -> Warning 4 (low-coverage "
-     "tumors). P-7000008: normal coverage 45 (<\"50\" lexicographic) -> "
-     "Warning 5 (low-coverage normals). Both pairs match tier-1. 2 rows; "
+     "tumors). P-7000008: normal coverage 45 (<50 numeric — no rescue row in "
+     "this case, so normal_bam_coverage stays numeric) -> Warning 5 "
+     "(low-coverage normals). Both pairs match tier-1. 2 rows; "
      "tn_pairs=2."),
     ("08", "na_coverage", ["P-7000009"],
      "NA coverage.",
@@ -175,13 +182,20 @@ CASES = [
      "unmatched=0. Pins that a lone normal is excluded from the pair file and "
      "from the counts."),
     ("13", "warning5_lexicographic_quirk", ["P-7000014"],
-     "BONUS: warning-5 lexicographic quirk.",
-     "Normal coverage '100': numerically 100 >= 50 (NOT low-coverage), but the "
-     "reference's Warning 5 is a LEXICOGRAPHIC string compare (the "
-     "normal_bam_coverage column is character-typed after the rescue ifelse), "
-     "so '100' < '50' is TRUE -> the normal IS flagged in Warning 5. This "
-     "pinned case documents the reference's quirk that syzygy must mirror. "
-     "One row; Warning 5 fires with P-7000014-N01."),
+     "BONUS: warning-5 lexicographic quirk (rescue-forced character column).",
+     "Two-tier frame in one patient. T01 (POOL14, IM6) tier-1 matches N01 "
+     "(POOL14, coverage '100'). T02 (POOL14C, IM7) has no same-pool normal, "
+     "so the tier-2 rescue matches N02 (POOL14D, IM7, coverage 45). Because "
+     "the frame now contains a rescue match (a non-NA rescued coverage), R's "
+     "rescue ifelse (R lines 65-66, type of the non-NA argument) promotes "
+     "normal_bam_coverage to CHARACTER for the WHOLE frame — so Warning 5's "
+     "`normal_bam_coverage < 50` becomes a LEXICOGRAPHIC string compare: "
+     "'100' < '50' is TRUE, and the coverage-100 normal N01 IS flagged "
+     "alongside N02 (45). BOUNDARY (verified against real R 4.6.2): without "
+     "the rescue pair the column stays NUMERIC and a '100' normal is NOT "
+     "flagged (ifelse(FALSE, NA_character_, 100) -> numeric). 2 rows; "
+     "Warning 5 = [P-7000014-N01-IM6, P-7000014-N02-IM7]; patients=1, "
+     "tn_pairs=2, unmatched=0."),
     ("99", "combined_all_cases",
      [f"P-700000{i}" for i in range(1, 10)] + ["P-7000010", "P-7000011",
                                               "P-7000012", "P-7000013"],
@@ -319,9 +333,12 @@ normal_IM_ver, pool_id, normal_bam_exists, normal_bam_coverage).
 - `normal_IM_ver` backfill (R lines 63-64): where the tier-1 normal_IM_ver is
   NA, it is filled with `tumor_IM_ver`. For a tier-2 rescue the two are equal
   (the rescue joins on IM_ver); for a no-normal row it is the tumor's ver.
-- `normal_bam_coverage` is a CHARACTER column (the rescue ifelse mixes the
-  numeric normal coverage with the character rescued coverage, R lines 65-66)
-  — this is what makes Warning 5 lexicographic.
+- `normal_bam_coverage` (R lines 34, 65-66): numeric after the as.numeric
+  mutate; the rescue ifelse then adopts the type of the NON-NA argument, so
+  the column is CHARACTER only when this case's frame contains at least one
+  rescue match — which makes Warning 5's `< 50` a LEXICOGRAPHIC string
+  compare ("100" < "50" is TRUE). Frames with no rescue row keep the column
+  NUMERIC (Warning 5 numeric). Warning 4 (tumor) is always numeric.
 - Row order is the reference key-file (tumor input) order, fan-out consecutive
   per tumor — NOT syzygy's created-desc order.
 """

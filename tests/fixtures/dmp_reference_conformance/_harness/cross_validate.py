@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Cross-validate the reference-derivation harness against the untracked
-ground-truth test (tests/test_dmp_reference_conformance.py).
+"""Cross-validate the reference-derivation harness against the ground-truth
+test (tests/test_dmp_reference_conformance.py, committed in ade3f9b).
 
-The untracked test is the user's prior (uncommitted) attempt at this fixture
-set. Its hand-pinned EXPECTED_FRAME / EXPECTED_SUMMARY / EXPECTED_WARNINGS are
+The test is the user's prior attempt at this fixture set. Its hand-pinned
+EXPECTED_FRAME / EXPECTED_SUMMARY / EXPECTED_WARNINGS are
 a solid INDEPENDENT check — but it was built against the SYZYGY code, and the
 syzygy code diverges from the reference (pair_tumor_with_normal.R +
 generate_dmp_tumor_normal_key.pl) in a handful of documented ways. So this
@@ -12,7 +12,7 @@ structure, coverage, pool, bam_exists, and the three coverage/BAM warnings)
 from the documented divergences (reported for transparency, not failures).
 
 How it works:
-  1. ast-parse the untracked test and extract RECORDS (its input samples),
+  1. ast-parse the test and extract RECORDS (its input samples),
      MISSING_BAM, and the EXPECTED_* constants — WITHOUT executing the file
      (so its syzygy imports never run).
   2. Reconstruct the reference key-file + BAM manifest from RECORDS, adding
@@ -30,7 +30,7 @@ Documented divergences (reported, NOT failures):
     no normal) and 2 (ambiguous normals) — the reference uses the key file's
     matched_tag column VERBATIM, whereas the syzygy code DERIVES it (a tumor
     is "Matched" if it paired to a normal, "Unmatched" otherwise). On the
-    untracked test's data the key file marks only P-7000006 "Matched" (the
+    test's data the key file marks only P-7000006 "Matched" (the
     matched-without-normal case), so the reference's summary is
     patients=1 / tn_pairs=1 / unmatched=13 while the syzygy code's is
     patients=11 / tn_pairs=13 / unmatched=1. Both are internally consistent
@@ -56,9 +56,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import derive_reference as ref  # noqa: E402
 
-# The untracked test lives three levels up: .../_harness -> fixtures -> dmp_
-# reference_conformance -> tests.
-UNTRACKED_TEST = HERE.parent.parent.parent / "test_dmp_reference_conformance.py"
+# The ground-truth test lives three levels up: .../_harness -> fixtures ->
+# dmp_reference_conformance -> tests.
+GROUND_TRUTH_TEST = HERE.parent.parent.parent / "test_dmp_reference_conformance.py"
 
 # 15 reference pair-frame columns (see dmp_translator.DMP_REF_COLUMNS).
 COLUMNS = [
@@ -180,7 +180,7 @@ def _key(row):
 
 
 def main():
-    consts = _extract_constants(UNTRACKED_TEST)
+    consts = _extract_constants(GROUND_TRUTH_TEST)
     records = consts["RECORDS"]
     missing_bam = consts["MISSING_BAM"]
     expected_frame = consts["EXPECTED_FRAME"]
@@ -194,7 +194,7 @@ def main():
     pair_rows, summary, warnings = ref.pair(tabbed)
     rendered = [_render(r) for r in pair_rows]
 
-    print(f"cross-validating harness vs {UNTRACKED_TEST.name}")
+    print(f"cross-validating harness vs {GROUND_TRUTH_TEST.name}")
     print(f"  input: {len(records)} samples, {len(manifest)} BAMs in mirror")
     print()
     print("RELIABLE checks (must match):")
@@ -268,8 +268,8 @@ def main():
 
     print()
     if reliable_ok:
-        print("CROSS-VALIDATION PASSED: harness matches the untracked test on "
-              "every reliable column; the divergences above are documented.")
+        print("CROSS-VALIDATION PASSED: harness matches the ground-truth test "
+              "on every reliable column; the divergences above are documented.")
         return 0
     print("CROSS-VALIDATION FAILED: at least one RELIABLE column mismatched.")
     return 1

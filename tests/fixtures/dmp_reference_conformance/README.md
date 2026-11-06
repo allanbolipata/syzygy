@@ -11,12 +11,16 @@ pairing, derived from the reference pipeline:
   tumor-only pair frame, `normal_IM_ver` backfill, 3 summary counts, and 5 QC
   warning buckets.
 
-Both live in `~/dev/bam-mirror-tools/scripts/`. `Rscript` is not installed on
-this machine, so the expectations were **derived by a faithful Python port of
-the full Perl→R pipeline** (`_harness/derive_reference.py`, line-mapped to the
-R script) and **cross-validated** against the hand-pinned expectations in the
-untracked ground-truth test `tests/test_dmp_reference_conformance.py`
-(`_harness/cross_validate.py`).
+Both live in `~/dev/bam-mirror-tools/scripts/`. The expectations were
+**derived by a faithful Python port of the full Perl→R pipeline**
+(`_harness/derive_reference.py`, line-mapped to the R script),
+**cross-validated** against the ground-truth test
+`tests/test_dmp_reference_conformance.py` (`_harness/cross_validate.py`), and
+**verified end-to-end against the real reference**: the real
+`generate_dmp_tumor_normal_key.pl` (perl) and the real
+`pair_tumor_with_normal.R` (R 4.6.2, dplyr + data.table) were run on every
+case's key file + BAM manifest, reproducing every pinned pair file, summary
+count, and warning bucket (2026-11-05).
 
 ## Layout
 
@@ -25,7 +29,7 @@ dmp_reference_conformance/
 ├── _harness/
 │   ├── derive_reference.py    # faithful Python port of Perl→R (the authority)
 │   ├── generate_fixtures.py   # defines the cases, derives + writes every fixture
-│   └── cross_validate.py      # harness vs the untracked test's EXPECTED_*
+│   └── cross_validate.py      # harness vs the ground-truth test's EXPECTED_*
 └── cases/
     └── <NN>_<name>/
         ├── key_file.csv        # raw comma key file (12 fields, end-anchored)
@@ -38,7 +42,7 @@ dmp_reference_conformance/
             └── warnings.json   # the 5 QC warning buckets
 ```
 
-## Cases (01–13 required, 99 combined)
+## Cases (01–12 required, 13 bonus, 99 combined)
 
 | #  | case                              | pins                                                                 |
 |----|-----------------------------------|----------------------------------------------------------------------|
@@ -54,8 +58,8 @@ dmp_reference_conformance/
 | 10 | unparseable sample name           | name fails `P-\d+-\w+-\w+` → empty patient/idx/ver (not "NA"); unmatched |
 | 11 | missing pool_id both sides        | pool_id empty → no tier-1; rescue on IM_ver; normal_IM_ver backfill   |
 | 12 | unpaired normal present           | a normal with no tumor → 0 pair rows (tumor-only frame)               |
-| 13 | warning-5 lexicographic quirk     | normal cov "100" — the R rescue `ifelse` promotes coverage to character, so `"100"<"50"` is TRUE lexicographically → warning-5 fires (bonus, not a required case) |
-| 99 | combined all cases                | all 27 samples in one key file — the cross-validation set (14 rows, summary 11/13/1) |
+| 13 | warning-5 lexicographic quirk     | a rescue pair (T02 x N02, cov 45) forces `normal_bam_coverage` to character (R ifelse takes the non-NA argument's type), so the tier-1 normal's cov "100" compares lexicographically: `"100"<"50"` TRUE → both normals flagged (bonus, not a required case; without the rescue row the column stays numeric and "100" is NOT flagged) |
+| 99 | combined all cases                | cases 01–12, all 27 samples in one key file — the cross-validation set (14 rows, summary 11/13/1) |
 
 ## Reference semantics (definitive, from the R script)
 
@@ -69,11 +73,15 @@ dmp_reference_conformance/
 - **Row order** = input key-file order; fan-out rows per tumor are consecutive.
 - **Unparseable name** → **empty strings** (not "NA") for patient/idx/ver —
   a documented divergence from the syzygy code.
-- **Warning-5** (normal low-cov <50) is a **lexicographic** string compare —
-  the R rescue `ifelse` promotes `normal_bam_coverage` to character (R 65–66).
-  `"45"<"50"` TRUE, `"588"<"50"` FALSE, `"100"<"50"` TRUE (the case-13 quirk).
-  **Warning-4** (tumor <100) is **numeric** and also fires on a tumor that has
-  a BAM but no coverage (R 147–148).
+- **Warning-5** (normal low-cov <50) compares `normal_bam_coverage`, numeric
+  after R line 34 but **character when the frame contains at least one rescue
+  match** (the rescue `ifelse`, R 65–66, adopts the type of the non-NA
+  argument — verified against real R 4.6.2: `ifelse(FALSE, NA_character_, 100)`
+  stays numeric). So the compare is **lexicographic** in frames with a rescue
+  row (`"45"<"50"` TRUE, `"588"<"50"` FALSE, `"100"<"50"` TRUE — the case-13
+  quirk) and **numeric** otherwise.
+  **Warning-4** (tumor <100) is always **numeric** and also fires on a tumor
+  that has a BAM but no coverage (R 147–148).
 - **Summary counts** (R 77–86) and **warnings 1 & 2** use the key file's
   `matched_tag` column **verbatim** (`tumor_matched == "Matched"`).
 
@@ -82,12 +90,15 @@ dmp_reference_conformance/
 ```bash
 cd tests/fixtures/dmp_reference_conformance/_harness
 python3 generate_fixtures.py   # rewrites every cases/<NN>/ from the samples
-python3 cross_validate.py      # harness vs the untracked test's EXPECTED_*
+python3 cross_validate.py      # harness vs the ground-truth test's EXPECTED_*
 ```
 
 `generate_fixtures.py` is the source of truth for the inputs; it re-derives and
 overwrites every `expected/` file. `cross_validate.py` exits 0 when the harness
-matches the untracked test on every **reliable** column.
+matches the ground-truth test on every **reliable** column. For the
+end-to-end check against the real reference scripts (perl + Rscript with
+dplyr/data.table), see the T7 verification: real Perl stage → real R stage →
+diff every pinned file (done 2026-11-05, 14/14 cases).
 
 ## Documented divergences (reference vs the syzygy code)
 
