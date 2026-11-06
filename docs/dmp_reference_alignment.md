@@ -422,3 +422,87 @@ the fixture) and `file_name`. Sources checked: `dmp_translator.py`,
   `scripts/import_beagle_dump.py` (import selects `fm.metadata` only),
   `scripts/.beagle_ground_truth.example.json`, and
   `pairing_strategies.py` (`DmpPairingStrategy`, lines 1009–1142).
+
+---
+
+## 7/8 completion note (DMP reference conformance — gate result)
+
+**Gate run (2026-11-06, commit 8183509, `feature/pairing-adjustments`, local,
+working tree clean):**
+`/Users/bolipatc/.pyenv/versions/syzygy/bin/python -m pytest tests/ -q` →
+**458 passed / 2 skipped / 0 failed** (4m12s). Baseline at ticket start was
+416 passed / 2 skipped; the delta is exactly the 42 new conformance tests
+(28 endpoint + 14 R cross-checks). The 2 skips are the NATS e2e tests
+(`test_nats_e2e.py`, `test_nats_ingest.py` — dev stack down), identical to the
+baseline. No non-DMP failures; zero regressions in other pairing logics.
+
+**Conformance harness (present):** `tests/test_dmp_reference_conformance.py`
+— fixture-driven over the 14-case set
+(`tests/fixtures/dmp_reference_conformance/cases/`: 12 required scenarios +
+bonus case 13 + combined case 99), feeding each payload through the real
+endpoint path (`pairing_report`, `export_pair_report`) and asserting the exact
+15-column pair rows (endpoint frame order), 3 summary counts, and 5 warning
+buckets against the byte-pinned reference expectations. 42/42 pass.
+
+**DMP behaviors now matching the reference** (byte-for-byte vs the pinned
+Perl→R expectations; those expectations were verified end-to-end against the
+real `generate_dmp_tumor_normal_key.pl` + `pair_tumor_with_normal.R`, R 4.6.2,
+2026-11-05):
+
+- Two-tier pairing: tier-1 plain left-join on `(patient, pool_id)` with **no
+  winner selection** — ambiguous matches fan out, one row per matching normal
+  (case 02); no pool match → a single row with NA normal columns.
+- Tier-2 IM_ver rescue on `(patient, IM_ver)` with `unique()` + `ifelse`
+  backfill, applied only where tier 1 is NA (cases 03, 11); pool beats
+  IM_ver (case 04); a normal may be shared by two tumors (case 05); unpaired
+  normals produce no rows — tumor-only frame (case 12).
+- `normal_IM_ver` backfill with the tumor's IM_ver wherever tier 1 is NA
+  (cases 03, 06, 11), including rows with no normal at all.
+- 15-column pair file: exact column names/order (c); endpoint frame order =
+  paired rows (created-desc) then unmatched DMP tumor rows.
+- 3 summary counts per the reference formulas (d): distinct patients among
+  matched rows, matched row count, unmatched row count.
+- 5 QC warning buckets per the reference conditions (e), including the
+  warning-5 lexicographic quirk (case 13 pins `"100" < "50"` → TRUE) and
+  warning 4's has-BAM-but-NA-coverage disjunct (case 08).
+
+**Rscript cross-check: USED (not skipped).** Rscript is installed on this
+host (`/opt/homebrew/bin/Rscript`; the pre-T7 gate note that it was absent is
+stale). All 14 cross-checks ran — the real `pair_tumor_with_normal.R`
+reproduces every pinned expectation byte-for-byte — and passed. The
+cross-check stays skipif-gated (Rscript + reference script presence), so the
+suite never depends on R.
+
+**Existing DMP tests: reconciled** (commit ade3f9b). The winner-era tie test
+in `tests/test_pairing_service.py` now asserts the no-winner fan-out
+expectation (one pairing row per matching normal; `new_pairings` carries the
+representative row). No stale DMP expectations remain in any DMP test file.
+
+**Remaining documented deviations** (render-level; the harness applies them
+via `endpoint_row` — the underlying pairing data is identical in every case):
+
+1. `tumor_group`: the endpoint renders NA — `group` is a gap in the DMP model
+   (g); the key file's group value is reference-side only.
+2. `patient`: the stored `patient__dmp` column wins over the reference's name
+   parse (g caveat 1) — case 10's unparseable id leaves the reference cell
+   empty while the stored column says P-7000011.
+3. Missing values: the reference leaves failed parses / missing pools as
+   EMPTY cells; the endpoint renders every missing value as `NA`.
+4. `tumor_matched`: the endpoint derives the flag from the pairing
+   (`matched_tag` audited absent from real records — g); an unmatched tumor
+   row renders `Unmatched` where the key file's `is_matched` can say `Matched`
+   (case 06 / combined case 99 row 7).
+
+Plus the spec-sanctioned data-level deviations (f/g): `bam_exists` is derived
+from the beagle file record (non-empty `path` → 1) instead of the BAM mirror
+listing, and `bamname` is the `anon_id` stand-in.
+
+**Still open (not a 7/8 blocker):** the 5/8 stakeholder-review flag on real
+`matched_tag` values remains open — real DMP records still carry none, so the
+pairing-derived status stands; an explicit `matched_tag`, if the DMP program
+ever supplies one, takes precedence (g, 5/8 flag).
+
+**Unrelated failures: none.** Only T7 files committed for this series of
+tickets: ade3f9b (reconcile), 1596576 (fixtures), 206843c (warning-5 quirk
+fixture fix), 8183509 (conformance harness) — all local on
+`feature/pairing-adjustments`, not pushed.
