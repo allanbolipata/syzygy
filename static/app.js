@@ -337,6 +337,10 @@ async function loadLogics() {
       `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
     renderPrLogicExplainer();
+    // The select has its options now, so the HARMONY view-mode (hidden
+    // column panel, "Download CSV" label) can apply to the default logic —
+    // the init-time call ran before these options existed.
+    applyHarmonyViewMode();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -1213,6 +1217,23 @@ const DMP_LEGEND = {
 };
 const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
+/* HARMONY view: the exact 8 columns of GET /pairing/harmony/ (ticket 2/4),
+ * in the endpoint's order. Fixed — HARMONY does not use the
+ * selectable-columns machinery or the legacy DMP/PAIR column sets. The
+ * endpoint orders rows normal-first, then tumor: a normal with several
+ * tumors occupies several consecutive rows and repeats its normal-side
+ * columns (one row per (normal, tumor) pair, 1-to-many). */
+const HARMONY_COLUMNS = [
+  { key: "normal_sample", header: "normal_sample" },
+  { key: "tumor_sample", header: "tumor_sample" },
+  { key: "normal_bamname", header: "normal_bamname" },
+  { key: "normal_bam_path", header: "normal_bam_path" },
+  { key: "tumor_bamname", header: "tumor_bamname" },
+  { key: "tumor_bam_path", header: "tumor_bam_path" },
+  { key: "patient", header: "patient" },
+  { key: "consent", header: "consent" },
+];
+
 const pairsState = {
   rows: [],
   logic: null,
@@ -1235,7 +1256,15 @@ const pairsState = {
   query: "",
 };
 
+/* HARMONY is its own pairing logic and its own normal-oriented view
+ * (one row per normal–tumor pair, 8 fixed columns — see HARMONY_COLUMNS).
+ * Its seeded row reuses the "dmp" strategy, so every DMP branch must treat
+ * it separately; isDmpLogic() below returns false for it. */
+function isHarmonyLogic(logicName) {
+  return !!logicName && logicName.toUpperCase() === "HARMONY";
+}
 function isDmpLogic(logicName) {
+  if (isHarmonyLogic(logicName)) return false;
   const l = PAIRING_LOGICS.find((x) => x.name === logicName);
   return !!logicName && (l ? l.strategy_name === "dmp" || logicName.toUpperCase() === "DMP" : logicName.toUpperCase() === "DMP");
 }
@@ -1253,6 +1282,20 @@ function selectionFor(logicName) {
 function activeLogicName() {
   return pairsState.logic || $("#pr-logic").value || null;
 }
+
+/* HARMONY view mode: the selectable-columns panel and the CSV/TSV format
+ * switch don't apply — HARMONY's columns are the fixed 8-column endpoint
+ * set and its download is the server-generated CSV. The Download button
+ * relabels to "Download CSV". Reversible: switching back to another logic
+ * restores the panel (collapsed state preserved). */
+function applyHarmonyViewMode() {
+  const harmony = isHarmonyLogic(activeLogicName());
+  $("#pr-panel").classList.toggle("hidden", harmony);
+  const showOpen = !harmony && $("#pr-panel").classList.contains("collapsed");
+  $("#pr-panel-open").classList.toggle("hidden", !showOpen);
+  $("#pr-format").closest("label").classList.toggle("hidden", harmony);
+  $("#pr-download").textContent = harmony ? "Download CSV" : "Download";
+}
 function selectedPairColumns() {
   const logic = activeLogicName();
   if (!logic) return [];
@@ -1265,6 +1308,9 @@ function selectedPairColumns() {
 function pairReportGroups() {
   const logic = activeLogicName();
   if (!logic) return [];
+  // HARMONY's columns are the fixed 8-column endpoint set — there is no
+  // selectable set to render (the panel itself is hidden for HARMONY).
+  if (isHarmonyLogic(logic)) return [];
   const bySide = new Map();
   for (const c of columnsForLogic(logic)) {
     if (!bySide.has(c.group)) bySide.set(c.group, []);
@@ -1337,6 +1383,31 @@ function visiblePairRows() {
   return q ? pairsState.rows.filter((r) => pairMatchesQuery(r, q)) : pairsState.rows;
 }
 
+/* HARMONY cells: the endpoint already resolves display values (em-dash
+ * placeholders for missing bam paths, null for the absent side); consent
+ * renders "true"/"false"/empty per the endpoint's value. */
+function harmonyCellText(r, key) {
+  const v = r[key];
+  if (key === "consent") return v === null || v === undefined ? "" : (v ? "true" : "false");
+  return pairText(v);
+}
+
+/* HARMONY search: the lowercased query matches ANY of the 8 columns
+ * (sample ids, bam names, bam paths, patient, consent), case-insensitively. */
+function harmonyMatchesQuery(r, q) {
+  return HARMONY_COLUMNS.some(({ key }) => {
+    const v = r[key];
+    return v !== null && v !== undefined && String(v).toLowerCase().includes(q);
+  });
+}
+
+/* HARMONY rows visible under the active search query (all loaded rows when
+ * there is no query). */
+function visibleHarmonyRows() {
+  const q = pairsState.query;
+  return q ? pairsState.rows.filter((r) => harmonyMatchesQuery(r, q)) : pairsState.rows;
+}
+
 /* Clickable identifier cells in the pair table. A column model may
  * declare an optional ``link`` that resolves a row to a navigation
  * target: a sample (its Matches & Overrides page), a patient (the
@@ -1359,7 +1430,58 @@ function pairCellHtml(r, c) {
   return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
 }
 
+/* HARMONY: normal-oriented 8-column table (HARMONY_COLUMNS). The endpoint
+ * orders rows normal-first, then tumor, so a normal's rows are consecutive:
+ * its normal-side columns repeat and a heavier top border marks each new
+ * normal, making the 1-to-many obvious at a glance. One-sided (unmatched)
+ * rows render the absent side's columns empty, like the DMP unmatched
+ * convention. Same pagination / count / empty states as the DMP view. */
+function renderHarmonyTable() {
+  const cols = HARMONY_COLUMNS;
+  $("#pairs-table thead").innerHTML =
+    `<tr>${cols.map((c) => `<th>${esc(c.header)}</th>`).join("")}</tr>`;
+  const full = pairsState.rows.length;
+  const rows = visibleHarmonyRows();
+  const total = rows.length;
+  const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
+  if (pairsState.page > maxPage) pairsState.page = maxPage;
+  const start = pairsState.page * pairsState.pageSize;
+  const slice = rows.slice(start, start + pairsState.pageSize);
+  $("#pairs-table tbody").innerHTML = slice
+    .map((r, i) => {
+      const prev = i > 0 ? slice[i - 1] : start > 0 ? rows[start - 1] : null;
+      const divider = prev !== null && prev.normal_sample !== r.normal_sample
+        ? ` style="border-top:2px solid #c3ccd6"` : "";
+      return `<tr>${cols.map((c) =>
+        `<td${divider}>${esc(harmonyCellText(r, c.key))}</td>`).join("")}</tr>`;
+    }).join("");
+  $("#pr-prev").disabled = pairsState.page === 0;
+  $("#pr-next").disabled = pairsState.page >= maxPage;
+  const totalPages = maxPage + 1;
+  const pageInput = $("#pr-page");
+  pageInput.max = totalPages;
+  pageInput.value = pairsState.page + 1;
+  $("#pr-page-of").textContent = `of ${totalPages}`;
+  pageInput.disabled = total === 0;
+  const matched = rows.filter((r) => r.normal_sample && r.tumor_sample).length;
+  const emptyEl = $("#pr-empty");
+  emptyEl.classList.toggle("hidden", total !== 0);
+  emptyEl.textContent =
+    pairsState.query && full > 0
+      ? "No HARMONY rows match this search."
+      : "No HARMONY rows yet — run pairing first.";
+  const filteredNote = pairsState.query && total !== full ? ` (filtered from ${full})` : "";
+  const paging = total > pairsState.pageSize
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + slice.length} of ${total})`
+    : "";
+  $("#pr-count").textContent =
+    `${total} rows: ${matched} matched, ${total - matched} unmatched${filteredNote}${paging}`;
+  $("#pr-download").disabled = total === 0;
+  $("#pr-legend").classList.add("hidden");
+}
+
 function renderPairsTable() {
+  if (isHarmonyLogic(activeLogicName())) return renderHarmonyTable();
   const logic = activeLogicName();
   const dmp = isDmpLogic(logic);
   const cols = selectedPairColumns();
@@ -1447,6 +1569,28 @@ async function loadPairs() {
   const active = () => signal === pairsAbort.signal;
   const isDmp = isDmpLogic(logic);
   pairsState.logic = logic;
+  if (isHarmonyLogic(logic)) {
+    // HARMONY: one server call returns the whole normal-oriented set —
+    // paired rows plus the unmatched one-sided rows (the endpoint appends
+    // them) — so no parallel unmatched fetch and no selectable columns.
+    try {
+      if (active()) showPrLoading("Loading HARMONY pairs…");
+      pairsState.rows = await api("/pairing/harmony/", { signal });
+      pairsState.page = 0;
+      renderPrGroups();
+      renderHarmonyTable();
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // superseded by a newer load
+      hidePrLoading();
+      banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      return;
+    }
+    if (active()) {
+      hidePrLoading();
+      loadPrOverviewStats();
+    }
+    return;
+  }
   try {
     // Start the (large, DMP-only) unmatched-set fetch in parallel with the
     // smaller paired-rows fetch; the two queries are independent. Paint the
@@ -1512,6 +1656,13 @@ function appendUnmatchedDmpRows(unmatched) {
 
 function downloadPairs() {
   if (!pairsState.logic) return;
+  // HARMONY: the server-generated CSV (exact 8 headers, full normal-
+  // oriented set), not a client-side build — the server endpoint owns
+  // the file's content and filename.
+  if (isHarmonyLogic(pairsState.logic)) {
+    downloadHarmonyCsv();
+    return;
+  }
   const cols = selectedPairColumns();
   // Export exactly the rows the table shows (the active search filter
   // applied, not the full unfiltered set).
@@ -1529,6 +1680,19 @@ function downloadPairs() {
   a.click();
   a.remove();
   URL.revokeObjectURL(a.href);
+}
+
+/* HARMONY download: GET /pairing/harmony/?format=csv — the server-
+ * generated CSV attachment with the exact 8 headers (ticket 2/4). A plain
+ * anchor navigation (cookie auth, like every other request in this app);
+ * the server's Content-Disposition supplies the download filename. */
+function downloadHarmonyCsv() {
+  const a = document.createElement("a");
+  a.href = `${API}/pairing/harmony/?format=csv`;
+  a.download = "harmony_pairs.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 /* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
@@ -1555,8 +1719,33 @@ async function runDmpPairing() {
   }
 }
 
+/* HARMONY pairing run: POST /pairing/trigger-harmony (ticket 2/4) — the
+ * HARMONY pairing space's own trigger, mirroring runDmpPairing() but
+ * resolving the HARMONY logic row (the DMP pairing space is never
+ * touched). The generic trigger-all endpoint refuses DMP-strategy logics
+ * with a 400, so HARMONY must use its own trigger. */
+async function runHarmonyPairing() {
+  const btn = $("#pr-run");
+  btn.disabled = true;
+  $("#pr-run-status").textContent = "Pairing…";
+  try {
+    const r = await api("/pairing/trigger-harmony", { method: "POST" });
+    $("#pr-run-status").textContent =
+      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
+      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
+    banner("ok", `HARMONY pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
+      `${r.missing_patient__dmp} missing patient__dmp`, true);
+    await loadPairs();
+  } catch (e) {
+    banner("error", `HARMONY pairing failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 /* Overview-header Run pairing button for the selected logic: DMP goes to
- * the DMP trigger; any other logic to the per-logic backfill (POST
+ * the DMP trigger, HARMONY to its own trigger (see runHarmonyPairing), and
+ * any other logic to the per-logic backfill (POST
  * /pairing/trigger-all?pairing_logic_name=, confirm first — it records
  * pairings). Result lands in #pr-run-status. */
 async function runPrPairing() {
@@ -1564,6 +1753,10 @@ async function runPrPairing() {
   if (!logic) return;
   if (isDmpLogic(logic)) {
     await runDmpPairing();
+    return;
+  }
+  if (isHarmonyLogic(logic)) {
+    await runHarmonyPairing();
     return;
   }
   const msg =
@@ -1632,7 +1825,11 @@ async function loadPrOverviewStats() {
   const logic = activeLogicName();
   if (!el || !logic) return;
   const paint = (unpairedHtml) => {
-    const paired = pairsState.rows.filter((r) => r.tumor && r.normal).length;
+    // HARMONY rows are flat dicts from /pairing/harmony/ (both sides
+    // present = matched); other logics use {tumor, normal} pair rows.
+    const harmony = isHarmonyLogic(logic);
+    const paired = pairsState.rows.filter((r) =>
+      harmony ? !!(r.normal_sample && r.tumor_sample) : !!(r.tumor && r.normal)).length;
     el.innerHTML =
       `<span class="pr-stat">Paired <strong>${paired}</strong></span>` +
       `<span class="pr-stat">Unpaired ${unpairedHtml}</span>`;
@@ -1656,6 +1853,7 @@ $("#pr-logic").addEventListener("change", () => {
   // A stale filter would otherwise carry into the new logic's rows.
   resetPrSearch();
   renderPrLogicExplainer();
+  applyHarmonyViewMode();
   loadPairs();
 });
 $("#pr-run").addEventListener("click", runPrPairing);
@@ -1787,6 +1985,7 @@ $("#pairs-table").addEventListener("click", (e) => {
 });
 
 renderPrGroups();
+applyHarmonyViewMode();
 
 /* ---------- try pairing view (dry run) ---------- */
 
