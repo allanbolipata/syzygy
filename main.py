@@ -38,6 +38,11 @@ async def lifespan(app: FastAPI):
             ("TEMPO", "tempo"),
             ("ACCESS", "default"),
             ("DMP", "dmp"),
+            # HARMONY is its own pairing logic and pairing space (its own
+            # pairing_table rows, its own trigger and endpoint). For now it
+            # reuses the "dmp" strategy; the two logics may drift over time,
+            # so nothing HARMONY-side couples to the DMP row.
+            ("HARMONY", "dmp"),
         ):
             existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
             if existing is None:

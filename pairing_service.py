@@ -419,6 +419,99 @@ def trigger_dmp_pairing(db: Session) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Automatic HARMONY pairing (POST /pairing/trigger-harmony)
+# ---------------------------------------------------------------------------
+
+#: Name of the pairing logic under which HARMONY samples pair
+#: automatically. HARMONY is its OWN pairing logic row and pairing space,
+#: separate from the DMP logic: the two may drift over time (a future
+#: HARMONY strategy class the HARMONY row points at), so this trigger
+#: resolves "HARMONY" by name and never touches the DMP logic row or its
+#: pairings. For now the HARMONY row reuses the ``dmp`` strategy (same
+#: matching: DMP-group only, ``patient__dmp`` + gene panel).
+HARMONY_LOGIC_NAME = "HARMONY"
+
+
+def trigger_harmony_pairing(db: Session) -> dict:
+    """Bulk automatic HARMONY pairing under the HARMONY pairing logic.
+
+    Modeled on ``trigger_dmp_pairing`` but resolves the "HARMONY" logic
+    row by name and runs the same automatic cascade under it. Every
+    unpaired DMP tumor is paired with its best DMP normal (same
+    ``patient__dmp`` and gene panel) via the strategy the HARMONY row
+    points at (currently the ``dmp`` strategy), recorded under the
+    HARMONY logic id — a separate pairing space from the DMP logic.
+    Existing pairings are never modified: a tumor that already has a
+    latest pairing under the HARMONY logic is skipped, whatever that
+    pairing's trigger type is.
+
+    Returns ``{"pairing_logic", "scanned", "already_paired",
+    "missing_patient__dmp", "paired", "unpaired", "new_pairings"}`` where
+    the four outcome counts sum to ``scanned``. DMP tumors without
+    ``patient__dmp`` cannot match (the strategy is patient-scoped) and are
+    reported in ``missing_patient__dmp``.
+
+    Raises ``HTTPException(400)`` when no active pairing logic named
+    "HARMONY" exists: the trigger has nothing to run against.
+    """
+    logic = find_logic_by_name(db, HARMONY_LOGIC_NAME)
+    if logic is None or not logic.active:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No active pairing logic named '{HARMONY_LOGIC_NAME}': the "
+                "HARMONY pairing trigger has nothing to run against."
+            ),
+        )
+
+    # Tumors already carrying a latest pairing under THIS (HARMONY) logic —
+    # one query instead of a lookup per tumor. DMP-logic pairings are a
+    # different pairing space and are deliberately not consulted here.
+    already_paired_ids = set(
+        db.scalars(
+            select(PairingTable.tumor_id).where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+            )
+        ).all()
+    )
+
+    tumors = db.scalars(
+        select(Sample).where(
+            Sample.sample_type == "DMP",
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+        )
+    ).all()
+
+    scanned = already_paired = missing_patient = paired = unpaired = 0
+    new_pairings: list[PairingTable] = []
+    for tumor in tumors:
+        scanned += 1
+        if tumor.id in already_paired_ids:
+            already_paired += 1
+            continue
+        if not (tumor.patient__dmp or "").strip():
+            missing_patient += 1
+            continue
+        pairing = trigger_pairing(db, tumor, logic, "automatic")
+        if pairing is None:
+            unpaired += 1
+        else:
+            paired += 1
+            new_pairings.append(pairing)
+
+    return {
+        "pairing_logic": logic.name,
+        "scanned": scanned,
+        "already_paired": already_paired,
+        "missing_patient__dmp": missing_patient,
+        "paired": paired,
+        "unpaired": unpaired,
+        "new_pairings": new_pairings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pairing overview: evaluate (dry-run) and per-logic unpaired count
 # ---------------------------------------------------------------------------
 

@@ -203,6 +203,53 @@ class DmpTriggerRead(BaseModel):
     new_pairings: list[PairingRead]
 
 
+class HarmonyTriggerRead(BaseModel):
+    """Summary of a POST /pairing/trigger-harmony run.
+
+    HARMONY is its own pairing logic and pairing space (separate from the
+    DMP logic, which may drift independently); for now it reuses the DMP
+    strategy (DMP-group only, same ``patient__dmp`` and gene panel).
+    ``scanned`` counts the DMP tumor samples processed; the four outcome
+    counts sum to it. ``missing_patient__dmp`` are DMP tumors without a
+    patient identifier that the strategy cannot match.
+    ``new_pairings`` lists the HARMONY-logic pairings created by this run.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    pairing_logic: str
+    scanned: int
+    already_paired: int
+    missing_patient__dmp: int
+    paired: int
+    unpaired: int
+    new_pairings: list[PairingRead]
+
+
+class HarmonyRow(BaseModel):
+    """One row of the HARMONY 8-column, normal-oriented pairing output.
+
+    One row per (normal, tumor) pair; a normal repeats on multiple rows
+    (1-to-many). Unmatched DMP samples appear with the opposite side's
+    columns null. ``normal_sample``/``tumor_sample`` are the samples'
+    ``primary_id``; ``normal_bamname``/``tumor_bamname`` are their
+    ``anon_id``; the ``*_bam_path`` columns are placeholders (no bam paths
+    in syzygy yet). ``patient`` and ``consent`` come from the present side
+    (tumor preferred).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    normal_sample: Optional[str] = None
+    tumor_sample: Optional[str] = None
+    normal_bamname: Optional[str] = None
+    normal_bam_path: Optional[str] = None
+    tumor_bamname: Optional[str] = None
+    tumor_bam_path: Optional[str] = None
+    patient: Optional[str] = None
+    consent: Optional[bool] = None
+
+
 class EvaluateRead(BaseModel):
     """Dry-run pairing preview for one logic (GET /pairing/evaluate/).
 

@@ -9,19 +9,24 @@ strategy, which is reserved for the automatic trigger.
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
+import csv
+import io
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from database import get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
+    HARMONY_LOGIC_NAME,
     count_unpaired,
     evaluate_logic,
     find_logic_by_name,
     resolve_pairing_logic,
     trigger_dmp_pairing,
+    trigger_harmony_pairing,
     trigger_pairing,
     trigger_pairing_for_unpaired_tumors,
 )
@@ -29,6 +34,8 @@ from pairing_strategies import get_pairing_strategy, strategies
 from schemas import (
     DmpTriggerRead,
     EvaluateRead,
+    HarmonyRow,
+    HarmonyTriggerRead,
     PairingRead,
     PairingTriggerCreate,
     SampleRead,
@@ -259,6 +266,194 @@ def trigger_dmp_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
     ``missing_patient__dmp``.
     """
     return trigger_dmp_pairing(db)
+
+
+# ---------------------------------------------------------------------------
+# HARMONY: its own pairing space + 8-column normal-oriented export
+# ---------------------------------------------------------------------------
+
+#: The HARMONY output columns — exact headers, exact order (user-confirmed).
+#: One row per (normal, tumor) pair; a normal repeats across rows (1-to-many).
+HARMONY_COLUMNS = (
+    "normal_sample",
+    "tumor_sample",
+    "normal_bamname",
+    "normal_bam_path",
+    "tumor_bamname",
+    "tumor_bam_path",
+    "patient",
+    "consent",
+)
+
+#: Placeholder for the bam-path columns: syzygy stores no bam paths (future
+#: DMP-payload field), so the column is emitted as an em dash.
+HARMONY_BAM_PATH_PLACEHOLDER = "\u2014"
+
+
+def _harmony_present_value(tumor: Optional[Sample], normal: Optional[Sample], field: str):
+    """A field value from the present side, tumor preferred.
+
+    On a paired row both sides are present, so the tumor's value wins; on a
+    one-sided (unmatched) row the only present side supplies it. Falls
+    through to the other side when the preferred side's value is null.
+    """
+    for side in (tumor, normal):
+        if side is not None:
+            value = getattr(side, field)
+            if value is not None:
+                return value
+    return None
+
+
+def _harmony_row(tumor: Optional[Sample], normal: Optional[Sample]) -> dict:
+    """Build one 8-column HARMONY row from a (possibly one-sided) pair.
+
+    ``normal_sample``/``tumor_sample`` <- ``primary_id``; ``normal_bamname``/
+    ``tumor_bamname`` <- ``anon_id``; the ``*_bam_path`` columns are the em-dash
+    placeholder for any present side and null for an absent side; ``patient``
+    and ``consent`` come from the present side (tumor preferred).
+    """
+    return {
+        "normal_sample": normal.primary_id if normal is not None else None,
+        "tumor_sample": tumor.primary_id if tumor is not None else None,
+        "normal_bamname": normal.anon_id if normal is not None else None,
+        "normal_bam_path": HARMONY_BAM_PATH_PLACEHOLDER if normal is not None else None,
+        "tumor_bamname": tumor.anon_id if tumor is not None else None,
+        "tumor_bam_path": HARMONY_BAM_PATH_PLACEHOLDER if tumor is not None else None,
+        "patient": _harmony_present_value(tumor, normal, "patient__dmp"),
+        "consent": _harmony_present_value(tumor, normal, "consent"),
+    }
+
+
+def _harmony_csv_field(value) -> str:
+    """Render one cell for the CSV export (nulls -> empty string)."""
+    return "" if value is None else str(value)
+
+
+def _harmony_csv_consent(consent) -> str:
+    """CSV rendering of consent: None -> empty, False -> "false", True -> "true"."""
+    if consent is None:
+        return ""
+    return "true" if consent is True else "false"
+
+
+def _harmony_rows(db: Session, logic: PairingLogic) -> list[dict]:
+    """All HARMONY rows: latest HARMONY pairings plus unmatched DMP samples.
+
+    Paired rows: every latest ``pairing_table`` row under the HARMONY logic
+    (tumor + normal embedded). Unmatched rows: DMP samples in the HARMONY
+    scope (``sample_type == "DMP"``) with no latest HARMONY pairing — each
+    becomes a one-sided row with the opposite side's columns null, mirroring
+    the DMP unmatched-visibility convention. Ordered by normal ``primary_id``
+    then tumor ``primary_id`` (absent sides sort first).
+    """
+    pairings = db.scalars(
+        select(PairingTable)
+        .options(
+            joinedload(PairingTable.tumor),
+            joinedload(PairingTable.normal),
+        )
+        .where(
+            PairingTable.pairing_logic_id == logic.id,
+            PairingTable.latest.is_(True),
+        )
+    ).all()
+    rows = [_harmony_row(p.tumor, p.normal) for p in pairings]
+
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    unmatched = db.scalars(
+        select(Sample).where(Sample.sample_type == "DMP", ~paired)
+    ).all()
+    for sample in unmatched:
+        if sample.tumor_or_normal == TumorOrNormal.NORMAL.value:
+            rows.append(_harmony_row(None, sample))
+        else:
+            rows.append(_harmony_row(sample, None))
+
+    rows.sort(key=lambda r: (r["normal_sample"] or "", r["tumor_sample"] or ""))
+    return rows
+
+
+def _harmony_csv_body(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(HARMONY_COLUMNS)
+    for r in rows:
+        writer.writerow(
+            [
+                _harmony_csv_field(r["normal_sample"]),
+                _harmony_csv_field(r["tumor_sample"]),
+                _harmony_csv_field(r["normal_bamname"]),
+                _harmony_csv_field(r["normal_bam_path"]),
+                _harmony_csv_field(r["tumor_bamname"]),
+                _harmony_csv_field(r["tumor_bam_path"]),
+                _harmony_csv_field(r["patient"]),
+                _harmony_csv_consent(r["consent"]),
+            ]
+        )
+    return buf.getvalue()
+
+
+@router.get("/harmony/", response_model=list[HarmonyRow])
+def get_harmony_pairings(
+    format: Optional[str] = Query(
+        None, pattern="^(json|csv)$",
+        description='Return "json" (default: a list of rows) or "csv" '
+        '(an 8-column, normal-oriented download).',
+    ),
+    db: Session = Depends(get_db),
+):
+    """The HARMONY pairing output, normal-oriented.
+
+    Rows are the latest HARMONY-logic pairings (one row per normal/tumor
+    pair) plus unmatched DMP samples in the HARMONY scope (no HARMONY pair
+    yet), shown one-sided with the opposite side's columns null.
+
+    ``?format=csv`` returns a ``text/csv`` attachment whose header is exactly
+    the 8 HARMONY columns (``normal_sample, tumor_sample, normal_bamname,
+    normal_bam_path, tumor_bamname, tumor_bam_path, patient, consent``), one
+    row per (normal, tumor) pair, ordered by normal ``primary_id`` then tumor
+    ``primary_id``. ``normal_bam_path``/``tumor_bam_path`` are em-dash
+    placeholders (no bam paths in syzygy yet). ``consent`` renders as
+    lowercase ``true``/``false`` (empty when unknown).
+    """
+    logic = find_logic_by_name(db, HARMONY_LOGIC_NAME)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    rows = _harmony_rows(db, logic)
+    if format == "csv":
+        return Response(
+            content=_harmony_csv_body(rows),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": 'attachment; filename="harmony_pairs.csv"'
+            },
+        )
+    return rows
+
+
+@router.post("/trigger-harmony", response_model=HarmonyTriggerRead)
+def trigger_harmony_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+    """Run automatic HARMONY pairing under the HARMONY pairing logic.
+
+    HARMONY is its own pairing logic and pairing space, separate from the
+    DMP logic (which may drift independently). For now it reuses the DMP
+    strategy (DMP-group only, same ``patient__dmp`` and gene panel): every
+    unpaired DMP tumor is paired with its best DMP normal, recorded under
+    the HARMONY logic id. Existing pairings are never modified or replaced.
+    DMP tumors without a ``patient__dmp`` value cannot be matched and are
+    reported in ``missing_patient__dmp``.
+    """
+    return trigger_harmony_pairing(db)
 
 
 @router.get("/unmatched-count/", response_model=UnmatchedCountRead)
