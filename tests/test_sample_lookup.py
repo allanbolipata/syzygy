@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from database import Base
 from models import Sample
 from routers.samples import lookup_samples_endpoint
-from schemas import TumorOrNormal
+from schemas import SampleRead, TumorOrNormal
 
 
 @pytest.fixture(scope="module")
@@ -124,3 +124,29 @@ def test_lookup_invalid_offset(db):
     with pytest.raises(HTTPException) as exc:
         lookup_samples_endpoint(q="T1", offset=-1, db=db)
     assert exc.value.status_code == 400
+
+
+def test_consent_round_trips_through_schema_layer(db):
+    # DMP sample: the consent column (placeholder False) survives
+    # ORM -> SampleRead round-trip.
+    s = Sample(
+        primary_id="CONSENT-1",
+        cmo_sample_name="CONSENT-1_name",
+        patient__cmo="C-9",
+        patient__dmp="P-9",
+        anon_id="anon-9",
+        sample_type="DMP",
+        gene_panel="IMPACT468",
+        bait_set="IMPACT468",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        consent=False,
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    read = SampleRead.model_validate(s)
+    assert read.consent is False
+    # LIMS/IGO samples carry no consent (NULL) through the schema layer.
+    s2 = _sample(db, "CONSENT-2")
+    assert s2.consent is None
+    assert SampleRead.model_validate(s2).consent is None

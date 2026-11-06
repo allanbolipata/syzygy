@@ -20,6 +20,10 @@ class SampleCreate(BaseModel):
     patient__dmp: Optional[str] = None
     # DMP-only: the DMP anonymous sample id.
     anon_id: Optional[str] = None
+    # DMP-only: whether the patient consented (placeholder False on DMP
+    # samples until the DMP payload carries the real value; None for
+    # LIMS/IGO samples).
+    consent: Optional[bool] = None
     request_id: Optional[str] = None
     sample_type: str
     gene_panel: str
@@ -54,6 +58,10 @@ class SampleRead(BaseModel):
     patient__dmp: Optional[str] = None
     # DMP-only: the DMP anonymous sample id (None for LIMS/IGO samples).
     anon_id: Optional[str] = None
+    # DMP-only: whether the patient consented (placeholder False on DMP
+    # samples until the DMP payload carries the real value; None for
+    # LIMS/IGO samples).
+    consent: Optional[bool] = None
     request_id: Optional[str] = None
     sample_type: str
     gene_panel: str
