@@ -1158,81 +1158,147 @@ const PAIR_COLUMNS = [
 const PAIR_DEFAULT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"];
 const PAIR_GROUPS = ["Tumor sample", "Normal sample", "Pairing"];
 
-/* Legacy DMP export columns: the exact headers and order of the beagle DMP
- * filemetadata export, no additions or removals. Values come from the DMP
- * sample record (primary_id / patient__dmp / anon_id) plus its
- * additional_metadata (coverage, project_name). */
-const DMP_PLACEHOLDER = "\u2014"; // "—" — columns whose source is not available yet
-function dmpMetaText(sample, key) {
-  const meta = (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
-  const v = meta[key];
-  return v === null || v === undefined ? "" : String(v);
+/* DMP pair-report columns: the reference's 15-column pair file (spec
+ * docs/dmp_reference_alignment.md, section c). Values are derived from the
+ * row's tumor/normal records exactly as dmp_translator.remap_dmp_record +
+ * the router's _dmp_pair_cells derive them server-side, so the table
+ * matches the CSV/TSV export. Genuinely absent values render the
+ * reference's NA sentinel — never a placeholder. */
+const DMP_NA = "NA";
+/* The reference's name parse: "P-0000001-T01-IM7" -> patient "P-0000001",
+ * idx "T01", ver "IM7". */
+const DMP_NAME_RE = /(P-\d+)-(\w+)-(\w+)/;
+function dmpMeta(sample) {
+  return (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
 }
-/* Second-to-last / last dash-separated segments of a DMP sample name,
- * e.g. "P-0000001-T01-IM7" -> ["T01", "IM7"]; blank when unparseable. */
-function dmpNameParts(name) {
-  const parts = String(name || "").split("-");
-  if (parts.length < 2) return ["", ""];
-  return [parts[parts.length - 2], parts[parts.length - 1]];
+/* Faithful port of dmp_translator.remap_dmp_record (T2/8): the key fields
+ * of a DMP sample record, with the reference's fallbacks. */
+function remapDmpRecord(sample) {
+  const name = sample ? String(sample.primary_id || "") : "";
+  const m = DMP_NAME_RE.exec(name);
+  const meta = dmpMeta(sample);
+  const pick = (v) => (v === null || v === undefined ? "" : String(v));
+  return {
+    idx: m ? m[2] : "",
+    ver: m ? m[3] : "",
+    bamname: pick(meta.bamname) || pick(sample && sample.anon_id),
+    group: pick(meta.group),
+    coverage: pick(meta.coverage),
+    matched: pick(meta.matched_tag),
+    pool_id: pick(meta.pool_id) || pick(meta.project_name),
+    patient: pick(sample && sample.patient__dmp) || (m ? m[1] : ""),
+  };
 }
+/* The reference's 15 cells for one report row (a port of the router's
+ * _dmp_pair_cells, T4/8). The normal side is NA when the tumor is
+ * unmatched — except normal_IM_ver, which the backend backfills from
+ * the tumor's version. *_bam_exists is resolved server-side from beagle
+ * file records for the export only; it is not in the report payload, so
+ * the table shows NA for both. */
+function dmpCells(r) {
+  const t = r.tumor;
+  const n = r.normal || null;
+  const tr = remapDmpRecord(t);
+  const nr = n ? remapDmpRecord(n) : null;
+  const na = DMP_NA;
+  return {
+    tumor_sample: (t && t.primary_id) ? String(t.primary_id) : na,
+    patient: tr.patient || na,
+    tumor_idx: tr.idx || na,
+    tumor_IM_ver: tr.ver || na,
+    tumor_bamname: tr.bamname || na,
+    tumor_group: tr.group || na,
+    tumor_matched: tr.matched || (n ? "Matched" : "Unmatched"),
+    tumor_bam_exists: na,
+    tumor_bam_coverage: tr.coverage || na,
+    normal_sample: (n && n.primary_id) ? String(n.primary_id) : na,
+    normal_bamname: nr ? (nr.bamname || na) : na,
+    // The reference backfills the tumor's IM_ver whenever the normal's is
+    // missing — on unmatched rows AND on paired rows whose normal name
+    // carries no version segment (mirrors _dmp_pair_cells' `or`).
+    normal_IM_ver: (nr && nr.ver) || tr.ver || na,
+    pool_id: tr.pool_id || na,
+    normal_bam_exists: na,
+    normal_bam_coverage: nr ? (nr.coverage || na) : na,
+  };
+}
+const dmpText = (key) => (r) => dmpCells(r)[key];
 const DMP_COLUMNS = [
-  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: (r) => (r.tumor ? r.tumor.primary_id : ""), link: (r) => sampleLink(r.tumor) },
-  { key: "patient", header: "patient", group: "Tumor", text: (r) => (r.tumor ? r.tumor.patient__dmp || "" : "") },
-  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[0] : "") },
-  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[1] : "") },
-  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: (r) => (r.tumor ? r.tumor.anon_id || "" : "") },
-  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: () => DMP_PLACEHOLDER },
-  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: (r) => (r.tumor ? (r.normal ? "Matched" : "Unmatched") : "") },
-  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: () => DMP_PLACEHOLDER },
-  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "coverage") },
-  { key: "normal_sample", header: "normal_sample", group: "Normal", text: (r) => (r.normal ? r.normal.primary_id : ""), link: (r) => sampleLink(r.normal) },
-  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: (r) => (r.normal ? (r.normal.anon_id || "") : "") },
-  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: (r) => (r.normal ? dmpNameParts(r.normal.primary_id)[1] : "") },
-  { key: "pool_id", header: "pool_id", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "project_name") },
-  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: () => DMP_PLACEHOLDER },
-  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: (r) => dmpMetaText(r.normal, "coverage") },
+  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: dmpText("tumor_sample"), link: (r) => sampleLink(r.tumor) },
+  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient") },
+  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: dmpText("tumor_idx") },
+  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: dmpText("tumor_IM_ver") },
+  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: dmpText("tumor_bamname") },
+  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: dmpText("tumor_group") },
+  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: dmpText("tumor_matched") },
+  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: dmpText("tumor_bam_exists") },
+  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: dmpText("tumor_bam_coverage") },
+  { key: "normal_sample", header: "normal_sample", group: "Normal", text: dmpText("normal_sample"), link: (r) => sampleLink(r.normal) },
+  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: dmpText("normal_bamname") },
+  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: dmpText("normal_IM_ver") },
+  { key: "pool_id", header: "pool_id", group: "Tumor", text: dmpText("pool_id") },
+  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: dmpText("normal_bam_exists") },
+  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: dmpText("normal_bam_coverage") },
 ];
-/* Where each legacy DMP column comes from (shown in the "About these
- * columns" panel and as tooltips on the column headers). */
+/* Where each DMP column comes from (shown in the "About these columns"
+ * panel and as tooltips on the column headers). */
 const DMP_LEGEND = {
-  tumor_sample: "DMP sample name (primary_id), e.g. P-0000001-T01-IM7",
-  patient: "patient__dmp: the DMP \u201cP-\u201d patient id",
-  tumor_idx: "Sample name, second-to-last dash segment (e.g. T01); blank when unparseable",
-  tumor_IM_ver: "Sample name, last dash segment (e.g. IM7); blank when unparseable",
-  tumor_bamname: "anon_id: the DMP anonymous sample id",
-  tumor_group: "Placeholder: source not yet available",
-  tumor_matched: "\u201cMatched\u201d when a normal is paired to this DMP sample, else \u201cUnmatched\u201d",
-  tumor_bam_exists: "Placeholder: source not yet available",
-  tumor_bam_coverage: "coverage from the DMP record's additional_metadata",
-  normal_sample: "Paired normal's sample name (primary_id)",
-  normal_bamname: "Paired normal's anon_id",
-  normal_IM_ver: "Paired normal's name, last dash segment",
-  pool_id: "project_name from the tumor-side DMP record's additional_metadata",
-  normal_bam_exists: "Placeholder: source not yet available",
-  normal_bam_coverage: "coverage from the paired normal's additional_metadata",
+  tumor_sample: "The DMP tumor's sample name (primary_id)",
+  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name",
+  tumor_idx: "Tumor index parsed from the sample name (second-to-last dash segment, e.g. T01); NA when unparseable",
+  tumor_IM_ver: "IM version parsed from the sample name (last dash segment, e.g. IM7); NA when unparseable",
+  tumor_bamname: "bamname from the DMP record's additional_metadata; falls back to anon_id",
+  tumor_group: "group from the DMP record's additional_metadata; NA when the record has none",
+  tumor_matched: "matched_tag from the DMP record; otherwise Matched / Unmatched from the pairing",
+  tumor_bam_exists: "Whether beagle has a BAM record for the tumor; resolved server-side for the export, NA in the table",
+  tumor_bam_coverage: "coverage from the DMP record's additional_metadata; NA when absent",
+  normal_sample: "The paired DMP normal's sample name (primary_id); NA when the tumor is unmatched",
+  normal_bamname: "The paired normal's bamname (additional_metadata, fallback anon_id); NA when the tumor is unmatched",
+  normal_IM_ver: "IM version parsed from the paired normal's name; backfilled from the tumor's version when the normal's is missing; NA otherwise",
+  pool_id: "pool_id from the DMP record's additional_metadata; falls back to project_name",
+  normal_bam_exists: "Whether beagle has a BAM record for the normal; resolved server-side for the export, NA in the table",
+  normal_bam_coverage: "coverage from the paired normal's additional_metadata; NA when absent or the tumor is unmatched",
 };
 const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
 const pairsState = {
+  // The current page of the report only. Pagination is server-side
+  // (GET /pairing/report/), so the browser never holds the full set.
   rows: [],
+  // Server total row count for the loaded logic (all pages combined).
+  total: 0,
   logic: null,
   // Per-logic selected column keys (each logic has its own column set and
   // its own selection, so ARGOS choices never affect DMP and vice versa).
   selected: {},
   // Split-panel filter groups that the user collapsed (default: expanded).
   groupCollapsed: {},
-  // Display pagination for the pair table. The full row set can be in the
-  // hundreds of thousands (the DMP report lists every DMP sample); rendering
-  // all of it to the DOM hangs the tab, so only one page is rendered at a
-  // time. The download still covers every row, not just the visible page.
+  // Server-side pagination: 0-based index of the page currently displayed.
+  // Next/Prev/jump fetch the requested page from /pairing/report/ (see
+  // loadReportPage) rather than slicing a full in-memory set. The download
+  // is server-side too (GET /pairing/export/) and covers the FULL searched
+  // set, not just the current page.
   page: 0,
   pageSize: 50,
-  // View-scoped search (#pr-search): lowercased substring matched
-  // client-side against the already-loaded rows (no server round-trip).
-  // Applied in renderPairsTable() and downloadPairs() so the table and the
-  // export always cover the same set. Cleared on view enter/leave and on
+  // View-scoped search (#pr-search): sent to the server as the q param on
+  // GET /pairing/report/ (and /pairing/export/), so it filters the FULL
+  // merged list, not just the loaded page. Stored trimmed + lowercased
+  // (the form the server matches in). Cleared on view enter/leave and on
   // logic change so a stale filter never carries into new rows.
   query: "",
+  // Server-sourced "Paired" count for the loaded logic (from
+  // /pairing/unmatched-count/): the logic's latest rows with both
+  // sides present. null until the count lands; #pr-count falls back
+  // to the in-memory rows meanwhile (and whenever a search filter
+  // narrows the table, which the server count doesn't cover).
+  pairedCount: null,
+  // DMP only: the report response's reference summary counts
+  // ({patients, tn_pairs, unmatched_tumors}) and 5 QC warning buckets
+  // (T5/8) — computed server-side over the FULL pair frame, identical
+  // on every page and independent of the search query. null for
+  // non-DMP logics and until the first DMP page lands.
+  dmpSummary: null,
+  dmpWarnings: null,
 };
 
 function isDmpLogic(logicName) {
@@ -1312,31 +1378,6 @@ function renderPrGroups() {
   }
 }
 
-/* View-scoped search (#pr-search): the lowercased query matches a row when
- * ANY searchable field on EITHER side contains it (case-insensitive).
- * Unpaired rows (one side null, e.g. appended DMP samples) are searched on
- * the side that is present. */
-const PAIR_SEARCH_FIELDS = ["patient__cmo", "patient__dmp", "cmo_sample_name", "primary_id", "bait_set"];
-
-function pairMatchesQuery(r, q) {
-  for (const side of [r.tumor, r.normal]) {
-    if (!side) continue;
-    for (const f of PAIR_SEARCH_FIELDS) {
-      const v = side[f];
-      if (v !== null && v !== undefined && String(v).toLowerCase().includes(q)) return true;
-    }
-  }
-  return false;
-}
-
-/* Rows visible under the active search query (all loaded rows when there is
- * no query). Shared by renderPairsTable() and downloadPairs() so the
- * export covers exactly what the table shows. */
-function visiblePairRows() {
-  const q = pairsState.query;
-  return q ? pairsState.rows.filter((r) => pairMatchesQuery(r, q)) : pairsState.rows;
-}
-
 /* Clickable identifier cells in the pair table. A column model may
  * declare an optional ``link`` that resolves a row to a navigation
  * target: a sample (its Matches & Overrides page), a patient (the
@@ -1366,18 +1407,30 @@ function renderPairsTable() {
   $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) =>
     `<th${dmp && DMP_LEGEND[c.key] ? ` title="${esc(DMP_LEGEND[c.key])}"` : ""}>${esc(c.header)}</th>`
   ).join("")}</tr>`;
-  // Render only the current page (see pairsState.pageSize). The row array
-  // keeps the full set in memory for the download; pagination and the count
-  // operate on the search-filtered set (visiblePairRows()).
-  const full = pairsState.rows.length;
-  const rows = visiblePairRows();
-  const total = rows.length;
+  // The browser holds only the current server page (pairsState.rows); the
+  // page indicator and the row count come from the server total
+  // (pairsState.total). A search query filters the FULL merged list
+  // server-side (the q param), so rows is already the searched set.
+  const rows = pairsState.rows;
+  const total = pairsState.total;
   const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
-  if (pairsState.page > maxPage) pairsState.page = maxPage;
   const start = pairsState.page * pairsState.pageSize;
-  const slice = rows.slice(start, start + pairsState.pageSize);
-  $("#pairs-table tbody").innerHTML = slice
-    .map((r) => `<tr>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`).join("");
+  // DMP: an ambiguous tumor legitimately appears on one row per candidate
+  // normal — flag the repeated rows with a subtle cue so they read as
+  // one tumor fanned out, not as duplicated data.
+  const tumorCounts = new Map();
+  if (dmp) {
+    for (const r of rows) {
+      const id = r.tumor && r.tumor.primary_id;
+      if (id) tumorCounts.set(id, (tumorCounts.get(id) || 0) + 1);
+    }
+  }
+  $("#pairs-table tbody").innerHTML = rows
+    .map((r) => {
+      const tid = r.tumor && r.tumor.primary_id;
+      const repeat = dmp && tid && (tumorCounts.get(tid) || 0) > 1;
+      return `<tr${repeat ? ` class="pr-dmp-repeat" title="Tumor appears on ${tumorCounts.get(tid)} rows: multiple candidate normals (ambiguous match)"` : ""}>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`;
+    }).join("");
   $("#pr-prev").disabled = pairsState.page === 0;
   $("#pr-next").disabled = pairsState.page >= maxPage;
   // Keep the skip-to-page input in sync with Prev/Next: the input shows
@@ -1388,29 +1441,78 @@ function renderPairsTable() {
   pageInput.value = pairsState.page + 1;
   $("#pr-page-of").textContent = `of ${totalPages}`;
   pageInput.disabled = total === 0;
-  const matched = rows.filter((r) => r.tumor && r.normal).length;
-  const empty = total === 0 || cols.length === 0;
+  // Matched: the server count (pairsState.pairedCount, from
+  // /pairing/unmatched-count/) once it has landed and no search filter
+  // narrows the table — until then, and while filtering, fall back to
+  // the current page's rows.
+  let matched;
+  if (pairsState.query) {
+    // A search narrows the set server-side, but the reference counts
+    // cover the FULL frame — while filtering, use the page's rows.
+    matched = rows.filter((r) => r.tumor && r.normal).length;
+  } else if (dmp && pairsState.dmpSummary) {
+    matched = pairsState.dmpSummary.tn_pairs;
+  } else if (pairsState.pairedCount != null) {
+    matched = pairsState.pairedCount;
+  } else {
+    matched = rows.filter((r) => r.tumor && r.normal).length;
+  }
+  const empty = rows.length === 0 || cols.length === 0;
   const emptyEl = $("#pr-empty");
   emptyEl.classList.toggle("hidden", !empty);
   emptyEl.textContent =
-    pairsState.query && full > 0 ? "No pairs match this search." : "No current pairs for this logic.";
-  const filteredNote = pairsState.query && total !== full ? ` (filtered from ${full})` : "";
+    pairsState.query ? "No pairs match this search." : "No current pairs for this logic.";
   const paging = total > pairsState.pageSize
-    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + slice.length} of ${total})`
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${Math.min(start + pairsState.pageSize, total)} of ${total})`
     : "";
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
     : dmp
-      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${filteredNote}${paging}`
-      : `${total} pair${total === 1 ? "" : "s"}${filteredNote}${paging}`;
+      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${paging}`
+      : `${total} pair${total === 1 ? "" : "s"}${paging}`;
   $("#pr-download").disabled = empty;
-  // Legend (and header tooltips) only for the legacy DMP column set.
+  // Legend (and header tooltips) only for the DMP column set.
   $("#pr-legend").classList.toggle("hidden", !dmp);
   if (dmp) {
     $("#pr-legend-body").innerHTML = DMP_COLUMNS.map((c) =>
       `<tr><td>${esc(c.header)}</td><td>${esc(DMP_LEGEND[c.key] || "")}</td></tr>`
     ).join("");
   }
+  renderDmpWarnings();
+}
+
+/* DMP QC warnings (T5/8): the 5 reference buckets, each expandable,
+ * from the report response's warnings field — computed over the FULL
+ * pair frame, so the buckets stay constant across pages and searches.
+ * Hidden (and cleared) for non-DMP logics. */
+const DMP_WARNING_BUCKETS = [
+  { key: "matched_tumors_without_normal", label: "Matched tumors without a normal" },
+  { key: "tumor_samples_with_multiple_ambiguous_normals", label: "Tumors with multiple ambiguous normals" },
+  { key: "samples_with_bams_missing", label: "Samples with BAMs missing" },
+  { key: "low_coverage_tumors", label: "Low-coverage tumors" },
+  { key: "low_coverage_normals", label: "Low-coverage normals" },
+];
+function renderDmpWarnings() {
+  const warnEl = $("#pr-dmp-warnings");
+  if (!warnEl) return;
+  if (!isDmpLogic(activeLogicName()) || !pairsState.dmpWarnings) {
+    warnEl.classList.add("hidden");
+    warnEl.innerHTML = "";
+    return;
+  }
+  const w = pairsState.dmpWarnings;
+  warnEl.classList.remove("hidden");
+  warnEl.innerHTML =
+    `<p class="pr-dmp-warnings-title">QC warnings <span class="hint">— full report, not just this page</span></p>` +
+    DMP_WARNING_BUCKETS.map((b) => {
+      const samples = w[b.key] || [];
+      return `<details class="pr-warn-bucket">
+  <summary>${esc(b.label)} <span class="pr-warn-count">${samples.length}</span></summary>
+  ${samples.length
+    ? `<ul class="pr-warn-list">${samples.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`
+    : `<p class="hint">None.</p>`}
+</details>`;
+    }).join("");
 }
 
 /* Abort controller for the in-flight pair load; a new load (tab click,
@@ -1434,101 +1536,175 @@ function hidePrLoading() {
   if (el) el.classList.add("hidden");
 }
 
-async function loadPairs() {
-  const logic = $("#pr-logic").value;
+/* URLSearchParams for GET /pairing/report/: the 1-based page and size,
+ * plus the active free-text search query (trimmed + lowercased, the
+ * form the server matches in; omitted when empty). One helper so the
+ * page fetch and the next-page prefetch always send identical params. */
+function reportPageParams(logic, page, pageSize) {
+  const params = new URLSearchParams({
+    pairing_logic_name: logic,
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  return params;
+}
+async function loadReportPage(page) {
+  const logic = pairsState.logic;
   if (!logic) return;
   if (pairsAbort) pairsAbort.abort();
   pairsAbort = new AbortController();
   const signal = pairsAbort.signal;
   // True only while THIS load is the active one. A newer load replaces
-  // pairsAbort (and thus owns the loading indicator + overview stats) and
-  // aborts this load's signal, so a stale load must not repaint or clear the
-  // spinner the newer load is showing.
+  // pairsAbort (and thus owns the loading indicator) and aborts this
+  // load's signal, so a stale load must not repaint or clear the spinner
+  // the newer load is showing.
   const active = () => signal === pairsAbort.signal;
-  const isDmp = isDmpLogic(logic);
-  pairsState.logic = logic;
+  // Spinner lifecycle invariant: hide any stale indicator at entry, show
+  // ours, and hide in `finally` so every exit path is covered.
+  hidePrLoading();
+  if (active()) showPrLoading(`Loading page ${page + 1}\u2026`);
   try {
-    // Start the (large, DMP-only) unmatched-set fetch in parallel with the
-    // smaller paired-rows fetch; the two queries are independent. Paint the
-    // paired rows as soon as they land so page 1 appears without waiting for
-    // the whole DMP population to transfer.
-    const unmatchedPromise = isDmp
-      ? api(`/pairing/unmatched/?${new URLSearchParams({ pairing_logic_name: logic })}`, { signal })
-      : null;
-    if (unmatchedPromise) unmatchedPromise.catch(() => {}); // no unhandled rejection if we bail early
-    if (active()) showPrLoading("Loading pairs…");
-    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`, { signal });
-    pairsState.page = 0;
-    renderPrGroups();
-    renderPairsTable(); // page 1 (paired rows) is on screen now
-  } catch (e) {
-    if (e && e.name === "AbortError") return; // superseded by a newer load
-    // Paired rows failed: cancel the in-flight unmatched fetch (it shares this
-    // signal) so we don't leave a large DMP query running for nothing, then
-    // report the failure.
-    pairsAbort.abort();
-    hidePrLoading();
-    banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
-    return;
-  }
-  if (unmatchedPromise) {
+    // Serve from the next-page prefetch when it has already landed for
+    // this exact logic/query/page; otherwise fetch for real. A failed
+    // prefetch resolves to null and falls through to the real fetch,
+    // which surfaces the error.
+    let data = null;
     try {
-      if (active()) showPrLoading("Loading unmatched samples…");
-      const unmatched = await unmatchedPromise;
-      // Only the active load may mutate shared state: a superseded load's
-      // stale DMP set must not be appended to the newer load's rows.
-      if (active()) {
-        appendUnmatchedDmpRows(unmatched);
-        renderPairsTable(); // counts + unmatched rows fill in
+      data = await consumePrPrefetch(page);
+      if (!data) {
+        data = await api(`/pairing/report/?${reportPageParams(logic, page + 1, pairsState.pageSize)}`, { signal });
       }
     } catch (e) {
-      if (e && e.name !== "AbortError") banner("error", `Failed to load unmatched samples: ${esc(e.message)}`, true);
+      if (e && e.name !== "AbortError") {
+        hidePrLoading();
+        banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      }
+      return;
     }
-  }
-  if (active()) {
-    hidePrLoading();
-    loadPrOverviewStats();
-  }
-}
-
-/* DMP report: the legacy export lists every DMP sample, so DMP samples
- * without a pairing yet are appended as rows with the opposite-side
- * columns left empty. The unmatched set is computed server-side (one
- * query) — the old client-side diff had to download the entire DMP
- * sample population in pages of 1000. loadPairs() fetches this set in
- * parallel with the paired rows and hands the result here. */
-function appendUnmatchedDmpRows(unmatched) {
-  for (const s of unmatched) {
-    pairsState.rows.push({
-      tumor: s.tumor_or_normal === "TUMOR" ? s : null,
-      normal: s.tumor_or_normal === "NORMAL" ? s : null,
-      pairing_logic: pairsState.logic,
-      trigger_type: null,
-      mismatched_keys: [],
-      created_date: s.created_date,
-    });
+    // Only the active load may mutate shared state: a superseded load's
+    // page must not paint over the newer load's rows.
+    if (!active()) return;
+    pairsState.rows = data.rows;
+    pairsState.total = data.total;
+    pairsState.page = page;
+    // DMP: the response carries the reference summary/warnings on every
+    // page (identical, page/q independent) — keep the latest.
+    pairsState.dmpSummary = data.summary || null;
+    pairsState.dmpWarnings = data.warnings || null;
+    renderPrGroups();
+    renderPairsTable();
+    if (page === 0) loadPrOverviewStats();
+    // The page is on screen: quietly fetch N+1 so "Next" is instant.
+    prefetchNextPrPage(page);
+  } finally {
+    // Invariant: whenever THIS load is still the newest, its spinner is
+    // hidden no matter how the body exited — completion, a fetch error,
+    // or a superseded early return.
+    if (active()) hidePrLoading();
   }
 }
 
-function downloadPairs() {
-  if (!pairsState.logic) return;
+async function loadPairs() {
+  const logic = $("#pr-logic").value;
+  if (!logic) return;
+  // A fresh load (init, tab re-entry, logic change, post-pairing refresh)
+  // starts at page 1; any cached prefetch belongs to the previous
+  // logic/query and is dropped.
+  invalidatePrPrefetch();
+  pairsState.logic = logic;
+  // The previous logic's server count is stale until the new one lands.
+  pairsState.pairedCount = null;
+  // Same for the DMP extras: the previous logic's summary/warnings must
+  // not linger when a new (or non-DMP) logic is selected.
+  pairsState.dmpSummary = null;
+  pairsState.dmpWarnings = null;
+  await loadReportPage(0);
+}
+
+/* Next-page prefetch: after a page paints, quietly fetch page N+1 and
+ * cache it so "Next" renders instantly. One slot, keyed by
+ * logic|query|page — a logic change or a search (which call
+ * invalidatePrPrefetch) can never serve a stale page, and a settled but
+ * superseded result is simply dropped. Prefetch failures are silent: a
+ * real page turn re-fetches and surfaces the error. */
+let prPrefetch = null; // { key, page, abort, promise, data }
+function prPrefetchKey() {
+  return `${pairsState.logic}|${pairsState.query}|${pairsState.pageSize}`;
+}
+function invalidatePrPrefetch() {
+  if (prPrefetch) {
+    prPrefetch.abort.abort(); // cancel the in-flight fetch, if any
+    prPrefetch = null;
+  }
+}
+function prefetchNextPrPage(page) {
+  const maxPage = Math.max(0, Math.ceil(pairsState.total / pairsState.pageSize) - 1);
+  const next = page + 1;
+  if (next > maxPage) return; // already on the last page
+  const key = `${prPrefetchKey()}|${next}`;
+  if (prPrefetch && prPrefetch.key === key) return; // in flight or cached
+  invalidatePrPrefetch();
+  const ctrl = new AbortController();
+  const entry = { key, page: next, abort: ctrl, data: null, promise: null };
+  entry.promise = api(`/pairing/report/?${reportPageParams(pairsState.logic, next + 1, pairsState.pageSize)}`, { signal: ctrl.signal })
+    .then((data) => {
+      if (prPrefetch === entry) entry.data = data; // else superseded: drop
+      return data;
+    })
+    .catch(() => null); // silent; a real turn re-fetches
+  prPrefetch = entry;
+}
+async function consumePrPrefetch(page) {
+  if (!prPrefetch || prPrefetch.page !== page) return null;
+  if (prPrefetch.key !== `${prPrefetchKey()}|${page}`) return null;
+  if (prPrefetch.data) return prPrefetch.data;
+  return await prPrefetch.promise; // null on silent failure → caller re-fetches
+}
+
+/* Export the FULL searched set from the server (GET /pairing/export/), not
+ * just the page the browser holds — server-side pagination means the client
+ * only ever has one page. The server owns the merge, the search filter (q)
+ * and the checked column set; the response streams to disk via a blob. */
+async function downloadPairs() {
+  const logic = pairsState.logic;
+  if (!logic) return;
   const cols = selectedPairColumns();
-  // Export exactly the rows the table shows (the active search filter
-  // applied, not the full unfiltered set).
-  const rows = visiblePairRows();
-  if (cols.length === 0 || rows.length === 0) return;
+  if (cols.length === 0) return;
   const tsv = $("#pr-format").value === "tsv";
-  const sep = tsv ? "\t" : ",";
-  const cell = (v) => (!tsv && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v.replace(/[\t\r\n]/g, " "));
-  const data = [cols.map((c) => c.header), ...rows.map((r) => cols.map((c) => c.text(r)))];
-  const text = data.map((r) => r.map(cell).join(sep)).join("\n") + "\n";
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: tsv ? "text/tab-separated-values" : "text/csv" }));
-  a.download = `pairs_${pairsState.logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(a.href);
+  const params = new URLSearchParams({
+    pairing_logic_name: logic,
+    fmt: tsv ? "tsv" : "csv",
+    columns: cols.map((c) => c.key).join(","),
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  const btn = $("#pr-download");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(API + "/pairing/export/?" + params);
+    let detail = null;
+    if (!res.ok) {
+      try { const b = await res.json(); detail = b && b.detail; } catch (_) { /* not JSON */ }
+      if (res.status === 401) location.href = "/login";
+      else if (res.status === 403) location.href = "/login?error=" + encodeURIComponent(detail || "Not allowed");
+      throw new Error((typeof detail === "string" ? detail : JSON.stringify(detail)) || `Export failed: ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `pairs_${logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    banner("error", `Export failed: ${esc(e.message)}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 /* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
@@ -1624,32 +1800,48 @@ function renderPrLogicExplainer() {
   el.innerHTML = explainer || `<p>${esc(logicName)}: no explainer available for this logic.</p>`;
 }
 
-/* Paired / Unpaired strip for the selected logic. Paired counts the
- * report rows with both sides (same rule as the DMP count line in
- * #pr-count); Unpaired comes from the per-logic unmatched-count endpoint. */
+/* Counts strip for the selected logic (#pr-overview-stats). Non-DMP
+ * logics: Paired / Unpaired from the per-logic unmatched-count endpoint
+ * (Paired = the logic's latest report rows with both sides present,
+ * Unpaired = its unpaired population). DMP: the reference's 3 summary
+ * counts from the report response's summary field (computed over the
+ * FULL pair frame, independent of page and search). */
 async function loadPrOverviewStats() {
   const el = $("#pr-overview-stats");
   const logic = activeLogicName();
   if (!el || !logic) return;
-  const paint = (unpairedHtml) => {
-    const paired = pairsState.rows.filter((r) => r.tumor && r.normal).length;
+  if (isDmpLogic(logic)) {
+    const s = pairsState.dmpSummary;
+    el.innerHTML = s
+      ? `<span class="pr-stat"># of patients <strong>${s.patients}</strong></span>` +
+        `<span class="pr-stat"># of Tumor-Normal pairs <strong>${s.tn_pairs}</strong></span>` +
+        `<span class="pr-stat"># of unmatched tumors <strong>${s.unmatched_tumors}</strong></span>`
+      : `<span class="pr-stat">summary <strong>…</strong></span>`;
+    return;
+  }
+  const paint = (pairedHtml, unpairedHtml) => {
     el.innerHTML =
-      `<span class="pr-stat">Paired <strong>${paired}</strong></span>` +
+      `<span class="pr-stat">Paired ${pairedHtml}</span>` +
       `<span class="pr-stat">Unpaired ${unpairedHtml}</span>`;
   };
-  paint("<strong>…</strong>");
+  paint("<strong>…</strong>", "<strong>…</strong>");
   try {
     const r = await api(`/pairing/unmatched-count/?pairing_logic_name=${encodeURIComponent(logic)}`);
-    if (activeLogicName() === logic) paint(`<strong>${r.unpaired}</strong>`);
+    if (activeLogicName() === logic) {
+      // The server count also drives #pr-count's "matched" figure.
+      pairsState.pairedCount = r.paired;
+      renderPairsTable();
+      paint(`<strong>${r.paired}</strong>`, `<strong>${r.unpaired}</strong>`);
+    }
   } catch (e) {
-    if (activeLogicName() === logic) paint("<strong>—</strong>");
+    if (activeLogicName() === logic) paint("<strong>—</strong>", "<strong>—</strong>");
   }
 }
 
 $("#pr-logic").addEventListener("change", () => {
   // Sync the state before re-rendering: activeLogicName() prefers
-  // pairsState.logic, which loadPairs() only updates once its fetch
-  // starts — the blurb would otherwise keep the previous logic's text.
+  // pairsState.logic, which loadPairs() sets when it runs — the blurb
+  // would otherwise keep the previous logic's text.
   pairsState.logic = $("#pr-logic").value;
   $("#pr-run-status").textContent = "";
   $("#pr-evaluate-result").textContent = "";
@@ -1662,27 +1854,27 @@ $("#pr-run").addEventListener("click", runPrPairing);
 $("#pr-evaluate").addEventListener("click", evaluatePrPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
-  if (pairsState.page > 0) {
-    pairsState.page--;
-    renderPairsTable();
-  }
+  if (pairsState.page > 0) loadReportPage(pairsState.page - 1);
 });
 $("#pr-next").addEventListener("click", () => {
-  const maxPage = Math.max(0, Math.ceil(visiblePairRows().length / pairsState.pageSize) - 1);
-  if (pairsState.page < maxPage) {
-    pairsState.page++;
-    renderPairsTable();
-  }
+  const maxPage = Math.max(0, Math.ceil(pairsState.total / pairsState.pageSize) - 1);
+  if (pairsState.page < maxPage) loadReportPage(pairsState.page + 1);
 });
 /* Skip-to-page: type a number (1-based) and press Enter, or let the
  * input commit on blur/change. Out-of-range values clamp to
  * [1, totalPages]; renderPairsTable() re-syncs the input and Prev/Next. */
 function goPrPage() {
-  const totalPages = Math.max(1, Math.ceil(visiblePairRows().length / pairsState.pageSize));
+  const totalPages = Math.max(1, Math.ceil(pairsState.total / pairsState.pageSize));
   const target = parseInt($("#pr-page").value, 10);
   if (Number.isNaN(target)) return; // blank input: next render re-syncs it
-  pairsState.page = Math.min(totalPages - 1, Math.max(0, target - 1));
-  renderPairsTable();
+  const page = Math.min(totalPages - 1, Math.max(0, target - 1));
+  // Same page (or a blank/clamped-identical value): just re-sync the input,
+  // no server round-trip.
+  if (page === pairsState.page) {
+    renderPairsTable();
+  } else {
+    loadReportPage(page);
+  }
 }
 $("#pr-page").addEventListener("change", goPrPage);
 $("#pr-page").addEventListener("keydown", (e) => {
@@ -1696,20 +1888,27 @@ function resetPrSearch() {
   if (box && box.value) box.value = "";
   if (pairsState.query) {
     pairsState.query = "";
-    pairsState.page = 0;
+    // The query change voids any cached prefetch (its key includes the
+    // query). The page index is a SERVER page, not a position in a filtered
+    // set, so it is left alone — the currently loaded page stays loaded.
+    invalidatePrPrefetch();
   }
 }
-/* View-scoped search: filter the already-loaded rows client-side as the
- * user types (no server round-trip). Debounced so typing over the
- * hundreds-of-thousands DMP set doesn't re-render on every keystroke. */
+/* View-scoped search: send the query to the server (GET /pairing/report/?q=)
+ * so it filters the FULL merged list, not just the loaded page. Debounced so
+ * typing doesn't issue a request per keystroke. A new/changed query resets
+ * to page 1 and refetches; #pr-count / #pr-page-of then reflect the server's
+ * filtered total (the same renderPairsTable path as any page fetch). */
 let prSearchTimer = null;
 $("#pr-search").addEventListener("input", () => {
   clearTimeout(prSearchTimer);
   prSearchTimer = setTimeout(() => {
-    pairsState.query = $("#pr-search").value.trim().toLowerCase();
-    pairsState.page = 0;
-    renderPairsTable();
-  }, 150);
+    const q = $("#pr-search").value.trim().toLowerCase();
+    if (q === pairsState.query) return; // unchanged: nothing to refetch
+    pairsState.query = q;
+    invalidatePrPrefetch(); // cached prefetch was fetched for the old query
+    loadReportPage(0); // server-side search starts at page 1
+  }, 250);
 });
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
 $("#pr-groups").addEventListener("change", (e) => {

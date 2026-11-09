@@ -1,19 +1,25 @@
 """E2E tests for automatic DMP pairing (DMP 4/4).
 
-Covers the full trigger path end-to-end under the DMP logic:
-  * a DMP TUMOR + DMP NORMAL with equal patient__dmp and gene_panel
-    auto-pair when triggered (tumor side and normal side);
-  * a DMP tumor with no same-patient__dmp same-gene-panel counterpart
-    stays unpaired;
+Covers the full trigger path end-to-end under the DMP logic. DMP
+Reference Alignment 3/8 replaced the single-winner (patient__dmp +
+gene_panel) semantics with the reference two-tier pairing
+(docs/dmp_reference_alignment.md): tier 1 matches on (patient,
+pool_id), tier 2 (IM_ver rescue) only when a tumor has no tier-1
+match, and there is NO winner — every matching (tumor, normal) pair
+becomes its own pairing row (multi_pair fan-out).
+
+  * a DMP TUMOR + DMP NORMAL with equal patient and pool auto-pair
+    when triggered (tumor side and normal side);
+  * a DMP tumor with no same-patient pool/IM_ver counterpart stays
+    unpaired;
   * a LIMS tumor does NOT auto-pair to a DMP normal (cross-group stays
     manual even when patient__cmo matches) — under both the DMP logic
     and the ARGOS logic;
   * a manually created DMP pairing survives an automatic re-trigger
     (manual wins; the automatic run returns the existing pairing and
     never replaces it);
-  * a DMP tumor with two candidate normals ends up with exactly one
-    pairing (deterministic primary_id pick), and re-triggering is
-    idempotent.
+  * a DMP tumor with two same-pool candidate normals ends up with TWO
+    pairing rows (no winner), and re-triggering is idempotent.
 
 Same in-memory SQLite fixture style as tests/test_pairing_service.py.
 """
@@ -88,6 +94,7 @@ def _dmp_sample(
     patient__cmo=None,
     anon_id=None,
     sequencing_date=None,
+    additional_metadata=None,
 ):
     sample = Sample(
         primary_id=primary_id,
@@ -99,6 +106,7 @@ def _dmp_sample(
         gene_panel=gene_panel,
         tumor_or_normal=tumor_or_normal,
         sequencing_date=sequencing_date,
+        additional_metadata=additional_metadata,
     )
     db.add(sample)
     db.commit()
@@ -143,8 +151,13 @@ def _pairings_for(db, tumor_id, logic_id):
 
 
 def test_dmp_tumor_and_normal_auto_pair_under_dmp_logic(db, dmp_logic):
-    tumor = _dmp_sample(db, "DMP-T-1", "P-1", tumor_or_normal=TumorOrNormal.TUMOR.value)
-    normal = _dmp_sample(db, "DMP-N-1", "P-1")
+    tumor = _dmp_sample(
+        db, "DMP-T-1", "P-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-1"},
+    )
+    normal = _dmp_sample(
+        db, "DMP-N-1", "P-1", additional_metadata={"project_name": "POOL-1"},
+    )
 
     pairing = trigger_pairing(db, tumor, dmp_logic, "automatic")
 
@@ -159,13 +172,18 @@ def test_dmp_tumor_and_normal_auto_pair_under_dmp_logic(db, dmp_logic):
 
 
 def test_dmp_normal_arriving_later_auto_pairs(db, dmp_logic):
-    tumor = _dmp_sample(db, "DMP-T-2", "P-2", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    tumor = _dmp_sample(
+        db, "DMP-T-2", "P-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-2"},
+    )
     # Tumor arrives first with no normal: nothing to pair.
     assert trigger_pairing(db, tumor, dmp_logic, "automatic") is None
     assert _get_latest_pairing(db, tumor.id, dmp_logic.id) is None
 
     # Normal arrives later: the normal-side trigger pairs it up.
-    normal = _dmp_sample(db, "DMP-N-2", "P-2")
+    normal = _dmp_sample(
+        db, "DMP-N-2", "P-2", additional_metadata={"project_name": "POOL-2"},
+    )
     trigger_pairing_for_normal(db, normal, dmp_logic)
 
     pairing = _get_latest_pairing(db, tumor.id, dmp_logic.id)
@@ -175,16 +193,23 @@ def test_dmp_normal_arriving_later_auto_pairs(db, dmp_logic):
     assert pairing.trigger_type == "automatic"
 
 
-def test_dmp_gene_panel_mismatch_stays_unpaired(db, dmp_logic):
+def test_dmp_gene_panel_mismatch_still_pairs(db, dmp_logic):
+    # gene_panel is NO LONGER a pairing key (the reference joins never
+    # use it): a same-patient same-pool cross-panel pair matches.
     tumor = _dmp_sample(
         db, "DMP-T-3", "P-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
-        gene_panel="IMPACT468",
+        gene_panel="IMPACT468", additional_metadata={"project_name": "POOL-3"},
     )
-    # Same DMP patient but a different assay (ACCESS): invalid pair.
-    _dmp_sample(db, "DMP-N-3", "P-3", gene_panel="ACCESS327")
+    # Same DMP patient, same pool, but a different assay (ACCESS).
+    normal = _dmp_sample(
+        db, "DMP-N-3", "P-3", gene_panel="ACCESS327",
+        additional_metadata={"project_name": "POOL-3"},
+    )
 
-    assert trigger_pairing(db, tumor, dmp_logic, "automatic") is None
-    assert _get_latest_pairing(db, tumor.id, dmp_logic.id) is None
+    pairing = trigger_pairing(db, tumor, dmp_logic, "automatic")
+    assert pairing is not None
+    assert pairing.normal_id == normal.id
+    assert _get_latest_pairing(db, tumor.id, dmp_logic.id) is not None
 
 
 def test_dmp_tumor_without_counterpart_stays_unpaired(db, dmp_logic):
@@ -240,13 +265,21 @@ def test_dmp_normal_side_ignores_lims_tumor(db, dmp_logic):
 
 
 def test_manual_dmp_pairing_survives_auto_retrigger(db, dmp_logic):
-    tumor = _dmp_sample(db, "DMP-T-7", "P-7", tumor_or_normal=TumorOrNormal.TUMOR.value)
-    normal_a = _dmp_sample(db, "DMP-N-7A", "P-7")
-    # A second candidate normal so the deterministic winner is well
-    # defined (normal_a, the first in primary_id string order).
-    _dmp_sample(db, "DMP-N-7B", "P-7")
+    tumor = _dmp_sample(
+        db, "DMP-T-7", "P-7", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-7"},
+    )
+    normal_a = _dmp_sample(
+        db, "DMP-N-7A", "P-7", additional_metadata={"project_name": "POOL-7"},
+    )
+    # A second same-pool candidate so the match set is well defined
+    # (without the manual pin, the fan-out would yield two rows).
+    _dmp_sample(
+        db, "DMP-N-7B", "P-7", additional_metadata={"project_name": "POOL-7"},
+    )
 
-    # A human pins the pairing manually (an explicit pin to normal_a).
+    # A human pins the pairing manually (an explicit pin to normal_a):
+    # the row set is replaced by the single pinned row.
     manual = trigger_pairing(db, tumor, dmp_logic, "manual", normal_a.id)
     assert manual is not None
     assert manual.normal_id == normal_a.id
@@ -267,54 +300,80 @@ def test_manual_dmp_pairing_survives_auto_retrigger(db, dmp_logic):
     assert len(_pairings_for(db, tumor.id, dmp_logic.id)) == 1
 
 
-def test_two_candidate_normals_exactly_one_deterministic(db, dmp_logic):
-    tumor = _dmp_sample(db, "DMP-T-8", "P-8", tumor_or_normal=TumorOrNormal.TUMOR.value)
-    # Create the higher primary_id first: the winner is the FIRST in
-    # primary_id string order, independent of insert order.
-    _dmp_sample(
+def test_two_candidate_normals_fan_out_no_winner(db, dmp_logic):
+    # No winner selection: two same-pool candidate normals yield TWO
+    # pairing rows (the reference left_join fan-out).
+    tumor = _dmp_sample(
+        db, "DMP-T-8", "P-8", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-8"},
+    )
+    # Create the higher primary_id first: the representative row is the
+    # FIRST in primary_id string order, independent of insert order.
+    normal_b = _dmp_sample(
         db, "DMP-N-8B", "P-8",
         sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        additional_metadata={"project_name": "POOL-8"},
     )
     normal_a = _dmp_sample(
         db, "DMP-N-8A", "P-8",
         sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        additional_metadata={"project_name": "POOL-8"},
     )
 
     pairing = trigger_pairing(db, tumor, dmp_logic, "automatic")
     assert pairing is not None
+    # The returned row is the deterministic representative.
     assert pairing.normal_id == normal_a.id
 
     rows = _pairings_for(db, tumor.id, dmp_logic.id)
-    assert len(rows) == 1
+    assert len(rows) == 2
+    assert {p.normal_id for p in rows} == {normal_a.id, normal_b.id}
     assert [p for p in rows if p.latest] == rows
+    assert all(p.multi_pair for p in rows)
 
 
 def test_auto_retrigger_is_idempotent(db, dmp_logic):
-    tumor = _dmp_sample(db, "DMP-T-9", "P-9", tumor_or_normal=TumorOrNormal.TUMOR.value)
-    _dmp_sample(db, "DMP-N-9A", "P-9")
+    tumor = _dmp_sample(
+        db, "DMP-T-9", "P-9", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-9"},
+    )
+    _dmp_sample(
+        db, "DMP-N-9A", "P-9", additional_metadata={"project_name": "POOL-9"},
+    )
     normal_newer = _dmp_sample(
         db, "DMP-N-9B", "P-9",
         sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        additional_metadata={"project_name": "POOL-9"},
     )
 
     first = trigger_pairing(db, tumor, dmp_logic, "automatic")
     assert first is not None
+    # No winner: both same-pool normals are in the row set.
+    assert len(_pairings_for(db, tumor.id, dmp_logic.id)) == 2
 
-    # A second automatic run (re-import) returns the same pairing even
-    # though a newer matching normal now exists.
+    # A second automatic run (re-import) returns the same representative
+    # row and leaves the row set untouched — no duplicates.
     second = trigger_pairing(db, tumor, dmp_logic, "automatic")
     assert second.id == first.id
     assert second.normal_id == first.normal_id
-    assert len(_pairings_for(db, tumor.id, dmp_logic.id)) == 1
-    # The newer normal is untouched.
-    assert _pairings_for(db, normal_newer.id, dmp_logic.id) == []
+    assert len(_pairings_for(db, tumor.id, dmp_logic.id)) == 2
+    # The newer normal is part of the row set (fan-out).
+    row_normals = {
+        p.normal_id for p in _pairings_for(db, tumor.id, dmp_logic.id)
+    }
+    assert normal_newer.id in row_normals
 
 
 def test_dmp_pairing_does_not_leak_into_other_logic(db, dmp_logic, argos_logic):
     # A DMP T/N pair under the DMP logic creates no pairing row under
     # the ARGOS logic (pairings are per logic).
-    tumor = _dmp_sample(db, "DMP-T-10", "P-10", tumor_or_normal=TumorOrNormal.TUMOR.value)
-    _dmp_sample(db, "DMP-N-10", "P-10")
+    tumor = _dmp_sample(
+        db, "DMP-T-10", "P-10", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-10"},
+    )
+    _dmp_sample(
+        db, "DMP-N-10", "P-10", additional_metadata={"project_name": "POOL-10"},
+    )
     trigger_pairing(db, tumor, dmp_logic, "automatic")
 
     assert _pairings_for(db, tumor.id, dmp_logic.id) != []

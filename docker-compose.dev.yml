@@ -67,14 +67,14 @@ services:
     restart: "no"
 
   # Standalone smile-client consumer: one durable consumer on the wildcard
-  # MDB_STREAM.server.cpt-gateway.> receives all three cmo subjects and
+  # MDB_STREAM.server.> receives all cmo and dmp subjects and
   # POSTs each message to the app's internal ingest endpoint.
   smile-listener:
     build: ./listener
     command: ["python", "/app/run.py"]
     environment:
       NATS_URL: nats://nats:4222
-      NATS_FILTER_SUBJECT: "MDB_STREAM.server.cpt-gateway.>"
+      NATS_FILTER_SUBJECT: "MDB_STREAM.server.>"
       NATS_DURABLE: "syzygy"
       SYZYGY_APP_URL: http://app:8123
       SYZYGY_NATS_TOKEN: dev-syzygy-nats-token

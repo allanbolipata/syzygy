@@ -218,17 +218,118 @@ class EvaluateRead(BaseModel):
 
 
 class UnmatchedCountRead(BaseModel):
-    """Per-logic unpaired count (GET /pairing/unmatched-count/).
+    """Per-logic paired/unpaired counts (GET /pairing/unmatched-count/).
 
-    DMP: unpaired DMP samples (tumor or normal), mirroring GET
-    /pairing/unmatched/. Any other logic: the logic's unpaired tumor
-    population (the backfill scope).
+    ``paired``: the logic's latest report rows where both the tumor
+    and the normal sides are present — the server-side form of the
+    Pair Report's "Paired" strip value. ``unpaired``: DMP: unpaired
+    DMP samples (tumor or normal), mirroring GET /pairing/unmatched/.
+    Any other logic: the logic's unpaired tumor population (the
+    backfill scope).
     """
 
     model_config = ConfigDict(from_attributes=True)
 
     pairing_logic: str
     unpaired: int
+    paired: int
+
+
+class PairingReportRowRead(BaseModel):
+    """One row of the merged Pair Report list (``GET /pairing/report/``).
+
+    A paired row carries the pairing's identity (``id``, ``pairing_logic_id``,
+    ``tumor_id``, ``normal_id``) and both sides. An unmatched DMP row (DMP
+    logics only) carries the sample on its natural side (``tumor`` if the
+    sample is TUMOR, otherwise ``normal``), leaves the other side null, and
+    carries no pairing identity at all — mirroring the frontend
+    ``appendUnmatchedDmpRows`` field mapping.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: Optional[UUID] = None
+    pairing_logic_id: Optional[UUID] = None
+    pairing_logic: str
+    tumor_id: Optional[UUID] = None
+    normal_id: Optional[UUID] = None
+    tumor: Optional[SampleRead] = None
+    normal: Optional[SampleRead] = None
+    trigger_type: Optional[str] = None
+    mismatched_keys: Optional[list[str]] = None
+    notes: Optional[list[str]] = None
+    created_date: datetime
+    modified_date: Optional[datetime] = None
+    latest: Optional[bool] = None
+
+
+class DmpSummaryRead(BaseModel):
+    """The reference's 3 summary counts (spec d; the
+    ``pair_tumor_with_normal.R`` summary block), computed over the FULL
+    15-column DMP pair frame.
+
+    ``patients``: distinct ``patient`` values among rows whose
+    ``tumor_matched`` is "Matched". ``tn_pairs``: row count of rows whose
+    ``tumor_matched`` is "Matched". ``unmatched_tumors``: row count of rows
+    whose ``tumor_matched`` is not "Matched".
+    """
+
+    patients: int
+    tn_pairs: int
+    unmatched_tumors: int
+
+
+class DmpWarningsRead(BaseModel):
+    """The reference's 5 QC warnings (spec e; the
+    ``pair_tumor_with_normal.R`` warning files). Each bucket is the
+    deduplicated list of affected samples (frame order, first-seen first) —
+    empty when nothing applies.
+
+    - ``matched_tumors_without_normal``: rows with
+      ``tumor_matched == "Matched"`` and a NA ``normal_bamname`` — the
+      reference's core QC case (the DMP program flagged the tumor matched
+      but no normal could be found).
+    - ``tumor_samples_with_multiple_ambiguous_normals``: rows whose
+      ``tumor_bamname`` appears on more than one MATCHED row (ambiguous
+      fan-out); the reference's file lists ALL rows — matched or not — of
+      an ambiguous bamname.
+    - ``samples_with_bams_missing``: rows with either side's
+      ``bam_exists == "0"``; both sides' samples are listed (a NA normal
+      side contributes nothing).
+    - ``low_coverage_tumors``: rows with a non-NA ``tumor_bamname`` whose
+      coverage is NA or numerically < 100 (strict).
+    - ``low_coverage_normals``: rows with a non-NA ``normal_bamname`` whose
+      coverage is NA or < 50 — the reference's normal-side column is
+      character-typed (spec e quirk), so the threshold applies
+      lexicographically to the rendered cell.
+    """
+
+    matched_tumors_without_normal: list[str]
+    tumor_samples_with_multiple_ambiguous_normals: list[str]
+    samples_with_bams_missing: list[str]
+    low_coverage_tumors: list[str]
+    low_coverage_normals: list[str]
+
+
+class PairingReportRead(BaseModel):
+    """One page of the merged Pair Report list (``GET /pairing/report/``).
+
+    ``rows`` is the requested page (at most ``page_size`` items) of the
+    logic's merged report — its latest paired rows, followed by (DMP logics
+    only) the unmatched DMP samples rendered as rows. ``total`` is the count
+    of the full merged list, so the client can page without fetching the
+    whole thing.
+
+    DMP logics only (5/8): ``summary`` and ``warnings`` carry the
+    reference's summary counts and QC warnings (spec d/e), computed over
+    the FULL pair frame — independent of the requested page and of the
+    ``q`` search. Both are null for non-DMP logics (existing contract).
+    """
+
+    rows: list[PairingReportRowRead]
+    total: int
+    summary: Optional[DmpSummaryRead] = None
+    warnings: Optional[DmpWarningsRead] = None
 
 
 class PossibleMatchCandidate(BaseModel):

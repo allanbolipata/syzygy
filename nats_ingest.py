@@ -5,7 +5,9 @@ message to /v1/ingest/nats; dispatch() routes it to the per-event
 handler by subject.
 
 Payloads are the JSON-decoded message bodies: a JSON object for
-new-request and sample-update, a JSON array for request-update (matching
+new-request, sample-update and dmp-sample (the dmp-sample object is the
+DB-format DMP record — docs/dmp_reference_alignment.md, section f), and a
+JSON array for request-update (matching
 beagle's smile_callback, which branches on isinstance(data, list)).
 
 Known limitation (re-pairing on update): the cmo-sample-update path
@@ -26,6 +28,7 @@ from sqlalchemy.orm import Session
 from database import settings
 from models import PairingTable, Sample
 from bait_sets import resolve_bait_set_logic
+from dmp_translator import to_dmp_sample_kwargs
 from pairing_service import trigger_pairing, trigger_pairing_for_normal
 from request_metadata import request_exists, update_request_metadata
 
@@ -681,6 +684,121 @@ def handle_sample_update(
     }
 
 
+# File group holding the DMP data structure — same value the beagle dump
+# import assigns (scripts/import_beagle_dump.py, DMP_FILEGROUP), so rows
+# ingested via NATS and via the dump are indistinguishable in that column.
+DMP_FILE_GROUP = "DMP BAMs"
+
+
+def _dmp_field_source_absent(payload: Dict[str, Any], column: str) -> bool:
+    """True when the payload omits the record key ``column`` is derived
+    from, so a partial update must leave the column as-is (no-clobber
+    semantics).
+
+    Checked PER COLUMN: a payload that explicitly carries e.g. ``patient``
+    or ``anon_id`` updates those columns even when unrelated keys
+    (``assay``, ``external_id``) are absent. (Columns whose derived value
+    is None are skipped by the caller's None rule regardless.)"""
+    if column == "cmo_sample_name":
+        # Without external_id the translator falls back to the primary_id,
+        # which would clobber a stored EXT-… name on a partial re-send.
+        return "external_id" not in payload
+    if column in ("gene_panel", "bait_set"):
+        # Both derive from cmo_assay with the assay mapping as fallback.
+        return "cmo_assay" not in payload and "assay" not in payload
+    if column == "patient__dmp":
+        patient = payload.get("patient")
+        return not isinstance(patient, dict) or "dmp" not in patient
+    if column == "patient__cmo":
+        patient = payload.get("patient")
+        return not isinstance(patient, dict) or "cmo" not in patient
+    if column == "anon_id":
+        return "anon_id" not in payload
+    return False
+
+
+def handle_dmp_sample(
+    db_session: Session, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Ingest a DMP sample record (dmp-gateway subject).
+
+    The payload is the DMP record in the exact format syzygy already
+    stores (docs/dmp_reference_alignment.md, section f) — NOT a
+    key-file-shaped payload. The record is upserted as-is via
+    ``to_dmp_sample_kwargs``: mapped keys become Sample columns,
+    everything else merges into ``additional_metadata`` (same behavior
+    as the beagle dump import path). No key-file fields are parsed.
+
+    Upserts are partial: a record re-arriving with only some fields
+    never clobbers the stored row — derived columns whose source key is
+    absent are left as-is, and values that resolve to None are skipped
+    so a partial record cannot clear a column. A record missing
+    ``type`` cannot create a row (tumor/normal is required); for an
+    existing row the stored ``tumor_or_normal`` is back-filled so the
+    update can proceed.
+
+    No pairing is triggered here: DMP pairing is driven by the
+    reference-alignment strategy (tickets 3/8-5/8 of the series).
+    """
+    if not isinstance(payload, dict):
+        logger.warning("nats dmp-sample: payload is not a JSON object")
+        return {"status": "error", "detail": "DMP payload must be a JSON object"}
+
+    sample_id = payload.get("sample")
+    if not isinstance(sample_id, str) or not sample_id.strip():
+        logger.warning("nats dmp-sample: record has no 'sample' id")
+        return {"status": "error", "detail": "DMP record is missing 'sample'"}
+    sample_id = sample_id.strip()
+
+    sample = db_session.scalar(
+        select(Sample).where(Sample.primary_id == sample_id).limit(1)
+    )
+
+    record = dict(payload)
+    if record.get("type") is None and sample is not None:
+        # Partial re-send: back-fill from the stored row so the
+        # translator can build the row without the key.
+        record["type"] = "T" if sample.tumor_or_normal == "TUMOR" else "N"
+    try:
+        kwargs = to_dmp_sample_kwargs(sample_id, record)
+    except ValueError as exc:
+        logger.warning("nats dmp-sample: %s", exc)
+        return {
+            "status": "error",
+            "detail": f"DMP record for {sample_id}: {exc}",
+        }
+
+    if sample is None:
+        sample = Sample(**kwargs)
+        sample.file_group = DMP_FILE_GROUP
+        db_session.add(sample)
+        db_session.commit()
+        return {
+            "status": "ok",
+            "summary": {"sample_id": sample_id, "action": "created"},
+            "detail": f"created DMP sample {sample_id}",
+        }
+
+    metadata = kwargs.pop("additional_metadata")
+    if metadata:
+        merged = dict(sample.additional_metadata or {})
+        merged.update(metadata)
+        sample.additional_metadata = merged
+    for column, value in kwargs.items():
+        if value is None:
+            continue  # a partial record never clears a column
+        if _dmp_field_source_absent(payload, column):
+            continue  # never reset a fallback-derived column
+        if getattr(sample, column) != value:
+            setattr(sample, column, value)
+    db_session.commit()
+    return {
+        "status": "ok",
+        "summary": {"sample_id": sample_id, "action": "updated"},
+        "detail": f"updated DMP sample {sample_id}",
+    }
+
+
 def dispatch(
     db_session: Session, subject: str, payload: Dict[str, Any] | List[Any]
 ) -> Dict[str, Any]:
@@ -693,6 +811,7 @@ def dispatch(
         settings.nats_new_request_subject: handle_new_request,
         settings.nats_request_update_subject: handle_request_update,
         settings.nats_sample_update_subject: handle_sample_update,
+        settings.nats_dmp_sample_subject: handle_dmp_sample,
     }
     handler = handlers.get(subject)
     if handler is None:

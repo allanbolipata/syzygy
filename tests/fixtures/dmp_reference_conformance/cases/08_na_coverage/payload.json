@@ -1,0 +1,34 @@
+[
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000001",
+      "metadata": {
+        "sample": "P-7000009-T01-IM6",
+        "type": "T",
+        "patient": {
+          "dmp": "P-7000009"
+        },
+        "anon_id": "AT09T-T",
+        "project_name": "POOL9",
+        "coverage": null
+      }
+    }
+  },
+  {
+    "model": "file_system.filemetadata",
+    "fields": {
+      "id": "f000000000002",
+      "metadata": {
+        "sample": "P-7000009-N01-IM6",
+        "type": "N",
+        "patient": {
+          "dmp": "P-7000009"
+        },
+        "anon_id": "AT09N-N",
+        "project_name": "POOL9",
+        "coverage": 588
+      }
+    }
+  }
+]

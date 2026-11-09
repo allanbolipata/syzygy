@@ -235,7 +235,7 @@
       <p id="pr-evaluate-result" class="hint"></p>
       <div id="pr-logic-explain" class="pr-explain"></div>
     </section>
-    <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the legacy DMP export columns.</p>
+    <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the reference's 15-column pair file, its 3 summary counts and 5 QC warning buckets.</p>
     <div class="pr-split" id="pr-split">
       <aside class="pr-panel" id="pr-panel">
         <div class="pr-panel-head">
@@ -256,7 +256,7 @@
       <div class="pr-main">
         <div class="filters">
           <label>search
-            <input type="search" id="pr-search" placeholder="Search pairs…" title="Filter the loaded pairs by patient, DMP patient, sample name, primary ID, or bait set">
+            <input type="search" id="pr-search" placeholder="Search pairs…" title="Search all pairs on the server by patient, DMP patient, sample name, primary ID, or bait set">
           </label>
           <label>format
             <select id="pr-format">
@@ -283,6 +283,7 @@
             <tbody id="pr-legend-body"></tbody>
           </table>
         </details>
+        <div id="pr-dmp-warnings" class="pr-dmp-warnings hidden"></div>
         <div class="table-wrap">
           <table id="pairs-table">
             <thead></thead>

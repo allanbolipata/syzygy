@@ -6,17 +6,24 @@ pairing logic. DMP samples are also pairable manually, but only under the
 other logics (e.g. ARGOS) — ``POST /pairing/trigger`` refuses the DMP
 strategy, which is reserved for the automatic trigger.
 """
-from datetime import datetime
+import json
+import math
+from datetime import datetime, timezone
+from enum import Enum
+from itertools import islice
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, exists, or_, select
+from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, create_engine, exists, func, or_, select, text
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from database import get_db, settings
+from dmp_translator import remap_dmp_record
+from database import SessionLocal, get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
+    _is_dmp_strategy,
     count_unpaired,
     evaluate_logic,
     find_logic_by_name,
@@ -27,9 +34,13 @@ from pairing_service import (
 )
 from pairing_strategies import get_pairing_strategy, strategies
 from schemas import (
+    DmpSummaryRead,
     DmpTriggerRead,
+    DmpWarningsRead,
     EvaluateRead,
     PairingRead,
+    PairingReportRead,
+    PairingReportRowRead,
     PairingTriggerCreate,
     SampleRead,
     TumorOrNormal,
@@ -175,6 +186,1061 @@ def list_unmatched_dmp_samples(
     if offset is not None:
         stmt = stmt.offset(offset)
     return db.scalars(stmt).all()
+
+
+# Pair Report server-side pagination. Default page size matches the
+# client's previous page size; the max clamps a single response so a
+# client can't request an unbounded page.
+REPORT_DEFAULT_PAGE_SIZE = 50
+REPORT_MAX_PAGE_SIZE = 200
+
+
+# Sample fields the Pair Report free-text search (``q``) matches against —
+# the former client-side search fields (app.js PAIR_SEARCH_FIELDS). A row
+# matches when ANY of these is a case-insensitive substring match on
+# EITHER side (tumor or normal); a NULL side simply never matches, the
+# same as the client skipping null fields.
+REPORT_SEARCH_FIELDS = (
+    "patient__cmo",
+    "patient__dmp",
+    "cmo_sample_name",
+    "primary_id",
+    "bait_set",
+)
+
+
+def _search_pattern(q: str) -> str:
+    """ILIKE pattern for a LITERAL case-insensitive substring.
+
+    The client searched with ``String(value).toLowerCase().includes(q)`` —
+    a plain substring — so ``%`` and ``_`` in the query are ordinary
+    characters, not LIKE wildcards.
+    """
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _search_conds(entity, q: str) -> list:
+    """The five ILIKE conditions for one side (a Sample entity or alias)."""
+    pattern = _search_pattern(q)
+    return [
+        getattr(entity, field).ilike(pattern, escape="\\")
+        for field in REPORT_SEARCH_FIELDS
+    ]
+
+
+def _either_side_conds(tumor_alias, normal_alias, q: str):
+    """OR'd match on any search field of EITHER side.
+
+    Each side's conditions reference its own aliased Sample so the two
+    sides never collide in one WHERE clause; columns of a NULL side
+    compare to NULL (no match), exactly like the old client-side filter.
+    """
+    return or_(*_search_conds(tumor_alias, q), *_search_conds(normal_alias, q))
+
+
+def _report_paired_page(
+    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None
+) -> list[PairingTable]:
+    """One slice of the logic's latest paired rows, in report order.
+
+    Same predicate and ordering as ``GET /pairing/`` (latest rows,
+    ``created_date desc, id desc``) so page boundaries are stable.
+    With ``q``, the slice is restricted to rows the query matches on
+    either side (NULL sides never match — the client-side semantics).
+    """
+    stmt = (
+        select(PairingTable)
+        .options(
+            joinedload(PairingTable.tumor),
+            joinedload(PairingTable.normal),
+            joinedload(PairingTable.pairing_logic_obj),
+        )
+        .where(
+            PairingTable.pairing_logic_id == logic.id,
+            PairingTable.latest.is_(True),
+        )
+        .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    if q is not None:
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        stmt = stmt.join(
+            tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True
+        )
+        stmt = stmt.join(
+            normal_alias, PairingTable.normal_id == normal_alias.id, isouter=True
+        )
+        stmt = stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+    return list(db.scalars(stmt).all())
+
+
+def _report_paired_total(
+    db: Session, logic: PairingLogic, q: str
+) -> int:
+    """SQL COUNT of the logic's latest paired rows matching the query.
+
+    Same predicate as ``_report_paired_page`` with ``q``, so the count
+    and the served pages always cover the same filtered set.
+    """
+    tumor_alias = aliased(Sample)
+    normal_alias = aliased(Sample)
+    return int(
+        db.scalar(
+            select(func.count(PairingTable.id))
+            .select_from(PairingTable)
+            .join(
+                tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True
+            )
+            .join(
+                normal_alias,
+                PairingTable.normal_id == normal_alias.id,
+                isouter=True,
+            )
+            .where(
+                PairingTable.pairing_logic_id == logic.id,
+                PairingTable.latest.is_(True),
+                _either_side_conds(tumor_alias, normal_alias, q),
+            )
+        )
+        or 0
+    )
+
+
+def _report_unmatched_page(
+    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None
+) -> list[Sample]:
+    """One slice of the unmatched DMP TUMOR rows, in report order.
+
+    DMP samples with no latest pairing under the logic,
+    ``created_date desc, id desc``. The reference pair file is
+    tumor-driven (spec b/c: every tumor row is kept; unpaired normals
+    never appear in it), so the report's unmatched section is restricted
+    to DMP tumors — unlike ``GET /pairing/unmatched/``, which still lists
+    every unpaired DMP sample on either side.
+    With ``q``, restricted to samples any report search field matches —
+    an unmatched row carries the sample on the tumor side only (the
+    normal side is null), so the search reduces to the tumor's own fields.
+    """
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    stmt = (
+        select(Sample)
+        .where(
+            Sample.sample_type == "DMP",
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            ~paired,
+        )
+        .order_by(Sample.created_date.desc(), Sample.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    if q is not None:
+        stmt = stmt.where(or_(*_search_conds(Sample, q)))
+    return list(db.scalars(stmt).all())
+
+
+def _report_unmatched_total(
+    db: Session, logic: PairingLogic, q: Optional[str] = None
+) -> int:
+    """SQL COUNT of the unmatched DMP TUMOR rows for the logic.
+
+    Uses the exact ``~paired`` predicate (plus the tumor-only restriction)
+    that ``_report_unmatched_page`` serves rows with, so the count equals
+    the number of rows the endpoint would actually return (DMP TUMORS with
+    no latest pairing under the logic — the reference pair file is
+    tumor-driven, so unpaired normals are not part of it). Unlike
+    ``count_unpaired``'s ``unpaired``, this never falls back to a
+    total-minus-paired estimate, so ``total`` stays exact. With ``q``,
+    narrowed to the same search the page rows are filtered by.
+    """
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    stmt = select(func.count(Sample.id)).where(
+        Sample.sample_type == "DMP",
+        Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+        ~paired,
+    )
+    if q is not None:
+        stmt = stmt.where(or_(*_search_conds(Sample, q)))
+    return db.scalar(stmt) or 0
+
+
+def _paired_row(p: PairingTable) -> PairingReportRowRead:
+    """Map a latest pairing row to a report row (both sides present)."""
+    return PairingReportRowRead.model_validate(p)
+
+
+def _unmatched_row(s: Sample, logic: PairingLogic) -> PairingReportRowRead:
+    """Map an unmatched DMP sample to a report row.
+
+    The DMP pair file is tumor-driven (spec b/c), so the report's unmatched
+    section only ever carries DMP TUMORS: the sample goes on the tumor side,
+    the normal side is null, ``mismatched_keys`` is an empty list, and no
+    pairing identity is set. (The normal-side branch is kept for safety;
+    ``GET /pairing/unmatched/`` renders its own rows independently.)
+    """
+    is_tumor = s.tumor_or_normal == TumorOrNormal.TUMOR.value
+    return PairingReportRowRead(
+        pairing_logic=logic.name,
+        tumor=s if is_tumor else None,
+        normal=None if is_tumor else s,
+        mismatched_keys=[],
+        created_date=s.created_date,
+    )
+
+
+@router.get("/report/", response_model=PairingReportRead)
+def pairing_report(
+    pairing_logic_name: str,
+    page: int = Query(1, ge=1, description="1-based page number."),
+    page_size: int = Query(
+        REPORT_DEFAULT_PAGE_SIZE,
+        ge=1,
+        description="Rows per page (clamped to at most 200).",
+    ),
+    db: Session = Depends(get_db),
+    q: Optional[str] = Query(
+        None,
+        description=(
+            "Free-text search: case-insensitive substring matched against "
+            "the report's search fields (patient CMO, DMP patient, sample "
+            "name, primary ID, bait set) on either side of a row. Filters "
+            "the FULL merged list; total and pagination reflect the "
+            "filtered set."
+        ),
+    ),
+):
+    """One page of the merged Pair Report list for the logic.
+
+    Returns ``{"rows": [...], "total": int}``. The merged list is the
+    logic's latest paired rows (both sides present), followed by — DMP
+    logics only — the unmatched DMP TUMORS rendered as rows with the tumor
+    on the tumor side and the normal side null: the reference pair file is
+    tumor-driven (spec b/c), so unpaired DMP normals are not part of the
+    report. ``total`` is the count of the FULL merged list, computed
+    with a SQL COUNT (never materializing the whole unmatched set in memory),
+    so the client can compute the page count.
+
+    With ``q`` (free-text search), both sections are restricted to rows the
+    query matches on either side — the server-side form of the former
+    client-side ``pairMatchesQuery`` — and ``total`` becomes the count of the
+    filtered list, so pages and counts reflect the search.
+
+    DMP logics only (5/8): ``summary`` and ``warnings`` carry the
+    reference's summary counts and QC warnings (spec d/e), computed over
+    the FULL pair frame — independent of the requested page and of ``q``
+    (the reference computes them over the whole pair file). Both are null
+    for non-DMP logics.
+
+    ``page`` is 1-based; ``page_size`` defaults to 50 and is clamped to
+    ``[1, 200]``. Ordering is stable and deterministic: paired rows are
+    ordered by (created_date desc, id desc) — the ``GET /pairing/`` ordering
+    — then unmatched DMP rows by (created_date desc, id desc), so page
+    boundaries never shift between repeated requests for the same logic.
+    """
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    # Normalize q to the form the old client-side filter compared in
+    # (trimmed, lowercased); blank means "no filter", like the client's
+    # falsy-q branch.
+    if q is not None:
+        q = q.strip().lower() or None
+
+    # paired section: the logic's latest rows with both sides present
+    # (count_unpaired's "paired" counts exactly these); with a query,
+    # count the matching subset instead.
+    if q is None:
+        paired_total = count_unpaired(db, pairing_logic_name)["paired"]
+    else:
+        paired_total = _report_paired_total(db, logic, q)
+    # unmatched section (DMP logics only): count it with the SAME predicate
+    # the rows are served with. We do NOT reuse count_unpaired's "unpaired"
+    # here: for a bait-set-less DMP logic it falls back to
+    # total-minus-paired, which can overcount and would make "total" drift
+    # from the rows actually returned.
+    if _is_dmp_strategy(logic):
+        unmatched_total = _report_unmatched_total(db, logic, q)
+    else:
+        unmatched_total = 0
+    total = paired_total + unmatched_total
+
+    offset = (page - 1) * page_size
+    limit = min(page_size, REPORT_MAX_PAGE_SIZE)
+
+    rows: list[PairingReportRowRead] = []
+    # The merged list is [paired rows [0, paired_total)) followed by
+    # [unmatched rows [paired_total, total)). The requested slice
+    # [offset, offset + limit) falls entirely within one section or straddles
+    # the boundary; fetch the part of each section it covers.
+    if offset < paired_total:
+        take = min(limit, paired_total - offset)
+        for p in _report_paired_page(db, logic, offset, take, q=q):
+            rows.append(_paired_row(p))
+    remaining = limit - len(rows)
+    if remaining > 0 and unmatched_total > 0:
+        # The slice has reached the unmatched section; its local offset is
+        # 0 when the slice started inside the paired section.
+        unmatched_offset = max(0, offset - paired_total)
+        for s in _report_unmatched_page(db, logic, unmatched_offset, remaining, q=q):
+            rows.append(_unmatched_row(s, logic))
+
+    # DMP logics only (5/8): the reference's summary counts + QC warnings
+    # over the FULL pair frame (spec d/e) — the reference computes them
+    # over the whole pair file, so they ignore the requested page and the
+    # q search (which filters rows only).
+    summary = None
+    warnings = None
+    if _is_dmp_strategy(logic):
+        summary, warnings = _dmp_report_stats(db, logic)
+
+    return PairingReportRead(
+        rows=rows, total=total, summary=summary, warnings=warnings
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pair Report server-side download/export (T6).
+#
+# The Pair Report table holds only one server page (T4), so the old
+# client-side "download the loaded set" only exported the visible page.
+# The export is computed server-side and STREAMED: the merged list (latest
+# paired rows, then — DMP logics only — the unmatched DMP tumor rows) is
+# fetched in keyset batches (created_date desc, id desc), never
+# materialized whole, and rendered to CSV/TSV one line at a time. Cell
+# formatting for non-DMP logics mirrors the frontend table renderers
+# (pairText / pairDate) so the file matches what the user sees.
+#
+# DMP logics (4/8) instead export the reference's 15-column pair file —
+# tumor rows only, no placeholders: values come from the remapped DMP
+# record (dmp_translator.remap_dmp_record, the 2/8 contract) and the
+# bam_exists cells from the sample's beagle file record (spec f).
+# ---------------------------------------------------------------------------
+
+# Rows fetched per SQL round-trip while streaming the export. Keyset
+# pagination (not OFFSET) means this stays O(1) in memory regardless of the
+# logic's row count (DMP: ~284k samples / ~111k pairs).
+EXPORT_BATCH_SIZE = 500
+
+
+def _s(v) -> str:
+    """Mirror the frontend ``x || ""`` for a scalar cell: null -> "", enums
+    yield their value, everything else stringifies."""
+    if v is None:
+        return ""
+    if isinstance(v, Enum):
+        return str(v.value)
+    return str(v)
+
+
+def _pair_text(v) -> str:
+    """Mirror the frontend ``pairText``: how the table renders a possibly
+    list / JSON / null sample field — arrays join with ", " (recursively),
+    objects JSON-stringify, null/empty -> ""."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_pair_text(x) for x in v)
+    if isinstance(v, dict):
+        return json.dumps(v, separators=(",", ":"))
+    if isinstance(v, Enum):
+        return str(v.value)
+    return str(v)
+
+
+def _pair_date(v) -> str:
+    """Mirror the frontend ``pairDate``: UTC minute precision
+    ("YYYY-MM-DD HH:mm"); null -> "". A string passes through untouched."""
+    if not v:
+        return ""
+    if isinstance(v, str):
+        return v
+    try:
+        return v.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (AttributeError, ValueError):
+        return str(v)
+
+
+def _t_attr(f):
+    return lambda r: _s(getattr(r.tumor, f)) if r.tumor is not None else ""
+
+
+def _n_attr(f):
+    return lambda r: _s(getattr(r.normal, f)) if r.normal is not None else ""
+
+
+def _t_text(f):
+    return lambda r: _pair_text(getattr(r.tumor, f)) if r.tumor is not None else ""
+
+
+def _n_text(f):
+    return lambda r: _pair_text(getattr(r.normal, f)) if r.normal is not None else ""
+
+
+def _t_date(f):
+    return lambda r: _pair_date(getattr(r.tumor, f)) if r.tumor is not None else ""
+
+
+def _n_date(f):
+    return lambda r: _pair_date(getattr(r.normal, f)) if r.normal is not None else ""
+
+
+def _t_errs(f):
+    return lambda r: "; ".join(getattr(r.tumor, f) or []) if r.tumor is not None else ""
+
+
+def _n_errs(f):
+    return lambda r: "; ".join(getattr(r.normal, f) or []) if r.normal is not None else ""
+
+
+# Python mirror of app.js PAIR_COLUMNS: the report column model for a
+# (non-DMP) logic, same order, with text renderers that reproduce the table
+# display (c.text).
+PAIR_EXPORT_COLUMNS = [
+    {"key": "tumor_primary_id", "header": "TUMOR_SAMPLE", "text": _t_attr("primary_id")},
+    {"key": "normal_primary_id", "header": "NORMAL_SAMPLE", "text": _n_attr("primary_id")},
+    {"key": "tumor_bait_set", "header": "BAIT_SET", "text": _t_attr("bait_set")},
+    {"key": "tumor_patient__cmo", "header": "TUMOR_PATIENT__CMO", "text": _t_attr("patient__cmo")},
+    {"key": "tumor_patient__dmp", "header": "TUMOR_PATIENT__DMP", "text": _t_attr("patient__dmp")},
+    {"key": "tumor_anon_id", "header": "TUMOR_ANON_ID", "text": _t_attr("anon_id")},
+    {"key": "tumor_cmo_sample_name", "header": "TUMOR_CMO_SAMPLE_NAME", "text": _t_text("cmo_sample_name")},
+    {"key": "tumor_role", "header": "TUMOR_ROLE", "text": _t_attr("tumor_or_normal")},
+    {"key": "tumor_sample_type", "header": "TUMOR_SAMPLE_TYPE", "text": _t_attr("sample_type")},
+    {"key": "tumor_gene_panel", "header": "TUMOR_GENE_PANEL", "text": _t_attr("gene_panel")},
+    {"key": "tumor_request_id", "header": "TUMOR_REQUEST_ID", "text": _t_attr("request_id")},
+    {"key": "tumor_run_mode", "header": "TUMOR_RUN_MODE", "text": _t_attr("run_mode")},
+    {"key": "tumor_file_group", "header": "TUMOR_FILE_GROUP", "text": _t_attr("file_group")},
+    {"key": "tumor_preservation", "header": "TUMOR_PRESERVATION", "text": _t_text("preservation")},
+    {"key": "tumor_sample_origin", "header": "TUMOR_SAMPLE_ORIGIN", "text": _t_text("sample_origin")},
+    {"key": "tumor_sequencing_date", "header": "TUMOR_SEQUENCING_DATE", "text": _t_date("sequencing_date")},
+    {"key": "tumor_additional_metadata", "header": "TUMOR_ADDITIONAL_METADATA", "text": _t_text("additional_metadata")},
+    {"key": "tumor_errors", "header": "TUMOR_ERRORS", "text": _t_errs("errors")},
+    {"key": "tumor_id", "header": "TUMOR_ID", "text": _t_attr("id")},
+    {"key": "normal_bait_set", "header": "NORMAL_BAIT_SET", "text": _n_attr("bait_set")},
+    {"key": "normal_patient__cmo", "header": "NORMAL_PATIENT__CMO", "text": _n_attr("patient__cmo")},
+    {"key": "normal_patient__dmp", "header": "NORMAL_PATIENT__DMP", "text": _n_attr("patient__dmp")},
+    {"key": "normal_anon_id", "header": "NORMAL_ANON_ID", "text": _n_attr("anon_id")},
+    {"key": "normal_cmo_sample_name", "header": "NORMAL_CMO_SAMPLE_NAME", "text": _n_text("cmo_sample_name")},
+    {"key": "normal_role", "header": "NORMAL_ROLE", "text": _n_attr("tumor_or_normal")},
+    {"key": "normal_sample_type", "header": "NORMAL_SAMPLE_TYPE", "text": _n_attr("sample_type")},
+    {"key": "normal_gene_panel", "header": "NORMAL_GENE_PANEL", "text": _n_attr("gene_panel")},
+    {"key": "normal_request_id", "header": "NORMAL_REQUEST_ID", "text": _n_attr("request_id")},
+    {"key": "normal_run_mode", "header": "NORMAL_RUN_MODE", "text": _n_attr("run_mode")},
+    {"key": "normal_file_group", "header": "NORMAL_FILE_GROUP", "text": _n_attr("file_group")},
+    {"key": "normal_preservation", "header": "NORMAL_PRESERVATION", "text": _n_text("preservation")},
+    {"key": "normal_sample_origin", "header": "NORMAL_SAMPLE_ORIGIN", "text": _n_text("sample_origin")},
+    {"key": "normal_sequencing_date", "header": "NORMAL_SEQUENCING_DATE", "text": _n_date("sequencing_date")},
+    {"key": "normal_additional_metadata", "header": "NORMAL_ADDITIONAL_METADATA", "text": _n_text("additional_metadata")},
+    {"key": "normal_errors", "header": "NORMAL_ERRORS", "text": _n_errs("errors")},
+    {"key": "normal_id", "header": "NORMAL_ID", "text": _n_attr("id")},
+    {"key": "pairing_logic", "header": "PAIRING_LOGIC", "text": lambda r: r.pairing_logic or ""},
+    {"key": "trigger_type", "header": "TRIGGER_TYPE", "text": lambda r: r.trigger_type or ""},
+    {"key": "mismatched_keys", "header": "MISMATCHED_KEYS", "text": lambda r: "; ".join(r.mismatched_keys or [])},
+    {"key": "created_date", "header": "CREATED_DATE", "text": lambda r: _pair_date(r.created_date)},
+]
+
+# The DMP logic's export column model: the reference's 15-column pair file
+# (docs/dmp_reference_alignment.md section c; bam-mirror-tools
+# pair_tumor_with_normal.R write.table block) — exact names and order.
+# These defs carry no "text" renderer: DMP cells are derived per row from
+# the remapped record + beagle bam_exists in _dmp_pair_cells (4/8).
+DMP_EXPORT_COLUMNS = [
+    {"key": "tumor_sample", "header": "tumor_sample"},
+    {"key": "patient", "header": "patient"},
+    {"key": "tumor_idx", "header": "tumor_idx"},
+    {"key": "tumor_IM_ver", "header": "tumor_IM_ver"},
+    {"key": "tumor_bamname", "header": "tumor_bamname"},
+    {"key": "tumor_group", "header": "tumor_group"},
+    {"key": "tumor_matched", "header": "tumor_matched"},
+    {"key": "tumor_bam_exists", "header": "tumor_bam_exists"},
+    {"key": "tumor_bam_coverage", "header": "tumor_bam_coverage"},
+    {"key": "normal_sample", "header": "normal_sample"},
+    {"key": "normal_bamname", "header": "normal_bamname"},
+    {"key": "normal_IM_ver", "header": "normal_IM_ver"},
+    {"key": "pool_id", "header": "pool_id"},
+    {"key": "normal_bam_exists", "header": "normal_bam_exists"},
+    {"key": "normal_bam_coverage", "header": "normal_bam_coverage"},
+]
+# Position of each pair-file column within _dmp_pair_cells' output.
+_DMP_COLUMN_INDEX = {c["key"]: i for i, c in enumerate(DMP_EXPORT_COLUMNS)}
+
+
+def _dmp_pair_cells(row: PairingReportRowRead, bam_map: dict) -> list:
+    """The 15 reference pair-file cells for one DMP report row, in the
+    reference's exact column order (spec c).
+
+    Values come from the remapped DMP record (remap_dmp_record — the 2/8
+    contract: bamname over anon_id, group/coverage/pool_id/matched_tag from
+    additional_metadata, patient/idx/ver from the stored patient__dmp or the
+    name). A missing value renders as the reference's literal "NA"
+    (write.table default); bam_exists is "1"/"0" from the sample's beagle
+    file record (spec f) and is never NA. ``tumor_matched`` passes the
+    record's matched_tag through and falls back to the pairing result
+    (Matched/Unmatched) — the flag is audited absent from real records
+    (spec g, caveat). ``normal_IM_ver`` backfills the tumor's own IM_ver
+    whenever the normal's is missing — unmatched rows, and paired rows
+    whose normal name carries no version segment (the reference applies
+    the ifelse to every row).
+    """
+    if row.tumor is None:
+        # The DMP pair file is tumor-driven; callers emit tumor rows only.
+        return ["NA"] * len(DMP_EXPORT_COLUMNS)
+    t = remap_dmp_record(
+        row.tumor, bam_exists=int(bam_map.get(row.tumor.primary_id, "0"))
+    )
+    n = (
+        remap_dmp_record(
+            row.normal, bam_exists=int(bam_map.get(row.normal.primary_id, "0"))
+        )
+        if row.normal is not None
+        else None
+    )
+
+    def na(v):
+        return "NA" if v in (None, "") else str(v)
+
+    matched = (
+        t["is_matched"]
+        if t["is_matched"] not in (None, "")
+        else ("Matched" if row.normal is not None else "Unmatched")
+    )
+    normal_im_ver = (n["ver"] if n is not None else None) or t["ver"]
+    return [
+        na(t["sample"]),
+        na(t["patient"]),
+        na(t["idx"]),
+        na(t["ver"]),
+        na(t["bamname"]),
+        t["group"] if t["group"] not in (None, "") else "NA",
+        matched,
+        str(t["bam_exists"]),
+        na(t["coverage"]),
+        na(n["sample"]) if n is not None else "NA",
+        na(n["bamname"]) if n is not None else "NA",
+        na(normal_im_ver),
+        na(t["pool_id"]),
+        str(n["bam_exists"]) if n is not None else "NA",
+        na(n["coverage"]) if n is not None else "NA",
+    ]
+
+
+def _dmp_batch_names(rows) -> set:
+    """Sample names (both sides) present in one batch of report rows —
+    the key set for the batch's bam_exists resolution."""
+    names = set()
+    for r in rows:
+        if r.tumor is not None:
+            names.add(r.tumor.primary_id)
+        if r.normal is not None:
+            names.add(r.normal.primary_id)
+    return names
+
+
+# Lazily-built read-only engine for the optional beagle DB (bam_exists);
+# module-level so tests can reset it between cases.
+_beagle_engine_cache = None
+
+
+def _beagle_engine():
+    """Lazily-built read-only engine for the optional beagle DB. None when
+    BEAGLE_DATABASE_URL is unset or the engine fails to build."""
+    global _beagle_engine_cache
+    if not settings.beagle_database_url:
+        return None
+    if _beagle_engine_cache is None:
+        try:
+            _beagle_engine_cache = create_engine(
+                settings.beagle_database_url, pool_pre_ping=True
+            )
+        except Exception:
+            return None
+    return _beagle_engine_cache
+
+
+def _beagle_bam_exists_map(sample_names) -> dict:
+    """Resolve DMP bam_exists for a batch of sample names (spec f, the
+    sanctioned deviation from the reference's BAM-mirror scan): the
+    sample's beagle file record — file_system_filemetadata (keyed by the
+    metadata ``sample`` field, latest rows) -> file_system_file — has a
+    non-empty path for any of its files -> "1", else "0". An
+    unset/unreachable beagle DB, or a name with no file record, resolves
+    to "0" (unresolvable -> 0)."""
+    engine = _beagle_engine()
+    if engine is None or not sample_names:
+        return {}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    select fm.metadata->>'sample' as name,
+                           bool_or(f.path is not null and f.path <> '') as bam_exists
+                      from file_system_filemetadata fm
+                      join file_system_file f on f.id = fm.file_id and fm.latest
+                     where fm.metadata->>'sample' = any(:names)
+                     group by 1
+                    """
+                ),
+                {"names": list(sample_names)},
+            ).all()
+    except Exception:
+        return {}
+    return {name: ("1" if bam else "0") for name, bam in rows if name}
+
+# The frontend default column sets (app.js PAIR_DEFAULT_KEYS / DMP_COLUMNS).
+PAIR_DEFAULT_EXPORT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"]
+DMP_DEFAULT_EXPORT_KEYS = [
+    "tumor_sample", "patient", "tumor_idx", "tumor_IM_ver", "tumor_bamname",
+    "tumor_group", "tumor_matched", "tumor_bam_exists", "tumor_bam_coverage",
+    "normal_sample", "normal_bamname", "normal_IM_ver", "pool_id",
+    "normal_bam_exists", "normal_bam_coverage",
+]
+
+_EXPORT_COLUMNS_BY_KEY = {c["key"]: c for c in PAIR_EXPORT_COLUMNS}
+_EXPORT_COLUMNS_BY_KEY.update({c["key"]: c for c in DMP_EXPORT_COLUMNS})
+
+
+def _resolve_export_columns(logic: PairingLogic, columns: Optional[str]) -> list:
+    """Resolve the requested export columns (comma-separated keys) into an
+    ordered list of column defs, or the logic's default set when omitted /
+    blank. Unknown keys are a 400.
+
+    DMP logics export the reference pair file (4/8): the selectable columns
+    are exactly its 15 columns (spec c) — pair-report keys are not valid
+    there. Other logics keep the pair-report column set.
+    """
+    keys = None
+    if columns is not None:
+        keys = [k.strip() for k in columns.split(",") if k.strip()]
+    dmp = _is_dmp_strategy(logic)
+    if not keys:
+        keys = DMP_DEFAULT_EXPORT_KEYS if dmp else PAIR_DEFAULT_EXPORT_KEYS
+    defs = []
+    for k in keys:
+        if dmp and k not in _DMP_COLUMN_INDEX:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown DMP pair-file column: {k}"
+            )
+        c = _EXPORT_COLUMNS_BY_KEY.get(k)
+        if c is None:
+            raise HTTPException(status_code=400, detail=f"Unknown export column: {k}")
+        defs.append(c)
+    return defs
+
+
+def _escape_cell(value: str, sep: str) -> str:
+    """Mirror the frontend cell escaping: TSV never quotes (control chars
+    blanked); CSV quotes only when the field holds the separator, a quote,
+    or a newline, doubling internal quotes; tab/CR/LF never survive."""
+    if sep == "\t":
+        return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    if '"' in value or sep in value or "\n" in value:
+        return '"' + value.replace('"', '""') + '"'
+    return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _csv_line(cells: list, sep: str) -> str:
+    return sep.join(_escape_cell(c, sep) for c in cells) + "\n"
+
+
+def _iter_paired_export_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+    """Stream every latest paired row for the logic in report order
+    (created_date desc, id desc) via keyset pagination, so the full set is
+    never materialized. Same predicate as _report_paired_page (incl. the q
+    either-side search); the keyset cursor replaces OFFSET."""
+    base_stmt = (
+        select(PairingTable)
+        .options(
+            joinedload(PairingTable.tumor),
+            joinedload(PairingTable.normal),
+            joinedload(PairingTable.pairing_logic_obj),
+        )
+        .where(PairingTable.pairing_logic_id == logic.id, PairingTable.latest.is_(True))
+        .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
+    )
+    if q is not None:
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        base_stmt = base_stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True)
+        base_stmt = base_stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id, isouter=True)
+        base_stmt = base_stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+    last_created = None
+    last_id = None
+    while True:
+        stmt = base_stmt.limit(EXPORT_BATCH_SIZE)
+        if last_created is not None:
+            stmt = stmt.where(
+                or_(
+                    PairingTable.created_date < last_created,
+                    and_(PairingTable.created_date == last_created, PairingTable.id < last_id),
+                )
+            )
+        batch = list(db.scalars(stmt).all())
+        if not batch:
+            break
+        for p in batch:
+            yield _paired_row(p)
+        if len(batch) < EXPORT_BATCH_SIZE:
+            break
+        last_created = batch[-1].created_date
+        last_id = batch[-1].id
+
+
+def _iter_unmatched_export_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+    """Stream every unmatched DMP TUMOR row for the logic in report order via
+    keyset pagination. Same predicate as _report_unmatched_page (DMP TUMORS
+    with no latest pairing under the logic — the pair file is tumor-driven,
+    so unpaired normals never appear — plus the q search)."""
+    paired = exists(
+        select(PairingTable.id).where(
+            or_(
+                PairingTable.tumor_id == Sample.id,
+                PairingTable.normal_id == Sample.id,
+            ),
+            PairingTable.latest.is_(True),
+            PairingTable.pairing_logic_id == logic.id,
+        )
+    )
+    base = [
+        Sample.sample_type == "DMP",
+        Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+        ~paired,
+    ]
+    if q is not None:
+        base.append(or_(*_search_conds(Sample, q)))
+    last_created = None
+    last_id = None
+    while True:
+        stmt = (
+            select(Sample)
+            .where(*base)
+            .order_by(Sample.created_date.desc(), Sample.id.desc())
+            .limit(EXPORT_BATCH_SIZE)
+        )
+        if last_created is not None:
+            stmt = stmt.where(
+                or_(
+                    Sample.created_date < last_created,
+                    and_(Sample.created_date == last_created, Sample.id < last_id),
+                )
+            )
+        batch = list(db.scalars(stmt).all())
+        if not batch:
+            break
+        for s in batch:
+            yield _unmatched_row(s, logic)
+        if len(batch) < EXPORT_BATCH_SIZE:
+            break
+        last_created = batch[-1].created_date
+        last_id = batch[-1].id
+
+
+def _iter_dmp_pair_lines(rows, col_defs, sep: str):
+    """Yield one reference pair-file line per DMP report row, in the
+    reference's 15-column cell order (spec c), restricted/reordered to
+    ``col_defs``.
+
+    Wraps a row iterator (paired or unmatched section) and resolves
+    bam_exists for each EXPORT_BATCH_SIZE chunk of rows at once, so the
+    beagle file-record lookup is batched and the stream stays O(batch) in
+    memory like the row iterators it wraps.
+    """
+    it = iter(rows)
+    while True:
+        batch = list(islice(it, EXPORT_BATCH_SIZE))
+        if not batch:
+            break
+        bam_map = _beagle_bam_exists_map(_dmp_batch_names(batch))
+        for row in batch:
+            cells = _dmp_pair_cells(row, bam_map)
+            yield _csv_line(
+                [cells[_DMP_COLUMN_INDEX[c["key"]]] for c in col_defs], sep
+            )
+
+
+def _sanitize_filename(name: str) -> str:
+    """Mirror the frontend filename sanitize (/[^\\w.-]+/g -> "_")."""
+    import re
+    return re.sub(r"[^\w.-]+", "_", name or "")
+
+
+# ---------------------------------------------------------------------------
+# DMP report summary counts + QC warnings (5/8).
+#
+# The reference's summary block and 5 warning files (pair_tumor_with_normal.R;
+# spec d/e) are computed over the FINAL 15-column pair frame — here, the same
+# cells _dmp_pair_cells renders for the DMP export, one row per report row
+# (latest paired rows, then unmatched DMP tumor rows), over the FULL frame:
+# the reference computes them over the whole pair file, so they are
+# independent of the requested page and of the report's q search (which
+# filters rows only).
+# ---------------------------------------------------------------------------
+
+# The reference's NA sentinel as rendered by _dmp_pair_cells.
+DMP_REF_NA = "NA"
+
+# The reference's low-coverage thresholds (pair_tumor_with_normal.R): tumor
+# coverage < 100 (numeric), normal coverage < 50 (character column — see
+# _dmp_report_stats warning 5 and the spec e quirk).
+DMP_TUMOR_COVERAGE_THRESHOLD = 100.0
+DMP_NORMAL_COVERAGE_THRESHOLD = "50"
+
+
+def _ref_coverage_numeric(value: str):
+    """R's ``as.numeric`` cast for a rendered coverage cell: a finite float
+    when the cell parses as one, None (R's NA) for the literal "NA", empty,
+    or unparseable values — as.numeric coerces non-numeric strings (including
+    NaN/Inf tokens) to NA."""
+    if value is None or value == DMP_REF_NA:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _dedup(values) -> list:
+    """Deduplicate, preserving first-seen order — the warning buckets list
+    affected samples, not pair rows (a shared normal or a fan-out tumor
+    appears once)."""
+    seen = set()
+    out = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _iter_dmp_pair_cells(db: Session, logic: PairingLogic):
+    """Yield the 15 reference pair-file cells (spec c) for every row of the
+    logic's FULL pair frame — latest paired rows, then unmatched DMP tumor
+    rows, no search filter — with bam_exists resolved per
+    EXPORT_BATCH_SIZE chunk via the beagle file records, exactly as the DMP
+    export renders them."""
+    for row_iter in (
+        _iter_paired_export_rows(db, logic, None),
+        _iter_unmatched_export_rows(db, logic, None),
+    ):
+        it = iter(row_iter)
+        while True:
+            batch = list(islice(it, EXPORT_BATCH_SIZE))
+            if not batch:
+                break
+            bam_map = _beagle_bam_exists_map(_dmp_batch_names(batch))
+            for row in batch:
+                yield _dmp_pair_cells(row, bam_map)
+
+
+def _dmp_report_stats(db: Session, logic: PairingLogic):
+    """The reference's 3 summary counts and 5 QC warnings (spec d/e) for
+    the logic's full DMP pair frame, in the exact row sets and conditions
+    pair_tumor_with_normal.R implements:
+
+    summary (over the final 15-column frame):
+      patients         = distinct patient among rows with tumor_matched
+                         == "Matched"
+      tn_pairs         = rows with tumor_matched == "Matched"
+      unmatched_tumors = rows with tumor_matched != "Matched"
+    warnings (each a deduplicated list of affected samples):
+      1 matched_tumors_without_normal
+        rows with tumor_matched == "Matched" and NA normal_bamname
+      2 tumor_samples_with_multiple_ambiguous_normals
+        count: tumor_bamname groups of >1 row among MATCHED rows;
+        list: the tumor_sample of ALL rows (matched or not) whose
+        tumor_bamname is in that set — the reference's file is written
+        without the matched filter
+      3 samples_with_bams_missing
+        rows with tumor_bam_exists == "0" or normal_bam_exists == "0";
+        both sides' samples are listed (a NA normal side contributes
+        nothing)
+      4 low_coverage_tumors
+        rows with (!is.na(tumor_bamname) & is.na(coverage)) |
+        (coverage < 100) — coverage is the reference's as.numeric cast of
+        the rendered cell; the second disjunct applies regardless of the
+        bamname (a no-bamname row with low present coverage flags), and a
+        row that is NA on both is dropped
+      5 low_coverage_normals
+        rows with (!is.na(normal_bamname) & is.na(coverage)) |
+        (coverage < 50) — the reference's normal-side column is
+        character-typed (spec e quirk), so the threshold applies
+        lexicographically to the rendered cell; same NA propagation as 4
+    """
+    ci = _DMP_COLUMN_INDEX
+    patients: set = set()
+    tn_pairs = 0
+    unmatched_tumors = 0
+    w_no_normal: list = []
+    w_bams_missing: list = []
+    w_low_tumors: list = []
+    w_low_normals: list = []
+    row_bams: list = []            # (tumor_bamname, tumor_sample) per row
+    matched_bam_counts: dict = {}
+    for cells in _iter_dmp_pair_cells(db, logic):
+        tumor_sample = cells[ci["tumor_sample"]]
+        matched = cells[ci["tumor_matched"]] == "Matched"
+        if matched:
+            tn_pairs += 1
+            patients.add(cells[ci["patient"]])
+            bamname = cells[ci["tumor_bamname"]]
+            matched_bam_counts[bamname] = matched_bam_counts.get(bamname, 0) + 1
+            # The reference's core QC case: the DMP program flagged the
+            # tumor matched but no normal BAM could be found.
+            if cells[ci["normal_bamname"]] == DMP_REF_NA:
+                w_no_normal.append(tumor_sample)
+        else:
+            unmatched_tumors += 1
+        row_bams.append((cells[ci["tumor_bamname"]], tumor_sample))
+        if cells[ci["tumor_bam_exists"]] == "0" or cells[ci["normal_bam_exists"]] == "0":
+            w_bams_missing.append(tumor_sample)
+            if cells[ci["normal_sample"]] != DMP_REF_NA:
+                w_bams_missing.append(cells[ci["normal_sample"]])
+        # Warnings 4/5 mirror the reference's exact NA propagation:
+        #   (!is.na(bamname) & is.na(coverage)) | (coverage < threshold)
+        # The second disjunct does NOT require a non-NA bamname — a row
+        # with no bamname but a present, low coverage is flagged too; a
+        # row that is NA on both sides evaluates NA and is dropped.
+        t_bn = cells[ci["tumor_bamname"]]
+        t_cov = _ref_coverage_numeric(cells[ci["tumor_bam_coverage"]])
+        if (t_bn != DMP_REF_NA and t_cov is None) or (
+            t_cov is not None and t_cov < DMP_TUMOR_COVERAGE_THRESHOLD
+        ):
+            if tumor_sample != DMP_REF_NA:
+                w_low_tumors.append(tumor_sample)
+        n_bn = cells[ci["normal_bamname"]]
+        n_cov_cell = cells[ci["normal_bam_coverage"]]
+        # The reference's normal-side column is character-typed (spec e
+        # quirk), so the threshold applies lexicographically to the
+        # rendered cell.
+        if (n_bn != DMP_REF_NA and n_cov_cell == DMP_REF_NA) or (
+            n_cov_cell != DMP_REF_NA and n_cov_cell < DMP_NORMAL_COVERAGE_THRESHOLD
+        ):
+            if cells[ci["normal_sample"]] != DMP_REF_NA:
+                w_low_normals.append(cells[ci["normal_sample"]])
+    ambiguous_bams = {b for b, n in matched_bam_counts.items() if n > 1 and b != DMP_REF_NA}
+    # The reference's file lists all rows (matched or not) whose
+    # tumor_bamname is ambiguous; an NA tumor_bamname never matches
+    # (dplyr's group_by drops NA groups, and NA %in% ... evaluates NA).
+    w_ambiguous = [s for b, s in row_bams if b in ambiguous_bams]
+    return (
+        DmpSummaryRead(
+            patients=len(patients),
+            tn_pairs=tn_pairs,
+            unmatched_tumors=unmatched_tumors,
+        ),
+        DmpWarningsRead(
+            matched_tumors_without_normal=_dedup(w_no_normal),
+            tumor_samples_with_multiple_ambiguous_normals=_dedup(w_ambiguous),
+            samples_with_bams_missing=_dedup(w_bams_missing),
+            low_coverage_tumors=_dedup(w_low_tumors),
+            low_coverage_normals=_dedup(w_low_normals),
+        ),
+    )
+
+
+def _open_stream_session() -> Session:
+    """Own session for the export stream.
+
+    The request-scoped session (``get_db``) may be closed before a streaming
+    body has finished sending, so the generator opens and closes its own
+    session. Module-level so tests can point it at the in-memory engine.
+    """
+    return SessionLocal()
+
+
+@router.get("/export/")
+def export_pair_report(
+    pairing_logic_name: str = Query(..., description="Pairing logic name"),
+    q: Optional[str] = Query(
+        None,
+        description="Case-insensitive literal substring on any of the report "
+        "search fields, on either side — same filter as /pairing/report/ (T5)",
+    ),
+    columns: Optional[str] = Query(
+        None,
+        description="Comma-separated report column keys to export; defaults to "
+        "the logic's default column set when omitted",
+    ),
+    fmt: str = Query("csv", description="csv or tsv"),
+    db: Session = Depends(get_db),
+):
+    """Stream the FULL merged Pair Report list for a logic as CSV/TSV.
+
+    The client holds only one page (T4), so the Download/Export button fetches
+    this endpoint for the searched set instead of exporting the loaded page.
+    Rows are produced in report order (latest paired rows, then — DMP logics
+    only — the unmatched DMP tumor rows), in the same cell format the table
+    displays. Keyset pagination keeps memory flat for large logics.
+
+    DMP logics (4/8) export the reference's 15-column pair file: tumor rows
+    only (unpaired normals never appear), real values from the remapped DMP
+    record — no placeholders (spec c).
+    """
+    # Validate the logic, search, format, and column set up front so the
+    # response is a clean 4xx rather than a broken stream.
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    if q is not None:
+        q = q.strip().lower() or None
+    fmt = (fmt or "").strip().lower()
+    if fmt not in ("csv", "tsv"):
+        raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'tsv'")
+    col_defs = _resolve_export_columns(logic, columns)
+    is_dmp = _is_dmp_strategy(logic)
+    logic_id = logic.id
+    filename = "pairs_" + _sanitize_filename(pairing_logic_name) + (".csv" if fmt == "csv" else ".tsv")
+
+    sep = "," if fmt == "csv" else "\t"
+    media_type = "text/csv" if fmt == "csv" else "text/tab-separated-values"
+
+    def gen():
+        db = _open_stream_session()
+        try:
+            logic = db.get(PairingLogic, logic_id)
+            if logic is None:
+                return
+            yield _csv_line([c["header"] for c in col_defs], sep)
+            if is_dmp:
+                # DMP pair file: each row renders as the reference's 15
+                # cells (spec c) restricted to col_defs; the unmatched
+                # section is tumor rows only.
+                for it in (
+                    _iter_paired_export_rows(db, logic, q),
+                    _iter_unmatched_export_rows(db, logic, q),
+                ):
+                    yield from _iter_dmp_pair_lines(it, col_defs, sep)
+            else:
+                for row in _iter_paired_export_rows(db, logic, q):
+                    yield _csv_line([c["text"](row) for c in col_defs], sep)
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        gen(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/trigger", response_model=PairingRead)
