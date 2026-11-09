@@ -70,6 +70,20 @@ def test_identifiers_now_stored_in_columns():
     assert kw2["patient__cmo"] is None
 
 
+def test_consent_placeholder_false():
+    kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta())
+    # PLACEHOLDER default (user decision 2026-11-05): every DMP sample is
+    # recorded as non-consented until the DMP payload carries the real
+    # consent value.
+    assert kw["consent"] is False
+    # The placeholder does NOT read any payload key (the real source field
+    # name is not agreed yet): a truthy consent-ish flag in the payload
+    # still yields False and stays verbatim in additional_metadata.
+    kw2 = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta(part_c_consent=1))
+    assert kw2["consent"] is False
+    assert kw2["additional_metadata"]["part_c_consent"] == 1
+
+
 def test_additional_metadata_carrying_every_unmapped_key_verbatim():
     meta = _meta()
     kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", meta)

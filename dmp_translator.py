@@ -16,6 +16,8 @@ syzygy Sample):
     cmo_assay           -> gene_panel            (fallback: ASSAY_MAPPING[assay])
     type ("T"/"N")      -> tumor_or_normal       (TUMOR / NORMAL)
     "DMP" (constant)    -> sample_type           (provenance marker)
+    False (constant)    -> consent               (PLACEHOLDER — the real source is
+                                                  a future DMP-payload field)
     every other key     -> additional_metadata   (verbatim under the
                                                   original key; null/empty
                                                   values skipped)
@@ -102,7 +104,7 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
 
     patient = meta.get("patient") or {}
     patient_cmo = patient.get("cmo")
-    return dict(
+    kw: dict[str, Any] = dict(
         primary_id=sample_id,
         cmo_sample_name=meta.get("external_id") or sample_id,
         patient__cmo=f"C-{patient_cmo}" if patient_cmo else None,
@@ -123,6 +125,13 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
         additional_metadata=unmapped_metadata(meta) or None,
         errors=None,
     )
+    # PLACEHOLDER default (user decision 2026-11-05): every DMP sample is
+    # recorded as non-consented (consent=False) until the DMP payload
+    # carries the real consent value. This is the SINGLE placeholder
+    # point — the real source is a future DMP-payload field whose name is
+    # NOT agreed yet; do not guess or hardcode a payload key here.
+    kw["consent"] = False
+    return kw
 
 
 # ---------------------------------------------------------------------------

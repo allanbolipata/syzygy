@@ -39,6 +39,10 @@ class Sample(Base):
     # DMP-only (sample_type == "DMP"): the DMP anonymous sample id
     # (anon_id in the DMP metadata); None for LIMS/IGO samples.
     anon_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
+    # DMP-only (sample_type == "DMP"): whether the patient consented; DMP
+    # samples default to False (placeholder until the DMP payload carries
+    # consent); None for LIMS/IGO samples.
+    consent: Mapped[Optional[bool]] = mapped_column(sa.Boolean, nullable=True)
     request_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     sample_type: Mapped[str] = mapped_column(sa.String(255))
     gene_panel: Mapped[str] = mapped_column(sa.String(255))
