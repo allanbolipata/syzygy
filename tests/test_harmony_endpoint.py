@@ -443,6 +443,75 @@ def test_harmony_csv_export_follows_the_search(client, db, dmp_logic, harmony_lo
 
 
 # ---------------------------------------------------------------------------
+# CSV column selection (?columns=): subset, order, 400 on unknown, default
+# ---------------------------------------------------------------------------
+
+
+def test_harmony_csv_columns_subset(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    # A subset in a client-chosen order (NOT the endpoint order): the header
+    # and every data row contain exactly those columns, in that order.
+    response = client.get(
+        "/v1/pairing/harmony/",
+        params={"format": "csv", "columns": "tumor_sample,consent,normal_sample"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    rows = _csv_rows(response)
+    assert rows[0] == ["tumor_sample", "consent", "normal_sample"]
+    # Same frame as the default export (5 rows), just fewer columns:
+    # row selection/ordering is untouched by column selection.
+    assert len(rows) == 6
+    assert all(len(r) == 3 for r in rows)
+    # consent still renders as lowercase true/false (the selected-column
+    # projection keeps the consent renderer on the consent column).
+    assert all(r[1] in ("true", "false", "") for r in rows[1:])
+    # Cross-check against the default export: identical tumor_sample and
+    # normal_sample columns, in the same row order.
+    default_rows = _csv_rows(
+        client.get("/v1/pairing/harmony/", params={"format": "csv"})
+    )
+    assert [r[0] for r in rows[1:]] == [r[1] for r in default_rows[1:]]
+    assert [r[2] for r in rows[1:]] == [r[0] for r in default_rows[1:]]
+    assert [r[1] for r in rows[1:]] == [r[7] for r in default_rows[1:]]
+
+
+def test_harmony_csv_columns_full_subset_explicit(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    # Requesting all 8 keys explicitly equals the default header (order given).
+    response = client.get(
+        "/v1/pairing/harmony/",
+        params={"format": "csv", "columns": ",".join(HARMONY_COLUMNS)},
+    )
+    assert response.status_code == 200
+    rows = _csv_rows(response)
+    assert rows[0] == list(HARMONY_COLUMNS)
+    assert len(rows) == 6
+
+
+def test_harmony_csv_unknown_column_rejected(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    bad = client.get(
+        "/v1/pairing/harmony/", params={"format": "csv", "columns": "normal_sample,bogus"}
+    )
+    assert bad.status_code == 400
+    assert "bogus" in bad.json()["detail"]
+    # A lone unknown key is also rejected before any streaming starts.
+    assert client.get(
+        "/v1/pairing/harmony/", params={"format": "csv", "columns": "tumor"}
+    ).status_code == 400
+
+
+def test_harmony_csv_no_columns_param_keeps_all_8(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    response = client.get("/v1/pairing/harmony/", params={"format": "csv"})
+    assert response.status_code == 200
+    rows = _csv_rows(response)
+    assert rows[0] == list(HARMONY_COLUMNS)
+    assert all(len(r) == 8 for r in rows)
+
+
+# ---------------------------------------------------------------------------
 # Isolation: triggering HARMONY never touches the DMP pairing space
 # ---------------------------------------------------------------------------
 
