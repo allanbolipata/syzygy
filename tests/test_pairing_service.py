@@ -5,7 +5,7 @@ from typing import Optional
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -16,14 +16,24 @@ from models import BaitSet, PairingLogic, PairingTable, Sample
 from pairing_service import (
     _create_pairing,
     _get_latest_pairing,
+    count_unpaired,
+    evaluate_logic,
     resolve_pairing_logic,
+    trigger_dmp_pairing,
     trigger_pairing,
     trigger_pairing_for_normal,
     trigger_pairing_for_unpaired_tumors,
 )
 from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
 from routers.pairing_logic import create_pairing_logic, list_pairing_logic
-from routers.pairings import list_pairings, trigger_all_pairings_endpoint, trigger_pairing_endpoint
+from routers.pairings import (
+    evaluate_pairing_endpoint,
+    list_pairings,
+    trigger_all_pairings_endpoint,
+    trigger_dmp_pairing_endpoint,
+    trigger_pairing_endpoint,
+    unmatched_count_endpoint,
+)
 from routers.patients import PATIENT_META_KEYS, list_patients
 from routers.requests import list_requests
 from routers.samples import create_sample, list_samples
@@ -2872,3 +2882,526 @@ def test_trigger_all_endpoint_returns_summary(db):
     assert result["skipped_no_logic"] == 0
     assert result["skipped_inactive_logic"] == 0
     assert [p.tumor_id for p in result["new_pairings"]] == [tumor.id]
+
+
+# ---------------------------------------------------------------------------
+# DMP automatic pairing (POST /pairing/trigger-dmp)
+# ---------------------------------------------------------------------------
+
+
+def _dmp_logic(db, name="DMP", active=True):
+    logic = PairingLogic(name=name, strategy_name="dmp", active=active)
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    return logic
+
+
+def _dmp_sample(
+    db,
+    primary_id,
+    patient__dmp,
+    tumor_or_normal=TumorOrNormal.NORMAL.value,
+    gene_panel="PANEL-A",
+    additional_metadata=None,
+):
+    sample = _sample(
+        db,
+        primary_id,
+        patient__cmo=f"CMO-{patient__dmp}",
+        tumor_or_normal=tumor_or_normal,
+        sample_type="DMP",
+        gene_panel=gene_panel,
+    )
+    sample.patient__dmp = patient__dmp
+    if additional_metadata is not None:
+        sample.additional_metadata = additional_metadata
+    db.commit()
+    db.refresh(sample)
+    return sample
+
+
+def test_trigger_dmp_pairs_dmp_tumor_with_dmp_normal(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000001-T1-X1", "P-0000001", TumorOrNormal.TUMOR.value)
+    normal = _dmp_sample(db, "P-0000001-N1-X1", "P-0000001")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["pairing_logic"] == "DMP"
+    assert result["scanned"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
+    assert result["already_paired"] == 0
+    assert result["missing_patient__dmp"] == 0
+    (pairing,) = result["new_pairings"]
+    assert pairing.tumor_id == tumor.id
+    assert pairing.normal_id == normal.id
+    assert pairing.trigger_type == "automatic"
+    assert pairing.pairing_logic_id == db.scalar(
+        select(PairingLogic.id).where(PairingLogic.name == "DMP")
+    )
+
+
+def test_trigger_dmp_fans_out_one_row_per_matching_normal(db):
+    # DMP Reference Alignment 3/8: no winner. Two same-patient normals
+    # (no pool -> tier-1 skipped, tier-2 IM_ver rescue; both carry ver X1)
+    # yield ONE PAIRING ROW PER NORMAL. ``new_pairings`` carries the
+    # deterministic representative row (first in primary_id order) — not a
+    # chosen winner; the other matched row still exists in the table.
+    _dmp_logic(db)
+    _dmp_sample(db, "P-0000002-T1-X1", "P-0000002", TumorOrNormal.TUMOR.value)
+    later = _dmp_sample(db, "P-0000002-N2-X1", "P-0000002")
+    first = _dmp_sample(db, "P-0000002-N1-X1", "P-0000002")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 1
+    (rep,) = result["new_pairings"]
+    assert rep.normal_id == first.id  # representative: first in primary_id order
+    rows = db.scalars(
+        select(PairingTable).where(
+            PairingTable.pairing_logic_id == db.scalar(
+                select(PairingLogic.id).where(PairingLogic.name == "DMP")
+            )
+        )
+    ).all()
+    assert len(rows) == 2  # one row per matching normal, neither suppressed
+    assert {r.normal_id for r in rows} == {first.id, later.id}
+
+
+def test_trigger_dmp_requires_same_dmp_patient(db):
+    _dmp_logic(db)
+    _dmp_sample(db, "P-0000003-T1-X1", "P-0000003", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-9999999-N1-X1", "P-9999999")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 0
+    assert result["unpaired"] == 1
+    assert result["new_pairings"] == []
+
+
+def test_trigger_dmp_gene_panel_is_not_a_key(db):
+    # DMP Reference Alignment 3/8: gene_panel is NO LONGER a pairing key
+    # (the reference joins never use it) — a same-patient cross-panel
+    # pair still matches (here via the shared IM_ver in the names).
+    _dmp_logic(db)
+    _dmp_sample(
+        db, "P-0000004-T1-X1", "P-0000004", TumorOrNormal.TUMOR.value,
+        gene_panel="PANEL-A",
+    )
+    _dmp_sample(db, "P-0000004-N1-X1", "P-0000004", gene_panel="PANEL-B")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["paired"] == 1
+    assert result["unpaired"] == 0
+
+
+def test_trigger_dmp_reports_missing_patient_dmp(db):
+    _dmp_logic(db)
+    tumor = _sample(
+        db, "DMP-NODMP-T", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP", patient__cmo="CMO-NODMP",
+    )
+    _dmp_sample(db, "P-0000005-N1-X1", "P-0000005")
+
+    result = trigger_dmp_pairing(db)
+
+    assert result["scanned"] == 1
+    assert result["missing_patient__dmp"] == 1
+    assert result["paired"] == 0
+    assert result["unpaired"] == 0
+    assert db.scalar(
+        select(PairingTable).where(PairingTable.tumor_id == tumor.id)
+    ) is None
+
+
+def test_trigger_dmp_skips_already_paired_tumors(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000006-T1-X1", "P-0000006", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-0000006-N1-X1", "P-0000006")
+
+    first = trigger_dmp_pairing(db)
+    assert first["paired"] == 1
+
+    second = trigger_dmp_pairing(db)
+    assert second["scanned"] == 1
+    assert second["already_paired"] == 1
+    assert second["paired"] == 0
+    assert second["new_pairings"] == []
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.tumor_id == tumor.id
+            )
+        )
+        == 1
+    )
+
+
+def test_trigger_dmp_400_when_no_dmp_logic(db):
+    _sample(db, "DMP-NOLOGIC-T", tumor_or_normal=TumorOrNormal.TUMOR.value,
+            sample_type="DMP", patient__cmo="CMO-X")
+    with pytest.raises(HTTPException) as exc:
+        trigger_dmp_pairing(db)
+    assert exc.value.status_code == 400
+    assert "DMP" in exc.value.detail
+
+
+def test_trigger_dmp_400_when_dmp_logic_inactive(db):
+    _dmp_logic(db, active=False)
+    with pytest.raises(HTTPException) as exc:
+        trigger_dmp_pairing(db)
+    assert exc.value.status_code == 400
+
+
+def test_manual_trigger_endpoint_refuses_dmp_logic(db):
+    """POST /pairing/trigger rejects the DMP strategy (automatic-only)."""
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000007-T1-X1", "P-0000007", TumorOrNormal.TUMOR.value)
+    _dmp_sample(db, "P-0000007-N1-X1", "P-0000007")
+    payload = PairingTriggerCreate(
+        tumor_id=tumor.id, trigger_type="manual", pairing_logic_name="DMP"
+    )
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_endpoint(payload, db=db)
+    assert exc.value.status_code == 400
+    assert "automatic" in exc.value.detail
+    assert db.scalar(
+        select(PairingTable).where(PairingTable.tumor_id == tumor.id)
+    ) is None
+
+
+def test_trigger_dmp_endpoint_pairs(db):
+    _dmp_logic(db)
+    tumor = _dmp_sample(db, "P-0000008-T1-X1", "P-0000008", TumorOrNormal.TUMOR.value)
+    normal = _dmp_sample(db, "P-0000008-N1-X1", "P-0000008")
+
+    result = trigger_dmp_pairing_endpoint(db=db)
+
+    assert result["paired"] == 1
+    (pairing,) = result["new_pairings"]
+    assert (pairing.tumor_id, pairing.normal_id) == (tumor.id, normal.id)
+
+
+# ---------------------------------------------------------------------------
+# Per-logic scoped backfill
+# (POST /pairing/trigger-all?pairing_logic_name=)
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_all_scoped_to_single_logic(db):
+    """With a logic name, only that logic's tumors are scanned and
+    paired; other logics and the DMP group are out of scope."""
+    logic_a = _bait_logic(db, name="L-A", bait="BAIT-A")
+    _bait_logic(db, name="L-B", bait="BAIT-B")
+    tumor_a = _sample(db, "TL-T-A", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-A")
+    _sample(db, "TL-N-A", bait_set="BAIT-A")
+    tumor_b = _sample(db, "TL-T-B", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-B")
+    _sample(db, "TL-N-B", bait_set="BAIT-B")
+    dmp_tumor = _sample(
+        db,
+        "TL-DMP-T",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sample_type="DMP",
+        bait_set="BAIT-A",
+    )
+
+    result = trigger_pairing_for_unpaired_tumors(db, logic_name="L-A")
+
+    assert result["scanned"] == 1
+    assert result["paired"] == 1
+    assert result["already_paired"] == 0
+    assert result["unpaired"] == 0
+    assert result["skipped_dmp"] == 0
+    assert result["skipped_no_logic"] == 0
+    assert result["skipped_inactive_logic"] == 0
+    (pairing,) = result["new_pairings"]
+    assert pairing.tumor_id == tumor_a.id
+    assert pairing.pairing_logic_id == logic_a.id
+    assert pairing.trigger_type == "automatic"
+    # Out-of-scope tumors are untouched.
+    assert _get_latest_pairing(db, tumor_b.id, logic_a.id) is None
+    assert db.scalar(select(PairingTable).where(PairingTable.tumor_id == tumor_b.id)) is None
+    assert db.scalar(select(PairingTable).where(PairingTable.tumor_id == dmp_tumor.id)) is None
+
+
+def test_trigger_all_scoped_counts_outcomes(db):
+    """Scoped counts cover the requested logic's tumors only."""
+    logic = _bait_logic(db, name="L-C", bait="BAIT-C")
+    _sample(db, "TL2-T-PAIR", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-C")
+    _sample(db, "TL2-N-PAIR", bait_set="BAIT-C")
+    already_tumor = _sample(
+        db, "TL2-T-KEEP", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient__cmo="PATIENT-KEEP", bait_set="BAIT-C",
+    )
+    _sample(db, "TL2-N-KEEP", patient__cmo="PATIENT-KEEP", bait_set="BAIT-C")
+    trigger_pairing(db, already_tumor, logic, "manual")
+    unpairable = _sample(
+        db, "TL2-T-UNPAIR", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient__cmo="PATIENT-UNPAIR", bait_set="BAIT-C",
+    )
+    other_logic_tumor = _sample(
+        db, "TL2-T-OTHER", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-OTHER"
+    )
+
+    result = trigger_pairing_for_unpaired_tumors(db, logic_name="L-C")
+
+    assert result["scanned"] == 3
+    assert result["already_paired"] == 1
+    assert result["paired"] == 1
+    assert result["unpaired"] == 1
+    # The already-paired tumor keeps its manual pairing.
+    latest = _get_latest_pairing(db, already_tumor.id, logic.id)
+    assert latest is not None and latest.trigger_type == "manual"
+    assert unpairable.id not in [p.tumor_id for p in result["new_pairings"]]
+    # Another logic's tumor is outside the scope, not paired.
+    assert db.scalar(select(PairingTable).where(PairingTable.tumor_id == other_logic_tumor.id)) is None
+
+
+def test_trigger_all_scoped_rejects_dmp_logic(db):
+    _dmp_logic(db)
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_for_unpaired_tumors(db, logic_name="DMP")
+    assert exc.value.status_code == 400
+    assert "trigger-dmp" in exc.value.detail
+
+
+def test_trigger_all_scoped_unknown_logic_404(db):
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_for_unpaired_tumors(db, logic_name="NOPE")
+    assert exc.value.status_code == 404
+
+
+def test_trigger_all_scoped_inactive_logic_400(db):
+    _bait_logic(db, name="L-OFF", bait="BAIT-OFF", active=False)
+    with pytest.raises(HTTPException) as exc:
+        trigger_pairing_for_unpaired_tumors(db, logic_name="L-OFF")
+    assert exc.value.status_code == 400
+
+
+def test_trigger_all_endpoint_scoped_param(db):
+    logic_a = _bait_logic(db, name="L-EP-A", bait="BAIT-EPA")
+    tumor_a = _sample(db, "TLE-T-A", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-EPA")
+    _sample(db, "TLE-N-A", bait_set="BAIT-EPA")
+    _bait_logic(db, name="L-EP-B", bait="BAIT-EPB")
+    tumor_b = _sample(db, "TLE-T-B", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-EPB")
+    _sample(db, "TLE-N-B", bait_set="BAIT-EPB")
+
+    result = trigger_all_pairings_endpoint(db=db, pairing_logic_name="L-EP-A")
+
+    assert result["scanned"] == 1
+    assert result["paired"] == 1
+    assert [p.tumor_id for p in result["new_pairings"]] == [tumor_a.id]
+    assert db.scalar(select(PairingTable).where(PairingTable.tumor_id == tumor_b.id)) is None
+
+
+# ---------------------------------------------------------------------------
+# Aggregate evaluate (GET /pairing/evaluate/ — strictly read-only dry-run)
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_logic_counts_would_pair(db):
+    """Counts over the backfill scope without writing anything."""
+    logic = _bait_logic(db, name="EV-L", bait="BAIT-EV")
+    pairable = _sample(db, "EV-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-EV")
+    _sample(db, "EV-N-1", bait_set="BAIT-EV")
+    already = _sample(
+        db, "EV-T-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient__cmo="PATIENT-EV2", bait_set="BAIT-EV",
+    )
+    _sample(db, "EV-N-2", patient__cmo="PATIENT-EV2", bait_set="BAIT-EV")
+    trigger_pairing(db, already, logic, "manual")
+    unpairable = _sample(
+        db, "EV-T-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient__cmo="PATIENT-EV3", bait_set="BAIT-EV",
+    )
+
+    before = db.scalar(select(func.count()).select_from(PairingTable))
+    result = evaluate_logic(db, "EV-L")
+    after = db.scalar(select(func.count()).select_from(PairingTable))
+
+    assert result["logic"] == "EV-L"
+    assert result["scope_total"] == 3
+    assert result["already_paired"] == 1
+    assert result["would_pair"] == 1
+    assert result["would_stay_unpaired"] == 1
+    assert result["missing_patient__dmp"] == 0
+    # Strictly read-only: no pairing rows and the would-pair tumor is
+    # still unpaired afterwards.
+    assert after == before
+    assert _get_latest_pairing(db, pairable.id, logic.id) is None
+    assert _get_latest_pairing(db, unpairable.id, logic.id) is None
+
+
+def test_evaluate_logic_readonly_does_not_register_bait(db):
+    """Unregistered bait names are scoped via the classification rules,
+    but — unlike the backfill — no bait_sets row is created."""
+    logic = PairingLogic(name="ARGOS", strategy_name="default")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+    _sample(db, "EV-IMP-T", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="IMPACT468")
+    _sample(db, "EV-IMP-N", bait_set="IMPACT468")
+
+    result = evaluate_logic(db, "ARGOS")
+
+    assert result["scope_total"] == 1
+    assert result["would_pair"] == 1
+    assert result["would_stay_unpaired"] == 0
+    assert db.scalar(select(BaitSet).where(BaitSet.bait_set == "IMPACT468")) is None
+
+
+def test_evaluate_dmp_logic(db):
+    _dmp_logic(db)
+    # P-EV-1: a same-pool tumor + normal (pool key — the names carry no
+    # P-\d+ IM_ver, so tier 1 is the only possible tier).
+    _dmp_sample(
+        db, "P-EV-1-T1-X1", "P-EV-1", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "EVP"},
+    )
+    _dmp_sample(
+        db, "P-EV-1-N1-X1", "P-EV-1",
+        additional_metadata={"project_name": "EVP"},
+    )
+    _dmp_sample(db, "P-EV-2-T1-X1", None, TumorOrNormal.TUMOR.value)  # no P- id
+    _dmp_sample(db, "P-EV-3-T1-X1", "P-EV-3", TumorOrNormal.TUMOR.value)  # no normal
+    # A normal-only DMP sample is out of the tumor scope.
+    _dmp_sample(db, "P-EV-4-N1-X1", "P-EV-4")
+
+    result = evaluate_logic(db, "DMP")
+
+    assert result["logic"] == "DMP"
+    assert result["scope_total"] == 3
+    assert result["already_paired"] == 0
+    assert result["would_pair"] == 1
+    assert result["would_stay_unpaired"] == 2
+    assert result["missing_patient__dmp"] == 1
+
+
+def test_evaluate_unknown_logic_404(db):
+    with pytest.raises(HTTPException) as exc:
+        evaluate_logic(db, "NOPE")
+    assert exc.value.status_code == 404
+
+
+def test_evaluate_endpoint(db):
+    _bait_logic(db, name="EV-EP", bait="BAIT-EVEP")
+    _sample(db, "EVEP-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-EVEP")
+    _sample(db, "EVEP-N-1", bait_set="BAIT-EVEP")
+
+    result = evaluate_pairing_endpoint(pairing_logic_name="EV-EP", db=db)
+
+    assert result["logic"] == "EV-EP"
+    assert result["scope_total"] == 1
+    assert result["would_pair"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-logic unpaired count (GET /pairing/unmatched-count/)
+# ---------------------------------------------------------------------------
+
+
+def test_unmatched_count_non_dmp(db):
+    """Non-DMP: the logic's unpaired tumor population."""
+    logic = _bait_logic(db, name="UC-L", bait="BAIT-UC")
+    _sample(db, "UC-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-UC")
+    paired_t = _sample(
+        db, "UC-T-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient__cmo="PATIENT-UC2", bait_set="BAIT-UC",
+    )
+    _sample(db, "UC-N-2", patient__cmo="PATIENT-UC2", bait_set="BAIT-UC")
+    trigger_pairing(db, paired_t, logic, "manual")
+    # Out-of-scope: another logic's bait set.
+    _sample(db, "UC-T-3", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-OTHER")
+
+    result = count_unpaired(db, "UC-L")
+
+    assert result["pairing_logic"] == "UC-L"
+    assert result["unpaired"] == 1
+
+
+def test_unmatched_count_dmp_mirrors_unmatched_endpoint(db):
+    """DMP: every unpaired DMP sample (tumor or normal), mirroring
+    GET /pairing/unmatched/ — paired samples are excluded."""
+    _dmp_logic(db)
+    # P-UC-1: cross-pool AND different IM_ver → no tier-1 match and no
+    # tier-2 rescue; both samples stay unpaired.
+    _dmp_sample(
+        db, "P-UC-1-T1-X1", "P-UC-1", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    _dmp_sample(
+        db, "P-UC-1-N1-X9", "P-UC-1",
+        additional_metadata={"project_name": "POOL-B"},
+    )
+    # P-UC-2: same pool → paired.
+    _dmp_sample(
+        db, "P-UC-2-T1-X1", "P-UC-2", TumorOrNormal.TUMOR.value,
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    _dmp_sample(
+        db, "P-UC-2-N1-X1", "P-UC-2",
+        additional_metadata={"project_name": "POOL-A"},
+    )
+    trigger_dmp_pairing(db)  # pairs P-UC-2 only
+
+    result = count_unpaired(db, "DMP")
+
+    assert result["pairing_logic"] == "DMP"
+    assert result["unpaired"] == 2  # P-UC-1's tumor + normal
+
+
+def test_unmatched_count_unknown_logic_404(db):
+    with pytest.raises(HTTPException) as exc:
+        count_unpaired(db, "NOPE")
+    assert exc.value.status_code == 404
+
+
+def test_unmatched_count_endpoint(db):
+    _bait_logic(db, name="UC-EP", bait="BAIT-UCEP")
+    _sample(db, "UCEP-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-UCEP")
+
+    result = unmatched_count_endpoint(pairing_logic_name="UC-EP", db=db)
+
+    assert result["pairing_logic"] == "UC-EP"
+    assert result["unpaired"] == 1
+
+
+def test_unmatched_count_paired_counts_latest_both_sides_rows(db):
+    """``paired`` counts this logic's latest report rows where both
+    sides are present — the Pair Report's ``r.tumor && r.normal`` rule.
+    The schema makes tumor_id/normal_id NOT NULL, so every row carries
+    both sides; the rule therefore selects exactly the logic's latest
+    rows. Stale rows and other logics' rows do not count."""
+    logic = _bait_logic(db, name="PC-L", bait="BAIT-PC")
+    # Two latest rows for this logic: both count toward paired.
+    t1 = _sample(db, "PC-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC1", bait_set="BAIT-PC")
+    n1 = _sample(db, "PC-N-1", patient__cmo="PATIENT-PC1", bait_set="BAIT-PC")
+    _make_pairing(db, t1, n1, logic)
+    t2 = _sample(db, "PC-T-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC2", bait_set="BAIT-PC")
+    n2 = _sample(db, "PC-N-2", patient__cmo="PATIENT-PC2", bait_set="BAIT-PC")
+    _make_pairing(db, t2, n2, logic)
+    # A stale (non-latest) both-sides row: not counted.
+    t3 = _sample(db, "PC-T-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC3", bait_set="BAIT-PC")
+    n3 = _sample(db, "PC-N-3", patient__cmo="PATIENT-PC3", bait_set="BAIT-PC")
+    _make_pairing(db, t3, n3, logic, latest=False)
+    # Another logic's latest row: not counted for this logic.
+    other = _bait_logic(db, name="PC-O", bait="BAIT-PCO")
+    t4 = _sample(db, "PC-T-4", tumor_or_normal=TumorOrNormal.TUMOR.value,
+                 patient__cmo="PATIENT-PC4", bait_set="BAIT-PCO")
+    n4 = _sample(db, "PC-N-4", patient__cmo="PATIENT-PC4", bait_set="BAIT-PCO")
+    _make_pairing(db, t4, n4, other)
+
+    result = count_unpaired(db, "PC-L")
+
+    assert result["pairing_logic"] == "PC-L"
+    assert result["paired"] == 2
+    # Backward compatible: unpaired is still the logic's unpaired tumor
+    # population (t1 and t2 have latest rows; t3 has none).
+    assert result["unpaired"] == 1

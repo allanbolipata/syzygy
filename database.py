@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     dev_auth_token: str = ""
     dev_auth_email: str = "dev-admin@syzygy.local"
 
+    # Optional read-only beagle DB (the restored beagle dump — local data,
+    # never in production) used ONLY to resolve the DMP pair file's
+    # bam_exists column (docs/dmp_reference_alignment.md section f, the
+    # sanctioned deviation from the reference's BAM-mirror scan): a
+    # sample's file record with a non-empty path -> 1, else 0. Unset or
+    # unreachable -> bam_exists 0 (unresolvable -> 0).
+    beagle_database_url: Optional[str] = None
+
     # NATS ingest (internal endpoint used by the standalone smile-listener;
     # the app itself never connects to NATS). Fail-closed: an empty token
     # (the default) DISABLES the endpoint — every request is rejected 403.
@@ -37,6 +45,12 @@ class Settings(BaseSettings):
     )
     nats_sample_update_subject: str = (
         "MDB_STREAM.server.cpt-gateway.cmo-sample-update"
+    )
+    # DMP sample records from the dmp-gateway service: the JSON record in
+    # the exact syzygy DB record format (docs/dmp_reference_alignment.md,
+    # section f) — upserted as-is via dmp_translator.to_dmp_sample_kwargs.
+    nats_dmp_sample_subject: str = (
+        "MDB_STREAM.server.dmp-gateway.dmp-sample"
     )
 
     # NATS cohort (TEMPO) subjects
@@ -55,10 +69,26 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+#: Explicit pool sizing instead of SQLAlchemy's defaults (pool_size 5,
+#: max_overflow 10, pool_timeout 30). A bulk pairing pass holds one session for
+#: its entire multi-minute Python loop, and FastAPI runs `def` endpoints on a
+#: 40-token AnyIO threadpool, so a few concurrent panel loads could check out
+#: more connections than the pool had and raise
+#: `QueuePool limit of size 5 overflow 10 reached ... timeout 30.00` mid
+#: request. main.py caps the threadpool at THREADPOOL_TOKENS so in-flight DB
+#: work can never outnumber POOL_SIZE + POOL_MAX_OVERFLOW.
+POOL_SIZE = 10
+POOL_MAX_OVERFLOW = 10
+POOL_TIMEOUT_SECONDS = 10
+THREADPOOL_TOKENS = 12
+
 engine = create_engine(
     settings.database_url,
     echo=False,
     pool_pre_ping=True,
+    pool_size=POOL_SIZE,
+    max_overflow=POOL_MAX_OVERFLOW,
+    pool_timeout=POOL_TIMEOUT_SECONDS,
 )
 
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

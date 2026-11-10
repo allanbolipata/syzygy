@@ -90,6 +90,66 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   font-size: 0.8rem; color: var(--muted);
 }
 
+/* Pair Report: pairing-logic overview header — the primary control
+ * (logic selector), its explainer blurb, the paired/unpaired strip and
+ * the Run pairing / Evaluate actions. Sits above the column panel and
+ * the report table. */
+.pr-overview {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.8rem 1.1rem 0.9rem;
+  margin-top: 0.6rem;
+}
+.pr-overview-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem 1.1rem;
+}
+.pr-overview-sel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.pr-overview-sel select {
+  font-size: 1rem;
+  font-weight: 600;
+  padding: 0.35rem 0.5rem;
+  min-width: 16rem;
+  color: var(--ink);
+}
+.pr-stats {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.pr-stat strong { color: var(--ink); font-size: 1.05rem; margin-left: 0.25rem; }
+.pr-overview-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.5rem;
+}
+.pr-explain { margin: 0.55rem 0 0; font-size: 0.85rem; color: var(--muted); }
+.pr-explain p { margin: 0.15rem 0; }
+/* Pair Report pager: compact page-number input beside prev/next —
+ * "page [2] of 5". Overrides the stacked .filters label layout. */
+.pr-pager { display: inline-flex; align-items: center; gap: 0.35rem; }
+.pr-pager label {
+  display: inline-flex; flex-direction: row; align-items: center; gap: 0.35rem;
+  font-size: 0.8rem; color: var(--muted);
+}
+#pr-page { width: 3.5rem; min-width: 0; }
+#pr-page-of { font-size: 0.82rem; color: var(--muted); }
+/* Pair Report search box (#pr-search): the generic .filters input rule
+ * already styles it; give the query a bit more room for long DMP
+ * sample names. */
+#view-pairs #pr-search { min-width: 13rem; }
+
 /* Pair Report: left split-panel column filter. */
 .linkbtn {
   background: none;
@@ -121,15 +181,6 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   display: flex; flex-direction: column; gap: 0.2rem;
   font-size: 0.8rem; color: var(--muted);
 }
-#pr-groupby {
-  font: inherit;
-  padding: 0.35rem 0.5rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #fff;
-  width: 100%;
-  margin-top: 0.15rem;
-}
 .pr-panel-actions {
   display: flex; gap: 0.4rem;
   margin-top: 0.5rem;
@@ -160,10 +211,12 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   border-radius: 999px;
   padding: 0.02rem 0.5rem;
 }
-.pr-group-body { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; padding: 0.35rem 0 0.15rem; }
-.pr-group-body .col-check { font-size: 0.78rem; }
-.col-check { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; cursor: pointer; }
+.pr-group-body { display: flex; flex-direction: column; gap: 0.3rem; padding: 0.35rem 0 0.15rem; }
+.col-check { display: flex; align-items: center; text-align: left; font-size: 0.8rem; cursor: pointer; }
 .col-check input { width: auto; min-width: 0; margin: 0; }
+.col-check-label { margin-left: 0.45rem; }
+/* Wins over .pr-panel-body label (which stacks the box above its text). */
+.pr-group-body .col-check { display: flex; flex-direction: row; align-items: center; text-align: left; gap: 0; font-size: 0.78rem; }
 
 /* DMP "About these columns" legend (only shown for the DMP logic). */
 .pr-legend {
@@ -277,3 +330,41 @@ footer {
   color: var(--muted);
   font-size: 0.8rem;
 }
+
+/* Pair Report load indicator (#pr-loading): a spinner + status text shown in
+ * the toolbar while the paired rows and the DMP unmatched set are in flight,
+ * so a large load doesn't look frozen. .hidden (display:none !important) hides
+ * it; toggled by showPrLoading()/hidePrLoading() in app.js. */
+.pr-loading { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); font-size: 0.82rem; }
+.pr-loading-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--accent);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: pr-spin 0.8s linear infinite;
+}
+@keyframes pr-spin { to { transform: rotate(360deg); } }
+
+/* DMP QC warning buckets (T5/8): expandable per-bucket sample lists,
+ * shown below the legend for DMP logics only. */
+.pr-dmp-warnings {
+  margin: 0.6rem 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.45rem 0.8rem 0.6rem;
+}
+.pr-dmp-warnings-title { margin: 0 0 0.3rem; font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+.pr-warn-bucket { margin: 0.3rem 0; }
+.pr-warn-bucket summary { cursor: pointer; font-size: 0.85rem; }
+.pr-warn-count { margin-left: 0.3rem; color: #b45309; font-weight: 600; }
+.pr-warn-list { margin: 0.35rem 0 0.2rem; padding-left: 1.25rem; }
+.pr-warn-more {
+  margin: 0.2rem 0 0.3rem 1.25rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.pr-warn-list li { font-size: 0.8rem; font-family: ui-monospace, monospace; }
+/* Subtle cue: DMP rows where the same tumor repeats (an ambiguous match
+ * fanned out onto one row per candidate normal). */
+#pairs-table tbody tr.pr-dmp-repeat td { background: rgba(180, 83, 9, 0.08); }

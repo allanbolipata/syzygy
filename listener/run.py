@@ -9,7 +9,7 @@ consumed message to the app's internal ingest endpoint.
 
 Two SmileClients run in one process, one asyncio task each:
 
-* legacy — ``MDB_STREAM.server.cpt-gateway.>`` (durable ``syzygy``)
+* legacy — ``MDB_STREAM.server.>``            (durable ``syzygy``)
 * tempo  — ``MDB_STREAM.consumers.tempo.>``    (durable ``syzygy-tmp``)
 
 Each client is supervised independently: a dead consumer task is
@@ -79,12 +79,15 @@ def _build_config(
 
 
 def build_config() -> dict:
-    """Config for the legacy cpt-gateway client
+    """Config for the legacy server-side client
     (NATS_FILTER_SUBJECT / NATS_DURABLE)."""
     return _build_config(
         filter_env="NATS_FILTER_SUBJECT",
         durable_env="NATS_DURABLE",
-        default_filter="MDB_STREAM.server.cpt-gateway.>",
+        # Broad by default: the cmo subjects and the DMP sample subject
+        # live under different second-level tokens (cpt-gateway vs
+        # dmp-gateway), so one wildcard covers both.
+        default_filter="MDB_STREAM.server.>",
         default_durable="syzygy",
     )
 

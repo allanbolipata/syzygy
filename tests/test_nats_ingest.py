@@ -18,16 +18,22 @@ from sqlalchemy.pool import StaticPool
 
 import database
 from database import Base, Settings
+from models import Sample
 from nats_ingest import dispatch
 from routers.nats_ingest import NatsIngestIn, ingest_nats
+from sqlalchemy import select
 
 NEW_REQUEST = "MDB_STREAM.server.cpt-gateway.cmo-new-request"
 REQUEST_UPDATE = "MDB_STREAM.server.cpt-gateway.cmo-request-update"
 SAMPLE_UPDATE = "MDB_STREAM.server.cpt-gateway.cmo-sample-update"
+# DMP key data arrives in the syzygy DB record format (ticket 2/8) — the
+# exact fields dmp_translator.to_dmp_sample_kwargs maps.
+DMP_SAMPLE = "MDB_STREAM.server.dmp-gateway.dmp-sample"
 SUBJECTS = {
     "new-request": NEW_REQUEST,
     "request-update": REQUEST_UPDATE,
     "sample-update": SAMPLE_UPDATE,
+    "dmp-sample": DMP_SAMPLE,
 }
 LIVE_NATS_URL = "nats://127.0.0.1:4222"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "nats"
@@ -61,13 +67,15 @@ def db(pg_engine):
 
 def test_settings_defaults(monkeypatch):
     for var in ("NATS_INGEST_TOKEN", "NATS_NEW_REQUEST_SUBJECT",
-                "NATS_REQUEST_UPDATE_SUBJECT", "NATS_SAMPLE_UPDATE_SUBJECT"):
+                "NATS_REQUEST_UPDATE_SUBJECT", "NATS_SAMPLE_UPDATE_SUBJECT",
+                "NATS_DMP_SAMPLE_SUBJECT"):
         monkeypatch.delenv(var, raising=False)
     s = Settings(_env_file=None)
     assert s.nats_ingest_token == ""
     assert s.nats_new_request_subject == NEW_REQUEST
     assert s.nats_request_update_subject == REQUEST_UPDATE
     assert s.nats_sample_update_subject == SAMPLE_UPDATE
+    assert s.nats_dmp_sample_subject == DMP_SAMPLE
 
 
 def test_dispatch_routes_each_production_subject(db, caplog):
@@ -94,6 +102,142 @@ def test_dispatch_unknown_subject_is_error(db):
     result = dispatch(db, "MDB_STREAM.server.cpt-gateway.unknown", {})
     assert result["status"] == "error"
     assert "unknown subject" in result["detail"]
+
+
+# ---------------------------------------------------------------------------
+# DMP ingest (ticket 2/8): the payload arrives in the syzygy DB record
+# format and is stored as-is (dmp_translator); no key-file-shaped parsing.
+# ---------------------------------------------------------------------------
+
+def _dmp_record(**overrides):
+    """A DMP record in the exact DB-format (beagle 'DMP BAMs' filemetadata)."""
+    record = {
+        "sample": "P-7700123-T01-IM6",
+        "type": "T",
+        "assay": "IM6",
+        "cmo_assay": "IMPACT468",
+        "anon_id": "ab3f9k2m",
+        "patient": {"cmo": "DMPAT12", "dmp": "P-7700123"},
+        "coverage": 687,
+        "project_name": "poolA",
+        "sample_type": "0",
+        "external_id": "EXT-7700123-T01",
+        "tumor_type": "lung",
+        "updated": "2024-04-30T12:00:00",
+        "version": 1,
+    }
+    record.update(overrides)
+    return record
+
+
+def _get_dmp_row(db):
+    return db.scalar(select(Sample).where(Sample.primary_id == "P-7700123-T01-IM6"))
+
+
+def test_dmp_dispatch_routes_db_format_record(db):
+    # A record object on the dmp subject routes to the DMP handler (an
+    # un-routed subject would report 'unknown subject').
+    result = dispatch(db, DMP_SAMPLE, _dmp_record())
+    assert result["status"] == "ok"
+    assert result["summary"]["action"] == "created"
+
+
+def test_dmp_full_record_created(db):
+    dispatch(db, DMP_SAMPLE, _dmp_record())
+    row = _get_dmp_row(db)
+    assert row is not None
+    assert row.sample_type == "DMP"
+    assert row.tumor_or_normal == "TUMOR"
+    assert row.patient__dmp == "P-7700123"
+    assert row.patient__cmo == "C-DMPAT12"
+    assert row.anon_id == "ab3f9k2m"
+    assert row.gene_panel == "IMPACT468"
+    assert row.bait_set == "IMPACT468"
+    assert row.cmo_sample_name == "EXT-7700123-T01"
+    # Same group as the beagle dump import assigns, so rows ingested via
+    # NATS and via the dump are indistinguishable in that column.
+    assert row.file_group == "DMP BAMs"
+    # The rest of the record is stored as-is in additional_metadata.
+    assert row.additional_metadata["coverage"] == 687
+    assert row.additional_metadata["project_name"] == "poolA"
+    assert row.additional_metadata["tumor_type"] == "lung"
+
+
+def test_dmp_partial_record_no_clobber(db):
+    dispatch(db, DMP_SAMPLE, _dmp_record())
+    # A partial re-send carrying only some fields must update those and
+    # leave everything else as-is.
+    result = dispatch(db, DMP_SAMPLE, {"sample": "P-7700123-T01-IM6", "coverage": 100})
+    assert result["status"] == "ok"
+    assert result["summary"]["action"] == "updated"
+    row = _get_dmp_row(db)
+    assert row.additional_metadata["coverage"] == 100        # updated
+    assert row.gene_panel == "IMPACT468"                     # not reset
+    assert row.cmo_sample_name == "EXT-7700123-T01"          # not reset to primary_id
+    assert row.patient__dmp == "P-7700123"
+    assert row.anon_id == "ab3f9k2m"
+    assert row.tumor_or_normal == "TUMOR"
+    # Metadata keys the partial record does not carry are preserved.
+    assert row.additional_metadata["project_name"] == "poolA"
+    assert row.additional_metadata["tumor_type"] == "lung"
+
+
+def test_dmp_partial_explicit_fields_apply_even_without_others(db):
+    # Regression: the per-column source check must not skip columns whose
+    # source key IS present just because unrelated keys are absent.
+    dispatch(db, DMP_SAMPLE, _dmp_record())
+    result = dispatch(db, DMP_SAMPLE, {
+        "sample": "P-7700123-T01-IM6",
+        "patient": {"dmp": "P-7700999"},
+        "anon_id": "zz99xx88",
+    })
+    assert result["status"] == "ok"
+    row = _get_dmp_row(db)
+    assert row.patient__dmp == "P-7700999"
+    assert row.anon_id == "zz99xx88"
+    # The absent patient.cmo does not clobber the stored cmo id...
+    assert row.patient__cmo == "C-DMPAT12"
+    # ...and unrelated columns are untouched.
+    assert row.gene_panel == "IMPACT468"
+    assert row.cmo_sample_name == "EXT-7700123-T01"
+
+
+def test_dmp_partial_without_type_backfills_stored(db):
+    dispatch(db, DMP_SAMPLE, _dmp_record(type="T"))
+    result = dispatch(db, DMP_SAMPLE, {"sample": "P-7700123-T01-IM6", "coverage": 55})
+    assert result["status"] == "ok"
+    row = _get_dmp_row(db)
+    assert row.tumor_or_normal == "TUMOR"
+    assert row.additional_metadata["coverage"] == 55
+
+
+def test_dmp_new_record_without_type_rejected(db):
+    rec = _dmp_record()
+    del rec["type"]
+    result = dispatch(db, DMP_SAMPLE, rec)
+    assert result["status"] == "error"
+    assert "type" in result["detail"]
+    assert _get_dmp_row(db) is None
+
+
+def test_dmp_invalid_type_rejected(db):
+    result = dispatch(db, DMP_SAMPLE, _dmp_record(type="X"))
+    assert result["status"] == "error"
+    assert _get_dmp_row(db) is None
+
+
+def test_dmp_missing_sample_id_rejected(db):
+    rec = _dmp_record()
+    del rec["sample"]
+    result = dispatch(db, DMP_SAMPLE, rec)
+    assert result["status"] == "error"
+    assert "sample" in result["detail"]
+
+
+def test_dmp_non_object_payload_rejected(db):
+    result = dispatch(db, DMP_SAMPLE, [_dmp_record()])
+    assert result["status"] == "error"
+    assert "JSON object" in result["detail"]
 
 
 def test_router_dispatch_returns_200_shape(monkeypatch, db, caplog):

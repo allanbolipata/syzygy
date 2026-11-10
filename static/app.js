@@ -105,11 +105,23 @@ function pushNav() {
 }
 
 function showView(name) {
+  const prev = currentViewName();
+  const isPairs = name === "pairs";
+  if (prev && prev !== "pairs" && isPairs) {
+    // Entering the Pair Report: drop any stale search so the user always
+    // lands on the full list for the current logic.
+    resetPrSearch();
+  }
+  if (prev === "pairs" && !isPairs) {
+    // Leaving the Pair Report: clear the search too, so returning later
+    // doesn't resurrect a filter over freshly loaded rows.
+    resetPrSearch();
+  }
   document.querySelectorAll(".tab[data-tab]").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === name)
   );
-  document.querySelectorAll("main.view").forEach((v) =>
-    v.classList.toggle("hidden", v.id !== `view-${name}`)
+  document.querySelectorAll("main.view").forEach((el) =>
+    el.classList.toggle("hidden", el.id !== `view-${name}`)
   );
   pushNav();
 }
@@ -324,6 +336,11 @@ async function loadLogics() {
     $("#tq-logic").innerHTML = logics.map((l) =>
       `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
+    renderPrLogicExplainer();
+    // The select has its options now, so the HARMONY view-mode (hidden
+    // column panel, "Download CSV" label) can apply to the default logic —
+    // the init-time call ran before these options existed.
+    applyHarmonyViewMode();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -401,6 +418,7 @@ async function searchMatchesSamples() {
 async function showMatches(offset) {
   const sample = matchesState.sample;
   const logic = $("#m-logic").value;
+  $("#m-dmp-warning").classList.toggle("hidden", !isDmpLogic(logic));
   if (!sample || !logic) return;
   if (matchesState.busy) return;
   if (offset === undefined || typeof offset !== "number") offset = matchesState.othersOffset;
@@ -591,6 +609,13 @@ function submitOverride(normalId) {
   const data = matchesState.data;
   const strict = $("#m-strict").checked;
   const logic = $("#m-logic").value;
+  if (isDmpLogic(logic)) {
+    banner("error",
+      "The DMP logic is automatic-only: use the “Run DMP pairing” button on " +
+      "the Pairs tab, or switch to another logic (e.g. ARGOS) to pin a " +
+      "DMP tumor to a non-DMP normal.", true);
+    return;
+  }
   const payload = {
     tumor_id: data.sample.id,
     normal_id: normalId,
@@ -1093,17 +1118,17 @@ function pairDate(v) {
  * columns and form the default selection, so the default view and export
  * are unchanged. ``text`` maps a PairingRead row to the column's value. */
 const PAIR_COLUMNS = [
-  { key: "tumor_primary_id", header: "TUMOR_SAMPLE", group: "Tumor sample", text: (r) => r.tumor.primary_id },
-  { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id },
+  { key: "tumor_primary_id", header: "TUMOR_SAMPLE", group: "Tumor sample", text: (r) => r.tumor.primary_id, link: (r) => sampleLink(r.tumor) },
+  { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id, link: (r) => sampleLink(r.normal) },
   { key: "tumor_bait_set", header: "BAIT_SET", group: "Tumor sample", text: (r) => r.tumor.bait_set || "" },
-  { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "" },
+  { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "", link: (r) => patientLink(r.tumor && r.tumor.patient__cmo) },
   { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "" },
   { key: "tumor_anon_id", header: "TUMOR_ANON_ID", group: "Tumor sample", text: (r) => r.tumor.anon_id || "" },
-  { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name) },
+  { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name), link: (r) => sampleLink(r.tumor) },
   { key: "tumor_role", header: "TUMOR_ROLE", group: "Tumor sample", text: (r) => r.tumor.tumor_or_normal || "" },
   { key: "tumor_sample_type", header: "TUMOR_SAMPLE_TYPE", group: "Tumor sample", text: (r) => r.tumor.sample_type || "" },
   { key: "tumor_gene_panel", header: "TUMOR_GENE_PANEL", group: "Tumor sample", text: (r) => r.tumor.gene_panel || "" },
-  { key: "tumor_request_id", header: "TUMOR_REQUEST_ID", group: "Tumor sample", text: (r) => r.tumor.request_id || "" },
+  { key: "tumor_request_id", header: "TUMOR_REQUEST_ID", group: "Tumor sample", text: (r) => r.tumor.request_id || "", link: (r) => requestLink(r.tumor && r.tumor.request_id) },
   { key: "tumor_run_mode", header: "TUMOR_RUN_MODE", group: "Tumor sample", text: (r) => r.tumor.run_mode || "" },
   { key: "tumor_file_group", header: "TUMOR_FILE_GROUP", group: "Tumor sample", text: (r) => r.tumor.file_group || "" },
   { key: "tumor_preservation", header: "TUMOR_PRESERVATION", group: "Tumor sample", text: (r) => pairText(r.tumor.preservation) },
@@ -1113,14 +1138,14 @@ const PAIR_COLUMNS = [
   { key: "tumor_errors", header: "TUMOR_ERRORS", group: "Tumor sample", text: (r) => (r.tumor.errors || []).join("; ") },
   { key: "tumor_id", header: "TUMOR_ID", group: "Tumor sample", text: (r) => r.tumor.id },
   { key: "normal_bait_set", header: "NORMAL_BAIT_SET", group: "Normal sample", text: (r) => r.normal.bait_set || "" },
-  { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "" },
+  { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "", link: (r) => patientLink(r.normal && r.normal.patient__cmo) },
   { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "" },
   { key: "normal_anon_id", header: "NORMAL_ANON_ID", group: "Normal sample", text: (r) => r.normal.anon_id || "" },
-  { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name) },
+  { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name), link: (r) => sampleLink(r.normal) },
   { key: "normal_role", header: "NORMAL_ROLE", group: "Normal sample", text: (r) => r.normal.tumor_or_normal || "" },
   { key: "normal_sample_type", header: "NORMAL_SAMPLE_TYPE", group: "Normal sample", text: (r) => r.normal.sample_type || "" },
   { key: "normal_gene_panel", header: "NORMAL_GENE_PANEL", group: "Normal sample", text: (r) => r.normal.gene_panel || "" },
-  { key: "normal_request_id", header: "NORMAL_REQUEST_ID", group: "Normal sample", text: (r) => r.normal.request_id || "" },
+  { key: "normal_request_id", header: "NORMAL_REQUEST_ID", group: "Normal sample", text: (r) => r.normal.request_id || "", link: (r) => requestLink(r.normal && r.normal.request_id) },
   { key: "normal_run_mode", header: "NORMAL_RUN_MODE", group: "Normal sample", text: (r) => r.normal.run_mode || "" },
   { key: "normal_file_group", header: "NORMAL_FILE_GROUP", group: "Normal sample", text: (r) => r.normal.file_group || "" },
   { key: "normal_preservation", header: "NORMAL_PRESERVATION", group: "Normal sample", text: (r) => pairText(r.normal.preservation) },
@@ -1137,72 +1162,180 @@ const PAIR_COLUMNS = [
 const PAIR_DEFAULT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"];
 const PAIR_GROUPS = ["Tumor sample", "Normal sample", "Pairing"];
 
-/* Legacy DMP export columns: the exact headers and order of the beagle DMP
- * filemetadata export, no additions or removals. Values come from the DMP
- * sample record (primary_id / patient__dmp / anon_id) plus its
- * additional_metadata (coverage, project_name). */
-const DMP_PLACEHOLDER = "\u2014"; // "—" — columns whose source is not available yet
-function dmpMetaText(sample, key) {
-  const meta = (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
-  const v = meta[key];
-  return v === null || v === undefined ? "" : String(v);
+/* DMP pair-report columns: the reference's 15-column pair file (spec
+ * docs/dmp_reference_alignment.md, section c). Values are derived from the
+ * row's tumor/normal records exactly as dmp_translator.remap_dmp_record +
+ * the router's _dmp_pair_cells derive them server-side, so the table
+ * matches the CSV/TSV export. Genuinely absent values render the
+ * reference's NA sentinel — never a placeholder. */
+const DMP_NA = "NA";
+/* The reference's name parse: "P-0000001-T01-IM7" -> patient "P-0000001",
+ * idx "T01", ver "IM7". */
+const DMP_NAME_RE = /(P-\d+)-(\w+)-(\w+)/;
+function dmpMeta(sample) {
+  return (sample && typeof sample.additional_metadata === "object" && sample.additional_metadata) || {};
 }
-/* Second-to-last / last dash-separated segments of a DMP sample name,
- * e.g. "P-0000001-T01-IM7" -> ["T01", "IM7"]; blank when unparseable. */
-function dmpNameParts(name) {
-  const parts = String(name || "").split("-");
-  if (parts.length < 2) return ["", ""];
-  return [parts[parts.length - 2], parts[parts.length - 1]];
+/* Faithful port of dmp_translator.remap_dmp_record (T2/8): the key fields
+ * of a DMP sample record, with the reference's fallbacks. */
+function remapDmpRecord(sample) {
+  const name = sample ? String(sample.primary_id || "") : "";
+  const m = DMP_NAME_RE.exec(name);
+  const meta = dmpMeta(sample);
+  const pick = (v) => (v === null || v === undefined ? "" : String(v));
+  return {
+    idx: m ? m[2] : "",
+    ver: m ? m[3] : "",
+    bamname: pick(meta.bamname) || pick(sample && sample.anon_id),
+    group: pick(meta.group),
+    coverage: pick(meta.coverage),
+    matched: pick(meta.matched_tag),
+    pool_id: pick(meta.pool_id) || pick(meta.project_name),
+    patient: pick(sample && sample.patient__dmp) || (m ? m[1] : ""),
+  };
 }
+/* The reference's 15 cells for one report row (a port of the router's
+ * _dmp_pair_cells, T4/8). The normal side is NA when the tumor is
+ * unmatched — except normal_IM_ver, which the backend backfills from
+ * the tumor's version. *_bam_exists is resolved server-side from beagle
+ * file records for the export only; it is not in the report payload, so
+ * the table shows NA for both. */
+function dmpCells(r) {
+  const t = r.tumor;
+  const n = r.normal || null;
+  const tr = remapDmpRecord(t);
+  const nr = n ? remapDmpRecord(n) : null;
+  const na = DMP_NA;
+  return {
+    tumor_sample: (t && t.primary_id) ? String(t.primary_id) : na,
+    patient: tr.patient || na,
+    tumor_idx: tr.idx || na,
+    tumor_IM_ver: tr.ver || na,
+    tumor_bamname: tr.bamname || na,
+    tumor_group: tr.group || na,
+    tumor_matched: tr.matched || (n ? "Matched" : "Unmatched"),
+    tumor_bam_exists: na,
+    tumor_bam_coverage: tr.coverage || na,
+    normal_sample: (n && n.primary_id) ? String(n.primary_id) : na,
+    normal_bamname: nr ? (nr.bamname || na) : na,
+    // The reference backfills the tumor's IM_ver whenever the normal's is
+    // missing — on unmatched rows AND on paired rows whose normal name
+    // carries no version segment (mirrors _dmp_pair_cells' `or`).
+    normal_IM_ver: (nr && nr.ver) || tr.ver || na,
+    pool_id: tr.pool_id || na,
+    normal_bam_exists: na,
+    normal_bam_coverage: nr ? (nr.coverage || na) : na,
+  };
+}
+const dmpText = (key) => (r) => dmpCells(r)[key];
 const DMP_COLUMNS = [
-  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: (r) => (r.tumor ? r.tumor.primary_id : "") },
-  { key: "patient", header: "patient", group: "Tumor", text: (r) => (r.tumor ? r.tumor.patient__dmp || "" : "") },
-  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[0] : "") },
-  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: (r) => (r.tumor ? dmpNameParts(r.tumor.primary_id)[1] : "") },
-  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: (r) => (r.tumor ? r.tumor.anon_id || "" : "") },
-  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: () => DMP_PLACEHOLDER },
-  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: (r) => (r.tumor ? (r.normal ? "Matched" : "Unmatched") : "") },
-  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: () => DMP_PLACEHOLDER },
-  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "coverage") },
-  { key: "normal_sample", header: "normal_sample", group: "Normal", text: (r) => (r.normal ? r.normal.primary_id : "") },
-  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: (r) => (r.normal ? (r.normal.anon_id || "") : "") },
-  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: (r) => (r.normal ? dmpNameParts(r.normal.primary_id)[1] : "") },
-  { key: "pool_id", header: "pool_id", group: "Tumor", text: (r) => dmpMetaText(r.tumor, "project_name") },
-  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: () => DMP_PLACEHOLDER },
-  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: (r) => dmpMetaText(r.normal, "coverage") },
+  { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: dmpText("tumor_sample"), link: (r) => sampleLink(r.tumor) },
+  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient") },
+  { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: dmpText("tumor_idx") },
+  { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: dmpText("tumor_IM_ver") },
+  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: dmpText("tumor_bamname") },
+  { key: "tumor_group", header: "tumor_group", group: "Tumor", text: dmpText("tumor_group") },
+  { key: "tumor_matched", header: "tumor_matched", group: "Tumor", text: dmpText("tumor_matched") },
+  { key: "tumor_bam_exists", header: "tumor_bam_exists", group: "Tumor", text: dmpText("tumor_bam_exists") },
+  { key: "tumor_bam_coverage", header: "tumor_bam_coverage", group: "Tumor", text: dmpText("tumor_bam_coverage") },
+  { key: "normal_sample", header: "normal_sample", group: "Normal", text: dmpText("normal_sample"), link: (r) => sampleLink(r.normal) },
+  { key: "normal_bamname", header: "normal_bamname", group: "Normal", text: dmpText("normal_bamname") },
+  { key: "normal_IM_ver", header: "normal_IM_ver", group: "Normal", text: dmpText("normal_IM_ver") },
+  { key: "pool_id", header: "pool_id", group: "Tumor", text: dmpText("pool_id") },
+  { key: "normal_bam_exists", header: "normal_bam_exists", group: "Normal", text: dmpText("normal_bam_exists") },
+  { key: "normal_bam_coverage", header: "normal_bam_coverage", group: "Normal", text: dmpText("normal_bam_coverage") },
 ];
-/* Where each legacy DMP column comes from (shown in the "About these
- * columns" panel and as tooltips on the column headers). */
+/* Where each DMP column comes from (shown in the "About these columns"
+ * panel and as tooltips on the column headers). */
 const DMP_LEGEND = {
-  tumor_sample: "DMP sample name (primary_id), e.g. P-0000001-T01-IM7",
-  patient: "patient__dmp: the DMP \u201cP-\u201d patient id",
-  tumor_idx: "Sample name, second-to-last dash segment (e.g. T01); blank when unparseable",
-  tumor_IM_ver: "Sample name, last dash segment (e.g. IM7); blank when unparseable",
-  tumor_bamname: "anon_id: the DMP anonymous sample id",
-  tumor_group: "Placeholder: source not yet available",
-  tumor_matched: "\u201cMatched\u201d when a normal is paired to this DMP sample, else \u201cUnmatched\u201d",
-  tumor_bam_exists: "Placeholder: source not yet available",
-  tumor_bam_coverage: "coverage from the DMP record's additional_metadata",
-  normal_sample: "Paired normal's sample name (primary_id)",
-  normal_bamname: "Paired normal's anon_id",
-  normal_IM_ver: "Paired normal's name, last dash segment",
-  pool_id: "project_name from the tumor-side DMP record's additional_metadata",
-  normal_bam_exists: "Placeholder: source not yet available",
-  normal_bam_coverage: "coverage from the paired normal's additional_metadata",
+  tumor_sample: "The DMP tumor's sample name (primary_id)",
+  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name",
+  tumor_idx: "Tumor index parsed from the sample name (second-to-last dash segment, e.g. T01); NA when unparseable",
+  tumor_IM_ver: "IM version parsed from the sample name (last dash segment, e.g. IM7); NA when unparseable",
+  tumor_bamname: "bamname from the DMP record's additional_metadata; falls back to anon_id",
+  tumor_group: "group from the DMP record's additional_metadata; NA when the record has none",
+  tumor_matched: "matched_tag from the DMP record; otherwise Matched / Unmatched from the pairing",
+  tumor_bam_exists: "Whether beagle has a BAM record for the tumor; resolved server-side for the export, NA in the table",
+  tumor_bam_coverage: "coverage from the DMP record's additional_metadata; NA when absent",
+  normal_sample: "The paired DMP normal's sample name (primary_id); NA when the tumor is unmatched",
+  normal_bamname: "The paired normal's bamname (additional_metadata, fallback anon_id); NA when the tumor is unmatched",
+  normal_IM_ver: "IM version parsed from the paired normal's name; backfilled from the tumor's version when the normal's is missing; NA otherwise",
+  pool_id: "pool_id from the DMP record's additional_metadata; falls back to project_name",
+  normal_bam_exists: "Whether beagle has a BAM record for the normal; resolved server-side for the export, NA in the table",
+  normal_bam_coverage: "coverage from the paired normal's additional_metadata; NA when absent or the tumor is unmatched",
 };
 const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
+/* HARMONY view: the exact 8 columns of GET /pairing/harmony/ (ticket 2/4),
+ * in the endpoint's order. Fixed — HARMONY does not use the
+ * selectable-columns machinery or the legacy DMP/PAIR column sets. The
+ * endpoint orders rows normal-first, then tumor: a normal with several
+ * tumors occupies several consecutive rows and repeats its normal-side
+ * columns (one row per (normal, tumor) pair, 1-to-many). */
+const HARMONY_COLUMNS = [
+  { key: "normal_sample", header: "normal_sample" },
+  { key: "tumor_sample", header: "tumor_sample" },
+  { key: "normal_bamname", header: "normal_bamname" },
+  { key: "normal_bam_path", header: "normal_bam_path" },
+  { key: "tumor_bamname", header: "tumor_bamname" },
+  { key: "tumor_bam_path", header: "tumor_bam_path" },
+  { key: "patient", header: "patient" },
+  { key: "consent", header: "consent" },
+];
+
 const pairsState = {
+  // The current page of the report only. Pagination is server-side
+  // (GET /pairing/report/), so the browser never holds the full set.
   rows: [],
+  // Server total row count for the loaded logic (all pages combined).
+  total: 0,
   logic: null,
   // Per-logic selected column keys (each logic has its own column set and
   // its own selection, so ARGOS choices never affect DMP and vice versa).
   selected: {},
   // Split-panel filter groups that the user collapsed (default: expanded).
   groupCollapsed: {},
+  // Server-side pagination: 0-based index of the page currently displayed.
+  // Next/Prev/jump fetch the requested page from /pairing/report/ (see
+  // loadReportPage) rather than slicing a full in-memory set. The download
+  // is server-side too (GET /pairing/export/) and covers the FULL searched
+  // set, not just the current page.
+  page: 0,
+  pageSize: 50,
+  // View-scoped search (#pr-search): sent to the server as the q param on
+  // GET /pairing/report/ (and /pairing/export/), so it filters the FULL
+  // merged list, not just the loaded page. Stored trimmed + lowercased
+  // (the form the server matches in). Cleared on view enter/leave and on
+  // logic change so a stale filter never carries into new rows.
+  query: "",
+  // Server-sourced "Paired" count for the loaded logic (from
+  // /pairing/unmatched-count/): the logic's latest rows with both
+  // sides present. null until the count lands; #pr-count falls back
+  // to the in-memory rows meanwhile (and whenever a search filter
+  // narrows the table, which the server count doesn't cover).
+  pairedCount: null,
+  // DMP only: the report response's reference summary counts
+  // ({patients, tn_pairs, unmatched_tumors}) and 5 QC warning buckets
+  // (T5/8) — computed server-side over the FULL pair frame, identical
+  // on every page and independent of the search query. null for
+  // non-DMP logics and until the first DMP page lands.
+  dmpSummary: null,
+  dmpWarnings: null,
+  dmpStatsPending: false,
+  // HARMONY only: the counts the harmony endpoint reports for the FULL
+  // searched frame ({matched, unmatched, prevNormal}) — a page's rows can
+  // never produce them. null until the first harmony page lands.
+  harmonyStats: null,
 };
 
+/* HARMONY is its own pairing logic and its own normal-oriented view
+ * (one row per normal–tumor pair, 8 fixed columns — see HARMONY_COLUMNS).
+ * Its seeded row reuses the "dmp" strategy, so every DMP branch must treat
+ * it separately; isDmpLogic() below returns false for it. */
+function isHarmonyLogic(logicName) {
+  return !!logicName && logicName.toUpperCase() === "HARMONY";
+}
 function isDmpLogic(logicName) {
+  if (isHarmonyLogic(logicName)) return false;
   const l = PAIRING_LOGICS.find((x) => x.name === logicName);
   return !!logicName && (l ? l.strategy_name === "dmp" || logicName.toUpperCase() === "DMP" : logicName.toUpperCase() === "DMP");
 }
@@ -1220,29 +1353,35 @@ function selectionFor(logicName) {
 function activeLogicName() {
   return pairsState.logic || $("#pr-logic").value || null;
 }
+
+/* HARMONY view mode: the selectable-columns panel and the CSV/TSV format
+ * switch don't apply — HARMONY's columns are the fixed 8-column endpoint
+ * set and its download is the server-generated CSV. The Download button
+ * relabels to "Download CSV". Reversible: switching back to another logic
+ * restores the panel (collapsed state preserved). */
+function applyHarmonyViewMode() {
+  const harmony = isHarmonyLogic(activeLogicName());
+  $("#pr-panel").classList.toggle("hidden", harmony);
+  const showOpen = !harmony && $("#pr-panel").classList.contains("collapsed");
+  $("#pr-panel-open").classList.toggle("hidden", !showOpen);
+  $("#pr-format").closest("label").classList.toggle("hidden", harmony);
+  $("#pr-download").textContent = harmony ? "Download CSV" : "Download";
+}
 function selectedPairColumns() {
   const logic = activeLogicName();
   if (!logic) return [];
   return columnsForLogic(logic).filter((c) => selectionFor(logic).has(c.key));
 }
 
-/* Groups for the left split-panel filter.
- *  - "side": the active logic's columns, grouped by side (Tumor / Normal /
- *    Pairing for the standard set; Tumor / Normal for DMP).
- *  - "logic": one group per pairing logic (ARGOS, TEMPO, ACCESS, DMP, ...),
- *    each carrying that logic's full column set. */
+/* Groups for the left split-panel filter: the selected (active) logic's
+ * columns, grouped by side (Tumor / Normal / Pairing for the standard set;
+ * Tumor / Normal for DMP). The panel never enumerates the other logics. */
 function pairReportGroups() {
-  const mode = $("#pr-groupby").value;
-  if (mode === "logic") {
-    return PAIRING_LOGICS.map((l) => ({
-      key: `logic:${l.name}`,
-      label: l.name,
-      logic: l.name,
-      columns: columnsForLogic(l.name),
-    }));
-  }
   const logic = activeLogicName();
   if (!logic) return [];
+  // HARMONY's columns are the fixed 8-column endpoint set — there is no
+  // selectable set to render (the panel itself is hidden for HARMONY).
+  if (isHarmonyLogic(logic)) return [];
   const bySide = new Map();
   for (const c of columnsForLogic(logic)) {
     if (!bySide.has(c.group)) bySide.set(c.group, []);
@@ -1276,7 +1415,7 @@ function renderPrGroups() {
       </div>
       <div class="pr-group-body${collapsed ? " hidden" : ""}">
         ${g.columns.map((c) =>
-          `<label class="col-check"><input type="checkbox" data-prcol="${esc(c.key)}" data-prlogic="${esc(g.logic)}"${sel.has(c.key) ? " checked" : ""}>${esc(c.header)}</label>`
+          `<label class="col-check"><input type="checkbox" data-prcol="${esc(c.key)}" data-prlogic="${esc(g.logic)}"${sel.has(c.key) ? " checked" : ""}><span class="col-check-label">${esc(c.header)}</span></label>`
         ).join("")}
       </div>
     </div>`;
@@ -1290,98 +1429,848 @@ function renderPrGroups() {
   }
 }
 
+/* HARMONY cells: the endpoint already resolves display values (em-dash
+ * placeholders for missing bam paths, null for the absent side); consent
+ * renders "true"/"false"/empty per the endpoint's value. */
+function harmonyCellText(r, key) {
+  const v = r[key];
+  if (key === "consent") return v === null || v === undefined ? "" : (v ? "true" : "false");
+  return pairText(v);
+}
+
+/* URLSearchParams for GET /pairing/harmony/: the same 1-based page/size and
+ * search query as reportPageParams (the harmony endpoint takes the same page
+ * contract), minus the report-only ones — pairing_logic_name is implicit
+ * (that endpoint IS the HARMONY frame) and there are no DMP stats to defer.
+ * One helper so the page fetch and the next-page prefetch send identical
+ * params. */
+function harmonyPageParams(page, pageSize) {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  return params;
+}
+/* Clickable identifier cells in the pair table. A column model may
+ * declare an optional ``link`` that resolves a row to a navigation
+ * target: a sample (its Matches & Overrides page), a patient (the
+ * Patients view) or a request (the Requests view). The cell renders as
+ * the app's standard nav-link only when the target resolves and the cell
+ * has a value; otherwise it stays plain text. Sample links carry the
+ * row's sample id; the #pairs-table click handler below resolves the full
+ * sample object from pairsState.rows (openMatchesFor needs more than the
+ * id — e.g. bait_set for logic preselection). */
+const sampleLink = (s) => (s && s.id != null ? { kind: "sample", id: s.id } : null);
+const patientLink = (id) => (id ? { kind: "patient", id } : null);
+const requestLink = (id) => (id ? { kind: "request", id } : null);
+
+function pairCellHtml(r, c) {
+  const raw = c.text(r);
+  const link = c.link ? c.link(r) : null;
+  if (!link || pairText(raw) === "") return `<td>${esc(raw)}</td>`;
+  const attr = link.kind === "sample" ? "data-sample-id"
+    : link.kind === "patient" ? "data-nav-patient" : "data-nav-request";
+  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
+}
+
+/* HARMONY: normal-oriented 8-column table (HARMONY_COLUMNS). The server
+ * returns ONE PAGE of the frame, ordered by normal primary_id then tumor
+ * primary_id, so a normal's rows are consecutive: its normal-side columns
+ * repeat and a heavier top border marks each new normal, making the 1-to-many
+ * obvious at a glance. One-sided (unmatched) rows render the absent side's
+ * columns empty, like the DMP unmatched convention. Same pagination / count /
+ * empty states as the DMP view, from the same server page contract. */
+function renderHarmonyTable() {
+  const cols = HARMONY_COLUMNS;
+  $("#pairs-table thead").innerHTML =
+    `<tr>${cols.map((c) => `<th>${esc(c.header)}</th>`).join("")}</tr>`;
+  const rows = pairsState.rows; // one server page, not the whole frame
+  const total = pairsState.total; // the FULL searched frame's size
+  const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
+  if (pairsState.page > maxPage) pairsState.page = maxPage;
+  const start = pairsState.page * pairsState.pageSize;
+  // Group divider across the page boundary: the endpoint sends the normal of
+  // the frame row just before this page (prev_normal_sample), so a normal's
+  // group cut in half by paging still reads as a continuation on the next
+  // page instead of as a brand-new group.
+  const stats = pairsState.harmonyStats;
+  const prevPageNormal = start > 0 && stats ? stats.prevNormal : null;
+  $("#pairs-table tbody").innerHTML = rows
+    .map((r, i) => {
+      const prev = i > 0 ? rows[i - 1].normal_sample : prevPageNormal;
+      const divider = prev !== null && prev !== r.normal_sample
+        ? ` style="border-top:2px solid #c3ccd6"` : "";
+      return `<tr>${cols.map((c) =>
+        `<td${divider}>${esc(harmonyCellText(r, c.key))}</td>`).join("")}</tr>`;
+    }).join("");
+  $("#pr-prev").disabled = pairsState.page === 0;
+  $("#pr-next").disabled = pairsState.page >= maxPage;
+  const totalPages = maxPage + 1;
+  const pageInput = $("#pr-page");
+  pageInput.max = totalPages;
+  pageInput.value = pairsState.page + 1;
+  $("#pr-page-of").textContent = `of ${totalPages}`;
+  pageInput.disabled = total === 0;
+  // Matched/unmatched are the endpoint's counts over the FULL searched frame
+  // a page cannot see the other pages' one-sided rows. Only before the
+  // first harmony response lands do we fall back to this page's own rows.
+  const matched = stats
+    ? stats.matched
+    : rows.filter((r) => r.normal_sample && r.tumor_sample).length;
+  const unmatched = stats
+    ? stats.unmatched
+    : rows.filter((r) => !(r.normal_sample && r.tumor_sample)).length;
+  const emptyEl = $("#pr-empty");
+  emptyEl.classList.toggle("hidden", total !== 0);
+  emptyEl.textContent =
+    pairsState.query
+      ? "No HARMONY rows match this search."
+      : "No HARMONY rows yet \u2014 run pairing first.";
+  const paging = total > pairsState.pageSize
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + rows.length} of ${total})`
+    : "";
+  $("#pr-count").textContent =
+    `${total} rows: ${matched} matched, ${unmatched} unmatched${paging}`;
+  $("#pr-download").disabled = total === 0;
+  $("#pr-legend").classList.add("hidden");
+}
+
 function renderPairsTable() {
+  if (isHarmonyLogic(activeLogicName())) return renderHarmonyTable();
   const logic = activeLogicName();
   const dmp = isDmpLogic(logic);
   const cols = selectedPairColumns();
   $("#pairs-table thead").innerHTML = `<tr>${cols.map((c) =>
     `<th${dmp && DMP_LEGEND[c.key] ? ` title="${esc(DMP_LEGEND[c.key])}"` : ""}>${esc(c.header)}</th>`
   ).join("")}</tr>`;
-  $("#pairs-table tbody").innerHTML = pairsState.rows
-    .map((r) => `<tr>${cols.map((c) => `<td>${esc(c.text(r))}</td>`).join("")}</tr>`).join("");
-  const matched = pairsState.rows.filter((r) => r.tumor && r.normal).length;
-  const empty = pairsState.rows.length === 0 || cols.length === 0;
-  $("#pr-empty").classList.toggle("hidden", !empty);
+  // The browser holds only the current server page (pairsState.rows); the
+  // page indicator and the row count come from the server total
+  // (pairsState.total). A search query filters the FULL merged list
+  // server-side (the q param), so rows is already the searched set.
+  const rows = pairsState.rows;
+  const total = pairsState.total;
+  const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
+  const start = pairsState.page * pairsState.pageSize;
+  // DMP: an ambiguous tumor legitimately appears on one row per candidate
+  // normal — flag the repeated rows with a subtle cue so they read as
+  // one tumor fanned out, not as duplicated data.
+  const tumorCounts = new Map();
+  if (dmp) {
+    for (const r of rows) {
+      const id = r.tumor && r.tumor.primary_id;
+      if (id) tumorCounts.set(id, (tumorCounts.get(id) || 0) + 1);
+    }
+  }
+  $("#pairs-table tbody").innerHTML = rows
+    .map((r) => {
+      const tid = r.tumor && r.tumor.primary_id;
+      const repeat = dmp && tid && (tumorCounts.get(tid) || 0) > 1;
+      return `<tr${repeat ? ` class="pr-dmp-repeat" title="Tumor appears on ${tumorCounts.get(tid)} rows: multiple candidate normals (ambiguous match)"` : ""}>${cols.map((c) => pairCellHtml(r, c)).join("")}</tr>`;
+    }).join("");
+  $("#pr-prev").disabled = pairsState.page === 0;
+  $("#pr-next").disabled = pairsState.page >= maxPage;
+  // Keep the skip-to-page input in sync with Prev/Next: the input shows
+  // the 1-based page; "of N" shows the last page (always >= 1).
+  const totalPages = maxPage + 1;
+  const pageInput = $("#pr-page");
+  pageInput.max = totalPages;
+  pageInput.value = pairsState.page + 1;
+  $("#pr-page-of").textContent = `of ${totalPages}`;
+  pageInput.disabled = total === 0;
+  // Matched: the server count (pairsState.pairedCount, from
+  // /pairing/unmatched-count/) once it has landed and no search filter
+  // narrows the table — until then, and while filtering, fall back to
+  // the current page's rows.
+  let matched;
+  if (pairsState.query) {
+    // A search narrows the set server-side, but the reference counts
+    // cover the FULL frame — while filtering, use the page's rows.
+    matched = rows.filter((r) => r.tumor && r.normal).length;
+  } else if (dmp && pairsState.dmpSummary) {
+    matched = pairsState.dmpSummary.tn_pairs;
+  } else if (pairsState.pairedCount != null) {
+    matched = pairsState.pairedCount;
+  } else {
+    matched = rows.filter((r) => r.tumor && r.normal).length;
+  }
+  const empty = rows.length === 0 || cols.length === 0;
+  const emptyEl = $("#pr-empty");
+  emptyEl.classList.toggle("hidden", !empty);
+  emptyEl.textContent =
+    pairsState.query ? "No pairs match this search." : "No current pairs for this logic.";
+  const paging = total > pairsState.pageSize
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${Math.min(start + pairsState.pageSize, total)} of ${total})`
+    : "";
   $("#pr-count").textContent = cols.length === 0
     ? "no columns selected"
     : dmp
-      ? `${pairsState.rows.length} rows: ${matched} matched, ${pairsState.rows.length - matched} unmatched`
-      : `${pairsState.rows.length} pair${pairsState.rows.length === 1 ? "" : "s"}`;
+      ? `${total} rows: ${matched} matched, ${total - matched} unmatched${paging}`
+      : `${total} pair${total === 1 ? "" : "s"}${paging}`;
   $("#pr-download").disabled = empty;
-  // Legend (and header tooltips) only for the legacy DMP column set.
+  // Legend (and header tooltips) only for the DMP column set.
   $("#pr-legend").classList.toggle("hidden", !dmp);
   if (dmp) {
     $("#pr-legend-body").innerHTML = DMP_COLUMNS.map((c) =>
       `<tr><td>${esc(c.header)}</td><td>${esc(DMP_LEGEND[c.key] || "")}</td></tr>`
     ).join("");
   }
+  renderDmpWarnings();
+}
+
+/* DMP QC warnings (T5/8): the 5 reference buckets, each expandable,
+ * from the report response's warnings field — computed over the FULL
+ * pair frame, so the buckets stay constant across pages and searches.
+ * Hidden (and cleared) for non-DMP logics. */
+const DMP_WARNING_BUCKETS = [
+  { key: "matched_tumors_without_normal", label: "Matched tumors without a normal" },
+  { key: "tumor_samples_with_multiple_ambiguous_normals", label: "Tumors with multiple ambiguous normals" },
+  { key: "samples_with_bams_missing", label: "Samples with BAMs missing" },
+  { key: "low_coverage_tumors", label: "Low-coverage tumors" },
+  { key: "low_coverage_normals", label: "Low-coverage normals" },
+];
+/* Buckets list their samples lazily and cumulatively in chunks. The full
+ * DMP buckets run to hundreds of thousands of ids (the BAM-missing bucket
+ * alone was ~278k), and materializing every one on every page paint is what
+ * froze the tab: a closed bucket shows only its count, opening it lists the
+ * first chunk, and "show more" extends that same list. */
+const DMP_WARNING_CHUNK = 300;
+function dmpWarningListHtml(samples, upto) {
+  const shown = Math.min(upto, samples.length);
+  const rest = samples.length - shown;
+  return `<ul class="pr-warn-list">${samples.slice(0, shown).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` +
+    (rest > 0
+      ? `<button type="button" class="pr-warn-more" data-upto="${shown + DMP_WARNING_CHUNK}">` +
+        `Show ${Math.min(rest, DMP_WARNING_CHUNK).toLocaleString()} more (${rest.toLocaleString()} remaining)</button>`
+      : "");
+}
+function renderDmpWarnings() {
+  const warnEl = $("#pr-dmp-warnings");
+  if (!warnEl) return;
+  // Only the DMP pairing space has the reference's warnings to show.
+  if (!isDmpLogic(activeLogicName())) {
+    warnEl.classList.add("hidden");
+    warnEl.innerHTML = "";
+    return;
+  }
+  if (!pairsState.dmpWarnings) {
+    // Stats are still in flight (or this logic has none yet).
+    if (pairsState.dmpStatsPending) {
+      warnEl.classList.remove("hidden");
+      warnEl.innerHTML =
+        `<p class="pr-dmp-warnings-title">QC warnings <span class="hint">— computing over the full report…</span></p>`;
+    } else {
+      warnEl.classList.add("hidden");
+      warnEl.innerHTML = "";
+    }
+    return;
+  }
+  const w = pairsState.dmpWarnings;
+  warnEl.classList.remove("hidden");
+  warnEl.innerHTML =
+    `<p class="pr-dmp-warnings-title">QC warnings <span class="hint">— full report, not just this page</span></p>` +
+    DMP_WARNING_BUCKETS.map((b) => {
+      const samples = w[b.key] || [];
+      return `<details class="pr-warn-bucket" data-warn-key="${b.key}">
+  <summary>${esc(b.label)} <span class="pr-warn-count">${samples.length.toLocaleString()}</span></summary>
+  <div class="pr-warn-body">${samples.length
+    ? `<p class="hint">Expand to list up to ${DMP_WARNING_CHUNK.toLocaleString()} of ${samples.length.toLocaleString()}.</p>`
+    : `<p class="hint">None.</p>`}</div>
+</details>`;
+    }).join("");
+  warnEl.querySelectorAll("details.pr-warn-bucket").forEach((det) => {
+    const key = det.getAttribute("data-warn-key");
+    const body = det.querySelector(".pr-warn-body");
+    const bucket = () => (pairsState.dmpWarnings || {})[key] || [];
+    let listed = 0;
+    det.addEventListener("toggle", () => {
+      if (!det.open || listed) return;
+      const samples = bucket();
+      if (!samples.length) return;
+      listed = Math.min(samples.length, DMP_WARNING_CHUNK);
+      body.innerHTML = dmpWarningListHtml(samples, listed);
+    });
+    body.addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".pr-warn-more");
+      if (!btn) return;
+      const samples = bucket();
+      listed = Math.min(samples.length, Number(btn.getAttribute("data-upto")));
+      body.innerHTML = dmpWarningListHtml(samples, listed);
+    });
+  });
+}
+
+/* DMP summary + QC warnings now come from GET /pairing/report-stats/ (5/8):
+ * they describe the full frame and are page/q independent, so pages request
+ * include_stats=false and this fetches the numbers in the background,
+ * cached per logic for the life of the tab (pairing runs drop the cache).
+ * The pair table paints without them. */
+let dmpStatsCache = {}; // logic name -> { summary, warnings }
+let dmpStatsAbort = null;
+async function loadDmpReportStats(logic) {
+  if (!isDmpLogic(logic)) return;
+  const cached = dmpStatsCache[logic];
+  if (cached) {
+    pairsState.dmpSummary = cached.summary;
+    pairsState.dmpWarnings = cached.warnings;
+    pairsState.dmpStatsPending = false;
+    if (activeLogicName() === logic) renderPairsTable();
+    return;
+  }
+  pairsState.dmpStatsPending = true;
+  if (activeLogicName() === logic) renderDmpWarnings();
+  if (dmpStatsAbort) dmpStatsAbort.abort();
+  dmpStatsAbort = new AbortController();
+  try {
+    const r = await api(
+      `/pairing/report-stats/?pairing_logic_name=${encodeURIComponent(logic)}`,
+      { signal: dmpStatsAbort.signal },
+    );
+    if (activeLogicName() !== logic) return; // logic changed mid-flight
+    dmpStatsCache[logic] = { summary: r.summary || null, warnings: r.warnings || null };
+    pairsState.dmpSummary = dmpStatsCache[logic].summary;
+    pairsState.dmpWarnings = dmpStatsCache[logic].warnings;
+    pairsState.dmpStatsPending = false;
+    renderPairsTable(); // repaint the DMP count line/overview with real numbers
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    pairsState.dmpStatsPending = false;
+    if (activeLogicName() === logic) {
+      renderDmpWarnings();
+      banner("error", `Failed to load QC warnings: ${esc(e.message)}`, true);
+    }
+  }
+}
+
+/* Abort controller for the in-flight pair load; a new load (tab click,
+ * logic change) cancels the previous one so scans can't pile up on the
+ * server. */
+let pairsAbort = null;
+
+/* Pair Report load indicator (#pr-loading in the toolbar). Shown while the
+ * paired rows and, for DMP, the large unmatched set are in flight so a big
+ * load doesn't look frozen. Callers guard it with the is-active check so a
+ * superseded load never hides the spinner the newer load is showing. */
+function showPrLoading(text) {
+  const el = $("#pr-loading");
+  if (!el) return;
+  const label = el.querySelector(".pr-loading-text");
+  if (label) label.textContent = text;
+  el.classList.remove("hidden");
+}
+function hidePrLoading() {
+  const el = $("#pr-loading");
+  if (el) el.classList.add("hidden");
+}
+
+/* URLSearchParams for GET /pairing/report/: the 1-based page and size,
+ * plus the active free-text search query (trimmed + lowercased, the
+ * form the server matches in; omitted when empty). One helper so the
+ * page fetch and the next-page prefetch always send identical params. */
+function reportPageParams(logic, page, pageSize) {
+  const params = new URLSearchParams({
+    pairing_logic_name: logic,
+    page: String(page),
+    page_size: String(pageSize),
+    // The DMP summary/QC warnings describe the FULL pair frame and cost a
+    // full-frame walk to compute; a page doesn't wait for them (see
+    // loadDmpReportStats, which fetches them in the background).
+    include_stats: "false",
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  return params;
+}
+async function loadReportPage(page) {
+  const logic = pairsState.logic;
+  if (!logic) return;
+  // HARMONY is server-paginated too, but on its own endpoint with its own
+  // row shape (the normal-oriented frame), so its page turns go through
+  // loadHarmonyPage instead of the report endpoint.
+  if (isHarmonyLogic(logic)) return loadHarmonyPage(page);
+  if (pairsAbort) pairsAbort.abort();
+  pairsAbort = new AbortController();
+  const signal = pairsAbort.signal;
+  // True only while THIS load is the active one. A newer load replaces
+  // pairsAbort (and thus owns the loading indicator) and aborts this
+  // load's signal, so a stale load must not repaint or clear the spinner
+  // the newer load is showing.
+  const active = () => signal === pairsAbort.signal;
+  // Spinner lifecycle invariant: hide any stale indicator at entry, show
+  // ours, and hide in `finally` so every exit path is covered.
+  hidePrLoading();
+  if (active()) showPrLoading(`Loading page ${page + 1}\u2026`);
+  try {
+    // Serve from the next-page prefetch when it has already landed for
+    // this exact logic/query/page; otherwise fetch for real. A failed
+    // prefetch resolves to null and falls through to the real fetch,
+    // which surfaces the error.
+    let data = null;
+    try {
+      data = await consumePrPrefetch(page);
+      if (!data) {
+        data = await api(`/pairing/report/?${reportPageParams(logic, page + 1, pairsState.pageSize)}`, { signal });
+      }
+    } catch (e) {
+      if (e && e.name !== "AbortError") {
+        hidePrLoading();
+        banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      }
+      return;
+    }
+    // Only the active load may mutate shared state: a superseded load's
+    // page must not paint over the newer load's rows.
+    if (!active()) return;
+    pairsState.rows = data.rows;
+    pairsState.total = data.total;
+    pairsState.page = page;
+    // DMP summary/QC warnings now arrive off the page path
+    // (include_stats=false): a response that does carry them still wins.
+    if (data.summary) pairsState.dmpSummary = data.summary;
+    if (data.warnings) pairsState.dmpWarnings = data.warnings;
+    renderPrGroups();
+    renderPairsTable();
+    if (page === 0) loadPrOverviewStats();
+    // The page is on screen: quietly fetch N+1 so "Next" is instant.
+    prefetchNextPrPage(page);
+    // ...and fetch the DMP QC extras in the background (cached per logic).
+    loadDmpReportStats(logic);
+  } finally {
+    // Invariant: whenever THIS load is still the newest, its spinner is
+    // hidden no matter how the body exited — completion, a fetch error,
+    // or a superseded early return.
+    if (active()) hidePrLoading();
+  }
+}
+
+/* HARMONY view: server-paginated on its own endpoint, mirroring the DMP
+ * report's page flow. GET /pairing/harmony/?page=&page_size=&q= returns ONE
+ * page of the normal-oriented frame plus the whole-frame numbers
+ * (total/matched/unmatched/prev_normal_sample): the frame is never fetched,
+ * filtered or held client-side (it used to be ~169k rows in one response,
+ * which is what froze the tab). Same prefetch slot and abort/spinner
+ * lifecycle as loadReportPage. */
+async function loadHarmonyPage(page) {
+  const logic = pairsState.logic;
+  if (!logic) return;
+  if (pairsAbort) pairsAbort.abort();
+  pairsAbort = new AbortController();
+  const signal = pairsAbort.signal;
+  const active = () => signal === pairsAbort.signal;
+  hidePrLoading();
+  if (active()) showPrLoading(page === 0 ? "Loading HARMONY pairs\u2026" : `Loading HARMONY page ${page + 1}\u2026`);
+  try {
+    let data = null;
+    try {
+      data = await consumePrPrefetch(page);
+      if (!data) {
+        data = await api(`/pairing/harmony/?${harmonyPageParams(page + 1, pairsState.pageSize)}`, { signal });
+      }
+    } catch (e) {
+      if (e && e.name !== "AbortError") {
+        hidePrLoading();
+        banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      }
+      return; // superseded, or the fetch failed: either way, nothing to paint
+    }
+    if (!active()) return;
+    // Same state shape as the report path: rows is the loaded PAGE (not the
+    // full frame) and total the searched frame's size; the frame-wide counts
+    // ride in harmonyStats for the count line and the page-boundary divider.
+    pairsState.rows = data.rows;
+    pairsState.total = data.total;
+    pairsState.page = page;
+    pairsState.harmonyStats = {
+      matched: data.matched,
+      unmatched: data.unmatched,
+      prevNormal: data.prev_normal_sample ?? null,
+    };
+    renderPrGroups();
+    renderHarmonyTable();
+    if (page === 0) loadPrOverviewStats();
+    // The page is on screen: quietly fetch N+1 so "Next" is instant.
+    prefetchNextPrPage(page);
+  } finally {
+    if (active()) hidePrLoading();
+  }
 }
 
 async function loadPairs() {
   const logic = $("#pr-logic").value;
   if (!logic) return;
-  try {
-    pairsState.logic = logic;
-    pairsState.rows = await api(`/pairing/?${new URLSearchParams({ latest: "true", pairing_logic_name: logic })}`);
-    if (isDmpLogic(logic)) await appendUnmatchedDmpSamples();
-    renderPrGroups();
-    renderPairsTable();
-  } catch (e) {
-    banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
-  }
+  // A fresh load (init, tab re-entry, logic change, post-pairing refresh)
+  // starts at page 1; any cached prefetch belongs to the previous
+  // logic/query and is dropped.
+  invalidatePrPrefetch();
+  pairsState.logic = logic;
+  // The previous logic's server count is stale until the new one lands.
+  pairsState.pairedCount = null;
+  // Same for the DMP extras: the previous logic's summary/warnings must
+  // not linger when a new (or non-DMP) logic is selected.
+  pairsState.dmpSummary = null;
+  pairsState.dmpWarnings = null;
+  // Same for the HARMONY frame counts: the previous load's matched/unmatched
+  // must not linger over a new logic, and a post-pairing refresh must show
+  // the frame's new numbers rather than the old ones.
+  pairsState.harmonyStats = null;
+  await loadReportPage(0);
 }
 
-/* DMP report: the legacy export lists every DMP sample, so DMP samples
- * without a pairing yet are appended as rows with the opposite-side
- * columns left empty. */
-async function appendUnmatchedDmpSamples() {
-  const paired = new Set();
-  for (const r of pairsState.rows) {
-    paired.add(r.tumor.id);
-    paired.add(r.normal.id);
+/* Next-page prefetch: after a page paints, quietly fetch page N+1 and
+ * cache it so "Next" renders instantly. One slot, keyed by
+ * logic|query|page — a logic change or a search (which call
+ * invalidatePrPrefetch) can never serve a stale page, and a settled but
+ * superseded result is simply dropped. Prefetch failures are silent: a
+ * real page turn re-fetches and surfaces the error. */
+let prPrefetch = null; // { key, page, abort, promise, data }
+function prPrefetchKey() {
+  return `${pairsState.logic}|${pairsState.query}|${pairsState.pageSize}`;
+}
+function invalidatePrPrefetch() {
+  if (prPrefetch) {
+    prPrefetch.abort.abort(); // cancel the in-flight fetch, if any
+    prPrefetch = null;
   }
-  const extra = [];
-  const page = 1000;
-  for (let offset = 0; ; offset += page) {
-    const batch = await api(`/sample/?${new URLSearchParams({ sample_type: "DMP", limit: String(page), offset: String(offset) })}`);
-    for (const s of batch) {
-      if (paired.has(s.id)) continue;
-      extra.push({
-        tumor: s.tumor_or_normal === "TUMOR" ? s : null,
-        normal: s.tumor_or_normal === "NORMAL" ? s : null,
-        pairing_logic: pairsState.logic,
-        trigger_type: null,
-        mismatched_keys: [],
-        created_date: s.created_date,
-      });
-    }
-    if (batch.length < page) break;
-  }
-  pairsState.rows = pairsState.rows.concat(extra);
+}
+function prefetchNextPrPage(page) {
+  const maxPage = Math.max(0, Math.ceil(pairsState.total / pairsState.pageSize) - 1);
+  const next = page + 1;
+  if (next > maxPage) return; // already on the last page
+  const key = `${prPrefetchKey()}|${next}`;
+  if (prPrefetch && prPrefetch.key === key) return; // in flight or cached
+  invalidatePrPrefetch();
+  const ctrl = new AbortController();
+  const entry = { key, page: next, abort: ctrl, data: null, promise: null };
+  // HARMONY prefetches from the harmony endpoint (same page contract, its own
+  // row shape); every other logic from the report endpoint.
+  const url = isHarmonyLogic(pairsState.logic)
+    ? `/pairing/harmony/?${harmonyPageParams(next + 1, pairsState.pageSize)}`
+    : `/pairing/report/?${reportPageParams(pairsState.logic, next + 1, pairsState.pageSize)}`;
+  entry.promise = api(url, { signal: ctrl.signal })
+    .then((data) => {
+      if (prPrefetch === entry) entry.data = data; // else superseded: drop
+      return data;
+    })
+    .catch(() => null); // silent; a real turn re-fetches
+  prPrefetch = entry;
+}
+async function consumePrPrefetch(page) {
+  if (!prPrefetch || prPrefetch.page !== page) return null;
+  if (prPrefetch.key !== `${prPrefetchKey()}|${page}`) return null;
+  if (prPrefetch.data) return prPrefetch.data;
+  return await prPrefetch.promise; // null on silent failure → caller re-fetches
 }
 
-function downloadPairs() {
-  if (!pairsState.logic) return;
+/* Export the FULL searched set from the server (GET /pairing/export/), not
+ * just the page the browser holds — server-side pagination means the client
+ * only ever has one page. The server owns the merge, the search filter (q)
+ * and the checked column set; the response streams to disk via a blob. */
+async function downloadPairs() {
+  const logic = pairsState.logic;
+  if (!logic) return;
+  // HARMONY: the server-generated CSV (exact 8 headers, full normal-oriented
+  // frame) — see downloadHarmonyCsv. The /pairing/export/ path below is the
+  // pair-table column model and does not apply to HARMONY's fixed 8 columns.
+  if (isHarmonyLogic(logic)) {
+    downloadHarmonyCsv();
+    return;
+  }
   const cols = selectedPairColumns();
-  if (cols.length === 0 || pairsState.rows.length === 0) return;
+  if (cols.length === 0) return;
   const tsv = $("#pr-format").value === "tsv";
-  const sep = tsv ? "\t" : ",";
-  const cell = (v) => (!tsv && /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v.replace(/[\t\r\n]/g, " "));
-  const rows = [cols.map((c) => c.header), ...pairsState.rows.map((r) => cols.map((c) => c.text(r)))];
-  const text = rows.map((r) => r.map(cell).join(sep)).join("\n") + "\n";
+  const params = new URLSearchParams({
+    pairing_logic_name: logic,
+    fmt: tsv ? "tsv" : "csv",
+    columns: cols.map((c) => c.key).join(","),
+  });
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  const btn = $("#pr-download");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(API + "/pairing/export/?" + params);
+    let detail = null;
+    if (!res.ok) {
+      try { const b = await res.json(); detail = b && b.detail; } catch (_) { /* not JSON */ }
+      if (res.status === 401) location.href = "/login";
+      else if (res.status === 403) location.href = "/login?error=" + encodeURIComponent(detail || "Not allowed");
+      throw new Error((typeof detail === "string" ? detail : JSON.stringify(detail)) || `Export failed: ${res.status}`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `pairs_${logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    banner("error", `Export failed: ${esc(e.message)}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* HARMONY download: GET /pairing/harmony/?format=csv — the server-generated
+ * CSV attachment with the exact 8 headers (ticket 2/4), streamed straight to
+ * the browser (a plain anchor navigation — cookie auth, like every other
+ * request here; the server's Content-Disposition supplies the filename). Like
+ * the report's export, it follows the active SEARCH query instead of the
+ * loaded page: the file is the full searched frame, never just what the tab
+ * happens to show. */
+function downloadHarmonyCsv() {
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: tsv ? "text/tab-separated-values" : "text/csv" }));
-  a.download = `pairs_${pairsState.logic.replace(/[^\w.-]+/g, "_")}.${tsv ? "tsv" : "csv"}`;
+  a.href = `${API}/pairing/harmony/?format=csv${pairsState.query ? `&q=${encodeURIComponent(pairsState.query)}` : ""}`;
+  a.download = "harmony_pairs.csv";
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(a.href);
 }
 
-$("#pr-logic").addEventListener("change", loadPairs);
+/* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
+ * with its DMP normal (same patient__dmp and gene panel). Invoked from the
+ * overview header's Run pairing button when the selected logic is a DMP
+ * logic; manual pairing of DMP samples happens under the other logics
+ * (e.g. ARGOS). */
+async function runDmpPairing() {
+  const btn = $("#pr-run");
+  btn.disabled = true;
+  $("#pr-run-status").textContent = "Pairing…";
+  try {
+    const r = await api("/pairing/trigger-dmp", { method: "POST" });
+    $("#pr-run-status").textContent =
+      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
+      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
+    banner("ok", `DMP pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
+      `${r.missing_patient__dmp} missing patient__dmp`, true);
+    dmpStatsCache = {}; // the pair frame just changed
+    await loadPairs();
+  } catch (e) {
+    banner("error", `DMP pairing failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* HARMONY pairing run: POST /pairing/trigger-harmony (ticket 2/4) — the
+ * HARMONY pairing space's own trigger, mirroring runDmpPairing() but
+ * resolving the HARMONY logic row (the DMP pairing space is never
+ * touched). The generic trigger-all endpoint refuses DMP-strategy logics
+ * with a 400, so HARMONY must use its own trigger. */
+async function runHarmonyPairing() {
+  const btn = $("#pr-run");
+  btn.disabled = true;
+  $("#pr-run-status").textContent = "Pairing…";
+  try {
+    const r = await api("/pairing/trigger-harmony", { method: "POST" });
+    $("#pr-run-status").textContent =
+      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
+      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
+    banner("ok", `HARMONY pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
+      `${r.missing_patient__dmp} missing patient__dmp`, true);
+    dmpStatsCache = {}; // the pair frame just changed
+    await loadPairs();
+  } catch (e) {
+    banner("error", `HARMONY pairing failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* Overview-header Run pairing button for the selected logic: DMP goes to
+ * the DMP trigger, HARMONY to its own trigger (see runHarmonyPairing), and
+ * any other logic to the per-logic backfill (POST
+ * /pairing/trigger-all?pairing_logic_name=, confirm first — it records
+ * pairings). Result lands in #pr-run-status. */
+async function runPrPairing() {
+  const logic = activeLogicName();
+  if (!logic) return;
+  if (isDmpLogic(logic)) {
+    await runDmpPairing();
+    return;
+  }
+  if (isHarmonyLogic(logic)) {
+    await runHarmonyPairing();
+    return;
+  }
+  const msg =
+    `Run pairing for ${logic}?\n\n` +
+    "This records a new pairing for every unpaired tumor under this logic. " +
+    "Existing pairings are kept.";
+  if (!confirm(msg)) return;
+  const btn = $("#pr-run");
+  btn.disabled = true;
+  $("#pr-run-status").textContent = "Pairing…";
+  try {
+    const r = await api(`/pairing/trigger-all?pairing_logic_name=${encodeURIComponent(logic)}`);
+    $("#pr-run-status").textContent =
+      `scanned ${r.scanned} · paired ${r.paired} · ` +
+      `unpaired ${r.unpaired} · already ${r.already_paired}`;
+    banner("ok", `Pairing complete for ${logic}: ${r.paired} paired, ${r.unpaired} unpaired`, true);
+    dmpStatsCache = {}; // the pair frame just changed
+    await loadPairs();
+  } catch (e) {
+    banner("error", `Run pairing failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* GET /pairing/evaluate/?pairing_logic_name= — read-only dry-run over the
+ * selected logic's backfill scope; renders "N of M would pair" plus the
+ * outcome breakdown in #pr-evaluate-result. Never records pairings. */
+async function evaluatePrPairing() {
+  const logic = activeLogicName();
+  if (!logic) return;
+  const btn = $("#pr-evaluate");
+  const out = $("#pr-evaluate-result");
+  btn.disabled = true;
+  out.textContent = "Evaluating…";
+  try {
+    const r = await api(`/pairing/evaluate/?pairing_logic_name=${encodeURIComponent(logic)}`);
+    let html = `${r.would_pair} of ${r.scope_total} would pair · ${r.already_paired} already paired · ${r.would_stay_unpaired} would stay unpaired`;
+    if (r.missing_patient__dmp > 0) {
+      html += ` · ${r.missing_patient__dmp} missing patient__dmp`;
+    }
+    out.innerHTML = html;
+  } catch (e) {
+    banner("error", `Evaluate failed: ${esc(e.message)}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* Overview-header blurb for the selected logic: the strategy's explainer
+ * from TRY_EXPLAINERS (same copy as the Try tab), with a short default
+ * line naming the logic when the strategy has no entry. */
+function renderPrLogicExplainer() {
+  const el = $("#pr-logic-explain");
+  const logicName = activeLogicName();
+  if (!el || !logicName) return;
+  const logic = PAIRING_LOGICS.find((l) => l.name === logicName);
+  const explainer = logic && TRY_EXPLAINERS[logic.strategy_name];
+  el.innerHTML = explainer || `<p>${esc(logicName)}: no explainer available for this logic.</p>`;
+}
+
+/* Counts strip for the selected logic (#pr-overview-stats). Non-DMP
+ * logics: Paired / Unpaired from the per-logic unmatched-count endpoint
+ * (Paired = the logic's latest report rows with both sides present,
+ * Unpaired = its unpaired population). DMP: the reference's 3 summary
+ * counts from the report response's summary field (computed over the
+ * FULL pair frame, independent of page and search). */
+async function loadPrOverviewStats() {
+  const el = $("#pr-overview-stats");
+  const logic = activeLogicName();
+  if (!el || !logic) return;
+  if (isDmpLogic(logic)) {
+    const s = pairsState.dmpSummary;
+    el.innerHTML = s
+      ? `<span class="pr-stat"># of patients <strong>${s.patients}</strong></span>` +
+        `<span class="pr-stat"># of Tumor-Normal pairs <strong>${s.tn_pairs}</strong></span>` +
+        `<span class="pr-stat"># of unmatched tumors <strong>${s.unmatched_tumors}</strong></span>`
+      : `<span class="pr-stat">summary <strong>…</strong></span>`;
+    return;
+  }
+  // HARMONY is deliberately NOT on the DMP summary path (isDmpLogic()
+  // excludes it): the per-logic unmatched-count endpoint already answers
+  // for it (Paired = HARMONY's latest rows with both sides present,
+  // Unpaired = its unpaired samples), so no client-side count is needed.
+  const paint = (pairedHtml, unpairedHtml) => {
+    el.innerHTML =
+      `<span class="pr-stat">Paired ${pairedHtml}</span>` +
+      `<span class="pr-stat">Unpaired ${unpairedHtml}</span>`;
+  };
+  paint("<strong>…</strong>", "<strong>…</strong>");
+  try {
+    const r = await api(`/pairing/unmatched-count/?pairing_logic_name=${encodeURIComponent(logic)}`);
+    if (activeLogicName() === logic) {
+      // The server count also drives #pr-count's "matched" figure.
+      pairsState.pairedCount = r.paired;
+      renderPairsTable();
+      paint(`<strong>${r.paired}</strong>`, `<strong>${r.unpaired}</strong>`);
+    }
+  } catch (e) {
+    if (activeLogicName() === logic) paint("<strong>—</strong>", "<strong>—</strong>");
+  }
+}
+
+$("#pr-logic").addEventListener("change", () => {
+  // Sync the state before re-rendering: activeLogicName() prefers
+  // pairsState.logic, which loadPairs() sets when it runs — the blurb
+  // would otherwise keep the previous logic's text.
+  pairsState.logic = $("#pr-logic").value;
+  $("#pr-run-status").textContent = "";
+  $("#pr-evaluate-result").textContent = "";
+  // A stale filter would otherwise carry into the new logic's rows.
+  resetPrSearch();
+  renderPrLogicExplainer();
+  applyHarmonyViewMode();
+  loadPairs();
+});
+$("#pr-run").addEventListener("click", runPrPairing);
+$("#pr-evaluate").addEventListener("click", evaluatePrPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
+$("#pr-prev").addEventListener("click", () => {
+  if (pairsState.page > 0) loadReportPage(pairsState.page - 1);
+});
+$("#pr-next").addEventListener("click", () => {
+  const maxPage = Math.max(0, Math.ceil(pairsState.total / pairsState.pageSize) - 1);
+  if (pairsState.page < maxPage) loadReportPage(pairsState.page + 1);
+});
+/* Skip-to-page: type a number (1-based) and press Enter, or let the
+ * input commit on blur/change. Out-of-range values clamp to
+ * [1, totalPages]; renderPairsTable() re-syncs the input and Prev/Next. */
+function goPrPage() {
+  const totalPages = Math.max(1, Math.ceil(pairsState.total / pairsState.pageSize));
+  const target = parseInt($("#pr-page").value, 10);
+  if (Number.isNaN(target)) return; // blank input: next render re-syncs it
+  const page = Math.min(totalPages - 1, Math.max(0, target - 1));
+  // Same page (or a blank/clamped-identical value): just re-sync the input,
+  // no server round-trip.
+  if (page === pairsState.page) {
+    renderPairsTable();
+  } else {
+    loadReportPage(page);
+  }
+}
+$("#pr-page").addEventListener("change", goPrPage);
+$("#pr-page").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") goPrPage();
+});
+/* Clear the Pair Report search box and its state. Called when the view is
+ * entered/left (see showView) and when the pairing logic changes, so a
+ * stale filter never carries into a new logic's rows. */
+function resetPrSearch() {
+  const box = $("#pr-search");
+  if (box && box.value) box.value = "";
+  if (pairsState.query) {
+    pairsState.query = "";
+    // The query change voids any cached prefetch (its key includes the
+    // query). The page index is a SERVER page, not a position in a filtered
+    // set, so it is left alone — the currently loaded page stays loaded.
+    invalidatePrPrefetch();
+  }
+}
+/* View-scoped search: send the query to the server (the report's and the
+ * harmony frame's endpoints both take ?q=)
+ * so it filters the FULL merged list, not just the loaded page. Debounced so
+ * typing doesn't issue a request per keystroke. A new/changed query resets
+ * to page 1 and refetches; #pr-count / #pr-page-of then reflect the server's
+ * filtered total (the same renderPairsTable path as any page fetch). */
+let prSearchTimer = null;
+$("#pr-search").addEventListener("input", () => {
+  clearTimeout(prSearchTimer);
+  prSearchTimer = setTimeout(() => {
+    const q = $("#pr-search").value.trim().toLowerCase();
+    if (q === pairsState.query) return; // unchanged: nothing to refetch
+    pairsState.query = q;
+    invalidatePrPrefetch(); // cached prefetch was fetched for the old query
+    loadReportPage(0); // server-side search starts at page 1
+  }, 250);
+});
 document.querySelector('.tab[data-tab="pairs"]').addEventListener("click", loadPairs);
-$("#pr-groupby").addEventListener("change", renderPrGroups);
 $("#pr-groups").addEventListener("change", (e) => {
   const t = e.target;
   if (!t.dataset) return;
@@ -1435,7 +2324,29 @@ $("#pr-cols-all").addEventListener("click", () =>
 $("#pr-cols-none").addEventListener("click", () => setSelectionForActive([]));
 $("#pr-cols-default").addEventListener("click", () =>
   setSelectionForActive([...defaultSelectionFor(activeLogicName())]));
+
+/* Identifier links in the pair table: same delegation pattern as the
+ * Matches view — patient/request spans navigate via the existing helpers,
+ * a sample span resolves the full sample object from the loaded rows and
+ * opens its Matches & Overrides page. */
+$("#pairs-table").addEventListener("click", (e) => {
+  const el = e.target.closest("[data-nav-patient],[data-nav-request],[data-sample-id]");
+  if (!el) return;
+  if (el.dataset.navPatient != null) return navigateToPatient(el.dataset.navPatient);
+  if (el.dataset.navRequest != null) return navigateToRequest(el.dataset.navRequest);
+  if (el.dataset.sampleId != null) {
+    const id = String(el.dataset.sampleId);
+    const row = pairsState.rows.find(
+      (r) => (r.tumor && String(r.tumor.id) === id) || (r.normal && String(r.normal.id) === id)
+    );
+    const sample = row && ((row.tumor && String(row.tumor.id) === id ? row.tumor : null)
+      || (row.normal && String(row.normal.id) === id ? row.normal : null));
+    if (sample) return openMatchesFor(sample);
+  }
+});
+
 renderPrGroups();
+applyHarmonyViewMode();
 
 /* ---------- try pairing view (dry run) ---------- */
 

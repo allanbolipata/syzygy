@@ -39,6 +39,10 @@ class Sample(Base):
     # DMP-only (sample_type == "DMP"): the DMP anonymous sample id
     # (anon_id in the DMP metadata); None for LIMS/IGO samples.
     anon_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
+    # DMP-only (sample_type == "DMP"): whether the patient consented; DMP
+    # samples default to False (placeholder until the DMP payload carries
+    # consent); None for LIMS/IGO samples.
+    consent: Mapped[Optional[bool]] = mapped_column(sa.Boolean, nullable=True)
     request_id: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     sample_type: Mapped[str] = mapped_column(sa.String(255))
     gene_panel: Mapped[str] = mapped_column(sa.String(255))
@@ -86,6 +90,13 @@ class PairingTable(Base):
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     latest: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    # Fan-out flag: the DMP two-tier strategy
+    # (docs/dmp_reference_alignment.md, section b) emits one row per
+    # (tumor, normal) match — an ambiguous tumor carries several latest
+    # rows under the DMP logic. multi_pair=True rows are exempt from the
+    # one-latest-per-tumor unique index below; every other logic keeps
+    # single-winner semantics.
+    multi_pair: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
 
     @property
     def pairing_logic(self) -> str:
@@ -97,8 +108,10 @@ class PairingTable(Base):
             "tumor_id",
             "pairing_logic_id",
             unique=True,
-            postgresql_where=sa.text("latest"),
-            sqlite_where=sa.text("latest"),
+            # One latest row per tumor — except multi_pair (DMP fan-out)
+            # rows, which are one per matched normal.
+            postgresql_where=sa.text("latest AND COALESCE(multi_pair, FALSE) = FALSE"),
+            sqlite_where=sa.text("latest AND COALESCE(multi_pair, 0) = 0"),
         ),
         sa.Index(
             "uq_pairing_table_tumor_normal_pairing_logic_latest",

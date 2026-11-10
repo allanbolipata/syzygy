@@ -219,7 +219,23 @@
 <main id="view-pairs" class="view hidden">
   <section class="panel">
     <h2>Pair Report</h2>
-    <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the legacy DMP export columns.</p>
+    <section class="pr-overview">
+      <div class="pr-overview-row">
+        <label class="pr-overview-sel">
+          pairing logic
+          <select id="pr-logic"></select>
+        </label>
+        <span id="pr-overview-stats" class="pr-stats"></span>
+        <span class="pr-overview-actions">
+          <button type="button" id="pr-run" class="primary">Run pairing</button>
+          <button type="button" id="pr-evaluate" title="Dry-run: how many unpaired samples would pair. Read-only — nothing is recorded.">Evaluate</button>
+        </span>
+      </div>
+      <p id="pr-run-status" class="hint"></p>
+      <p id="pr-evaluate-result" class="hint"></p>
+      <div id="pr-logic-explain" class="pr-explain"></div>
+    </section>
+    <p class="hint">Current (latest) pairings under the selected logic. Filter the report's columns in the side panel &mdash; the table and the download always contain exactly the checked columns. DMP shows the reference's 15-column pair file, its 3 summary counts and 5 QC warning buckets.</p>
     <div class="pr-split" id="pr-split">
       <aside class="pr-panel" id="pr-panel">
         <div class="pr-panel-head">
@@ -227,13 +243,7 @@
           <button type="button" class="linkbtn" id="pr-panel-collapse" title="Collapse filter panel">&lsaquo;</button>
         </div>
         <div class="pr-panel-body" id="pr-panel-body">
-          <label>group by
-            <select id="pr-groupby">
-              <option value="side">Tumor / Normal</option>
-              <option value="logic">Pair logic / Strategy</option>
-            </select>
-          </label>
-          <p class="hint">A group header toggles every column in its group. The table and export update live.</p>
+          <p class="hint">The selected logic's columns, grouped by side. A group header toggles every column in its group. The table and export update live.</p>
           <div id="pr-groups"></div>
           <div class="pr-panel-actions">
             <button type="button" class="small" id="pr-cols-all">All</button>
@@ -245,8 +255,8 @@
       <button type="button" class="pr-panel-open hidden" id="pr-panel-open" title="Show filter panel">&rsaquo;</button>
       <div class="pr-main">
         <div class="filters">
-          <label>pairing logic
-            <select id="pr-logic"></select>
+          <label>search
+            <input type="search" id="pr-search" placeholder="Search pairs…" title="Search all pairs on the server by patient, DMP patient, sample name, primary ID, or bait set">
           </label>
           <label>format
             <select id="pr-format">
@@ -255,6 +265,15 @@
             </select>
           </label>
           <button id="pr-download" disabled>Download</button>
+          <button type="button" id="pr-prev" disabled title="Previous page">&lsaquo;</button>
+          <button type="button" id="pr-next" disabled title="Next page">&rsaquo;</button>
+          <span class="pr-pager">
+            <label>page
+              <input id="pr-page" type="number" min="1" max="1" disabled title="Jump to page (Enter to go)">
+            </label>
+            <span id="pr-page-of" class="hint">of 1</span>
+          </span>
+          <span id="pr-loading" class="pr-loading hidden"><span class="pr-loading-spinner"></span><span class="pr-loading-text">Loading…</span></span>
           <span id="pr-count" class="hint"></span>
         </div>
         <details class="pr-legend hidden" id="pr-legend">
@@ -264,6 +283,7 @@
             <tbody id="pr-legend-body"></tbody>
           </table>
         </details>
+        <div id="pr-dmp-warnings" class="pr-dmp-warnings hidden"></div>
         <div class="table-wrap">
           <table id="pairs-table">
             <thead></thead>
@@ -426,6 +446,12 @@
       to 500 per page &mdash; use Prev/Next to page the full scope.
       Click a candidate row to open its matches &amp; overrides.
       Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
+    </p>
+    <p id="m-dmp-warning" class="hint hidden">
+      The DMP logic is automatic-only: DMP tumors pair with their DMP
+      normals via the <em>Run DMP pairing</em> button on the Pairs tab.
+      To pin a DMP tumor to a non-DMP normal, switch to another logic
+      (e.g. ARGOS) first.
     </p>
     <label class="check">
       <input type="checkbox" id="m-strict">

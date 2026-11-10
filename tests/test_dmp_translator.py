@@ -1,6 +1,13 @@
 import pytest
 
-from dmp_translator import ASSAY_MAPPING, EXCLUDED_DMP_KEYS, to_dmp_sample_kwargs
+from dmp_translator import (
+    ASSAY_MAPPING,
+    DMP_REF_COLUMNS,
+    EXCLUDED_DMP_KEYS,
+    remap_dmp_record,
+    to_dmp_sample_kwargs,
+)
+from models import Sample
 
 
 def _meta(**overrides):
@@ -61,6 +68,20 @@ def test_identifiers_now_stored_in_columns():
     assert kw2["patient__dmp"] is None
     assert kw2["anon_id"] is None
     assert kw2["patient__cmo"] is None
+
+
+def test_consent_placeholder_false():
+    kw = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta())
+    # PLACEHOLDER default (user decision 2026-11-05): every DMP sample is
+    # recorded as non-consented until the DMP payload carries the real
+    # consent value.
+    assert kw["consent"] is False
+    # The placeholder does NOT read any payload key (the real source field
+    # name is not agreed yet): a truthy consent-ish flag in the payload
+    # still yields False and stays verbatim in additional_metadata.
+    kw2 = to_dmp_sample_kwargs("P-0001234-N01-IM6", _meta(part_c_consent=1))
+    assert kw2["consent"] is False
+    assert kw2["additional_metadata"]["part_c_consent"] == 1
 
 
 def test_additional_metadata_carrying_every_unmapped_key_verbatim():
@@ -148,3 +169,74 @@ def test_argos_dmp_pairs_are_manual_pairing_only():
     assert argos.matches(lims, mk(sample_type="DMP", bait_set="OTHER")) is False
     assert any("bait_set" in r for r in reasons)
     assert "DMP: manual pairing only" in reasons
+
+
+# ---------------------------------------------------------------------------
+# remap_dmp_record — the section g reference-column contract (ticket 2/8).
+# 3/8 (two-tier strategy) and 4/8 (Pair Report) consume this helper.
+# ---------------------------------------------------------------------------
+
+def _dmp_sample(**meta_overrides):
+    """Build a stored DMP Sample row the way ingest (or the beagle import)
+    would, so remap tests run against realistic rows."""
+    meta = _meta()
+    meta.update(meta_overrides)
+    return Sample(**to_dmp_sample_kwargs("P-0001234-N01-IM6", meta))
+
+
+def test_remap_full_record_all_twelve_columns():
+    out = remap_dmp_record(_dmp_sample())
+    assert tuple(out.keys()) == DMP_REF_COLUMNS
+    assert out["sample"] == "P-0001234-N01-IM6"
+    assert out["patient"] == "P-0001234"        # stored patient__dmp wins
+    assert out["idx"] == "N01"                  # parsed from the sample id
+    assert out["ver"] == "IM6"                  # IM_ver for the rescue tier
+    assert out["bamname"] == "anon-0001234"     # anon_id stand-in
+    assert out["bprefix"] == "anon"
+    assert out["bsuffix"] == "0001234"
+    assert out["group"] is None                 # gap: absent from real records
+    assert out["bam_exists"] == 0               # default: unresolvable
+    assert out["coverage"] == 687               # as-is
+    assert out["pool_id"] == "proj"             # project_name stand-in
+    assert out["is_matched"] is None            # gap: no matched_tag
+
+
+def test_remap_explicit_fields_take_precedence():
+    s = _dmp_sample(bamname="P-777-BA9", pool_id="POOL9",
+                    matched_tag="Matched", group="grp1")
+    out = remap_dmp_record(s, bam_exists=1)
+    assert out["bamname"] == "P-777-BA9"        # explicit beats anon_id
+    assert out["bprefix"] == "P"
+    assert out["bsuffix"] == "777"
+    assert out["pool_id"] == "POOL9"            # explicit beats project_name
+    assert out["is_matched"] == "Matched"       # explicit tag passes through
+    assert out["group"] == "grp1"
+    assert out["bam_exists"] == 1               # caller-resolved override
+
+
+def test_remap_patient_falls_back_to_name_parse():
+    s = _dmp_sample(patient=None)
+    assert s.patient__dmp is None
+    assert remap_dmp_record(s)["patient"] == "P-0001234"
+
+
+def test_remap_anon_id_without_dash_leaves_prefix_suffix_empty():
+    # Real anon_id values are dash-free letter tokens (2/8 fixture audit):
+    # bprefix/bsuffix come back "" and must not be read as a T/N signal.
+    out = remap_dmp_record(_dmp_sample(anon_id="abcdefgh"))
+    assert out["bamname"] == "abcdefgh"
+    assert out["bprefix"] == ""
+    assert out["bsuffix"] == ""
+
+
+def test_remap_bam_exists_default_and_override():
+    s = _dmp_sample()
+    assert remap_dmp_record(s)["bam_exists"] == 0
+    assert remap_dmp_record(s, bam_exists=1)["bam_exists"] == 1
+
+
+def test_remap_coverage_none_is_not_zero():
+    # The reference treats missing coverage as a distinct warning case —
+    # never coerce NA to 0.
+    s = _dmp_sample(coverage=None)
+    assert remap_dmp_record(s)["coverage"] is None
