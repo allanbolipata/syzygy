@@ -101,10 +101,6 @@ subjects** above.
    reflect the real source.
 2. **`cohort-result` subject name:** confirm at the meeting; currently a
    placeholder (see single rename point above).
-3. **Mock coverage:** `scripts/mock_smile.py` knows only the 3 cmo events;
-   the cohort e2e (`tests/test_cohort_e2e.py`) publishes directly via
-   nats-py. Add `cohort-validate` (and a result-sub mode) to the mock if
-   ad-hoc local poking of cohort events is wanted.
 
 ## Settled
 
@@ -115,3 +111,8 @@ subjects** above.
 - **CRF re-send semantics:** locked in — once a CRF is made, its data rows
   are never rewritten; later `cohort-validate` events only refresh the
   header (merge).
+- **Mock coverage:** `scripts/mock_smile.py` pub/sub covers the 3 cmo +
+  2 cohort subjects, plus a `cohort-validate` mode that builds a synthetic cohort
+  request (locally validated against `schemas/cohort-request.schema.json`)
+  and publishes it — pair with `sub cohort-result` to watch the report
+  round-trip through the dev stack.
