@@ -607,7 +607,7 @@ $("#m-others").addEventListener("click", (e) => {
 
 function submitOverride(normalId) {
   const data = matchesState.data;
-  const strict = $("#m-strict").checked;
+  const allow = $("#m-allow-overrides").checked;
   const logic = $("#m-logic").value;
   if (isDmpLogic(logic)) {
     banner("error",
@@ -621,7 +621,7 @@ function submitOverride(normalId) {
     normal_id: normalId,
     trigger_type: "override",
     pairing_logic_name: logic,
-    strict: strict,
+    strict: !allow,
   };
   api("/pairing/trigger", { method: "POST", body: JSON.stringify(payload) })
     .then((p) => {
