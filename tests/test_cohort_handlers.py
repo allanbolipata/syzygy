@@ -1,4 +1,4 @@
-"""Scenario tests for the cohort submit/update NATS handlers (T8).
+"""Scenario tests for the cohort-validate NATS handler (T8).
 
 Covers the locked pipeline invariants end to end (handler -> schema
 validation (T3) -> classification (T5) -> CRF write (T4) -> outbox
@@ -11,7 +11,7 @@ staging (T6)):
    jsonSchemaValidated=false report, no crash;
 4. top-level piName -> stripped by T3 (legacy Cohort.__init__ semantics),
    so it is NOT a schema failure (pins the actual T3 API);
-5. update on an existing CRF -> header replaced, data rows preserved;
+5. re-send while the CRF exists -> header replaced, data rows preserved;
 6. CRF write failure (read-only dir) -> raises (500 via the router),
    no pass report, no outbox row (the already-committed pairing row
    survives — trigger_pairing commits internally; harmless for the
@@ -158,13 +158,13 @@ def _assert_outbox(db, cohort_id, expected_report):
 # ---------------------------------------------------------------------------
 
 
-def test_submit_fully_valid_writes_crf_stages_report_and_outbox(db, tmp_path, monkeypatch):
+def test_validate_fully_valid_writes_crf_stages_report_and_outbox(db, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "crf_output_dir", str(tmp_path / "crf"))
     _setup_logic(db)
     _tumor(db)
     _add_sample(db, "NORMAL-A", "C-10001-N001-d01")
 
-    result = nats_ingest.cohort_submit_handler(db, _payload())
+    result = nats_ingest.cohort_validate_handler(db, _payload())
 
     assert result["status"] == "ok"
     report = result["report"]
@@ -196,11 +196,11 @@ def test_submit_fully_valid_writes_crf_stages_report_and_outbox(db, tmp_path, mo
 # ---------------------------------------------------------------------------
 
 
-def test_submit_tumor_not_found_is_report_only_no_crf(db, tmp_path, monkeypatch):
+def test_validate_tumor_not_found_is_report_only_no_crf(db, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "crf_output_dir", str(tmp_path / "crf"))
     # No Sample row for the tumor: it lands in tumorNotFound.
 
-    result = nats_ingest.cohort_submit_handler(
+    result = nats_ingest.cohort_validate_handler(
         db,
         _payload(samples=[_entry(primaryId="99999_A", cmoId="C-99999-X001-d01")]),
     )
@@ -224,12 +224,12 @@ def test_submit_tumor_not_found_is_report_only_no_crf(db, tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-def test_submit_schema_invalid_top_level_key_is_schema_failure_report(db, tmp_path, monkeypatch):
+def test_validate_schema_invalid_top_level_key_is_schema_failure_report(db, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "crf_output_dir", str(tmp_path / "crf"))
     payload = _payload()
     payload["bogusKey"] = "x"  # rejected: top-level additionalProperties:false
 
-    result = nats_ingest.cohort_submit_handler(db, payload)
+    result = nats_ingest.cohort_validate_handler(db, payload)
 
     assert result["status"] == "ok"
     report = result["report"]
@@ -242,7 +242,7 @@ def test_submit_schema_invalid_top_level_key_is_schema_failure_report(db, tmp_pa
     _assert_outbox(db, "COH-1", report)
 
 
-def test_submit_pi_name_stripped_by_schema_layer_not_schema_failure(db, tmp_path, monkeypatch):
+def test_validate_pi_name_stripped_by_schema_layer_not_schema_failure(db, tmp_path, monkeypatch):
     """T3 strips top-level piName before request-schema validation (legacy
     Cohort.__init__ semantics — see tests/test_cohort_schema.py), so a
     piName payload must NOT produce a jsonSchemaValidated=false report; it
@@ -252,7 +252,7 @@ def test_submit_pi_name_stripped_by_schema_layer_not_schema_failure(db, tmp_path
     payload = _payload()
     payload["piName"] = "Dr. Investigator"
 
-    result = nats_ingest.cohort_submit_handler(db, payload)
+    result = nats_ingest.cohort_validate_handler(db, payload)
 
     assert result["status"] == "ok"
     report = result["report"]
@@ -266,24 +266,24 @@ def test_submit_pi_name_stripped_by_schema_layer_not_schema_failure(db, tmp_path
 
 
 # ---------------------------------------------------------------------------
-# 4. update on an existing CRF -> header replaced, data rows preserved
+# 4. re-send with an existing CRF -> header replaced, data rows preserved
 # ---------------------------------------------------------------------------
 
 
-def test_update_existing_crf_replaces_header_preserves_rows(db, tmp_path, monkeypatch):
+def test_validate_resend_existing_crf_replaces_header_preserves_rows(db, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "crf_output_dir", str(tmp_path / "crf"))
     _setup_logic(db)
     _tumor(db)
     _add_sample(db, "NORMAL-A", "C-10001-N001-d01")
 
-    # First a submit writes the full CRF...
-    submit = nats_ingest.cohort_submit_handler(db, _payload())
-    assert submit["report"]["passesCheck"] is True
+    # First send full-writes the CRF...
+    first = nats_ingest.cohort_validate_handler(db, _payload())
+    assert first["report"]["passesCheck"] is True
 
-    # ...then an update with a changed header.
-    update_payload = _payload()
-    update_payload["endUsers"] = ["newanalyst@example.org"]
-    result = nats_ingest.cohort_update_handler(db, update_payload)
+    # ...then a re-send with a changed header header-merges.
+    resend_payload = _payload()
+    resend_payload["endUsers"] = ["newanalyst@example.org"]
+    result = nats_ingest.cohort_validate_handler(db, resend_payload)
 
     assert result["status"] == "ok"
     assert result["report"]["passesCheck"] is True
@@ -295,21 +295,21 @@ def test_update_existing_crf_replaces_header_preserves_rows(db, tmp_path, monkey
     data_rows = [line for line in lines if not line.startswith("#")]
     assert data_rows == ["C-10001-X001-d01\tC-10001-N001-d01"]  # preserved verbatim
 
-    # Both reports staged (submit + update), newest is the update's.
+    # Both reports staged (first send + re-send), newest is the re-send's.
     rows = _outbox_rows(db)
     assert len(rows) == 2
     assert json.loads(rows[-1].report_json) == result["report"]
 
 
-def test_update_missing_crf_falls_back_to_full_write(db, tmp_path, monkeypatch):
-    """An update for a cohort with no existing CRF writes the full CRF
-    (idempotent overwrite — the manual re-send recovery path)."""
+def test_validate_missing_crf_full_writes(db, tmp_path, monkeypatch):
+    """A cohort-validate for a cohort with no existing CRF full-writes the
+    CRF (idempotent overwrite — the manual re-send recovery path)."""
     monkeypatch.setattr(settings, "crf_output_dir", str(tmp_path / "crf"))
     _setup_logic(db)
     _tumor(db)
     _add_sample(db, "NORMAL-A", "C-10001-N001-d01")
 
-    result = nats_ingest.cohort_update_handler(db, _payload())
+    result = nats_ingest.cohort_validate_handler(db, _payload())
 
     assert result["status"] == "ok"
     assert result["report"]["passesCheck"] is True
@@ -323,7 +323,7 @@ def test_update_missing_crf_falls_back_to_full_write(db, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_submit_crf_write_failure_raises_no_pass_report_no_outbox(db, tmp_path, monkeypatch):
+def test_validate_crf_write_failure_raises_no_pass_report_no_outbox(db, tmp_path, monkeypatch):
     ro_dir = tmp_path / "crf"
     ro_dir.mkdir()
     os.chmod(ro_dir, 0o555)  # read-only: mkstemp inside it must fail
@@ -334,7 +334,7 @@ def test_submit_crf_write_failure_raises_no_pass_report_no_outbox(db, tmp_path, 
 
     try:
         with pytest.raises(OSError):
-            nats_ingest.cohort_submit_handler(db, _payload())
+            nats_ingest.cohort_validate_handler(db, _payload())
     finally:
         os.chmod(ro_dir, 0o755)  # allow tmp cleanup
 
@@ -352,26 +352,23 @@ def test_submit_crf_write_failure_raises_no_pass_report_no_outbox(db, tmp_path, 
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_routes_cohort_subjects(db, tmp_path, monkeypatch):
+def test_dispatch_routes_cohort_subject(db, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "crf_output_dir", str(tmp_path / "crf"))
     _setup_logic(db)
     _tumor(db)
     _add_sample(db, "NORMAL-A", "C-10001-N001-d01")
 
-    for subject, handler in (
-        (settings.nats_cohort_submit_subject, nats_ingest.cohort_submit_handler),
-        (settings.nats_cohort_update_subject, nats_ingest.cohort_update_handler),
-    ):
-        result = nats_ingest.dispatch(db, subject, _payload())
-        assert result["status"] == "ok"
-        assert result["report"]["cohortId"] == "COH-1"
-        assert result["report"]["passesCheck"] is True
+    result = nats_ingest.dispatch(
+        db, settings.nats_cohort_validate_subject, _payload()
+    )
+    assert result["status"] == "ok"
+    assert result["report"]["cohortId"] == "COH-1"
+    assert result["report"]["passesCheck"] is True
 
 
-def test_cohort_handlers_reject_non_object_payloads(db):
+def test_cohort_validate_handler_rejects_non_object_payload(db):
     bad_payload: Any = ["not", "an", "object"]
-    for handler in (nats_ingest.cohort_submit_handler, nats_ingest.cohort_update_handler):
-        result = handler(db, bad_payload)
-        assert result["status"] == "error"
-        assert "JSON object" in result["detail"]
-        assert "report" not in result
+    result = nats_ingest.cohort_validate_handler(db, bad_payload)
+    assert result["status"] == "error"
+    assert "JSON object" in result["detail"]
+    assert "report" not in result

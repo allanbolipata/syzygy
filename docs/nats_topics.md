@@ -88,11 +88,11 @@ its own redelivery position (shadow mode).
 `listener/init_nats_stream.py` must create/update `MDB_STREAM` with **all 6
 subjects** above.
 
-> **TODO (merge):** the `feature/cohort-tempo` copy of
-> `init_nats_stream.py` currently bootstraps only 3 cmo + 2 tempo subjects
-> (it was written before the update-topic merge and lost
-> `MDB_STREAM.server.dmp-gateway.dmp-sample`, which is present on `dev`).
-> Re-add the DMP subject before/when merging.
+> Resolved on `feature/cohort-tempo` (dev merge + topic collapse):
+> `init_nats_stream.py` bootstraps all 6 subjects — 3 cmo +
+> `dmp-sample` + `cohort-validate` + `cohort-result`. A stream that
+> predates a subject is updated in place (the bootstrap adds missing
+> subjects instead of recreating the stream).
 
 ## Open items
 
@@ -101,9 +101,7 @@ subjects** above.
    reflect the real source.
 2. **`cohort-result` subject name:** confirm at the meeting; currently a
    placeholder (see single rename point above).
-3. **Stream bootstrap:** merge the subject lists (see TODO above) so the dev
-   bootstrap ends up with all 6 subjects.
-4. **Mock coverage:** `scripts/mock_smile.py` knows only the 3 cmo events;
+3. **Mock coverage:** `scripts/mock_smile.py` knows only the 3 cmo events;
    the cohort e2e (`tests/test_cohort_e2e.py`) publishes directly via
    nats-py. Add `cohort-validate` (and a result-sub mode) to the mock if
    ad-hoc local poking of cohort events is wanted.

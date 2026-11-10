@@ -9,9 +9,9 @@ new-request, sample-update and dmp-sample (the dmp-sample object is the
 DB-format DMP record — docs/dmp_reference_alignment.md, section f), and a
 JSON array for request-update (matching
 beagle's smile_callback, which branches on isinstance(data, list)).
-The tempo cohort subjects (new-cohort-submit, cohort-update) also carry
-JSON objects; their handlers return the validation report under a
-``"report"`` key, which the router passes through to the listener.
+The tempo cohort subject (cohort-validate) also carries a JSON object;
+its handler returns the validation report under a ``"report"`` key,
+which the router passes through to the listener.
 
 Known limitation (re-pairing on update): the cmo-sample-update path
 re-runs the same cascade as ingestion — TUMOR samples go through
@@ -715,11 +715,10 @@ def _stage_cohort_report(
 def _cohort_pipeline(
     db_session: Session,
     payload: Dict[str, Any],
-    op: str,
     existing_content: Optional[str],
 ) -> Dict[str, Any]:
     """Shared validate -> classify -> (write CRF) -> stage-report flow for
-    cohort-submit and cohort-update.
+    the cohort-validate handler.
 
     Locked invariants (all-or-nothing):
     * passesCheck = jsonSchemaValidated AND all samples valid;
@@ -734,10 +733,10 @@ def _cohort_pipeline(
     """
     cohort_id = payload.get("cohortId")
     if not isinstance(cohort_id, str) or not cohort_id:
-        logger.warning("nats cohort-%s: payload has no usable cohortId", op)
+        logger.warning("nats cohort-validate: payload has no usable cohortId")
         return {
             "status": "error",
-            "detail": f"cohort-{op} payload has no usable cohortId",
+            "detail": "cohort-validate payload has no usable cohortId",
         }
 
     # 1. Request schema validation (T3). On failure: a schema-failure
@@ -747,8 +746,8 @@ def _cohort_pipeline(
         cohort = validate_cohort_request(payload)
     except jsonschema.ValidationError as exc:
         logger.warning(
-            "nats cohort-%s %s: request failed schema validation: %s",
-            op, cohort_id, exc.message,
+            "nats cohort-validate %s: request failed schema validation: %s",
+            cohort_id, exc.message,
         )
         report = {
             "cohortId": cohort_id,
@@ -772,7 +771,7 @@ def _cohort_pipeline(
         }
         _stage_cohort_report(db_session, cohort_id, report)
         detail = f"cohort {cohort_id}: {len(findings)} problem sample(s); report staged for publish"
-        logger.info("nats cohort-%s: %s", op, detail)
+        logger.info("nats cohort-validate: %s", detail)
         return {"status": "ok", "detail": detail, "report": report}
 
     # 3. Pass: write the CRF FIRST (atomic), rows from classification's
@@ -789,7 +788,7 @@ def _cohort_pipeline(
         # then wins classification. Rollback guards any other uncommitted
         # session state.
         db_session.rollback()
-        logger.exception("nats cohort-%s %s: CRF write failed", op, cohort_id)
+        logger.exception("nats cohort-validate %s: CRF write failed", cohort_id)
         raise
 
     report = {
@@ -804,41 +803,33 @@ def _cohort_pipeline(
         f"cohort {cohort_id}: all samples valid; CRF written to {crf_path}; "
         "report staged for publish"
     )
-    logger.info("nats cohort-%s: %s", op, detail)
+    logger.info("nats cohort-validate: %s", detail)
     return {"status": "ok", "detail": detail, "report": report}
 
 
-def cohort_submit_handler(
+def cohort_validate_handler(
     db_session: Session, payload: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Ingest a tempo new-cohort-submit message (JSON only — no protobuf,
+    """Ingest a tempo cohort-validate message (JSON only — no protobuf,
     no PLACEHOLDER path).
 
-    Validates the request against the vendored request schema, classifies
+    New cohort or update — one topic for both (docs/nats_topics.md):
+    validates the request against the vendored request schema, classifies
     every tumor against live Syzygy data, and — only when every sample is
     valid — writes the cohort's CRF atomically before staging the
     validation report for publishing on the cohort-result subject.
-    """
-    if not isinstance(payload, dict):
-        logger.warning("nats cohort-submit: payload is not a JSON object")
-        return {"status": "error", "detail": "cohort-submit payload must be a JSON object"}
-    return _cohort_pipeline(db_session, payload, "submit", None)
 
-
-def cohort_update_handler(
-    db_session: Session, payload: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Ingest a tempo cohort-update message (JSON only).
-
-    Same flow as cohort-submit, but the CRF write is a header-only merge
-    when the cohort's CRF already exists: the existing file's content is
+    The CRF is locked in once made: when the cohort's CRF already exists
+    the write is a header-only merge — the existing file's content is
     passed to write_crf, which replaces the ``#`` header lines and
-    preserves the data rows verbatim. A missing file falls back to a full
-    write (idempotent overwrite — the re-send recovery path).
+    preserves the data rows verbatim (already-validated rows are never
+    rewritten, even if the new payload's classification would differ; an
+    existing CRF is by construction fully validated). A missing file gets
+    a full write (idempotent overwrite — the re-send recovery path).
     """
     if not isinstance(payload, dict):
-        logger.warning("nats cohort-update: payload is not a JSON object")
-        return {"status": "error", "detail": "cohort-update payload must be a JSON object"}
+        logger.warning("nats cohort-validate: payload is not a JSON object")
+        return {"status": "error", "detail": "cohort-validate payload must be a JSON object"}
     existing: Optional[str] = None
     cohort_id = payload.get("cohortId")
     if isinstance(cohort_id, str) and cohort_id:
@@ -846,7 +837,7 @@ def cohort_update_handler(
         if os.path.isfile(crf_path):
             with open(crf_path, "r", encoding="utf-8") as f:
                 existing = f.read()
-    return _cohort_pipeline(db_session, payload, "update", existing)
+    return _cohort_pipeline(db_session, payload, existing)
 # File group holding the DMP data structure — same value the beagle dump
 # import assigns (scripts/import_beagle_dump.py, DMP_FILEGROUP), so rows
 # ingested via NATS and via the dump are indistinguishable in that column.
@@ -974,8 +965,7 @@ def dispatch(
         settings.nats_new_request_subject: handle_new_request,
         settings.nats_request_update_subject: handle_request_update,
         settings.nats_sample_update_subject: handle_sample_update,
-        settings.nats_cohort_submit_subject: cohort_submit_handler,
-        settings.nats_cohort_update_subject: cohort_update_handler,
+        settings.nats_cohort_validate_subject: cohort_validate_handler,
         settings.nats_dmp_sample_subject: handle_dmp_sample,
     }
     handler = handlers.get(subject)

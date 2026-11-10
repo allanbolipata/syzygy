@@ -1,11 +1,12 @@
 """Live end-to-end test for the cohort chain over the dev stack (T9).
 
 Publishes a valid, pairable fixture cohort to the live dev NATS server
-(``docker-compose.dev.yml`` stack) on ``MDB_STREAM.consumers.tempo.
-new-cohort-submit`` and follows the full production path:
+(``docker-compose.dev.yml`` stack) on
+``MDB_STREAM.consumers.tempo.cohort-validate`` and follows the full
+production path:
 
     dev NATS -> smile-listener (tempo durable) -> app /v1/ingest/nats
-    (cohort_submit_handler: validate T3 -> classify T5 -> CRF write T4)
+    (cohort_validate_handler: validate T3 -> classify T5 -> CRF write T4)
     -> report fast-path publish back to the cohort-result subject
     -> CRF file under the host bind mount ``crf_output_dev/``.
 
@@ -54,7 +55,7 @@ DEV_DB_URL = os.environ.get(
     "postgresql+psycopg2://app:app@127.0.0.1:%d/app" % DEV_DB_PORT,
 )
 
-SUBMIT_SUBJECT = "MDB_STREAM.consumers.tempo.new-cohort-submit"
+VALIDATE_SUBJECT = "MDB_STREAM.consumers.tempo.cohort-validate"
 RESULT_SUBJECT = os.environ.get(
     "NATS_RESULT_SUBJECT", "MDB_STREAM.consumers.tempo.cohort-result"
 )
@@ -282,7 +283,7 @@ def _publish_and_wait(fixture: dict) -> dict:
             # Subscribe BEFORE publishing: the JetStream stream retains
             # the result even if the fast path wins the race.
             sub = await js.pull_subscribe(RESULT_SUBJECT, stream="MDB_STREAM")
-            ack = await js.publish(SUBMIT_SUBJECT, json.dumps(payload).encode("utf-8"))
+            ack = await js.publish(VALIDATE_SUBJECT, json.dumps(payload).encode("utf-8"))
             assert ack.stream == "MDB_STREAM", f"published to {ack.stream!r}"
             deadline = time.monotonic() + RESULT_TIMEOUT_S
             while True:
@@ -325,7 +326,7 @@ def _publish_and_wait(fixture: dict) -> dict:
     reason="dev stack (docker-compose.dev.yml) not up: "
     "no NATS/MDB_STREAM at 127.0.0.1:4222 or no dev Postgres at 127.0.0.1:5435",
 )
-def test_cohort_submit_live_e2e():
+def test_cohort_validate_live_e2e():
     """Full production path over live dev NATS: publish a valid, pairable
     fixture cohort, get the pass report on the result subject, and find
     the CRF under the host bind mount."""
