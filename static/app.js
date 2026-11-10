@@ -2029,119 +2029,6 @@ function downloadHarmonyCsv() {
   a.remove();
 }
 
-/* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
- * with its DMP normal (same patient__dmp and gene panel). Invoked from the
- * overview header's Run pairing button when the selected logic is a DMP
- * logic; manual pairing of DMP samples happens under the other logics
- * (e.g. ARGOS). */
-async function runDmpPairing() {
-  const btn = $("#pr-run");
-  btn.disabled = true;
-  $("#pr-run-status").textContent = "Pairing…";
-  try {
-    const r = await api("/pairing/trigger-dmp", { method: "POST" });
-    $("#pr-run-status").textContent =
-      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
-      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
-    banner("ok", `DMP pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
-      `${r.missing_patient__dmp} missing patient__dmp`, true);
-    dmpStatsCache = {}; // the pair frame just changed
-    await loadPairs();
-  } catch (e) {
-    banner("error", `DMP pairing failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/* HARMONY pairing run: POST /pairing/trigger-harmony (ticket 2/4) — the
- * HARMONY pairing space's own trigger, mirroring runDmpPairing() but
- * resolving the HARMONY logic row (the DMP pairing space is never
- * touched). The generic trigger-all endpoint refuses DMP-strategy logics
- * with a 400, so HARMONY must use its own trigger. */
-async function runHarmonyPairing() {
-  const btn = $("#pr-run");
-  btn.disabled = true;
-  $("#pr-run-status").textContent = "Pairing…";
-  try {
-    const r = await api("/pairing/trigger-harmony", { method: "POST" });
-    $("#pr-run-status").textContent =
-      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
-      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
-    banner("ok", `HARMONY pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
-      `${r.missing_patient__dmp} missing patient__dmp`, true);
-    dmpStatsCache = {}; // the pair frame just changed
-    await loadPairs();
-  } catch (e) {
-    banner("error", `HARMONY pairing failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/* Overview-header Run pairing button for the selected logic: DMP goes to
- * the DMP trigger, HARMONY to its own trigger (see runHarmonyPairing), and
- * any other logic to the per-logic backfill (POST
- * /pairing/trigger-all?pairing_logic_name=, confirm first — it records
- * pairings). Result lands in #pr-run-status. */
-async function runPrPairing() {
-  const logic = activeLogicName();
-  if (!logic) return;
-  if (isDmpLogic(logic)) {
-    await runDmpPairing();
-    return;
-  }
-  if (isHarmonyLogic(logic)) {
-    await runHarmonyPairing();
-    return;
-  }
-  const msg =
-    `Run pairing for ${logic}?\n\n` +
-    "This records a new pairing for every unpaired tumor under this logic. " +
-    "Existing pairings are kept.";
-  if (!confirm(msg)) return;
-  const btn = $("#pr-run");
-  btn.disabled = true;
-  $("#pr-run-status").textContent = "Pairing…";
-  try {
-    const r = await api(`/pairing/trigger-all?pairing_logic_name=${encodeURIComponent(logic)}`);
-    $("#pr-run-status").textContent =
-      `scanned ${r.scanned} · paired ${r.paired} · ` +
-      `unpaired ${r.unpaired} · already ${r.already_paired}`;
-    banner("ok", `Pairing complete for ${logic}: ${r.paired} paired, ${r.unpaired} unpaired`, true);
-    dmpStatsCache = {}; // the pair frame just changed
-    await loadPairs();
-  } catch (e) {
-    banner("error", `Run pairing failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/* GET /pairing/evaluate/?pairing_logic_name= — read-only dry-run over the
- * selected logic's backfill scope; renders "N of M would pair" plus the
- * outcome breakdown in #pr-evaluate-result. Never records pairings. */
-async function evaluatePrPairing() {
-  const logic = activeLogicName();
-  if (!logic) return;
-  const btn = $("#pr-evaluate");
-  const out = $("#pr-evaluate-result");
-  btn.disabled = true;
-  out.textContent = "Evaluating…";
-  try {
-    const r = await api(`/pairing/evaluate/?pairing_logic_name=${encodeURIComponent(logic)}`);
-    let html = `${r.would_pair} of ${r.scope_total} would pair · ${r.already_paired} already paired · ${r.would_stay_unpaired} would stay unpaired`;
-    if (r.missing_patient__dmp > 0) {
-      html += ` · ${r.missing_patient__dmp} missing patient__dmp`;
-    }
-    out.innerHTML = html;
-  } catch (e) {
-    banner("error", `Evaluate failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 /* Overview-header blurb for the selected logic: the strategy's explainer
  * from TRY_EXPLAINERS (same copy as the Try tab), with a short default
  * line naming the logic when the strategy has no entry. */
@@ -2201,16 +2088,12 @@ $("#pr-logic").addEventListener("change", () => {
   // pairsState.logic, which loadPairs() sets when it runs — the blurb
   // would otherwise keep the previous logic's text.
   pairsState.logic = $("#pr-logic").value;
-  $("#pr-run-status").textContent = "";
-  $("#pr-evaluate-result").textContent = "";
   // A stale filter would otherwise carry into the new logic's rows.
   resetPrSearch();
   renderPrLogicExplainer();
   applyHarmonyViewMode();
   loadPairs();
 });
-$("#pr-run").addEventListener("click", runPrPairing);
-$("#pr-evaluate").addEventListener("click", evaluatePrPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
   if (pairsState.page > 0) loadReportPage(pairsState.page - 1);

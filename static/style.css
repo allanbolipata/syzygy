@@ -91,9 +91,9 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
 }
 
 /* Pair Report: pairing-logic overview header — the primary control
- * (logic selector), its explainer blurb, the paired/unpaired strip and
- * the Run pairing / Evaluate actions. Sits above the column panel and
- * the report table. */
+ * (logic selector), its explainer blurb and the paired/unpaired strip.
+ * Pairing triggers are API-only (no buttons here). Sits above the column
+ * panel and the report table. */
 .pr-overview {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -129,11 +129,6 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   color: var(--muted);
 }
 .pr-stat strong { color: var(--ink); font-size: 1.05rem; margin-left: 0.25rem; }
-.pr-overview-actions {
-  margin-left: auto;
-  display: flex;
-  gap: 0.5rem;
-}
 .pr-explain { margin: 0.55rem 0 0; font-size: 0.85rem; color: var(--muted); }
 .pr-explain p { margin: 0.15rem 0; }
 /* Pair Report pager: compact page-number input beside prev/next —
