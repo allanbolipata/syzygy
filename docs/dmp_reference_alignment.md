@@ -5,7 +5,7 @@ Tickets 2–7 implement against this document. **Where this doc and the referenc
 scripts disagree, the scripts win.** Stakeholder rule: when in doubt, follow
 `bam-mirror-tools`.
 
-Reference implementation (authoritative): `/Users/bolipatc/dev/bam-mirror-tools`
+Reference implementation (authoritative): the internal `bam-mirror-tools` repo (not published with this project)
 
 - `scripts/generate_dmp_tumor_normal_key.pl` — raw DMP key file → 12-column TSV
 - `scripts/pair_tumor_with_normal.R` — two-tier pairing → 15-column pair file, summary counts, 5 QC warnings
@@ -322,7 +322,7 @@ for one stored DMP `Sample` row.
 | 11 | `pool_id` | `additional_metadata.pool_id`, else `additional_metadata.project_name` | Explicit `pool_id` wins if ever present (absent in the known format); `project_name` is the stakeholder-confirmed rename. |
 | 12 | `is_matched` | `additional_metadata.matched_tag` if ever present | **Gap** (audited absent — a DMP-program flag, not lab metadata). An explicit `matched_tag` passes through (the reference's raw value); otherwise `None`, and 3/8 derives match status from the pairing result — a tumor is *matched* iff the strategy output gives it at least one normal after both tiers. 4/8 renders that status. |
 
-### Caveats (2/8 fixture audit, `/Users/bolipatc/dev/beagle/file_system/fixtures/DMP_data.json`)
+### Caveats (2/8 fixture audit, beagle repo `file_system/fixtures/DMP_data.json`)
 
 1. **`patient` divergence.** For 3 of the 4 distinct DMP samples in the
    fixture, the stored `patient__dmp` differs from the sample-name prefix
@@ -371,7 +371,7 @@ are reference-faithful). The stakeholder-review flag on real
 
 ## Field audit
 
-Fixture examined: `/Users/bolipatc/dev/beagle/file_system/fixtures/DMP_data.json`
+Fixture examined: beagle repo `file_system/fixtures/DMP_data.json`
 (Django fixture; 8 `file_system.filemetadata` records, each `fields.metadata`
 with keys: `type, assay, sample, anon_id, patient{cmo,dmp}, updated,
 version, coverage, imported, cmo_assay, tumor_type, external_id,
@@ -429,7 +429,7 @@ the fixture) and `file_name`. Sources checked: `dmp_translator.py`,
 
 **Gate run (2026-11-06, commit 8183509, `feature/pairing-adjustments`, local,
 working tree clean):**
-`/Users/bolipatc/.pyenv/versions/syzygy/bin/python -m pytest tests/ -q` →
+`python -m pytest tests/ -q` (repo venv) →
 **458 passed / 2 skipped / 0 failed** (4m12s). Baseline at ticket start was
 416 passed / 2 skipped; the delta is exactly the 42 new conformance tests
 (28 endpoint + 14 R cross-checks). The 2 skips are the NATS e2e tests
