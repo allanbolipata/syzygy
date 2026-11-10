@@ -8,6 +8,7 @@ strategy, which is reserved for the automatic trigger.
 """
 import json
 import math
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from itertools import islice
@@ -15,16 +16,30 @@ from typing import Optional
 from uuid import UUID
 import csv
 import io
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy import and_, create_engine, exists, func, or_, select, text
+from sqlalchemy import (
+    and_,
+    case,
+    cast,
+    create_engine,
+    exists,
+    func,
+    or_,
+    select,
+    String,
+    text,
+    union_all,
+)
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from dmp_translator import remap_dmp_record
 from database import SessionLocal, get_db, settings
 from models import PairingLogic, PairingTable, Sample
 from pairing_service import (
+    DMP_LOGIC_NAME,
     HARMONY_LOGIC_NAME,
     _is_dmp_strategy,
     count_unpaired,
@@ -38,10 +53,12 @@ from pairing_service import (
 )
 from pairing_strategies import get_pairing_strategy, strategies
 from schemas import (
+    DmpReportStatsRead,
     DmpSummaryRead,
     DmpTriggerRead,
     DmpWarningsRead,
     EvaluateRead,
+    HarmonyFrameRead,
     HarmonyRow,
     HarmonyTriggerRead,
     PairingRead,
@@ -434,6 +451,15 @@ def pairing_report(
             "filtered set."
         ),
     ),
+    include_stats: bool = Query(
+        True,
+        description=(
+            "DMP logics only: when false, summary and warnings are null "
+            "and the full pair-frame walk is skipped entirely — rows and "
+            "total are unchanged. The same data is served by GET "
+            "/pairing/report-stats/. Default true keeps the 5/8 contract."
+        ),
+    ),
 ):
     """One page of the merged Pair Report list for the logic.
 
@@ -456,6 +482,13 @@ def pairing_report(
     the FULL pair frame — independent of the requested page and of ``q``
     (the reference computes them over the whole pair file). Both are null
     for non-DMP logics.
+
+    Walking that frame (~450k rows with per-batch beagle lookups) on every
+    page request was the report's real cost, so it is cached (see the stats
+    cache below) and skippable: ``include_stats=false`` returns the same
+    rows/total with null stats, and ``GET /pairing/report-stats/`` serves
+    the stats on their own. The UI pages with ``include_stats=false`` and
+    fetches the stats separately.
 
     ``page`` is 1-based; ``page_size`` defaults to 50 and is clamped to
     ``[1, 200]``. Ordering is stable and deterministic: paired rows are
@@ -516,12 +549,34 @@ def pairing_report(
     # q search (which filters rows only).
     summary = None
     warnings = None
-    if _is_dmp_strategy(logic):
-        summary, warnings = _dmp_report_stats(db, logic)
+    if _is_dmp_strategy(logic) and include_stats:
+        summary, warnings = _dmp_report_stats_cached(db, logic)
 
     return PairingReportRead(
         rows=rows, total=total, summary=summary, warnings=warnings
     )
+
+
+@router.get("/report-stats/", response_model=DmpReportStatsRead)
+def pairing_report_stats(
+    pairing_logic_name: str,
+    db: Session = Depends(get_db),
+):
+    """The DMP summary counts + 5 QC warning buckets on their own (5/8).
+
+    The same payload ``GET /pairing/report/`` carries for DMP logics, served
+    separately so paging the report never re-walks the full pair frame.
+    Cached per logic until the frame's watermark moves or the entry ages out
+    (see the stats cache below). ``summary``/``warnings`` are null for
+    non-DMP logics, matching the report's contract.
+    """
+    logic = find_logic_by_name(db, pairing_logic_name)
+    if logic is None:
+        raise HTTPException(status_code=404, detail="Pairing logic not found")
+    if not _is_dmp_strategy(logic):
+        return DmpReportStatsRead(summary=None, warnings=None)
+    summary, warnings = _dmp_report_stats_cached(db, logic)
+    return DmpReportStatsRead(summary=summary, warnings=warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1113,126 @@ def _iter_dmp_pair_cells(db: Session, logic: PairingLogic):
                 yield _dmp_pair_cells(row, bam_map)
 
 
+# ---------------------------------------------------------------------------
+# Caching for the full-frame DMP stats
+#
+# _dmp_report_stats walks the logic's whole pair frame (~450k rows, with
+# per-batch beagle bam_exists lookups) no matter which page was requested,
+# so running it on every page request dominated the Pair Report's load time
+# (~17s/page, ~8MB/page of warning ids). Entries are cached per logic on the
+# engine they were computed against and reused while a cheap watermark
+# (this logic's latest pairing rows and the sample table, each as a row
+# count + max modified_date) is unchanged. The watermark cannot see the
+# beagle file records behind bam_exists, so entries also expire after
+# DMP_STATS_TTL_SECONDS; the pairing triggers clear the cache outright.
+# Keying the cache on the engine keeps per-test engines (each with its own
+# monkeypatched beagle fixtures) from sharing results.
+# ---------------------------------------------------------------------------
+
+#: How long a watermark-matching DMP stats entry may be reused.
+DMP_STATS_TTL_SECONDS = 300
+
+
+def _dmp_stats_cache(db: Session):
+    """The per-engine DMP stats cache, created on first use."""
+    engine = db.get_bind()
+    cache = getattr(engine, "_dmp_report_stats_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            engine._dmp_report_stats_cache = cache
+        except Exception:
+            return None
+    return cache
+
+
+def _dmp_stats_watermark(db: Session, logic: PairingLogic):
+    """Cheap freshness token for the DMP pair frame: this logic's latest
+    pairing rows and the sample table, each as (row count, max
+    modified_date). Any pairing or sample edit moves it."""
+    pairing = db.query(
+        func.count(PairingTable.id),
+        func.max(PairingTable.modified_date),
+    ).filter(
+        PairingTable.pairing_logic_id == logic.id,
+        PairingTable.latest.is_(True),
+    ).one()
+    sample = db.query(
+        func.count(Sample.id),
+        func.max(Sample.modified_date),
+    ).one()
+    return (pairing[0], pairing[1], sample[0], sample[1])
+
+
+def _invalidate_dmp_report_stats(db: Session) -> None:
+    """Drop every cached DMP stats entry (a pairing run just changed the frame)."""
+    cache = _dmp_stats_cache(db)
+    if cache:
+        cache.clear()
+
+
+#: Bulk pairing passes run for minutes and hold a pooled DB connection for their
+#: whole Python loop. Two passes for the same logic — the re-click after a
+#: request the browser already gave up on, a second tab, trigger-all racing a
+#: per-logic trigger — double the pairing work AND the connection pressure, and
+#: that combination is what exhausted the connection pool. This registry is the
+#: guard: it never touches the DB (a Postgres advisory lock would have to ride a
+#: Session connection that commit() returns to the pool mid-pass), it is
+#: per-process (uvicorn runs a single worker here), and a restart clears it.
+_active_pairing_passes: set = set()
+_active_pairing_passes_lock = threading.Lock()
+
+
+@contextmanager
+def _pairing_pass(db: Session, logic: Optional[PairingLogic], label: str):
+    """Claim one bulk pairing pass.
+
+    ``409`` when a pass for this logic is already running: the first pass keeps
+    running even after the browser gives up, so a second click only adds work
+    and another pooled connection. ``logic=None`` (the unscoped bulk backfill,
+    or a trigger naming a logic row that does not exist) claims a shared key so
+    two bulk backfills cannot stack either. The claim is released on the way out
+    even if the pass raises.
+    """
+    key = logic.id if logic is not None else None
+    with _active_pairing_passes_lock:
+        if key in _active_pairing_passes:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A {label} pairing run is already in progress on this "
+                    "server. It keeps running even if this tab gives up — wait "
+                    "for it instead of triggering again."
+                ),
+            )
+        _active_pairing_passes.add(key)
+    try:
+        yield
+    finally:
+        with _active_pairing_passes_lock:
+            _active_pairing_passes.discard(key)
+
+
+def _dmp_report_stats_cached(db: Session, logic: PairingLogic):
+    """_dmp_report_stats, reused across requests while the frame looks the
+    same (watermark + TTL; see the cache notes above)."""
+    cache = _dmp_stats_cache(db)
+    if cache is None:
+        return _dmp_report_stats(db, logic)
+    key = str(logic.id)
+    watermark = _dmp_stats_watermark(db, logic)
+    hit = cache.get(key)
+    if (
+        hit is not None
+        and hit[0] == watermark
+        and (datetime.now(timezone.utc) - hit[1]).total_seconds() < DMP_STATS_TTL_SECONDS
+    ):
+        return hit[2], hit[3]
+    summary, warnings = _dmp_report_stats(db, logic)
+    cache[key] = (watermark, datetime.now(timezone.utc), summary, warnings)
+    return summary, warnings
+
+
 def _dmp_report_stats(db: Session, logic: PairingLogic):
     """The reference's 3 summary counts and 5 QC warnings (spec d/e) for
     the logic's full DMP pair frame, in the exact row sets and conditions
@@ -1295,6 +1470,7 @@ def trigger_pairing_endpoint(
             if selection.notes:
                 detail += ": " + " | ".join(selection.notes)
         raise HTTPException(status_code=404, detail=detail)
+    _invalidate_dmp_report_stats(db)
     return pairing
 
 
@@ -1317,7 +1493,11 @@ def trigger_all_pairings_endpoint(
     all-logics behavior is unchanged. DMP still runs via ``POST
     /trigger-dmp``.
     """
-    return trigger_pairing_for_unpaired_tumors(db, logic_name=pairing_logic_name)
+    scope = find_logic_by_name(db, pairing_logic_name) if pairing_logic_name else None
+    with _pairing_pass(db, scope, "bulk pairing"):
+        result = trigger_pairing_for_unpaired_tumors(db, logic_name=pairing_logic_name)
+        _invalidate_dmp_report_stats(db)
+        return result
 
 
 @router.post("/trigger-dmp", response_model=DmpTriggerRead)
@@ -1330,7 +1510,10 @@ def trigger_dmp_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
     ``patient__dmp`` value cannot be matched and are reported in
     ``missing_patient__dmp``.
     """
-    return trigger_dmp_pairing(db)
+    with _pairing_pass(db, find_logic_by_name(db, DMP_LOGIC_NAME), "DMP"):
+        result = trigger_dmp_pairing(db)
+        _invalidate_dmp_report_stats(db)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1355,40 +1538,6 @@ HARMONY_COLUMNS = (
 HARMONY_BAM_PATH_PLACEHOLDER = "\u2014"
 
 
-def _harmony_present_value(tumor: Optional[Sample], normal: Optional[Sample], field: str):
-    """A field value from the present side, tumor preferred.
-
-    On a paired row both sides are present, so the tumor's value wins; on a
-    one-sided (unmatched) row the only present side supplies it. Falls
-    through to the other side when the preferred side's value is null.
-    """
-    for side in (tumor, normal):
-        if side is not None:
-            value = getattr(side, field)
-            if value is not None:
-                return value
-    return None
-
-
-def _harmony_row(tumor: Optional[Sample], normal: Optional[Sample]) -> dict:
-    """Build one 8-column HARMONY row from a (possibly one-sided) pair.
-
-    ``normal_sample``/``tumor_sample`` <- ``primary_id``; ``normal_bamname``/
-    ``tumor_bamname`` <- ``anon_id``; the ``*_bam_path`` columns are the em-dash
-    placeholder for any present side and null for an absent side; ``patient``
-    and ``consent`` come from the present side (tumor preferred).
-    """
-    return {
-        "normal_sample": normal.primary_id if normal is not None else None,
-        "tumor_sample": tumor.primary_id if tumor is not None else None,
-        "normal_bamname": normal.anon_id if normal is not None else None,
-        "normal_bam_path": HARMONY_BAM_PATH_PLACEHOLDER if normal is not None else None,
-        "tumor_bamname": tumor.anon_id if tumor is not None else None,
-        "tumor_bam_path": HARMONY_BAM_PATH_PLACEHOLDER if tumor is not None else None,
-        "patient": _harmony_present_value(tumor, normal, "patient__dmp"),
-        "consent": _harmony_present_value(tumor, normal, "consent"),
-    }
-
 
 def _harmony_csv_field(value) -> str:
     """Render one cell for the CSV export (nulls -> empty string)."""
@@ -1402,30 +1551,84 @@ def _harmony_csv_consent(consent) -> str:
     return "true" if consent is True else "false"
 
 
-def _harmony_rows(db: Session, logic: PairingLogic) -> list[dict]:
-    """All HARMONY rows: latest HARMONY pairings plus unmatched DMP samples.
+# Frame search semantics — the server-side replacement of the old
+# client-side harmonyMatchesQuery. The query is a case-insensitive literal
+# substring (the SAME _search_pattern as the Pair Report search) matched
+# against the frame's searchable columns on either side. Two deliberate
+# departures from what the client filter used to do: the *_bam_path columns
+# are the constant em-dash placeholder, so matching them matched every row
+# with any present side, and consent as a substring matched "true"/"false"
+# for almost every row — both made short searches match everything. Consent
+# therefore matches only when the whole query is exactly true/false.
+HARMONY_SEARCH_FIELDS = ("primary_id", "anon_id", "patient__dmp")
 
-    Paired rows: every latest ``pairing_table`` row under the HARMONY logic
-    (tumor + normal embedded). Unmatched rows: DMP samples in the HARMONY
-    scope (``sample_type == "DMP"``) with no latest HARMONY pairing — each
-    becomes a one-sided row with the opposite side's columns null, mirroring
-    the DMP unmatched-visibility convention. Ordered by normal ``primary_id``
-    then tumor ``primary_id`` (absent sides sort first).
+
+def _harmony_side_conds(side, q: str) -> list:
+    """The search conditions for one sample side (an entity or an alias)."""
+    pattern = _search_pattern(q)
+    conds = [getattr(side, f).ilike(pattern, escape="\\") for f in HARMONY_SEARCH_FIELDS]
+    if q == "true":
+        conds.append(side.consent.is_(True))
+    elif q == "false":
+        conds.append(side.consent.is_(False))
+    return conds
+
+
+def _harmony_paired_select(logic: PairingLogic, q: Optional[str]):
+    """SELECT of the frame's paired section: the logic's latest pairings.
+
+    The column labels are the UNION contract shared with
+    :func:`_harmony_unmatched_select` — the frame's 8 response columns plus
+    three ORDER BY keys the frame never returns: ``sort_normal``/``sort_tumor``
+    are the null-free sort keys (the old Python sort's keys: normal
+    ``primary_id``, then tumor ``primary_id``, absent sides first) and
+    ``row_id`` breaks ties, so pages and keyset batches never overlap or skip.
+
+    ``q`` narrows to pairings whose TUMOR or NORMAL side matches — the same
+    either-side search semantics the report's paired section has.
     """
-    pairings = db.scalars(
-        select(PairingTable)
-        .options(
-            joinedload(PairingTable.tumor),
-            joinedload(PairingTable.normal),
+    tumor = aliased(Sample)
+    normal = aliased(Sample)
+    stmt = (
+        select(
+            normal.primary_id.label("normal_sample"),
+            tumor.primary_id.label("tumor_sample"),
+            normal.anon_id.label("normal_bamname"),
+            cast(HARMONY_BAM_PATH_PLACEHOLDER, String).label("normal_bam_path"),
+            tumor.anon_id.label("tumor_bamname"),
+            cast(HARMONY_BAM_PATH_PLACEHOLDER, String).label("tumor_bam_path"),
+            func.coalesce(tumor.patient__dmp, normal.patient__dmp).label("patient"),
+            func.coalesce(tumor.consent, normal.consent).label("consent"),
+            func.coalesce(normal.primary_id, "").label("sort_normal"),
+            func.coalesce(tumor.primary_id, "").label("sort_tumor"),
+            PairingTable.id.label("row_id"),
         )
+        .join(tumor, PairingTable.tumor_id == tumor.id)
+        .join(normal, PairingTable.normal_id == normal.id)
         .where(
             PairingTable.pairing_logic_id == logic.id,
             PairingTable.latest.is_(True),
         )
-    ).all()
-    rows = [_harmony_row(p.tumor, p.normal) for p in pairings]
+    )
+    if q is not None:
+        stmt = stmt.where(or_(*_harmony_side_conds(tumor, q), *_harmony_side_conds(normal, q)))
+    return stmt
 
-    paired = exists(
+
+def _harmony_unmatched_select(logic: PairingLogic, q: Optional[str]):
+    """SELECT of the frame's unmatched section: samples with no latest pairing.
+
+    The same unmatched visibility the Python builder had, in SQL: the HARMONY
+    logic is configured over DMP samples, so unmatched stays scoped to that
+    cohort (``sample_type == "DMP"``), each sample a one-sided row with the
+    opposite side's columns null. A sample counts as paired when it is the
+    tumor OR the normal of a latest pairing for this logic — NOT EXISTS over
+    the pairing table, never an ``id NOT IN <big set>``: a full pairing pass
+    writes >100k rows and a 100k-element IN list makes every later call
+    re-plan and re-scan it. Nothing paired yet, the same NOT EXISTS is simply
+    false for every DMP sample (the freshly-initialized-database case).
+    """
+    already_paired = exists(
         select(PairingTable.id).where(
             or_(
                 PairingTable.tumor_id == Sample.id,
@@ -1435,75 +1638,260 @@ def _harmony_rows(db: Session, logic: PairingLogic) -> list[dict]:
             PairingTable.pairing_logic_id == logic.id,
         )
     )
-    unmatched = db.scalars(
-        select(Sample).where(Sample.sample_type == "DMP", ~paired)
-    ).all()
-    for sample in unmatched:
-        if sample.tumor_or_normal == TumorOrNormal.NORMAL.value:
-            rows.append(_harmony_row(None, sample))
-        else:
-            rows.append(_harmony_row(sample, None))
+    is_normal = Sample.tumor_or_normal == TumorOrNormal.NORMAL.value
+    is_tumor = Sample.tumor_or_normal == TumorOrNormal.TUMOR.value
+    stmt = select(
+        case((is_normal, Sample.primary_id), else_=None).label("normal_sample"),
+        case((is_tumor, Sample.primary_id), else_=None).label("tumor_sample"),
+        case((is_normal, Sample.anon_id), else_=None).label("normal_bamname"),
+        case((is_normal, cast(HARMONY_BAM_PATH_PLACEHOLDER, String)), else_=None).label(
+            "normal_bam_path"
+        ),
+        case((is_tumor, Sample.anon_id), else_=None).label("tumor_bamname"),
+        case((is_tumor, cast(HARMONY_BAM_PATH_PLACEHOLDER, String)), else_=None).label(
+            "tumor_bam_path"
+        ),
+        Sample.patient__dmp.label("patient"),
+        Sample.consent.label("consent"),
+        case((is_normal, Sample.primary_id), else_=cast("", String)).label("sort_normal"),
+        case((is_tumor, Sample.primary_id), else_=cast("", String)).label("sort_tumor"),
+        Sample.id.label("row_id"),
+    ).where(Sample.sample_type == "DMP", ~already_paired)
+    if q is not None:
+        stmt = stmt.where(or_(*_harmony_side_conds(Sample, q)))
+    return stmt
 
-    rows.sort(key=lambda r: (r["normal_sample"] or "", r["tumor_sample"] or ""))
-    return rows
+
+#: The frame's response/CSV columns, exactly as the UNION labels them.
+HARMONY_FRAME_COLUMNS = HARMONY_COLUMNS
+#: ORDER BY keys the frame carries but never returns.
+HARMONY_FRAME_ORDER = ("sort_normal", "sort_tumor", "row_id")
 
 
-def _harmony_csv_body(rows: list[dict]) -> str:
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(HARMONY_COLUMNS)
-    for r in rows:
-        writer.writerow(
-            [
-                _harmony_csv_field(r["normal_sample"]),
-                _harmony_csv_field(r["tumor_sample"]),
-                _harmony_csv_field(r["normal_bamname"]),
-                _harmony_csv_field(r["normal_bam_path"]),
-                _harmony_csv_field(r["tumor_bamname"]),
-                _harmony_csv_field(r["tumor_bam_path"]),
-                _harmony_csv_field(r["patient"]),
-                _harmony_csv_consent(r["consent"]),
-            ]
+def _harmony_frame_subquery(logic: PairingLogic, q: Optional[str]):
+    """The whole merged frame as one subquery: paired rows UNION ALL unmatched.
+
+    UNION ALL, not UNION: the two sections are disjoint BY CONSTRUCTION (the
+    unmatched section excludes paired samples) and UNION's dedup would sort
+    the entire frame on every request. Merging in SQL is what makes the frame
+    pageable at all — pairing rows and unmatched samples interleave by normal
+    primary_id, so a page cannot be assembled from the two sections
+    independently (the old code built the whole frame as a list of dicts,
+    twice per request, and the browser then held all 169k rows).
+    """
+    return union_all(
+        _harmony_paired_select(logic, q),
+        _harmony_unmatched_select(logic, q),
+    ).subquery("harmony_frame")
+
+
+def _harmony_section_total(db: Session, section_select) -> int:
+    """SQL COUNT of one frame section, never materializing it."""
+    return db.scalar(select(func.count()).select_from(section_select.subquery())) or 0
+
+
+def _harmony_frame_page(
+    db: Session, logic: PairingLogic, q: Optional[str], offset: int, limit: int
+) -> tuple[list[dict], Optional[str]]:
+    """One slice of the merged frame, in frame order: ``(rows, prev_normal)``.
+
+    LIMIT/OFFSET over the frame subquery — constant-size regardless of frame
+    size. The frame row just BEFORE the page is fetched with it (one extra
+    row, dropped from the rows) and its normal returned, so a page's first
+    row can still be marked as the tail of a group that began on an earlier
+    page.
+    """
+    frame = _harmony_frame_subquery(logic, q)
+    stmt = select(*(frame.c[name] for name in HARMONY_FRAME_COLUMNS)).order_by(
+        *(frame.c[name] for name in HARMONY_FRAME_ORDER)
+    )
+    fetch_offset = max(0, offset - 1)  # the boundary row, unless page 1
+    # One extra row only when a boundary row exists to fetch: page 1 has none,
+    # and asking for limit+1 there would hand back a page one row too big.
+    fetch_limit = limit + (1 if offset > 0 else 0)
+    recs = db.execute(stmt.offset(fetch_offset).limit(fetch_limit)).all()
+    rows = [dict(zip(HARMONY_FRAME_COLUMNS, rec)) for rec in recs]
+    prev_normal_sample = None
+    if fetch_offset < offset and rows:
+        prev_normal_sample = rows.pop(0)["normal_sample"]
+    return rows, prev_normal_sample
+
+
+def _iter_harmony_frame_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+    """Stream the WHOLE merged frame in frame order, via keyset pagination.
+
+    The export path: ``(sort_normal, sort_tumor, row_id)`` replaces OFFSET, so
+    a full-frame download is the same constant-size batches from the first row
+    to the last, at any frame size, and never materializes the frame.
+    """
+    frame = _harmony_frame_subquery(logic, q)
+    base = (
+        select(
+            *(frame.c[name] for name in HARMONY_FRAME_COLUMNS),
+            *(frame.c[name] for name in HARMONY_FRAME_ORDER),
         )
-    return buf.getvalue()
+        .order_by(*(frame.c[name] for name in HARMONY_FRAME_ORDER))
+        .limit(EXPORT_BATCH_SIZE)
+    )
+    last = None  # (sort_normal, sort_tumor, row_id) of the last row yielded
+    while True:
+        stmt = base
+        if last is not None:
+            sort_normal, sort_tumor, row_id = last
+            stmt = stmt.where(
+                or_(
+                    frame.c.sort_normal > sort_normal,
+                    and_(
+                        frame.c.sort_normal == sort_normal,
+                        frame.c.sort_tumor > sort_tumor,
+                    ),
+                    and_(
+                        frame.c.sort_normal == sort_normal,
+                        frame.c.sort_tumor == sort_tumor,
+                        frame.c.row_id > row_id,
+                    ),
+                )
+            )
+        batch = list(db.execute(stmt).all())
+        if not batch:
+            break
+        yield from batch
+        if len(batch) < EXPORT_BATCH_SIZE:
+            break
+        last = tuple(batch[-1][-len(HARMONY_FRAME_ORDER):])
 
 
-@router.get("/harmony/", response_model=list[HarmonyRow])
+def _iter_harmony_csv_lines(db: Session, logic: PairingLogic, q: Optional[str]):
+    """Yield the HARMONY CSV as batch-sized chunks of text.
+
+    The same dialect the single-string export used (csv.writer: exact headers,
+    CRLF lines, minimal quoting), fed row by row from the keyset stream so
+    memory stays O(EXPORT_BATCH_SIZE) instead of holding a 169k-row string.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(HARMONY_COLUMNS)
+
+    def drain() -> str:
+        chunk = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate()
+        return chunk
+
+    written = 0
+    for rec in _iter_harmony_frame_rows(db, logic, q):
+        writer.writerow(
+            [_harmony_csv_field(rec[i]) for i in range(len(HARMONY_COLUMNS) - 1)]
+            + [_harmony_csv_consent(rec[len(HARMONY_COLUMNS) - 1])]
+        )
+        written += 1
+        if written % EXPORT_BATCH_SIZE == 0:
+            chunk = drain()
+            if chunk:
+                yield chunk
+    tail = drain()
+    if tail:
+        yield tail
+
+
+@router.get("/harmony/", response_model=HarmonyFrameRead)
 def get_harmony_pairings(
     format: Optional[str] = Query(
         None, pattern="^(json|csv)$",
-        description='Return "json" (default: a list of rows) or "csv" '
-        '(an 8-column, normal-oriented download).',
+        description='Return "json" (default: one page of rows) or "csv" '
+        '(an 8-column, normal-oriented download of the full searched frame).',
+    ),
+    page: int = Query(1, ge=1, description="1-based page (json only)"),
+    page_size: int = Query(
+        REPORT_DEFAULT_PAGE_SIZE,
+        ge=1,
+        description="Rows per page (json only, clamped to at most 200) like the "
+        "report's — clamped, not rejected, so a 500-row page request answers "
+        "instead of 422ing",
+    ),
+    q: Optional[str] = Query(
+        None,
+        description="Free-text search (case-insensitive literal substring) over "
+        "the frame's searchable columns on either side — sample primary_id, bam "
+        "name (anon_id), patient; consent matches only the exact words true or "
+        "false. Filters the FULL frame: for json, total/matched/unmatched and "
+        "every page reflect the search; for csv, the export covers the searched "
+        "set",
     ),
     db: Session = Depends(get_db),
 ):
-    """The HARMONY pairing output, normal-oriented.
+    """One page of the HARMONY pairing output, normal-oriented.
 
-    Rows are the latest HARMONY-logic pairings (one row per normal/tumor
-    pair) plus unmatched DMP samples in the HARMONY scope (no HARMONY pair
-    yet), shown one-sided with the opposite side's columns null.
+    The frame is the latest HARMONY-logic pairings (one row per normal/tumor
+    pair) merged with the unmatched DMP samples in the HARMONY scope (no
+    HARMONY pair yet), shown one-sided with the opposite side's columns null,
+    ordered by normal ``primary_id`` then tumor ``primary_id`` (absent sides
+    first) — the order the CSV download has always had. Merge, order, count
+    and search all happen in SQL (see :func:`_harmony_frame_subquery`); the
+    frame is never materialized, which is what makes a >150k-row panel load at
+    all.
+
+    Server-side pagination, same contract as the Pair Report's page envelope:
+    ``rows`` is the requested ``page`` of ``page_size`` rows (clamped like the
+    report's), ``total`` is the size of the FULL searched frame, and
+    ``matched``/``unmatched`` are the both-sides / one-sided row counts of that
+    same set — counts a paged client cannot derive from one page.
+    ``prev_normal_sample`` is the normal of the frame row immediately before
+    this page (null on page 1): the group-divider context a paged client would
+    otherwise lose mid-group.
 
     ``?format=csv`` returns a ``text/csv`` attachment whose header is exactly
     the 8 HARMONY columns (``normal_sample, tumor_sample, normal_bamname,
     normal_bam_path, tumor_bamname, tumor_bam_path, patient, consent``), one
-    row per (normal, tumor) pair, ordered by normal ``primary_id`` then tumor
-    ``primary_id``. ``normal_bam_path``/``tumor_bam_path`` are em-dash
-    placeholders (no bam paths in syzygy yet). ``consent`` renders as
-    lowercase ``true``/``false`` (empty when unknown).
+    row per (normal, tumor) pair. ``normal_bam_path``/``tumor_bam_path`` are
+    em-dash placeholders (no bam paths in syzygy yet). ``consent`` renders as
+    lowercase ``true``/``false`` (empty when unknown). The export covers the
+    FULL searched frame, ignoring page/page_size — the download is the whole
+    set, not the loaded page (same as GET /pairing/export/) — streamed in
+    keyset batches on its own session.
     """
     logic = find_logic_by_name(db, HARMONY_LOGIC_NAME)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
-    rows = _harmony_rows(db, logic)
+    if q is not None:
+        q = q.strip().lower() or None
+
     if format == "csv":
-        return Response(
-            content=_harmony_csv_body(rows),
+        logic_id = logic.id
+
+        def gen():
+            # The export generator outlives the request's session dependency,
+            # so it borrows its own pool connection (same as _stream_pairing_export).
+            db2 = _open_stream_session()
+            try:
+                stream_logic = db2.get(PairingLogic, logic_id)
+                if stream_logic is None:
+                    return
+                yield from _iter_harmony_csv_lines(db2, stream_logic, q)
+            finally:
+                db2.close()
+
+        return StreamingResponse(
+            gen(),
             media_type="text/csv",
-            headers={
-                "Content-Disposition": 'attachment; filename="harmony_pairs.csv"'
-            },
+            headers={"Content-Disposition": 'attachment; filename="harmony_pairs.csv"'},
         )
-    return rows
+
+    page_size = min(page_size, REPORT_MAX_PAGE_SIZE)  # same clamp as the report
+    matched = _harmony_section_total(db, _harmony_paired_select(logic, q))
+    unmatched = _harmony_section_total(db, _harmony_unmatched_select(logic, q))
+    total = matched + unmatched
+    offset = (page - 1) * page_size
+    if offset >= total:
+        return HarmonyFrameRead(rows=[], total=total, matched=matched, unmatched=unmatched)
+    rows, prev_normal_sample = _harmony_frame_page(db, logic, q, offset, page_size)
+    return HarmonyFrameRead(
+        rows=rows,
+        total=total,
+        matched=matched,
+        unmatched=unmatched,
+        prev_normal_sample=prev_normal_sample,
+    )
 
 
 @router.post("/trigger-harmony", response_model=HarmonyTriggerRead)
@@ -1518,7 +1906,10 @@ def trigger_harmony_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
     DMP tumors without a ``patient__dmp`` value cannot be matched and are
     reported in ``missing_patient__dmp``.
     """
-    return trigger_harmony_pairing(db)
+    with _pairing_pass(db, find_logic_by_name(db, HARMONY_LOGIC_NAME), "HARMONY"):
+        result = trigger_harmony_pairing(db)
+        _invalidate_dmp_report_stats(db)
+        return result
 
 
 @router.get("/unmatched-count/", response_model=UnmatchedCountRead)

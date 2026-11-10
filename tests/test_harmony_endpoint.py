@@ -33,6 +33,7 @@ from database import Base, get_db
 from main import app
 from models import PairingLogic, PairingTable, Sample
 from routers.pairings import (
+    REPORT_MAX_PAGE_SIZE,
     HARMONY_BAM_PATH_PLACEHOLDER,
     HARMONY_COLUMNS,
 )
@@ -183,7 +184,7 @@ def test_harmony_csv_exact_headers_and_row(client, db, dmp_logic, harmony_logic)
     ]
 
 
-def test_harmony_json_default_returns_row_list(client, db, dmp_logic, harmony_logic):
+def test_harmony_json_default_returns_paged_frame(client, db, dmp_logic, harmony_logic):
     _dmp_sample(db, "P-0001234-T01-IM6", "P-0001234",
                 tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t1")
     _dmp_sample(db, "P-0001234-N01-IM6", "P-0001234", anon_id="anon-n1")
@@ -193,8 +194,13 @@ def test_harmony_json_default_returns_row_list(client, db, dmp_logic, harmony_lo
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
     data = response.json()
-    assert isinstance(data, list) and len(data) == 1
-    row = data[0]
+    # Page envelope, not a bare row list: the frame is server-paginated like
+    # the Pair Report's, so a page never carries the whole frame.
+    assert set(data) == {"rows", "total", "matched", "unmatched", "prev_normal_sample"}
+    assert data["total"] == 1 and data["matched"] == 1 and data["unmatched"] == 0
+    assert data["prev_normal_sample"] is None  # page 1 has no previous row
+    assert len(data["rows"]) == 1
+    row = data["rows"][0]
     assert set(row) == set(HARMONY_COLUMNS)
     assert row["normal_sample"] == "P-0001234-N01-IM6"
     assert row["tumor_sample"] == "P-0001234-T01-IM6"
@@ -276,6 +282,164 @@ def test_harmony_unmatched_normal_one_sided(client, db, dmp_logic, harmony_logic
     assert unmatched_row[5] == ""                     # tumor_bam_path (empty)
     assert unmatched_row[6] == "P-0009999"            # patient (normal's)
     assert unmatched_row[7] == "false"                # consent (normal's)
+
+
+# ---------------------------------------------------------------------------
+# Server-side pagination: pages cover the merged frame exactly once
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def export_stream(db, engine, monkeypatch):
+    """Point the CSV stream's own session at the in-memory test engine.
+
+    The harmony export validates with the request session but streams through
+    its own (the request session may close before the body finishes sending);
+    redirecting that factory is what makes the stream see the fixture rows —
+    same as the report export's fixture in tests/test_pairings_report.py.
+    """
+    monkeypatch.setattr(
+        "routers.pairings._open_stream_session", sessionmaker(bind=engine)
+    )
+
+
+def _frame_keys(data):
+    return [(r["normal_sample"], r["tumor_sample"]) for r in data["rows"]]
+
+
+def _seed_harmony_frame(client, db):
+    _dmp_sample(db, "P-3000-T01-IM6", "P-3000",
+                tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t3")
+    _dmp_sample(db, "P-1000-T01-IM6", "P-1000",
+                tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t1")
+    _dmp_sample(db, "P-1000-T02-IM6", "P-1000",
+                tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t2")
+    _dmp_sample(db, "P-1000-N01-IM6", "P-1000", anon_id="anon-n1")
+    _dmp_sample(db, "P-2000-N01-IM6", "P-2000", anon_id="anon-n2")
+    trigger = client.post("/v1/pairing/trigger-harmony")
+    assert trigger.status_code == 200
+    assert trigger.json()["paired"] == 2  # P-1000's two tumors; P-3000 has no normal
+
+
+def test_harmony_pages_cover_the_frame_once(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+
+    page1 = client.get("/v1/pairing/harmony/", params={"page": 1, "page_size": 2}).json()
+    assert page1["total"] == 4 and page1["matched"] == 2 and page1["unmatched"] == 2
+    assert page1["prev_normal_sample"] is None
+    assert _frame_keys(page1) == [(None, "P-3000-T01-IM6"),
+                                  ("P-1000-N01-IM6", "P-1000-T01-IM6")]
+
+    page2 = client.get("/v1/pairing/harmony/", params={"page": 2, "page_size": 2}).json()
+    assert page2["total"] == 4  # counts are frame-wide, not page-wide
+    # Group-divider context: this page starts mid-group (the P-1000 normal's
+    # second tumor), and the endpoint says which normal the previous row had.
+    assert page2["prev_normal_sample"] == "P-1000-N01-IM6"
+    assert _frame_keys(page2) == [("P-1000-N01-IM6", "P-1000-T02-IM6"),
+                                  ("P-2000-N01-IM6", None)]
+
+    # Past the last page: empty rows, counts intact (the client's page
+    # controls clamp there; no error).
+    beyond = client.get("/v1/pairing/harmony/", params={"page": 3, "page_size": 2}).json()
+    assert beyond["rows"] == [] and beyond["total"] == 4
+
+    # Page size 1 covers every row exactly once, in frame order.
+    seen = []
+    for page in range(1, 6):
+        data = client.get("/v1/pairing/harmony/", params={"page": page, "page_size": 1}).json()
+        seen.extend(_frame_keys(data))
+        if data["rows"] == []:
+            break
+    assert seen == [(None, "P-3000-T01-IM6"),
+                    ("P-1000-N01-IM6", "P-1000-T01-IM6"),
+                    ("P-1000-N01-IM6", "P-1000-T02-IM6"),
+                    ("P-2000-N01-IM6", None)]
+
+
+def test_harmony_invalid_page_params(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    # 1-based like the report's params.
+    assert client.get("/v1/pairing/harmony/", params={"page": 0}).status_code == 422
+    assert client.get("/v1/pairing/harmony/", params={"page_size": 0}).status_code == 422
+
+
+def test_harmony_page_size_clamped_to_max(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    # Same clamp the report applies (test_page_size_clamped_to_max): an oversized
+    # page_size is answered with REPORT_MAX_PAGE_SIZE rows — a 422 would break the
+    # UI's large page sizes, and total still has to report the FULL frame.
+    for i in range(250):
+        _dmp_sample(db, f"P-9{i:03d}-T01-IM6", f"P-9{i:03d}", TumorOrNormal.TUMOR.value)
+    data = client.get("/v1/pairing/harmony/", params={"page": 1, "page_size": 10_000}).json()
+    assert data["total"] == 4 + 250
+    assert len(data["rows"]) == REPORT_MAX_PAGE_SIZE
+    # 2 paired + (1 unpaired normal + 1 unpaired tumor + 250) one-sided
+    assert (data["matched"], data["unmatched"]) == (2, 252)
+
+
+# ---------------------------------------------------------------------------
+# Server-side search: the query narrows the WHOLE frame, not the loaded page
+# ---------------------------------------------------------------------------
+
+
+def test_harmony_search_filters_the_full_frame(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+
+    r = client.get("/v1/pairing/harmony/", params={"q": "1000"}).json()
+    assert r["total"] == 2 and r["matched"] == 2 and r["unmatched"] == 0
+    assert _frame_keys(r) == [("P-1000-N01-IM6", "P-1000-T01-IM6"),
+                              ("P-1000-N01-IM6", "P-1000-T02-IM6")]
+
+    # Either-side match: the unmatched normal on its side only.
+    r = client.get("/v1/pairing/harmony/", params={"q": "P-2000"}).json()
+    assert r["total"] == 1 and r["matched"] == 0 and r["unmatched"] == 1
+    assert _frame_keys(r) == [("P-2000-N01-IM6", None)]
+
+    # Search feeds the page contract too: a filtered frame has its own pages.
+    page1 = client.get("/v1/pairing/harmony/", params={"q": "im6", "page": 1, "page_size": 1}).json()
+    # Every seeded primary_id ends -IM6, and ilike is case-insensitive even
+    # though the query was lowercased and the ids are not.
+    assert page1["total"] == 4 and len(page1["rows"]) == 1
+    page2 = client.get("/v1/pairing/harmony/", params={"q": "im6", "page": 2, "page_size": 1}).json()
+    assert _frame_keys(page2) == [("P-1000-N01-IM6", "P-1000-T01-IM6")]
+
+    # No match: empty frame, not an error.
+    r = client.get("/v1/pairing/harmony/", params={"q": "zzz"}).json()
+    assert r == {"rows": [], "total": 0, "matched": 0, "unmatched": 0,
+                 "prev_normal_sample": None}
+
+
+def test_harmony_search_covers_bam_names_and_consent(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    _dmp_sample(db, "P-4000-T01-IM6", "P-4000",
+                tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t4", consent=True)
+    _dmp_sample(db, "P-4000-N01-IM6", "P-4000", anon_id="anon-n4", consent=True)
+    client.post("/v1/pairing/trigger-harmony")
+
+    # bam name (anon_id) is searchable on either side.
+    r = client.get("/v1/pairing/harmony/", params={"q": "anon-n2"}).json()
+    assert _frame_keys(r) == [("P-2000-N01-IM6", None)]
+
+    # Consent matches only the exact words, because every row's consent column
+    # is populated: substring search would match the whole frame.
+    r = client.get("/v1/pairing/harmony/", params={"q": "true"}).json()
+    assert r["total"] == 1 and r["matched"] == 1
+    assert _frame_keys(r) == [("P-4000-N01-IM6", "P-4000-T01-IM6")]
+    assert client.get("/v1/pairing/harmony/", params={"q": "tru"}).json()["total"] == 0
+    r = client.get("/v1/pairing/harmony/", params={"q": "false"}).json()
+    assert r["total"] == 4  # the seeded frame's consent is all false
+
+
+def test_harmony_csv_export_follows_the_search(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    response = client.get("/v1/pairing/harmony/", params={"format": "csv", "q": "1000"})
+    assert response.status_code == 200
+    rows = _csv_rows(response)
+    assert rows[0] == list(HARMONY_COLUMNS)
+    # The searched set (2 paired P-1000 rows), not the whole frame and not a
+    # page: same "export the full searched set" rule as GET /pairing/export/.
+    assert len(rows) == 3
+    assert rows[1][1] == "P-1000-T01-IM6" and rows[2][1] == "P-1000-T02-IM6"
 
 
 # ---------------------------------------------------------------------------

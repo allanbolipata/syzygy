@@ -250,6 +250,29 @@ class HarmonyRow(BaseModel):
     consent: Optional[bool] = None
 
 
+class HarmonyFrameRead(BaseModel):
+    """One page of the HARMONY normal-oriented frame (GET /pairing/harmony/).
+
+    Same page contract as the Pair Report's ``{rows, total}``: ``rows`` is
+    the requested page, ``total`` is the size of the FULL
+    (search-filtered) frame so the client can compute the page count.
+    ``matched``/``unmatched`` are the both-sides / one-sided row counts of
+    that same filtered set — the UI's count line, which a paged client can
+    no longer compute from one page of rows. ``prev_normal_sample`` is the
+    ``normal_sample`` of the frame row immediately before this page (null on
+    the first page): the group-divider context the client loses when a
+    normal's 1-to-many group is cut in half by a page boundary.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    rows: list[HarmonyRow]
+    total: int
+    matched: int
+    unmatched: int
+    prev_normal_sample: Optional[str] = None
+
+
 class EvaluateRead(BaseModel):
     """Dry-run pairing preview for one logic (GET /pairing/evaluate/).
 
@@ -383,6 +406,19 @@ class PairingReportRead(BaseModel):
 
     rows: list[PairingReportRowRead]
     total: int
+    summary: Optional[DmpSummaryRead] = None
+    warnings: Optional[DmpWarningsRead] = None
+
+
+class DmpReportStatsRead(BaseModel):
+    """The DMP summary counts and QC warning buckets served on their own
+    (``GET /pairing/report-stats/``) — the identical payload the report
+    response carries in ``summary``/``warnings``, split out so paging the
+    Pair Report never has to re-walk the full pair frame to paint a page.
+
+    Null for non-DMP logics (same contract as the report response).
+    """
+
     summary: Optional[DmpSummaryRead] = None
     warnings: Optional[DmpWarningsRead] = None
 

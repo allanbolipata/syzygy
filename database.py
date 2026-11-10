@@ -56,10 +56,26 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+#: Explicit pool sizing instead of SQLAlchemy's defaults (pool_size 5,
+#: max_overflow 10, pool_timeout 30). A bulk pairing pass holds one session for
+#: its entire multi-minute Python loop, and FastAPI runs `def` endpoints on a
+#: 40-token AnyIO threadpool, so a few concurrent panel loads could check out
+#: more connections than the pool had and raise
+#: `QueuePool limit of size 5 overflow 10 reached ... timeout 30.00` mid
+#: request. main.py caps the threadpool at THREADPOOL_TOKENS so in-flight DB
+#: work can never outnumber POOL_SIZE + POOL_MAX_OVERFLOW.
+POOL_SIZE = 10
+POOL_MAX_OVERFLOW = 10
+POOL_TIMEOUT_SECONDS = 10
+THREADPOOL_TOKENS = 12
+
 engine = create_engine(
     settings.database_url,
     echo=False,
     pool_pre_ping=True,
+    pool_size=POOL_SIZE,
+    max_overflow=POOL_MAX_OVERFLOW,
+    pool_timeout=POOL_TIMEOUT_SECONDS,
 )
 
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

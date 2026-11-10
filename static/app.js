@@ -1320,10 +1320,11 @@ const pairsState = {
   // non-DMP logics and until the first DMP page lands.
   dmpSummary: null,
   dmpWarnings: null,
-  // HARMONY only: the full frame fetched from GET /pairing/harmony/ (no
-  // server pagination/search there), cached so a page turn or a search
-  // re-slices locally instead of re-fetching. null = nothing cached.
-  harmonyRows: null,
+  dmpStatsPending: false,
+  // HARMONY only: the counts the harmony endpoint reports for the FULL
+  // searched frame ({matched, unmatched, prevNormal}) — a page's rows can
+  // never produce them. null until the first harmony page lands.
+  harmonyStats: null,
 };
 
 /* HARMONY is its own pairing logic and its own normal-oriented view
@@ -1437,23 +1438,20 @@ function harmonyCellText(r, key) {
   return pairText(v);
 }
 
-/* HARMONY search: the lowercased query matches ANY of the 8 columns
- * (sample ids, bam names, bam paths, patient, consent), case-insensitively.
- * Server-side search is the report endpoint's (see reportPageParams), and
- * GET /pairing/harmony/ has no q param — so HARMONY filters its fetched
- * rows here, while the download stays the server-generated CSV. */
-function harmonyMatchesQuery(r, q) {
-  return HARMONY_COLUMNS.some(({ key }) => {
-    const v = r[key];
-    return v !== null && v !== undefined && String(v).toLowerCase().includes(q);
+/* URLSearchParams for GET /pairing/harmony/: the same 1-based page/size and
+ * search query as reportPageParams (the harmony endpoint takes the same page
+ * contract), minus the report-only ones — pairing_logic_name is implicit
+ * (that endpoint IS the HARMONY frame) and there are no DMP stats to defer.
+ * One helper so the page fetch and the next-page prefetch send identical
+ * params. */
+function harmonyPageParams(page, pageSize) {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
   });
-}
-
-/* HARMONY rows visible under the active search query (all loaded rows when
- * there is no query). */
-function visibleHarmonyRows() {
-  const q = pairsState.query;
-  return q ? pairsState.rows.filter((r) => harmonyMatchesQuery(r, q)) : pairsState.rows;
+  const q = (pairsState.query || "").trim().toLowerCase();
+  if (q) params.set("q", q);
+  return params;
 }
 /* Clickable identifier cells in the pair table. A column model may
  * declare an optional ``link`` that resolves a row to a navigation
@@ -1477,27 +1475,32 @@ function pairCellHtml(r, c) {
   return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
 }
 
-/* HARMONY: normal-oriented 8-column table (HARMONY_COLUMNS). The endpoint
- * orders rows normal-first, then tumor, so a normal's rows are consecutive:
- * its normal-side columns repeat and a heavier top border marks each new
- * normal, making the 1-to-many obvious at a glance. One-sided (unmatched)
- * rows render the absent side's columns empty, like the DMP unmatched
- * convention. Same pagination / count / empty states as the DMP view. */
+/* HARMONY: normal-oriented 8-column table (HARMONY_COLUMNS). The server
+ * returns ONE PAGE of the frame, ordered by normal primary_id then tumor
+ * primary_id, so a normal's rows are consecutive: its normal-side columns
+ * repeat and a heavier top border marks each new normal, making the 1-to-many
+ * obvious at a glance. One-sided (unmatched) rows render the absent side's
+ * columns empty, like the DMP unmatched convention. Same pagination / count /
+ * empty states as the DMP view, from the same server page contract. */
 function renderHarmonyTable() {
   const cols = HARMONY_COLUMNS;
   $("#pairs-table thead").innerHTML =
     `<tr>${cols.map((c) => `<th>${esc(c.header)}</th>`).join("")}</tr>`;
-  const full = pairsState.rows.length;
-  const rows = visibleHarmonyRows();
-  const total = rows.length;
+  const rows = pairsState.rows; // one server page, not the whole frame
+  const total = pairsState.total; // the FULL searched frame's size
   const maxPage = Math.max(0, Math.ceil(total / pairsState.pageSize) - 1);
   if (pairsState.page > maxPage) pairsState.page = maxPage;
   const start = pairsState.page * pairsState.pageSize;
-  const slice = rows.slice(start, start + pairsState.pageSize);
-  $("#pairs-table tbody").innerHTML = slice
+  // Group divider across the page boundary: the endpoint sends the normal of
+  // the frame row just before this page (prev_normal_sample), so a normal's
+  // group cut in half by paging still reads as a continuation on the next
+  // page instead of as a brand-new group.
+  const stats = pairsState.harmonyStats;
+  const prevPageNormal = start > 0 && stats ? stats.prevNormal : null;
+  $("#pairs-table tbody").innerHTML = rows
     .map((r, i) => {
-      const prev = i > 0 ? slice[i - 1] : start > 0 ? rows[start - 1] : null;
-      const divider = prev !== null && prev.normal_sample !== r.normal_sample
+      const prev = i > 0 ? rows[i - 1].normal_sample : prevPageNormal;
+      const divider = prev !== null && prev !== r.normal_sample
         ? ` style="border-top:2px solid #c3ccd6"` : "";
       return `<tr>${cols.map((c) =>
         `<td${divider}>${esc(harmonyCellText(r, c.key))}</td>`).join("")}</tr>`;
@@ -1510,19 +1513,26 @@ function renderHarmonyTable() {
   pageInput.value = pairsState.page + 1;
   $("#pr-page-of").textContent = `of ${totalPages}`;
   pageInput.disabled = total === 0;
-  const matched = rows.filter((r) => r.normal_sample && r.tumor_sample).length;
+  // Matched/unmatched are the endpoint's counts over the FULL searched frame
+  // a page cannot see the other pages' one-sided rows. Only before the
+  // first harmony response lands do we fall back to this page's own rows.
+  const matched = stats
+    ? stats.matched
+    : rows.filter((r) => r.normal_sample && r.tumor_sample).length;
+  const unmatched = stats
+    ? stats.unmatched
+    : rows.filter((r) => !(r.normal_sample && r.tumor_sample)).length;
   const emptyEl = $("#pr-empty");
   emptyEl.classList.toggle("hidden", total !== 0);
   emptyEl.textContent =
-    pairsState.query && full > 0
+    pairsState.query
       ? "No HARMONY rows match this search."
-      : "No HARMONY rows yet — run pairing first.";
-  const filteredNote = pairsState.query && total !== full ? ` (filtered from ${full})` : "";
+      : "No HARMONY rows yet \u2014 run pairing first.";
   const paging = total > pairsState.pageSize
-    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + slice.length} of ${total})`
+    ? ` (page ${pairsState.page + 1}/${maxPage + 1}: showing ${start + 1}\u2013${start + rows.length} of ${total})`
     : "";
   $("#pr-count").textContent =
-    `${total} rows: ${matched} matched, ${total - matched} unmatched${filteredNote}${paging}`;
+    `${total} rows: ${matched} matched, ${unmatched} unmatched${paging}`;
   $("#pr-download").disabled = total === 0;
   $("#pr-legend").classList.add("hidden");
 }
@@ -1620,12 +1630,40 @@ const DMP_WARNING_BUCKETS = [
   { key: "low_coverage_tumors", label: "Low-coverage tumors" },
   { key: "low_coverage_normals", label: "Low-coverage normals" },
 ];
+/* Buckets list their samples lazily and cumulatively in chunks. The full
+ * DMP buckets run to hundreds of thousands of ids (the BAM-missing bucket
+ * alone was ~278k), and materializing every one on every page paint is what
+ * froze the tab: a closed bucket shows only its count, opening it lists the
+ * first chunk, and "show more" extends that same list. */
+const DMP_WARNING_CHUNK = 300;
+function dmpWarningListHtml(samples, upto) {
+  const shown = Math.min(upto, samples.length);
+  const rest = samples.length - shown;
+  return `<ul class="pr-warn-list">${samples.slice(0, shown).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` +
+    (rest > 0
+      ? `<button type="button" class="pr-warn-more" data-upto="${shown + DMP_WARNING_CHUNK}">` +
+        `Show ${Math.min(rest, DMP_WARNING_CHUNK).toLocaleString()} more (${rest.toLocaleString()} remaining)</button>`
+      : "");
+}
 function renderDmpWarnings() {
   const warnEl = $("#pr-dmp-warnings");
   if (!warnEl) return;
-  if (!isDmpLogic(activeLogicName()) || !pairsState.dmpWarnings) {
+  // Only the DMP pairing space has the reference's warnings to show.
+  if (!isDmpLogic(activeLogicName())) {
     warnEl.classList.add("hidden");
     warnEl.innerHTML = "";
+    return;
+  }
+  if (!pairsState.dmpWarnings) {
+    // Stats are still in flight (or this logic has none yet).
+    if (pairsState.dmpStatsPending) {
+      warnEl.classList.remove("hidden");
+      warnEl.innerHTML =
+        `<p class="pr-dmp-warnings-title">QC warnings <span class="hint">— computing over the full report…</span></p>`;
+    } else {
+      warnEl.classList.add("hidden");
+      warnEl.innerHTML = "";
+    }
     return;
   }
   const w = pairsState.dmpWarnings;
@@ -1634,13 +1672,75 @@ function renderDmpWarnings() {
     `<p class="pr-dmp-warnings-title">QC warnings <span class="hint">— full report, not just this page</span></p>` +
     DMP_WARNING_BUCKETS.map((b) => {
       const samples = w[b.key] || [];
-      return `<details class="pr-warn-bucket">
-  <summary>${esc(b.label)} <span class="pr-warn-count">${samples.length}</span></summary>
-  ${samples.length
-    ? `<ul class="pr-warn-list">${samples.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`
-    : `<p class="hint">None.</p>`}
+      return `<details class="pr-warn-bucket" data-warn-key="${b.key}">
+  <summary>${esc(b.label)} <span class="pr-warn-count">${samples.length.toLocaleString()}</span></summary>
+  <div class="pr-warn-body">${samples.length
+    ? `<p class="hint">Expand to list up to ${DMP_WARNING_CHUNK.toLocaleString()} of ${samples.length.toLocaleString()}.</p>`
+    : `<p class="hint">None.</p>`}</div>
 </details>`;
     }).join("");
+  warnEl.querySelectorAll("details.pr-warn-bucket").forEach((det) => {
+    const key = det.getAttribute("data-warn-key");
+    const body = det.querySelector(".pr-warn-body");
+    const bucket = () => (pairsState.dmpWarnings || {})[key] || [];
+    let listed = 0;
+    det.addEventListener("toggle", () => {
+      if (!det.open || listed) return;
+      const samples = bucket();
+      if (!samples.length) return;
+      listed = Math.min(samples.length, DMP_WARNING_CHUNK);
+      body.innerHTML = dmpWarningListHtml(samples, listed);
+    });
+    body.addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".pr-warn-more");
+      if (!btn) return;
+      const samples = bucket();
+      listed = Math.min(samples.length, Number(btn.getAttribute("data-upto")));
+      body.innerHTML = dmpWarningListHtml(samples, listed);
+    });
+  });
+}
+
+/* DMP summary + QC warnings now come from GET /pairing/report-stats/ (5/8):
+ * they describe the full frame and are page/q independent, so pages request
+ * include_stats=false and this fetches the numbers in the background,
+ * cached per logic for the life of the tab (pairing runs drop the cache).
+ * The pair table paints without them. */
+let dmpStatsCache = {}; // logic name -> { summary, warnings }
+let dmpStatsAbort = null;
+async function loadDmpReportStats(logic) {
+  if (!isDmpLogic(logic)) return;
+  const cached = dmpStatsCache[logic];
+  if (cached) {
+    pairsState.dmpSummary = cached.summary;
+    pairsState.dmpWarnings = cached.warnings;
+    pairsState.dmpStatsPending = false;
+    if (activeLogicName() === logic) renderPairsTable();
+    return;
+  }
+  pairsState.dmpStatsPending = true;
+  if (activeLogicName() === logic) renderDmpWarnings();
+  if (dmpStatsAbort) dmpStatsAbort.abort();
+  dmpStatsAbort = new AbortController();
+  try {
+    const r = await api(
+      `/pairing/report-stats/?pairing_logic_name=${encodeURIComponent(logic)}`,
+      { signal: dmpStatsAbort.signal },
+    );
+    if (activeLogicName() !== logic) return; // logic changed mid-flight
+    dmpStatsCache[logic] = { summary: r.summary || null, warnings: r.warnings || null };
+    pairsState.dmpSummary = dmpStatsCache[logic].summary;
+    pairsState.dmpWarnings = dmpStatsCache[logic].warnings;
+    pairsState.dmpStatsPending = false;
+    renderPairsTable(); // repaint the DMP count line/overview with real numbers
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    pairsState.dmpStatsPending = false;
+    if (activeLogicName() === logic) {
+      renderDmpWarnings();
+      banner("error", `Failed to load QC warnings: ${esc(e.message)}`, true);
+    }
+  }
 }
 
 /* Abort controller for the in-flight pair load; a new load (tab click,
@@ -1673,6 +1773,10 @@ function reportPageParams(logic, page, pageSize) {
     pairing_logic_name: logic,
     page: String(page),
     page_size: String(pageSize),
+    // The DMP summary/QC warnings describe the FULL pair frame and cost a
+    // full-frame walk to compute; a page doesn't wait for them (see
+    // loadDmpReportStats, which fetches them in the background).
+    include_stats: "false",
   });
   const q = (pairsState.query || "").trim().toLowerCase();
   if (q) params.set("q", q);
@@ -1681,9 +1785,9 @@ function reportPageParams(logic, page, pageSize) {
 async function loadReportPage(page) {
   const logic = pairsState.logic;
   if (!logic) return;
-  // HARMONY has no server pagination and no server-side search (GET
-  // /pairing/harmony/ answers with the whole normal-oriented frame), so its
-  // page turns go through loadHarmonyPage instead of the report endpoint.
+  // HARMONY is server-paginated too, but on its own endpoint with its own
+  // row shape (the normal-oriented frame), so its page turns go through
+  // loadHarmonyPage instead of the report endpoint.
   if (isHarmonyLogic(logic)) return loadHarmonyPage(page);
   if (pairsAbort) pairsAbort.abort();
   pairsAbort = new AbortController();
@@ -1721,15 +1825,17 @@ async function loadReportPage(page) {
     pairsState.rows = data.rows;
     pairsState.total = data.total;
     pairsState.page = page;
-    // DMP: the response carries the reference summary/warnings on every
-    // page (identical, page/q independent) — keep the latest.
-    pairsState.dmpSummary = data.summary || null;
-    pairsState.dmpWarnings = data.warnings || null;
+    // DMP summary/QC warnings now arrive off the page path
+    // (include_stats=false): a response that does carry them still wins.
+    if (data.summary) pairsState.dmpSummary = data.summary;
+    if (data.warnings) pairsState.dmpWarnings = data.warnings;
     renderPrGroups();
     renderPairsTable();
     if (page === 0) loadPrOverviewStats();
     // The page is on screen: quietly fetch N+1 so "Next" is instant.
     prefetchNextPrPage(page);
+    // ...and fetch the DMP QC extras in the background (cached per logic).
+    loadDmpReportStats(logic);
   } finally {
     // Invariant: whenever THIS load is still the newest, its spinner is
     // hidden no matter how the body exited — completion, a fetch error,
@@ -1738,14 +1844,13 @@ async function loadReportPage(page) {
   }
 }
 
-/* HARMONY view: one server call (GET /pairing/harmony/) returns the whole
- * normal-oriented frame — paired rows plus the unmatched one-sided rows the
- * endpoint appends. It has no page/q params, so the frame is cached
- * (pairsState.harmonyRows) and page turns and the #pr-search filter are
- * applied client-side by renderHarmonyTable(). The cache is dropped by
- * loadPairs() — view enter, logic change, search-independent reloads and the
- * post-run refresh — which is therefore the only point a re-fetch happens.
- * The abort/spinner lifecycle matches loadReportPage's exactly. */
+/* HARMONY view: server-paginated on its own endpoint, mirroring the DMP
+ * report's page flow. GET /pairing/harmony/?page=&page_size=&q= returns ONE
+ * page of the normal-oriented frame plus the whole-frame numbers
+ * (total/matched/unmatched/prev_normal_sample): the frame is never fetched,
+ * filtered or held client-side (it used to be ~169k rows in one response,
+ * which is what froze the tab). Same prefetch slot and abort/spinner
+ * lifecycle as loadReportPage. */
 async function loadHarmonyPage(page) {
   const logic = pairsState.logic;
   if (!logic) return;
@@ -1754,30 +1859,38 @@ async function loadHarmonyPage(page) {
   const signal = pairsAbort.signal;
   const active = () => signal === pairsAbort.signal;
   hidePrLoading();
-  if (active()) showPrLoading(page === 0 ? "Loading HARMONY pairs…" : `Loading HARMONY page ${page + 1}\u2026`);
+  if (active()) showPrLoading(page === 0 ? "Loading HARMONY pairs\u2026" : `Loading HARMONY page ${page + 1}\u2026`);
   try {
-    if (pairsState.harmonyRows === null) {
-      try {
-        pairsState.harmonyRows = await api("/pairing/harmony/", { signal });
-      } catch (e) {
-        if (e && e.name !== "AbortError") {
-          banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
-        }
-        return; // superseded, or the fetch failed: either way, nothing to paint
+    let data = null;
+    try {
+      data = await consumePrPrefetch(page);
+      if (!data) {
+        data = await api(`/pairing/harmony/?${harmonyPageParams(page + 1, pairsState.pageSize)}`, { signal });
       }
+    } catch (e) {
+      if (e && e.name !== "AbortError") {
+        hidePrLoading();
+        banner("error", `Failed to load pairs: ${esc(e.message)}`, true);
+      }
+      return; // superseded, or the fetch failed: either way, nothing to paint
     }
     if (!active()) return;
-    // HARMONY is the one view whose rows array holds the FULL frame
-    // (renderHarmonyTable slices it per page); the other logics keep only
-    // the current server page in rows.
-    pairsState.rows = pairsState.harmonyRows;
+    // Same state shape as the report path: rows is the loaded PAGE (not the
+    // full frame) and total the searched frame's size; the frame-wide counts
+    // ride in harmonyStats for the count line and the page-boundary divider.
+    pairsState.rows = data.rows;
+    pairsState.total = data.total;
     pairsState.page = page;
-    // Prev/Next/goPrPage compute their range from pairsState.total, so for
-    // HARMONY that total is the filtered frame's row count.
-    pairsState.total = visibleHarmonyRows().length;
+    pairsState.harmonyStats = {
+      matched: data.matched,
+      unmatched: data.unmatched,
+      prevNormal: data.prev_normal_sample ?? null,
+    };
     renderPrGroups();
     renderHarmonyTable();
     if (page === 0) loadPrOverviewStats();
+    // The page is on screen: quietly fetch N+1 so "Next" is instant.
+    prefetchNextPrPage(page);
   } finally {
     if (active()) hidePrLoading();
   }
@@ -1797,9 +1910,10 @@ async function loadPairs() {
   // not linger when a new (or non-DMP) logic is selected.
   pairsState.dmpSummary = null;
   pairsState.dmpWarnings = null;
-  // Same for the HARMONY frame cache: a fresh load (especially the
-  // post-pairing refresh) must re-fetch it instead of re-showing a stale one.
-  pairsState.harmonyRows = null;
+  // Same for the HARMONY frame counts: the previous load's matched/unmatched
+  // must not linger over a new logic, and a post-pairing refresh must show
+  // the frame's new numbers rather than the old ones.
+  pairsState.harmonyStats = null;
   await loadReportPage(0);
 }
 
@@ -1828,7 +1942,12 @@ function prefetchNextPrPage(page) {
   invalidatePrPrefetch();
   const ctrl = new AbortController();
   const entry = { key, page: next, abort: ctrl, data: null, promise: null };
-  entry.promise = api(`/pairing/report/?${reportPageParams(pairsState.logic, next + 1, pairsState.pageSize)}`, { signal: ctrl.signal })
+  // HARMONY prefetches from the harmony endpoint (same page contract, its own
+  // row shape); every other logic from the report endpoint.
+  const url = isHarmonyLogic(pairsState.logic)
+    ? `/pairing/harmony/?${harmonyPageParams(next + 1, pairsState.pageSize)}`
+    : `/pairing/report/?${reportPageParams(pairsState.logic, next + 1, pairsState.pageSize)}`;
+  entry.promise = api(url, { signal: ctrl.signal })
     .then((data) => {
       if (prPrefetch === entry) entry.data = data; // else superseded: drop
       return data;
@@ -1894,13 +2013,16 @@ async function downloadPairs() {
   }
 }
 
-/* HARMONY download: GET /pairing/harmony/?format=csv — the server-
- * generated CSV attachment with the exact 8 headers (ticket 2/4). A plain
- * anchor navigation (cookie auth, like every other request in this app);
- * the server's Content-Disposition supplies the download filename. */
+/* HARMONY download: GET /pairing/harmony/?format=csv — the server-generated
+ * CSV attachment with the exact 8 headers (ticket 2/4), streamed straight to
+ * the browser (a plain anchor navigation — cookie auth, like every other
+ * request here; the server's Content-Disposition supplies the filename). Like
+ * the report's export, it follows the active SEARCH query instead of the
+ * loaded page: the file is the full searched frame, never just what the tab
+ * happens to show. */
 function downloadHarmonyCsv() {
   const a = document.createElement("a");
-  a.href = `${API}/pairing/harmony/?format=csv`;
+  a.href = `${API}/pairing/harmony/?format=csv${pairsState.query ? `&q=${encodeURIComponent(pairsState.query)}` : ""}`;
   a.download = "harmony_pairs.csv";
   document.body.appendChild(a);
   a.click();
@@ -1923,6 +2045,7 @@ async function runDmpPairing() {
       `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
     banner("ok", `DMP pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
       `${r.missing_patient__dmp} missing patient__dmp`, true);
+    dmpStatsCache = {}; // the pair frame just changed
     await loadPairs();
   } catch (e) {
     banner("error", `DMP pairing failed: ${esc(e.message)}`, true);
@@ -1947,6 +2070,7 @@ async function runHarmonyPairing() {
       `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
     banner("ok", `HARMONY pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
       `${r.missing_patient__dmp} missing patient__dmp`, true);
+    dmpStatsCache = {}; // the pair frame just changed
     await loadPairs();
   } catch (e) {
     banner("error", `HARMONY pairing failed: ${esc(e.message)}`, true);
@@ -1985,6 +2109,7 @@ async function runPrPairing() {
       `scanned ${r.scanned} · paired ${r.paired} · ` +
       `unpaired ${r.unpaired} · already ${r.already_paired}`;
     banner("ok", `Pairing complete for ${logic}: ${r.paired} paired, ${r.unpaired} unpaired`, true);
+    dmpStatsCache = {}; // the pair frame just changed
     await loadPairs();
   } catch (e) {
     banner("error", `Run pairing failed: ${esc(e.message)}`, true);
@@ -2128,7 +2253,8 @@ function resetPrSearch() {
     invalidatePrPrefetch();
   }
 }
-/* View-scoped search: send the query to the server (GET /pairing/report/?q=)
+/* View-scoped search: send the query to the server (the report's and the
+ * harmony frame's endpoints both take ?q=)
  * so it filters the FULL merged list, not just the loaded page. Debounced so
  * typing doesn't issue a request per keystroke. A new/changed query resets
  * to page 1 and refetches; #pr-count / #pr-page-of then reflect the server's

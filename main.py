@@ -3,12 +3,13 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
-from database import Base, SessionLocal, engine
+from database import Base, SessionLocal, THREADPOOL_TOKENS, engine
 from models import PairingLogic
 from pairing_strategies import seed_pooled_machines
 from bait_sets import seed_bait_sets
@@ -27,6 +28,12 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Sync `def` endpoints (pairing triggers, full-frame pairing reads) run on
+    # AnyIO's threadpool - 40 tokens by default - and each token can hold a DB
+    # connection for the whole request. Cap concurrency at what database.py's
+    # pool can actually serve, so overload queues requests instead of
+    # exhausting the QueuePool and failing mid-request on a checkout timeout.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_TOKENS
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:

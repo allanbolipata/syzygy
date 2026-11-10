@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 
 import routers.pairings as pairings
 from models import Base, PairingLogic, PairingTable, Sample
-from routers.pairings import pairing_report
+from routers.pairings import pairing_report, pairing_report_stats
 from schemas import TumorOrNormal
 
 BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -658,3 +658,73 @@ def test_non_dmp_logic_keeps_contract(db):
     assert r.summary is None
     assert r.warnings is None
     assert len(r.rows) == 1
+
+# ---------------------------------------------------------------------------
+# Stats off the page path: include_stats=false + GET /pairing/report-stats/
+# ---------------------------------------------------------------------------
+
+
+def test_include_stats_false_keeps_page_and_total(db):
+    """include_stats=false returns the same rows/total with null stats: the
+    page contract is unchanged, only the full-frame walk is skipped."""
+    _logic(db)
+    full = pairing_report("DMP", 1, 50, db, q=None)
+    lean = pairing_report("DMP", 1, 50, db, q=None, include_stats=False)
+    assert lean.summary is None and lean.warnings is None
+    assert lean.total == full.total
+    assert [r.id for r in lean.rows] == [r.id for r in full.rows]
+
+
+def test_report_stats_endpoint_matches_report_payload(db):
+    """The split-out endpoint serves exactly what the report response used to
+    embed, including the spec (d) summary and (e) warnings keys."""
+    _logic(db)
+    full = pairing_report("DMP", 1, 50, db, q=None)
+    stats = pairing_report_stats("DMP", db)
+    assert stats.summary == full.summary
+    assert stats.warnings == full.warnings
+
+
+def test_report_stats_non_dmp_logic_is_null(db):
+    """Non-DMP logics have no reference stats, same as the report response."""
+    _logic(db, name="ARGOS", strategy_name="legacy")
+    stats = pairing_report_stats("ARGOS", db)
+    assert stats.summary is None
+    assert stats.warnings is None
+
+
+def test_dmp_stats_walk_runs_once_across_pages(db, monkeypatch):
+    """The full-frame walk is cached: two pages and the stats endpoint share
+    one computation while the pair frame's watermark is unchanged."""
+    calls = []
+    real = pairings._dmp_report_stats
+    monkeypatch.setattr(
+        pairings,
+        "_dmp_report_stats",
+        lambda database, logic: (calls.append(logic.id), real(database, logic))[1],
+    )
+    _logic(db)
+    page1 = pairing_report("DMP", 1, 50, db, q=None)
+    page2 = pairing_report("DMP", 2, 10, db, q=None)
+    stats = pairing_report_stats("DMP", db)
+    assert len(calls) == 1
+    assert page2.warnings == page1.warnings == stats.warnings
+
+
+def test_stats_cache_invalidates_when_pairing_changes(db, monkeypatch):
+    """_invalidate_dmp_report_stats — what every pairing trigger calls —
+    forces a fresh walk on the next request."""
+    calls = []
+    real = pairings._dmp_report_stats
+    monkeypatch.setattr(
+        pairings,
+        "_dmp_report_stats",
+        lambda database, logic: (calls.append(logic.id), real(database, logic))[1],
+    )
+    _logic(db)
+    pairing_report("DMP", 1, 50, db, q=None)
+    pairing_report("DMP", 2, 10, db, q=None)
+    assert len(calls) == 1
+    pairings._invalidate_dmp_report_stats(db)
+    pairing_report_stats("DMP", db)
+    assert len(calls) == 2

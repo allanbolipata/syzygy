@@ -359,6 +359,11 @@ footer {
 .pr-warn-bucket summary { cursor: pointer; font-size: 0.85rem; }
 .pr-warn-count { margin-left: 0.3rem; color: #b45309; font-weight: 600; }
 .pr-warn-list { margin: 0.35rem 0 0.2rem; padding-left: 1.25rem; }
+.pr-warn-more {
+  margin: 0.2rem 0 0.3rem 1.25rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
 .pr-warn-list li { font-size: 0.8rem; font-family: ui-monospace, monospace; }
 /* Subtle cue: DMP rows where the same tumor repeats (an ambiguous match
  * fanned out onto one row per candidate normal). */
