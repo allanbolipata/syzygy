@@ -459,9 +459,9 @@ def test_harmony_csv_columns_subset(client, db, dmp_logic, harmony_logic):
     assert response.headers["content-type"].startswith("text/csv")
     rows = _csv_rows(response)
     assert rows[0] == ["tumor_sample", "consent", "normal_sample"]
-    # Same frame as the default export (5 rows), just fewer columns:
-    # row selection/ordering is untouched by column selection.
-    assert len(rows) == 6
+    # Same frame as the default export (header + the 4 frame rows), just
+    # fewer columns: row selection/ordering is untouched by column selection.
+    assert len(rows) == 5
     assert all(len(r) == 3 for r in rows)
     # consent still renders as lowercase true/false (the selected-column
     # projection keeps the consent renderer on the consent column).
@@ -486,7 +486,8 @@ def test_harmony_csv_columns_full_subset_explicit(client, db, dmp_logic, harmony
     assert response.status_code == 200
     rows = _csv_rows(response)
     assert rows[0] == list(HARMONY_COLUMNS)
-    assert len(rows) == 6
+    # Header + the 4 frame rows (same as the default export).
+    assert len(rows) == 5
 
 
 def test_harmony_csv_unknown_column_rejected(client, db, dmp_logic, harmony_logic):

@@ -1775,7 +1775,10 @@ def _iter_harmony_csv_lines(
     selection is pure output projection and never changes the frame's shape
     or ordering.
     """
-    consent_idx = HARMONY_COLUMNS.index("consent")
+    # Frame rows are positional tuples in HARMONY_COLUMNS order (plus the
+    # keyset tail columns), so map each requested column NAME to its frame
+    # position; the emitted order is the client's name order, not this map's.
+    name_to_pos = {name: pos for pos, name in enumerate(HARMONY_COLUMNS)}
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(columns)
@@ -1790,8 +1793,11 @@ def _iter_harmony_csv_lines(
     for rec in _iter_harmony_frame_rows(db, logic, q):
         writer.writerow(
             [
-                _harmony_csv_consent(rec[i]) if i == consent_idx else _harmony_csv_field(rec[i])
-                for i in columns
+                _harmony_csv_consent(rec[pos])
+                if name == "consent"
+                else _harmony_csv_field(rec[pos])
+                for name in columns
+                for pos in (name_to_pos[name],)
             ]
         )
         written += 1
