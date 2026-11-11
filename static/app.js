@@ -337,9 +337,9 @@ async function loadLogics() {
       `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
     ).join("");
     renderPrLogicExplainer();
-    // The select has its options now, so the HARMONY view-mode (hidden
-    // column panel, "Download CSV" label) can apply to the default logic —
-    // the init-time call ran before these options existed.
+    // The select has its options now, so the HARMONY view-mode (its own
+    // column set in the panel, "Download CSV" label) can apply to the
+    // default logic — the init-time call ran before these options existed.
     applyHarmonyViewMode();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
@@ -607,7 +607,7 @@ $("#m-others").addEventListener("click", (e) => {
 
 function submitOverride(normalId) {
   const data = matchesState.data;
-  const strict = $("#m-strict").checked;
+  const allow = $("#m-allow-overrides").checked;
   const logic = $("#m-logic").value;
   if (isDmpLogic(logic)) {
     banner("error",
@@ -621,7 +621,7 @@ function submitOverride(normalId) {
     normal_id: normalId,
     trigger_type: "override",
     pairing_logic_name: logic,
-    strict: strict,
+    strict: !allow,
   };
   api("/pairing/trigger", { method: "POST", body: JSON.stringify(payload) })
     .then((p) => {
@@ -1266,21 +1266,23 @@ const DMP_LEGEND = {
 const DMP_DEFAULT_KEYS = DMP_COLUMNS.map((c) => c.key);
 
 /* HARMONY view: the exact 8 columns of GET /pairing/harmony/ (ticket 2/4),
- * in the endpoint's order. Fixed — HARMONY does not use the
- * selectable-columns machinery or the legacy DMP/PAIR column sets. The
- * endpoint orders rows normal-first, then tumor: a normal with several
- * tumors occupies several consecutive rows and repeats its normal-side
- * columns (one row per (normal, tumor) pair, 1-to-many). */
+ * in the endpoint's order. HARMONY uses the selectable-columns machinery
+ * with its own column set (groups: Normal side, Tumor side, patient +
+ * consent) — never the legacy DMP/PAIR column sets. The endpoint orders
+ * rows normal-first, then tumor: a normal with several tumors occupies
+ * several consecutive rows and repeats its normal-side columns (one row
+ * per (normal, tumor) pair, 1-to-many). */
 const HARMONY_COLUMNS = [
-  { key: "normal_sample", header: "normal_sample" },
-  { key: "tumor_sample", header: "tumor_sample" },
-  { key: "normal_bamname", header: "normal_bamname" },
-  { key: "normal_bam_path", header: "normal_bam_path" },
-  { key: "tumor_bamname", header: "tumor_bamname" },
-  { key: "tumor_bam_path", header: "tumor_bam_path" },
-  { key: "patient", header: "patient" },
-  { key: "consent", header: "consent" },
+  { key: "normal_sample", header: "normal_sample", group: "Normal" },
+  { key: "tumor_sample", header: "tumor_sample", group: "Tumor" },
+  { key: "normal_bamname", header: "normal_bamname", group: "Normal" },
+  { key: "normal_bam_path", header: "normal_bam_path", group: "Normal" },
+  { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor" },
+  { key: "tumor_bam_path", header: "tumor_bam_path", group: "Tumor" },
+  { key: "patient", header: "patient", group: "Patient" },
+  { key: "consent", header: "consent", group: "Patient" },
 ];
+const HARMONY_DEFAULT_KEYS = HARMONY_COLUMNS.map((c) => c.key);
 
 const pairsState = {
   // The current page of the report only. Pagination is server-side
@@ -1340,9 +1342,11 @@ function isDmpLogic(logicName) {
   return !!logicName && (l ? l.strategy_name === "dmp" || logicName.toUpperCase() === "DMP" : logicName.toUpperCase() === "DMP");
 }
 function columnsForLogic(logicName) {
+  if (isHarmonyLogic(logicName)) return HARMONY_COLUMNS;
   return isDmpLogic(logicName) ? DMP_COLUMNS : PAIR_COLUMNS;
 }
 function defaultSelectionFor(logicName) {
+  if (isHarmonyLogic(logicName)) return new Set(HARMONY_DEFAULT_KEYS);
   return new Set(isDmpLogic(logicName) ? DMP_DEFAULT_KEYS : PAIR_DEFAULT_KEYS);
 }
 function selectionFor(logicName) {
@@ -1354,15 +1358,15 @@ function activeLogicName() {
   return pairsState.logic || $("#pr-logic").value || null;
 }
 
-/* HARMONY view mode: the selectable-columns panel and the CSV/TSV format
- * switch don't apply — HARMONY's columns are the fixed 8-column endpoint
- * set and its download is the server-generated CSV. The Download button
- * relabels to "Download CSV". Reversible: switching back to another logic
- * restores the panel (collapsed state preserved). */
+/* HARMONY view mode: the CSV/TSV format switch doesn't apply — HARMONY's
+ * download is always the server-generated CSV. The selectable-columns panel
+ * DOES apply: HARMONY has its own column set (HARMONY_COLUMNS, with its own
+ * per-logic selection in pairsState.selected). The Download button relabels
+ * to "Download CSV". Reversible: switching back to another logic restores
+ * that logic's panel (collapsed state preserved). */
 function applyHarmonyViewMode() {
   const harmony = isHarmonyLogic(activeLogicName());
-  $("#pr-panel").classList.toggle("hidden", harmony);
-  const showOpen = !harmony && $("#pr-panel").classList.contains("collapsed");
+  const showOpen = $("#pr-panel").classList.contains("collapsed");
   $("#pr-panel-open").classList.toggle("hidden", !showOpen);
   $("#pr-format").closest("label").classList.toggle("hidden", harmony);
   $("#pr-download").textContent = harmony ? "Download CSV" : "Download";
@@ -1375,13 +1379,11 @@ function selectedPairColumns() {
 
 /* Groups for the left split-panel filter: the selected (active) logic's
  * columns, grouped by side (Tumor / Normal / Pairing for the standard set;
- * Tumor / Normal for DMP). The panel never enumerates the other logics. */
+ * Tumor / Normal for DMP; Normal / Tumor / Patient for HARMONY). The panel
+ * never enumerates the other logics. */
 function pairReportGroups() {
   const logic = activeLogicName();
   if (!logic) return [];
-  // HARMONY's columns are the fixed 8-column endpoint set — there is no
-  // selectable set to render (the panel itself is hidden for HARMONY).
-  if (isHarmonyLogic(logic)) return [];
   const bySide = new Map();
   for (const c of columnsForLogic(logic)) {
     if (!bySide.has(c.group)) bySide.set(c.group, []);
@@ -1475,7 +1477,9 @@ function pairCellHtml(r, c) {
   return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
 }
 
-/* HARMONY: normal-oriented 8-column table (HARMONY_COLUMNS). The server
+/* HARMONY: normal-oriented table over the CHECKED HARMONY columns (via
+ * selectedPairColumns(), which resolves HARMONY_COLUMNS for this logic).
+ * The server
  * returns ONE PAGE of the frame, ordered by normal primary_id then tumor
  * primary_id, so a normal's rows are consecutive: its normal-side columns
  * repeat and a heavier top border marks each new normal, making the 1-to-many
@@ -1483,7 +1487,7 @@ function pairCellHtml(r, c) {
  * columns empty, like the DMP unmatched convention. Same pagination / count /
  * empty states as the DMP view, from the same server page contract. */
 function renderHarmonyTable() {
-  const cols = HARMONY_COLUMNS;
+  const cols = selectedPairColumns(); // checked subset, endpoint order
   $("#pairs-table thead").innerHTML =
     `<tr>${cols.map((c) => `<th>${esc(c.header)}</th>`).join("")}</tr>`;
   const rows = pairsState.rows; // one server page, not the whole frame
@@ -1523,9 +1527,10 @@ function renderHarmonyTable() {
     ? stats.unmatched
     : rows.filter((r) => !(r.normal_sample && r.tumor_sample)).length;
   const emptyEl = $("#pr-empty");
-  emptyEl.classList.toggle("hidden", total !== 0);
-  emptyEl.textContent =
-    pairsState.query
+  emptyEl.classList.toggle("hidden", total !== 0 && cols.length !== 0);
+  emptyEl.textContent = cols.length === 0
+    ? "No columns selected — tick columns in the side panel."
+    : pairsState.query
       ? "No HARMONY rows match this search."
       : "No HARMONY rows yet \u2014 run pairing first.";
   const paging = total > pairsState.pageSize
@@ -1533,7 +1538,7 @@ function renderHarmonyTable() {
     : "";
   $("#pr-count").textContent =
     `${total} rows: ${matched} matched, ${unmatched} unmatched${paging}`;
-  $("#pr-download").disabled = total === 0;
+  $("#pr-download").disabled = total === 0 || cols.length === 0;
   $("#pr-legend").classList.add("hidden");
 }
 
@@ -1969,9 +1974,10 @@ async function consumePrPrefetch(page) {
 async function downloadPairs() {
   const logic = pairsState.logic;
   if (!logic) return;
-  // HARMONY: the server-generated CSV (exact 8 headers, full normal-oriented
-  // frame) — see downloadHarmonyCsv. The /pairing/export/ path below is the
-  // pair-table column model and does not apply to HARMONY's fixed 8 columns.
+  // HARMONY: the server-generated CSV (the checked harmony columns, full
+  // normal-oriented frame) — see downloadHarmonyCsv. The /pairing/export/
+  // path below is the pair-table column model and does not apply to
+  // HARMONY's own column set.
   if (isHarmonyLogic(logic)) {
     downloadHarmonyCsv();
     return;
@@ -2014,132 +2020,26 @@ async function downloadPairs() {
 }
 
 /* HARMONY download: GET /pairing/harmony/?format=csv — the server-generated
- * CSV attachment with the exact 8 headers (ticket 2/4), streamed straight to
- * the browser (a plain anchor navigation — cookie auth, like every other
- * request here; the server's Content-Disposition supplies the filename). Like
- * the report's export, it follows the active SEARCH query instead of the
- * loaded page: the file is the full searched frame, never just what the tab
- * happens to show. */
+ * CSV attachment (ticket 2/4), streamed straight to the browser (a plain
+ * anchor navigation — cookie auth, like every other request here; the
+ * server's Content-Disposition supplies the filename). Like the report's
+ * export, it follows the active SEARCH query instead of the loaded page: the
+ * file is the full searched frame, never just what the tab happens to show.
+ * The CHECKED harmony columns travel as the `columns` param (endpoint order)
+ * so the file contains exactly the columns the table shows; an all-checked
+ * selection omits the param and gets the endpoint's default all-8 header. */
 function downloadHarmonyCsv() {
+  const cols = selectedPairColumns();
+  if (cols.length === 0) return;
+  const params = new URLSearchParams({ format: "csv" });
+  if (pairsState.query) params.set("q", pairsState.query);
+  if (cols.length < HARMONY_COLUMNS.length) params.set("columns", cols.map((c) => c.key).join(","));
   const a = document.createElement("a");
-  a.href = `${API}/pairing/harmony/?format=csv${pairsState.query ? `&q=${encodeURIComponent(pairsState.query)}` : ""}`;
+  a.href = `${API}/pairing/harmony/?${params}`;
   a.download = "harmony_pairs.csv";
   document.body.appendChild(a);
   a.click();
   a.remove();
-}
-
-/* Automatic DMP pairing: the DMP strategy pairs every unpaired DMP tumor
- * with its DMP normal (same patient__dmp and gene panel). Invoked from the
- * overview header's Run pairing button when the selected logic is a DMP
- * logic; manual pairing of DMP samples happens under the other logics
- * (e.g. ARGOS). */
-async function runDmpPairing() {
-  const btn = $("#pr-run");
-  btn.disabled = true;
-  $("#pr-run-status").textContent = "Pairing…";
-  try {
-    const r = await api("/pairing/trigger-dmp", { method: "POST" });
-    $("#pr-run-status").textContent =
-      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
-      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
-    banner("ok", `DMP pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
-      `${r.missing_patient__dmp} missing patient__dmp`, true);
-    dmpStatsCache = {}; // the pair frame just changed
-    await loadPairs();
-  } catch (e) {
-    banner("error", `DMP pairing failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/* HARMONY pairing run: POST /pairing/trigger-harmony (ticket 2/4) — the
- * HARMONY pairing space's own trigger, mirroring runDmpPairing() but
- * resolving the HARMONY logic row (the DMP pairing space is never
- * touched). The generic trigger-all endpoint refuses DMP-strategy logics
- * with a 400, so HARMONY must use its own trigger. */
-async function runHarmonyPairing() {
-  const btn = $("#pr-run");
-  btn.disabled = true;
-  $("#pr-run-status").textContent = "Pairing…";
-  try {
-    const r = await api("/pairing/trigger-harmony", { method: "POST" });
-    $("#pr-run-status").textContent =
-      `paired ${r.paired} · unpaired ${r.unpaired} · ` +
-      `missing patient__dmp ${r.missing_patient__dmp} · already ${r.already_paired}`;
-    banner("ok", `HARMONY pairing complete: ${r.paired} paired, ${r.unpaired} unpaired, ` +
-      `${r.missing_patient__dmp} missing patient__dmp`, true);
-    dmpStatsCache = {}; // the pair frame just changed
-    await loadPairs();
-  } catch (e) {
-    banner("error", `HARMONY pairing failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/* Overview-header Run pairing button for the selected logic: DMP goes to
- * the DMP trigger, HARMONY to its own trigger (see runHarmonyPairing), and
- * any other logic to the per-logic backfill (POST
- * /pairing/trigger-all?pairing_logic_name=, confirm first — it records
- * pairings). Result lands in #pr-run-status. */
-async function runPrPairing() {
-  const logic = activeLogicName();
-  if (!logic) return;
-  if (isDmpLogic(logic)) {
-    await runDmpPairing();
-    return;
-  }
-  if (isHarmonyLogic(logic)) {
-    await runHarmonyPairing();
-    return;
-  }
-  const msg =
-    `Run pairing for ${logic}?\n\n` +
-    "This records a new pairing for every unpaired tumor under this logic. " +
-    "Existing pairings are kept.";
-  if (!confirm(msg)) return;
-  const btn = $("#pr-run");
-  btn.disabled = true;
-  $("#pr-run-status").textContent = "Pairing…";
-  try {
-    const r = await api(`/pairing/trigger-all?pairing_logic_name=${encodeURIComponent(logic)}`);
-    $("#pr-run-status").textContent =
-      `scanned ${r.scanned} · paired ${r.paired} · ` +
-      `unpaired ${r.unpaired} · already ${r.already_paired}`;
-    banner("ok", `Pairing complete for ${logic}: ${r.paired} paired, ${r.unpaired} unpaired`, true);
-    dmpStatsCache = {}; // the pair frame just changed
-    await loadPairs();
-  } catch (e) {
-    banner("error", `Run pairing failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/* GET /pairing/evaluate/?pairing_logic_name= — read-only dry-run over the
- * selected logic's backfill scope; renders "N of M would pair" plus the
- * outcome breakdown in #pr-evaluate-result. Never records pairings. */
-async function evaluatePrPairing() {
-  const logic = activeLogicName();
-  if (!logic) return;
-  const btn = $("#pr-evaluate");
-  const out = $("#pr-evaluate-result");
-  btn.disabled = true;
-  out.textContent = "Evaluating…";
-  try {
-    const r = await api(`/pairing/evaluate/?pairing_logic_name=${encodeURIComponent(logic)}`);
-    let html = `${r.would_pair} of ${r.scope_total} would pair · ${r.already_paired} already paired · ${r.would_stay_unpaired} would stay unpaired`;
-    if (r.missing_patient__dmp > 0) {
-      html += ` · ${r.missing_patient__dmp} missing patient__dmp`;
-    }
-    out.innerHTML = html;
-  } catch (e) {
-    banner("error", `Evaluate failed: ${esc(e.message)}`, true);
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 /* Overview-header blurb for the selected logic: the strategy's explainer
@@ -2201,16 +2101,12 @@ $("#pr-logic").addEventListener("change", () => {
   // pairsState.logic, which loadPairs() sets when it runs — the blurb
   // would otherwise keep the previous logic's text.
   pairsState.logic = $("#pr-logic").value;
-  $("#pr-run-status").textContent = "";
-  $("#pr-evaluate-result").textContent = "";
   // A stale filter would otherwise carry into the new logic's rows.
   resetPrSearch();
   renderPrLogicExplainer();
   applyHarmonyViewMode();
   loadPairs();
 });
-$("#pr-run").addEventListener("click", runPrPairing);
-$("#pr-evaluate").addEventListener("click", evaluatePrPairing);
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
   if (pairsState.page > 0) loadReportPage(pairsState.page - 1);

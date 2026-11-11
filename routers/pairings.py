@@ -1761,16 +1761,27 @@ def _iter_harmony_frame_rows(db: Session, logic: PairingLogic, q: Optional[str])
         last = tuple(batch[-1][-len(HARMONY_FRAME_ORDER):])
 
 
-def _iter_harmony_csv_lines(db: Session, logic: PairingLogic, q: Optional[str]):
+def _iter_harmony_csv_lines(
+    db: Session, logic: PairingLogic, q: Optional[str], columns: tuple
+):
     """Yield the HARMONY CSV as batch-sized chunks of text.
 
     The same dialect the single-string export used (csv.writer: exact headers,
     CRLF lines, minimal quoting), fed row by row from the keyset stream so
     memory stays O(EXPORT_BATCH_SIZE) instead of holding a 169k-row string.
+    ``columns`` is the validated requested column subset (already in the
+    client-given order); the header and every data row contain exactly those
+    columns. The frame itself always carries all 8 columns, so column
+    selection is pure output projection and never changes the frame's shape
+    or ordering.
     """
+    # Frame rows are positional tuples in HARMONY_COLUMNS order (plus the
+    # keyset tail columns), so map each requested column NAME to its frame
+    # position; the emitted order is the client's name order, not this map's.
+    name_to_pos = {name: pos for pos, name in enumerate(HARMONY_COLUMNS)}
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(HARMONY_COLUMNS)
+    writer.writerow(columns)
 
     def drain() -> str:
         chunk = buffer.getvalue()
@@ -1781,8 +1792,13 @@ def _iter_harmony_csv_lines(db: Session, logic: PairingLogic, q: Optional[str]):
     written = 0
     for rec in _iter_harmony_frame_rows(db, logic, q):
         writer.writerow(
-            [_harmony_csv_field(rec[i]) for i in range(len(HARMONY_COLUMNS) - 1)]
-            + [_harmony_csv_consent(rec[len(HARMONY_COLUMNS) - 1])]
+            [
+                _harmony_csv_consent(rec[pos])
+                if name == "consent"
+                else _harmony_csv_field(rec[pos])
+                for name in columns
+                for pos in (name_to_pos[name],)
+            ]
         )
         written += 1
         if written % EXPORT_BATCH_SIZE == 0:
@@ -1799,7 +1815,7 @@ def get_harmony_pairings(
     format: Optional[str] = Query(
         None, pattern="^(json|csv)$",
         description='Return "json" (default: one page of rows) or "csv" '
-        '(an 8-column, normal-oriented download of the full searched frame).',
+        '(a normal-oriented download of the full searched frame).',
     ),
     page: int = Query(1, ge=1, description="1-based page (json only)"),
     page_size: int = Query(
@@ -1817,6 +1833,14 @@ def get_harmony_pairings(
         "false. Filters the FULL frame: for json, total/matched/unmatched and "
         "every page reflect the search; for csv, the export covers the searched "
         "set",
+    ),
+    columns: Optional[str] = Query(
+        None,
+        description="CSV only: comma-separated column keys from the HarmonyRow "
+        "field set (normal_sample, tumor_sample, normal_bamname, normal_bam_path, "
+        "tumor_bamname, tumor_bam_path, patient, consent). The export contains "
+        "exactly those columns in the order given; omit for all 8 columns. An "
+        "unknown key is a 400 (rejected even when the frame is empty).",
     ),
     db: Session = Depends(get_db),
 ):
@@ -1840,12 +1864,14 @@ def get_harmony_pairings(
     this page (null on page 1): the group-divider context a paged client would
     otherwise lose mid-group.
 
-    ``?format=csv`` returns a ``text/csv`` attachment whose header is exactly
-    the 8 HARMONY columns (``normal_sample, tumor_sample, normal_bamname,
-    normal_bam_path, tumor_bamname, tumor_bam_path, patient, consent``), one
-    row per (normal, tumor) pair. ``normal_bam_path``/``tumor_bam_path`` are
-    em-dash placeholders (no bam paths in syzygy yet). ``consent`` renders as
-    lowercase ``true``/``false`` (empty when unknown). The export covers the
+    ``?format=csv`` returns a ``text/csv`` attachment: one row per (normal,
+    tumor) pair, ``normal_bam_path``/``tumor_bam_path`` as em-dash placeholders
+    (no bam paths in syzygy yet), ``consent`` rendered as lowercase
+    ``true``/``false`` (empty when unknown). Without ``columns`` the header is
+    exactly the 8 HARMONY columns (``normal_sample, tumor_sample,
+    normal_bamname, normal_bam_path, tumor_bamname, tumor_bam_path, patient,
+    consent``); with ``columns`` the header and every row contain exactly the
+    requested keys in the order given (unknown key → 400). The export covers the
     FULL searched frame, ignoring page/page_size — the download is the whole
     set, not the loaded page (same as GET /pairing/export/) — streamed in
     keyset batches on its own session.
@@ -1857,6 +1883,22 @@ def get_harmony_pairings(
         q = q.strip().lower() or None
 
     if format == "csv":
+        # Column selection is validated up front — an unknown key is a 400
+        # even when the frame is empty, and a valid subset is pure output
+        # projection (the frame keeps its shape, order and 8-column UNION).
+        csv_columns = HARMONY_COLUMNS
+        if columns is not None:
+            requested = [c.strip() for c in columns.split(",") if c.strip()]
+            unknown = [c for c in requested if c not in HARMONY_COLUMNS]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unknown harmony column(s): {', '.join(unknown)}. "
+                        f"Allowed: {', '.join(HARMONY_COLUMNS)}"
+                    ),
+                )
+            csv_columns = tuple(requested)
         logic_id = logic.id
 
         def gen():
@@ -1867,7 +1909,7 @@ def get_harmony_pairings(
                 stream_logic = db2.get(PairingLogic, logic_id)
                 if stream_logic is None:
                     return
-                yield from _iter_harmony_csv_lines(db2, stream_logic, q)
+                yield from _iter_harmony_csv_lines(db2, stream_logic, q, csv_columns)
             finally:
                 db2.close()
 
