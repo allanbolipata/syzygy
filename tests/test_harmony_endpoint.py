@@ -19,6 +19,8 @@ a TestClient wired via ``dependency_overrides`` (no lifespan run).
 
 import csv
 import io
+import re
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -36,6 +38,8 @@ from routers.pairings import (
     REPORT_MAX_PAGE_SIZE,
     HARMONY_BAM_PATH_PLACEHOLDER,
     HARMONY_COLUMNS,
+    HARMONY_FRAME_COLUMNS,
+    _harmony_csv_consent,
 )
 from schemas import TumorOrNormal
 
@@ -443,6 +447,76 @@ def test_harmony_csv_export_follows_the_search(client, db, dmp_logic, harmony_lo
 
 
 # ---------------------------------------------------------------------------
+# CSV column selection (?columns=): subset, order, 400 on unknown, default
+# ---------------------------------------------------------------------------
+
+
+def test_harmony_csv_columns_subset(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    # A subset in a client-chosen order (NOT the endpoint order): the header
+    # and every data row contain exactly those columns, in that order.
+    response = client.get(
+        "/v1/pairing/harmony/",
+        params={"format": "csv", "columns": "tumor_sample,consent,normal_sample"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    rows = _csv_rows(response)
+    assert rows[0] == ["tumor_sample", "consent", "normal_sample"]
+    # Same frame as the default export (header + the 4 frame rows), just
+    # fewer columns: row selection/ordering is untouched by column selection.
+    assert len(rows) == 5
+    assert all(len(r) == 3 for r in rows)
+    # consent still renders as lowercase true/false (the selected-column
+    # projection keeps the consent renderer on the consent column).
+    assert all(r[1] in ("true", "false", "") for r in rows[1:])
+    # Cross-check against the default export: identical tumor_sample and
+    # normal_sample columns, in the same row order.
+    default_rows = _csv_rows(
+        client.get("/v1/pairing/harmony/", params={"format": "csv"})
+    )
+    assert [r[0] for r in rows[1:]] == [r[1] for r in default_rows[1:]]
+    assert [r[2] for r in rows[1:]] == [r[0] for r in default_rows[1:]]
+    assert [r[1] for r in rows[1:]] == [r[7] for r in default_rows[1:]]
+
+
+def test_harmony_csv_columns_full_subset_explicit(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    # Requesting all 8 keys explicitly equals the default header (order given).
+    response = client.get(
+        "/v1/pairing/harmony/",
+        params={"format": "csv", "columns": ",".join(HARMONY_COLUMNS)},
+    )
+    assert response.status_code == 200
+    rows = _csv_rows(response)
+    assert rows[0] == list(HARMONY_COLUMNS)
+    # Header + the 4 frame rows (same as the default export).
+    assert len(rows) == 5
+
+
+def test_harmony_csv_unknown_column_rejected(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    bad = client.get(
+        "/v1/pairing/harmony/", params={"format": "csv", "columns": "normal_sample,bogus"}
+    )
+    assert bad.status_code == 400
+    assert "bogus" in bad.json()["detail"]
+    # A lone unknown key is also rejected before any streaming starts.
+    assert client.get(
+        "/v1/pairing/harmony/", params={"format": "csv", "columns": "tumor"}
+    ).status_code == 400
+
+
+def test_harmony_csv_no_columns_param_keeps_all_8(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    response = client.get("/v1/pairing/harmony/", params={"format": "csv"})
+    assert response.status_code == 200
+    rows = _csv_rows(response)
+    assert rows[0] == list(HARMONY_COLUMNS)
+    assert all(len(r) == 8 for r in rows)
+
+
+# ---------------------------------------------------------------------------
 # Isolation: triggering HARMONY never touches the DMP pairing space
 # ---------------------------------------------------------------------------
 
@@ -481,3 +555,165 @@ def test_harmony_trigger_does_not_touch_dmp_pairings(
     harmony_rows = _pairings_for_logic(db, harmony_logic.id)
     assert len(harmony_rows) == 1
     assert harmony_rows[0].latest is True
+
+
+# ---------------------------------------------------------------------------
+# T4: the canonical column set/order is a contract, not an implementation
+# detail — and consent must be present in every row, table and CSV.
+#
+# CANONICAL_HARMONY_COLUMNS below is a deliberate LITERAL, not a copy of
+# routers.pairings.HARMONY_COLUMNS or static/app.js HARMONY_COLUMNS: the whole
+# point is that a reorder (or a dropped column) on either side fails here.
+# Order user-confirmed 2026-11-10: patient between tumor_bam_path and consent,
+# consent last.
+# ---------------------------------------------------------------------------
+
+CANONICAL_HARMONY_COLUMNS = [
+    "normal_sample",
+    "tumor_sample",
+    "normal_bamname",
+    "normal_bam_path",
+    "tumor_bamname",
+    "tumor_bam_path",
+    "patient",
+    "consent",
+]
+
+APP_JS = Path(__file__).resolve().parent.parent / "static" / "app.js"
+
+
+def _app_js_harmony_column_keys() -> list[str]:
+    """The keys of static/app.js ``const HARMONY_COLUMNS``, in source order.
+
+    The table header and the CSV ``columns`` param are both built from
+    HARMONY_COLUMNS (``selectedPairColumns()`` filters it, keeping its order;
+    ``HARMONY_DEFAULT_KEYS`` is every key of it), so this source order IS the
+    on-screen column order of the default HARMONY Pair Report.
+    """
+    src = APP_JS.read_text(encoding="utf-8")
+    match = re.search(r"const HARMONY_COLUMNS\s*=\s*\[(.*?)\];", src, re.DOTALL)
+    assert match is not None, "const HARMONY_COLUMNS not found in static/app.js"
+    return re.findall(r"key:\s*\"([A-Za-z_]+)\"", match.group(1))
+
+
+def test_harmony_backend_column_constants_are_canonical():
+    assert list(HARMONY_COLUMNS) == CANONICAL_HARMONY_COLUMNS
+    # The frame's response/CSV projection is the same tuple — the CSV header
+    # cannot drift from what the endpoint declares.
+    assert list(HARMONY_FRAME_COLUMNS) == CANONICAL_HARMONY_COLUMNS
+    # The field name is `consent` everywhere; `consented` must not appear.
+    assert "consented" not in " ".join(HARMONY_COLUMNS)
+    assert "consented" not in APP_JS.read_text(encoding="utf-8")
+
+
+def test_harmony_client_column_order_matches_canonical_default_all_8():
+    keys = _app_js_harmony_column_keys()
+    assert keys == CANONICAL_HARMONY_COLUMNS
+    # The DEFAULT checked set is every HARMONY column (all 8, this order), so
+    # a fresh Pair Report shows consent without ticking anything.
+    src = APP_JS.read_text(encoding="utf-8")
+    assert re.search(
+        r"const HARMONY_DEFAULT_KEYS\s*=\s*HARMONY_COLUMNS\.map\(\(c\) => c\.key\);",
+        src,
+    ), "HARMONY default selection is no longer every HARMONY_COLUMNS key"
+    # An all-checked download omits ?columns=, i.e. takes the server's
+    # canonical default header instead of a client-supplied order.
+    assert "if (cols.length < HARMONY_COLUMNS.length) params.set(\"columns\"" in src
+
+
+def test_harmony_csv_default_header_is_the_canonical_order(client, db, dmp_logic, harmony_logic):
+    _seed_harmony_frame(client, db)
+    response = client.get("/v1/pairing/harmony/", params={"format": "csv"})
+    assert response.status_code == 200
+    rows = _csv_rows(response)
+    # Literals, not HARMONY_COLUMNS: this is the assertion that catches a reorder.
+    assert rows[0] == [
+        "normal_sample",
+        "tumor_sample",
+        "normal_bamname",
+        "normal_bam_path",
+        "tumor_bamname",
+        "tumor_bam_path",
+        "patient",
+        "consent",
+    ]
+    assert rows[0][-1] == "consent"
+    assert rows[0][-2] == "patient"
+
+
+def test_harmony_json_rows_always_carry_the_consent_key(client, db, dmp_logic, harmony_logic):
+    # Three patients: consented pair, non-consented pair, consent unknown.
+    _dmp_sample(db, "P-5000-T01-IM6", "P-5000", TumorOrNormal.TUMOR.value, consent=True)
+    _dmp_sample(db, "P-5000-N01-IM6", "P-5000", consent=True)
+    _dmp_sample(db, "P-6000-T01-IM6", "P-6000", TumorOrNormal.TUMOR.value, consent=False)
+    _dmp_sample(db, "P-6000-N01-IM6", "P-6000", consent=False)
+    _dmp_sample(db, "P-7000-T01-IM6", "P-7000", TumorOrNormal.TUMOR.value, consent=None)
+    _dmp_sample(db, "P-7000-N01-IM6", "P-7000", consent=None)
+    assert client.post("/v1/pairing/trigger-harmony").json()["paired"] == 3
+
+    data = client.get("/v1/pairing/harmony/").json()
+    assert data["total"] == 3
+    by_patient = {r["patient"]: r for r in data["rows"]}
+    assert set(by_patient) == {"P-5000", "P-6000", "P-7000"}
+    # consent is present on EVERY row (never omitted from the JSON), with the
+    # native JSON type: true / false / null (null only when genuinely unknown).
+    assert all("consent" in r for r in data["rows"])
+    assert by_patient["P-5000"]["consent"] is True
+    assert by_patient["P-6000"]["consent"] is False
+    assert by_patient["P-7000"]["consent"] is None
+    # And every row carries exactly the 8 canonical keys.
+    for r in data["rows"]:
+        assert set(r) == set(CANONICAL_HARMONY_COLUMNS)
+
+
+def test_harmony_csv_consent_renders_true_false_and_empty(client, db, dmp_logic, harmony_logic):
+    _dmp_sample(db, "P-5000-T01-IM6", "P-5000", TumorOrNormal.TUMOR.value, consent=True)
+    _dmp_sample(db, "P-5000-N01-IM6", "P-5000", consent=True)
+    _dmp_sample(db, "P-6000-T01-IM6", "P-6000", TumorOrNormal.TUMOR.value, consent=False)
+    _dmp_sample(db, "P-6000-N01-IM6", "P-6000", consent=False)
+    _dmp_sample(db, "P-7000-T01-IM6", "P-7000", TumorOrNormal.TUMOR.value, consent=None)
+    _dmp_sample(db, "P-7000-N01-IM6", "P-7000", consent=None)
+    client.post("/v1/pairing/trigger-harmony")
+
+    rows = _csv_rows(client.get("/v1/pairing/harmony/", params={"format": "csv"}))
+    header = rows[0]
+    consent_col = header.index("consent")
+    values = {r[header.index("patient")]: r[consent_col] for r in rows[1:]}
+    assert values == {"P-5000": "true", "P-6000": "false", "P-7000": ""}
+
+    # Same three values through an explicit ?columns= projection: the consent
+    # renderer stays on the consent column wherever the client puts it.
+    sub = _csv_rows(client.get(
+        "/v1/pairing/harmony/", params={"format": "csv", "columns": "consent,patient"}
+    ))
+    assert sub[0] == ["consent", "patient"]
+    assert {r[1]: r[0] for r in sub[1:]} == {"P-5000": "true", "P-6000": "false", "P-7000": ""}
+
+
+def test_harmony_csv_consent_renderer_semantics():
+    # The single cell renderer the CSV path uses, in isolation.
+    assert _harmony_csv_consent(None) == ""
+    assert _harmony_csv_consent(True) is not None and _harmony_csv_consent(True) == "true"
+    assert _harmony_csv_consent(False) == "false"
+    # Empty is ONLY for a genuine unknown — never for a present False.
+    assert _harmony_csv_consent(False) != _harmony_csv_consent(None)
+
+
+def test_harmony_consent_comes_from_the_present_side_tumor_preferred(
+    client, db, dmp_logic, harmony_logic
+):
+    # Documented HarmonyRow semantics: patient/consent come from the present
+    # side, tumor preferred — a tumor whose own consent is unknown inherits the
+    # normal's, and a present tumor value wins over the normal's.
+    _dmp_sample(db, "P-8000-T01-IM6", "P-8000", TumorOrNormal.TUMOR.value, consent=True)
+    _dmp_sample(db, "P-8000-N01-IM6", "P-8000", consent=False)
+    _dmp_sample(db, "P-8100-T01-IM6", "P-8100", TumorOrNormal.TUMOR.value, consent=None)
+    _dmp_sample(db, "P-8100-N01-IM6", "P-8100", consent=True)
+    assert client.post("/v1/pairing/trigger-harmony").json()["paired"] == 2
+
+    rows = _csv_rows(client.get("/v1/pairing/harmony/", params={"format": "csv"}))
+    header = rows[0]
+    got = {
+        r[header.index("patient")]: r[header.index("consent")] for r in rows[1:]
+    }
+    assert got == {"P-8000": "true", "P-8100": "true"}
