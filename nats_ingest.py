@@ -9,6 +9,9 @@ new-request, sample-update and dmp-sample (the dmp-sample object is the
 DB-format DMP record — docs/dmp_reference_alignment.md, section f), and a
 JSON array for request-update (matching
 beagle's smile_callback, which branches on isinstance(data, list)).
+The tempo cohort subject (cohort-validate) also carries a JSON object;
+its handler returns the validation report under a ``"report"`` key,
+which the router passes through to the listener.
 
 Known limitation (re-pairing on update): the cmo-sample-update path
 re-runs the same cascade as ingestion — TUMOR samples go through
@@ -19,15 +22,20 @@ an already-paired sample are therefore not re-evaluated;
 """
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import jsonschema
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from database import settings
-from models import PairingTable, Sample
+from models import PairingTable, PendingNatsPublish, Sample
 from bait_sets import resolve_bait_set_logic
+from cohort_crf import write_crf
+from cohort_schema import validate_cohort_request, validate_report
+from cohort_validation import classify_cohort
 from dmp_translator import to_dmp_sample_kwargs
 from pairing_service import trigger_pairing, trigger_pairing_for_normal
 from request_metadata import request_exists, update_request_metadata
@@ -684,6 +692,152 @@ def handle_sample_update(
     }
 
 
+def _stage_cohort_report(
+    db_session: Session, cohort_id: str, report: Dict[str, Any]
+) -> None:
+    """Stage a validation report for the listener's outbox flusher.
+
+    Committed as part of this message's processing. (Classification's own
+    pairing rows are committed internally by pairing_service, so this is
+    the follow-up commit — on the pass path it lands only AFTER the CRF
+    write succeeded, which is the ordering the invariants require.)
+    """
+    db_session.add(
+        PendingNatsPublish(
+            cohort_id=cohort_id,
+            subject=settings.nats_cohort_result_subject,
+            report_json=json.dumps(report),
+        )
+    )
+    db_session.commit()
+
+
+def _cohort_pipeline(
+    db_session: Session,
+    payload: Dict[str, Any],
+    existing_content: Optional[str],
+) -> Dict[str, Any]:
+    """Shared validate -> classify -> (write CRF) -> stage-report flow for
+    the cohort-validate handler.
+
+    Locked invariants (all-or-nothing):
+    * passesCheck = jsonSchemaValidated AND all samples valid;
+    * on pass: the CRF is written FIRST (atomic) and the report is only
+      staged/returned after the write succeeded — CRF write failure
+      propagates as a 500 with no pass report (recovery: a manual
+      re-send from SMILE; the overwrite is idempotent and any pairing
+      rows classification committed along the way are harmless);
+    * on fail: report only — a CRF is NEVER written (no partial CRFs, no
+      blank rows);
+    * the report lists only problem samples; absence = valid.
+    """
+    cohort_id = payload.get("cohortId")
+    if not isinstance(cohort_id, str) or not cohort_id:
+        logger.warning("nats cohort-validate: payload has no usable cohortId")
+        return {
+            "status": "error",
+            "detail": "cohort-validate payload has no usable cohortId",
+        }
+
+    # 1. Request schema validation (T3). On failure: a schema-failure
+    # report (jsonSchemaValidated=false, passesCheck=false, no findings),
+    # staged and returned — never a 500.
+    try:
+        cohort = validate_cohort_request(payload)
+    except jsonschema.ValidationError as exc:
+        logger.warning(
+            "nats cohort-validate %s: request failed schema validation: %s",
+            cohort_id, exc.message,
+        )
+        report = {
+            "cohortId": cohort_id,
+            "jsonSchemaValidated": False,
+            "passesCheck": False,
+        }
+        _stage_cohort_report(db_session, cohort_id, report)
+        detail = f"cohort {cohort_id}: request failed schema validation; report staged for publish"
+        return {"status": "ok", "detail": detail, "report": report}
+
+    # 2. Classification (T5) against the validated, normalized cohort.
+    passes, findings, resolved_pairs = classify_cohort(db_session, cohort)
+
+    if not passes:
+        # Fail: report only — never write a CRF.
+        report = {
+            "cohortId": cohort_id,
+            "jsonSchemaValidated": True,
+            "passesCheck": False,
+            "samples": findings,
+        }
+        _stage_cohort_report(db_session, cohort_id, report)
+        detail = f"cohort {cohort_id}: {len(findings)} problem sample(s); report staged for publish"
+        logger.info("nats cohort-validate: %s", detail)
+        return {"status": "ok", "detail": detail, "report": report}
+
+    # 3. Pass: write the CRF FIRST (atomic), rows from classification's
+    # resolved pairs — no pass report without a CRF.
+    try:
+        crf_path = write_crf(
+            settings.crf_output_dir, cohort, resolved_pairs, existing=existing_content
+        )
+    except Exception:
+        # CRF write failure: NO pass report without a CRF — the error
+        # propagates to a 500 (recovery: manual re-send from SMILE; the
+        # overwrite is idempotent). Pairing rows classification committed
+        # along the way are harmless for the re-send: the current match
+        # then wins classification. Rollback guards any other uncommitted
+        # session state.
+        db_session.rollback()
+        logger.exception("nats cohort-validate %s: CRF write failed", cohort_id)
+        raise
+
+    report = {
+        "cohortId": cohort_id,
+        "jsonSchemaValidated": True,
+        "passesCheck": True,
+        "samples": findings,
+    }
+    validate_report(report)  # self-check before publish (T3)
+    _stage_cohort_report(db_session, cohort_id, report)
+    detail = (
+        f"cohort {cohort_id}: all samples valid; CRF written to {crf_path}; "
+        "report staged for publish"
+    )
+    logger.info("nats cohort-validate: %s", detail)
+    return {"status": "ok", "detail": detail, "report": report}
+
+
+def cohort_validate_handler(
+    db_session: Session, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Ingest a tempo cohort-validate message (JSON only — no protobuf,
+    no PLACEHOLDER path).
+
+    New cohort or update — one topic for both (docs/nats_topics.md):
+    validates the request against the vendored request schema, classifies
+    every tumor against live Syzygy data, and — only when every sample is
+    valid — writes the cohort's CRF atomically before staging the
+    validation report for publishing on the cohort-result subject.
+
+    The CRF is locked in once made: when the cohort's CRF already exists
+    the write is a header-only merge — the existing file's content is
+    passed to write_crf, which replaces the ``#`` header lines and
+    preserves the data rows verbatim (already-validated rows are never
+    rewritten, even if the new payload's classification would differ; an
+    existing CRF is by construction fully validated). A missing file gets
+    a full write (idempotent overwrite — the re-send recovery path).
+    """
+    if not isinstance(payload, dict):
+        logger.warning("nats cohort-validate: payload is not a JSON object")
+        return {"status": "error", "detail": "cohort-validate payload must be a JSON object"}
+    existing: Optional[str] = None
+    cohort_id = payload.get("cohortId")
+    if isinstance(cohort_id, str) and cohort_id:
+        crf_path = os.path.join(settings.crf_output_dir, f"{cohort_id}.cohort.txt")
+        if os.path.isfile(crf_path):
+            with open(crf_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+    return _cohort_pipeline(db_session, payload, existing)
 # File group holding the DMP data structure — same value the beagle dump
 # import assigns (scripts/import_beagle_dump.py, DMP_FILEGROUP), so rows
 # ingested via NATS and via the dump are indistinguishable in that column.
@@ -811,6 +965,7 @@ def dispatch(
         settings.nats_new_request_subject: handle_new_request,
         settings.nats_request_update_subject: handle_request_update,
         settings.nats_sample_update_subject: handle_sample_update,
+        settings.nats_cohort_validate_subject: cohort_validate_handler,
         settings.nats_dmp_sample_subject: handle_dmp_sample,
     }
     handler = handlers.get(subject)

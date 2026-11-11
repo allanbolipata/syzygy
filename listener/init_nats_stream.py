@@ -19,6 +19,8 @@ SUBJECTS = [
     "MDB_STREAM.server.cpt-gateway.cmo-request-update",
     "MDB_STREAM.server.cpt-gateway.cmo-sample-update",
     "MDB_STREAM.server.dmp-gateway.dmp-sample",
+    "MDB_STREAM.consumers.tempo.cohort-validate",
+    "MDB_STREAM.consumers.tempo.cohort-result",
 ]
 
 

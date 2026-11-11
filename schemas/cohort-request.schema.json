@@ -1,0 +1,88 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema",
+    "title": "cohort request obj",
+    "description": "Validate cohort complete NATS message",
+    "type": "object",
+    "properties": {
+        "cohortId": {
+            "type": "string",
+            "description": "Cohort identifier"
+        },
+        "type":{
+            "type": "string",
+            "description": "Date of when the MAF analysis completed (YYYY-MM-DD)",
+            "enum":["investigator","MSKWESRP","operational"]
+        },
+        "endUsers":{
+            "type":"array",
+            "description":"Analysts with access to the sample via cohorts",
+            "items": {
+                "type": "string"
+            }
+        },
+        "pmUsers":{
+            "type":"array",
+            "description":"PMs managing the cohort",
+            "items": {
+                "type": "string"
+            }
+        },
+        "projectTitle":{
+            "type":"string",
+            "description":"Project title"
+        },
+        "projectSubtitle":{
+            "type":"string",
+            "description":"Project subtitle"
+        },
+        "status":{
+            "type":"string",
+            "description":"Pipeline status",
+            "enum":["PASS","FAIL","PROVISIONAL"]
+        },
+        "samples":{
+            "type":"array",
+            "description": "List of paired tumors in the cohort",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "primaryId": {
+                        "type":"string",
+                        "description": "Stable tumor sample identifier",
+                        "pattern": "^\\d{5}(?:_[A-Z]*)?(?:_\\d+){0,6}$"
+
+                    },
+                    "normalPrimaryId": {
+                        "type":"string",
+                        "description": "Stable normal sample identifier",
+                        "pattern": "^\\d{5}(?:_[A-Z]*)?(?:_\\d+){0,6}$"
+                    },
+                    "cmoId": {
+                        "type":"string",
+                        "description": "Stable tumor sample identifier"
+                    },
+                    "normalCmoId": {
+                        "type":"string",
+                        "description": "Stable normal sample identifier"
+                    },
+		    "embargoDate": {
+			"type":"string",
+			"description": "Date on which the embargo expires (YYYY-MM-DD)",
+			"pattern": "^\\d{4}\\-(0?[1-9]|1[012])\\-(0?[1-9]|[12][0-9]|3[01])$"
+		    }
+                },
+                "anyOf": [
+                    {
+                        "required": ["primaryId"]
+                    },
+                    {
+                        "required": ["cmoId"]
+                    }
+                ]
+            },
+            "uniqueItems": true
+        }
+    },
+    "required":["cohortId","samples","endUsers","pmUsers","projectTitle"],
+    "additionalProperties":false
+}

@@ -53,6 +53,18 @@ class Settings(BaseSettings):
         "MDB_STREAM.server.dmp-gateway.dmp-sample"
     )
 
+    # NATS cohort (TEMPO) subjects (docs/nats_topics.md): ONE inbound
+    # cohort topic — submit-vs-update needs no distinct subjects because
+    # a CRF is never written unless every sample passed validation.
+    nats_cohort_validate_subject: str = (
+        "MDB_STREAM.consumers.tempo.cohort-validate"
+    )
+    nats_cohort_result_subject: str = (
+        "MDB_STREAM.consumers.tempo.cohort-result"
+    )
+    crf_output_dir: str = "./crf_output"
+    cohort_publish_enabled: bool = False
+
 
 settings = Settings()
 

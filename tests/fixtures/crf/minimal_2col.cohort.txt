@@ -1,0 +1,8 @@
+#endUsers:analyst3@example.org
+#pmUsers:pm2@example.org
+#projectTitle:Minimal Cohort
+#type:investigator
+#TUMOR_ID	NORMAL_ID
+C-PPPP19-X001-d01	C-PPPP19-X001-n01
+C-PPPP20-X002-d02	
+C-PPPP21-X003-d03	

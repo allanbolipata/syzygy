@@ -1,0 +1,9 @@
+#endUsers:old_user@example.org
+#pmUsers:old_pm@example.org
+#projectTitle:Original Title
+#projectSubtitle:Original Subtitle
+#type:investigator
+#TUMOR_ID	NORMAL_ID
+C-PPPP22-X001-d01	C-PPPP22-X001-n01
+C-PPPP22-X002-d02	C-PPPP22-X002-n02
+C-PPPP22-X003-d03	
