@@ -106,12 +106,14 @@ on the database. Point `DATABASE_URL` at it:
     KEYCLOAK_URL=... KEYCLOAK_CLIENT_SECRET=*** \
     docker compose -f docker-compose.yml up -d
 
-The production base file bundles no Postgres and no Keycloak, so this
-is also the production deployment shape. For *local development*
-against an existing database, drop the `db` service (and the `app`'s
-`depends_on` on it) from `docker-compose.dev.yml` and set
-`DATABASE_URL` there instead — the dev Keycloak still comes from the
-override file.
+The same command is the production deployment shape when the
+deployment's database is external: point `DATABASE_URL` at it and the
+bundled `db` service starts unused (to remove it entirely, delete the
+`db` service and the `app`'s `depends_on` from `docker-compose.yml` and
+the `db` override from `docker-compose.dev.yml`). For *local
+development* against an existing database, set `DATABASE_URL` in the
+dev override instead. The dev Keycloak always comes from the override
+file.
 
 ## Docker compose
 
@@ -120,11 +122,12 @@ override:
 
 | File | Services | Role |
 |------|----------|------|
-| `docker-compose.yml` | `app` (**8000**) only | **Production base.** Wires the app to an external database (`DATABASE_URL`, required) and an external Keycloak (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`). It bundles neither. |
-| `docker-compose.dev.yml` | adds `db` (syzygy Postgres, published on **5435**), `keycloak` (**8080**) and `keycloak-db` (Keycloak's own Postgres, not published on the host) | **Local development override.** Layered on the base: adds the two services the app needs locally and overrides the app's env with dev values. |
+| `docker-compose.yml` | `app` (**8000**), `db` (app Postgres, not published on the host) | **Production base.** App plus its bundled Postgres — data on the host via the `PG_DATA_DIR` bind mount (named volume `db_data` when unset). Wires the app to an external Keycloak (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`). |
+| `docker-compose.dev.yml` | adapts `db` (dev credentials, published on **5435**); adds `keycloak` (**8080**), `keycloak-db` (Keycloak's own Postgres, not published on the host), `nats`, `nats-init`, `smile-listener` | **Local development override.** Layered on the base: adapts the bundled `db` for dev, adds the dev-only services, and overrides the app's env with dev values. |
 
-Both files declare the project name `syzygy` and share one network,
-`syzygy-dev`, so every command passes both files.
+Both files declare the project name `syzygy`. Local development layers
+both files and pins its services to the shared `syzygy-dev` network;
+production runs the base file alone on its default network.
 
 **Local development:**
 
@@ -134,62 +137,61 @@ Tear down (add `-v` to also delete the dev Postgres data volumes):
 
     docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 
-**Production:** run the base file alone, with the required variables
-set on the command line (shell environment wins over any `.env` in
-this directory):
+**Production:** run the base file alone. The app's Postgres is bundled
+(`db`); put its data on the host by setting `PG_DATA_DIR` (and
+`chown -R 999:999` that directory on a Linux host), and set the
+required variables on the command line (shell environment wins over
+any `.env` in this directory):
 
-    DATABASE_URL=postgresql+psycopg2://user:pass@db-host:5432/app \
+    PG_DATA_DIR=/var/lib/postgres/syzygy/app \
+    POSTGRES_PASSWORD='change-me-strong-password' \
+    DATABASE_URL=postgresql+psycopg2://syzygy:change-me-strong-password@db:5432/syzygy \
     KEYCLOAK_URL=https://keycloak.example.org \
     KEYCLOAK_CLIENT_SECRET=*** \
     docker compose -f docker-compose.yml up -d
 
-Point `KEYCLOAK_URL` at the externally managed org Keycloak and
-`DATABASE_URL` at the deployment's Postgres. Every value in the base
-file's `app` environment is overridable, so deployment-specific
-values can be injected the same way without editing the compose
-files.
+Point `KEYCLOAK_URL` at the externally managed org Keycloak. To use an
+external database instead of the bundled one, point `DATABASE_URL` at
+it (the bundled `db` then starts unused). Every value in the base
+file's `app` and `db` environment is overridable, so deployment-
+specific values can be injected the same way without editing the
+compose files.
 
 ### Pointing Postgres at a database
 
-The dev Postgres services (`db` and `keycloak-db`) store their data
-in `/var/lib/postgresql/data`. Three ways to point that at a
-database:
+The app's Postgres (`db` in the base file) stores its data in
+`/var/lib/postgresql/data` inside the container. Three ways to point
+that at a database (the dev Keycloak's own Postgres, `keycloak-db`,
+always uses its own named volume `keycloak_db_data`):
 
-1. **Named volume (the default).** The dev override declares
-   top-level volumes (`db_data`, `keycloak_db_data`) and mounts them,
-   e.g. `- db_data:/var/lib/postgresql/data`. Docker/Podman keeps the
-   volume outside the repo and it survives container recreation;
-   `docker compose down -v` deletes it.
-2. **An existing directory on the host (bind mount).** Replace the
-   named volume with a host path:
-
-       volumes:
-         - ./pgdata:/var/lib/postgresql/data
-         # or an absolute path:
-         # - /var/lib/postgres/syzygy/app:/var/lib/postgresql/data
-
-   Relative paths resolve against the compose file's directory. The
-   directory may be empty (Postgres initializes it on first start) or
-   already hold a cluster built by a compatible PostgreSQL (the
-   container adopts it as-is). The cluster data is written as the
-   `postgres` user (uid 999): on a Linux host, chown the directory
-   first (`chown -R 999:999 <dir>` as root) so the container's
-   entrypoint does not have to re-chown it. On macOS (Docker
-   Desktop), bind mounts to the data directory do not work: the VM
-   mount rejects `chown` and macOS will not chown to uid 999 without
-   root, so the entrypoint aborts with `chown: Permission denied` —
-   use the named volume instead. Point at most one stack at a given
-   directory.
-3. **An existing database, no compose Postgres.** The production base
-   file does exactly this: `docker-compose.yml` declares no `db`
-   service at all — set `DATABASE_URL` on the command line (or in the
-   `app` service's `environment` block) to point anywhere: a host
-   Postgres, a managed cluster, or another container. To run the dev
-   stack against an existing database instead, drop the `db` service
-   (and the `app` service's `depends_on` on it) from
-   `docker-compose.dev.yml` and set `DATABASE_URL` there instead. If
-   that database's container sits on `syzygy-dev`, reference it by
-   its service or container name in the URL.
+1. **A directory on the host (bind mount — the production default).**
+   Set `PG_DATA_DIR` to a host path; the base file mounts it as
+   `- ${PG_DATA_DIR:-db_data}:/var/lib/postgresql/data`. The directory
+   may be empty (Postgres initializes it on first start) or already
+   hold a cluster built by a compatible PostgreSQL (the container
+   adopts it as-is). The cluster data is written as the `postgres`
+   user (uid 999): on a Linux host, chown the directory first
+   (`chown -R 999:999 <dir>` as root) so the container's entrypoint
+   does not have to re-chown it. On macOS (Docker Desktop), bind
+   mounts to the data directory do not work: the VM mount rejects
+   `chown` and macOS will not chown to uid 999 without root, so the
+   entrypoint aborts with `chown: Permission denied` — leave
+   `PG_DATA_DIR` unset there (the dev default) to use the named
+   volume. Point at most one stack at a given directory.
+2. **Named volume (the dev default).** Leave `PG_DATA_DIR` unset and
+   the mount resolves to the named volume `db_data` (declared at the
+   bottom of both compose files). Docker/Podman keeps the volume
+   outside the repo and it survives container recreation; `docker
+   compose down -v` deletes it. This is what the dev stack uses
+   (including on macOS, where bind mounts fail).
+3. **An existing database, no compose Postgres.** Point
+   `DATABASE_URL` anywhere: a host Postgres, a managed cluster, or
+   another container. The bundled `db` service then starts but is
+   unused — to disable it entirely, remove the `db` service (and the
+   `app` service's `depends_on` on it) from `docker-compose.yml` and
+   the `db` override from `docker-compose.dev.yml`. If the external
+   database's container sits on `syzygy-dev`, reference it by its
+   service or container name in the URL.
 
 ## Mocking the production SMILE flow (dev NATS)
 

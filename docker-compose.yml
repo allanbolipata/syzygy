@@ -1,10 +1,18 @@
 # Syzygy app — production base.
 #
-# This is the minimal stack: just the app, wired to an EXTERNAL database
-# and an EXTERNAL (org-managed) Keycloak. It bundles neither. For local
-# development, layer docker-compose.dev.yml on top — it adds a local
-# Postgres and a local dev Keycloak and sets dev values for the app's
-# env:
+# This is the minimal stack: the app plus its Postgres (`db`), so a
+# production deployment is a single `docker compose up -d`. Keycloak
+# remains EXTERNAL (org-managed).
+#
+# The database data lives on the HOST, not in the container:
+#   - set PG_DATA_DIR to a host directory → bind mount (recommended
+#     for production);
+#   - leave PG_DATA_DIR unset → the named volume db_data.
+#
+# For local development, layer docker-compose.dev.yml on top — it
+# adapts the bundled db for dev (dev credentials, port 5435, dev
+# network) and adds a local dev Keycloak, its own Postgres, and the
+# dev NATS stack:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 #
 # For a production run, set the required variables on the command line
@@ -23,9 +31,10 @@ services:
     # The Dockerfile CMD runs uvicorn on port 8000, which matches the
     # healthcheck below and the 8000:8000 port mapping.
     environment:
-      # Required: the database this app uses. This file does not provide
-      # one — deployments point at their own Postgres.
-      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL, e.g. postgresql+psycopg2://user:pass@host:5432/app}
+      # Required: the database this app uses. The bundled `db` service
+      # below is the default target in production; deployments may also
+      # point at their own external Postgres.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL, e.g. postgresql+psycopg2://syzygy:PASSWORD@db:5432/syzygy (the bundled db) or an external database}
       # KEYCLOAK_URL must be the same URL the BROWSER uses: the token's
       # issuer claim is stamped from the browser-side authorize request,
       # so a mismatch makes every login 401. In production this is the
@@ -38,6 +47,9 @@ services:
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
     ports:
       - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       # Single-quoted CMD-SHELL scalar: compose v2.33 re-tokenizes
       # double-quoted flow-sequence entries (it split the old -c probe
@@ -48,3 +60,41 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
+
+  # The app's Postgres, bundled so a production deployment needs no
+  # external database. Data lives on the host: with PG_DATA_DIR set the
+  # mount is a bind to that host directory (recommended for prod); with
+  # PG_DATA_DIR unset it is the named volume db_data. NOT published on
+  # the host — the app reaches it over the compose network as db:5432.
+  #
+  # docker-compose.dev.yml overrides this service's environment (dev
+  # credentials) and adds its port and network. It must NOT re-declare
+  # the service's volumes or healthcheck: compose merges files by
+  # concatenating list-valued keys, so a second declaration would yield
+  # two mounts at /var/lib/postgresql/data and an invalid healthcheck.
+  db:
+    image: postgres:17
+    container_name: syzygy-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-syzygy}
+      # Weak default for local runs; production must set a strong
+      # POSTGRES_PASSWORD and use the same value in DATABASE_URL.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-syzygy}
+      POSTGRES_DB: ${POSTGRES_DB:-syzygy}
+    healthcheck:
+      # Probes TCP 5432 without credentials — valid for any user.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      # PG_DATA_DIR set → bind mount to that host directory (on a Linux
+      # host, chown -R 999:999 it first); unset → named volume db_data.
+      - ${PG_DATA_DIR:-db_data}:/var/lib/postgresql/data
+    # For host access, uncomment (the dev file maps 5435:5432 instead):
+    # ports:
+    #   - "5432:5432"
+    restart: unless-stopped
+
+volumes:
+  db_data:
