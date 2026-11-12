@@ -481,13 +481,30 @@
       </label>
       <button id="m-search" class="primary">Search</button>
     </div>
-    <div class="actions">
-      <label>sample
-        <select id="m-sample" disabled></select>
-      </label>
+    <div id="m-selected-bar" class="selected-bar hidden">
+      <span class="selected-chip">selected</span>
+      <span class="selected-text" id="m-selected-text"></span>
       <button id="m-show" class="primary" disabled>Show matches</button>
     </div>
     <p id="m-logic-mismatch" class="hint logic-mismatch hidden"></p>
+  </section>
+
+  <section id="m-results" class="panel hidden">
+    <div class="table-head">
+      <h3>Samples</h3>
+      <span id="m-results-count" class="count"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="m-results-table">
+        <thead>
+          <tr><th>primary_id</th><th>cmo_sample_name</th><th>patient</th><th>request</th><th>type</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="m-results-empty" class="empty">No samples match.</p>
+    </div>
+    <p id="m-results-more" class="hint hidden">Results capped at 50 — refine the search to narrow the list.</p>
+    <p class="hint">Click a row to select that sample and show its matches &amp; overrides.</p>
   </section>
 
   <section id="m-summary" class="panel hidden">
@@ -559,13 +576,32 @@
         <input id="tq-id" placeholder="primary_id or cmo_sample_name">
       </label>
       <button id="tq-lookup" class="primary">Lookup</button>
-      <label>sample (matched)
-        <select id="tq-sample" disabled></select>
-      </label>
       <button id="tq-run" class="primary" disabled>Run dry run</button>
     </div>
+    <div id="tq-selected-bar" class="selected-bar hidden">
+      <span class="selected-chip">selected</span>
+      <span class="selected-text" id="tq-selected-text"></span>
+    </div>
     <p id="tq-logic-mismatch" class="hint logic-mismatch hidden"></p>
-    <p class="hint">Lookup matches primary_id and cmo_sample_name case-insensitively; the dry run always uses the topbar View's logic &mdash; a hint appears when the sample's bait set belongs to a different logic.</p>
+    <p class="hint">Lookup matches primary_id and cmo_sample_name case-insensitively; the dry run always uses the topbar View's logic — a hint appears when the sample's bait set belongs to a different logic.</p>
+  </section>
+
+  <section id="tq-results" class="panel hidden">
+    <div class="table-head">
+      <h3>Matched samples</h3>
+      <span id="tq-results-count" class="count"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="tq-results-table">
+        <thead>
+          <tr><th>primary_id</th><th>cmo_sample_name</th><th>patient</th><th>request</th><th>type</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="tq-results-empty" class="empty">No samples match.</p>
+    </div>
+    <p id="tq-results-more" class="hint hidden">Results capped at 50 — refine the lookup to narrow the list.</p>
+    <p class="hint">Click a row to select that sample for the dry run.</p>
   </section>
 
   <section id="tq-summary" class="panel hidden">

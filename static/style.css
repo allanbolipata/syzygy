@@ -285,8 +285,7 @@ details.advanced-filters {
   font-size: 0.8rem;
 }
 .pr-legend-table td:first-child { font-weight: 600; white-space: nowrap; }
-.filters input, .actions input, .actions select, .filters select,
-#m-sample, #m-logic {
+.filters input, .actions input, .actions select, .filters select {
   font: inherit;
   padding: 0.35rem 0.5rem;
   border: 1px solid var(--line);
@@ -348,6 +347,14 @@ td input {
 .nav-link { color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .nav-link:hover { color: #173c8a; }
 tbody tr.current { background: #f3f8ef; }
+/* Sample results panels (Matches & Overrides / Try Pairing): the picked row. */
+tbody tr.selected { background: #e8f0fe; box-shadow: inset 3px 0 0 var(--accent); }
+.selected-bar { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.6rem; flex-wrap: wrap; }
+.selected-chip {
+  background: var(--accent); color: #fff; border-radius: 999px;
+  padding: 0.12rem 0.6rem; font-size: 0.75rem; font-weight: 600;
+}
+.selected-text { font-weight: 600; overflow-wrap: anywhere; }
 
 .badge {
   display: inline-block;

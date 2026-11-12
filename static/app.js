@@ -333,15 +333,16 @@ async function restoreFromHash() {
         else banner("error", `Sample ${esc(id)} not found.`, true);
       }
     } else if (view === "try" && id) {
-      const rows = await api(`/sample/lookup?q=${encodeURIComponent(id)}&limit=25`);
+      const rows = await api(`/sample/lookup?q=${encodeURIComponent(id)}&limit=${SAMPLE_PICK_LIMIT}`);
       const row = rows.find((x) =>
         x.primary_id.toLowerCase() === id.toLowerCase() ||
         x.cmo_sample_name.toLowerCase() === id.toLowerCase()
       );
       if (row) {
         $("#tq-id").value = id;
-        tryFillSelect(rows);
-        $("#tq-sample").value = row.id;
+        tryState.candidates = rows;
+        tryState.resultsTotal = null;
+        tryRenderResults();
         await selectTrySample(row);
       } else banner("error", `Sample ${esc(id)} not found.`, true);
     }
@@ -514,7 +515,8 @@ const matchesState = {
   sample: null,
   data: null,
   busy: false,
-  candidates: [],
+  results: [], // the current lookup rows shown in the results panel
+  resultsTotal: null, // X-Total-Count for those rows (null when absent)
   othersOffset: 0,
   othersTotal: 0,
   baitLogic: null, // the open sample's bait-set logic (mismatch-hint input)
@@ -546,17 +548,61 @@ async function lookupBaitSetLogic(sample) {
   }
 }
 
+/* Shared sample results panel (card t_4f824f62): the Matches & Overrides and
+ * Try Pairing search boxes render a clickable results table in the p-detail
+ * visual language (panel + click rows) instead of the old dropdowns. Rows are
+ * capped at SAMPLE_PICK_LIMIT; a hint appears when the list is truncated.
+ * Clicking a row selects that sample for the tab's downstream action. */
+const SAMPLE_PICK_LIMIT = 50;
+
+function renderSampleResults(prefix, rows, selectedId, total, onSelect) {
+  $(`#${prefix}-results`).classList.remove("hidden");
+  const tbody = $(`#${prefix}-results-table tbody`);
+  tbody.innerHTML = rows.map((s) => `
+    <tr class="click${selectedId != null && String(s.id) === String(selectedId) ? " selected" : ""}" data-id="${esc(s.id)}">
+      <td>${esc(s.primary_id)}</td>
+      <td>${esc(s.cmo_sample_name)}</td>
+      <td>${esc(s.patient__cmo || "—")}</td>
+      <td>${esc(s.request_id || "—")}</td>
+      <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
+    </tr>`).join("");
+  $(`#${prefix}-results-empty`).classList.toggle("hidden", rows.length > 0);
+  $(`#${prefix}-results-count`).textContent = countLabel(total, rows, 0);
+  const capped = total !== null ? total > rows.length : rows.length >= SAMPLE_PICK_LIMIT;
+  $(`#${prefix}-results-more`).classList.toggle("hidden", !capped);
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const sample = rows.find((s) => String(s.id) === tr.dataset.id);
+      if (sample) onSelect(sample);
+    });
+  });
+}
+
+/* "selected" summary line above a pairing tab's downstream buttons. */
+function renderSelectedBar(prefix, sample) {
+  const bar = $(`#${prefix}-selected-bar`);
+  if (!sample) {
+    bar.classList.add("hidden");
+    return;
+  }
+  $(`#${prefix}-selected-text`).innerHTML = sampleLabel(sample);
+  bar.classList.remove("hidden");
+}
+
 async function openMatchesFor(sample) {
   matchesState.sample = sample;
-  const sel = $("#m-sample");
-  sel.innerHTML = `<option value="${sample.id}" selected>${esc(sampleLabel(sample))}</option>`;
-  sel.disabled = false;
-  $("#m-show").disabled = false;
+  // A sample arriving from another page: the results panel shows it as the
+  // selected row — it is exactly how the user reached this tab.
+  matchesState.results = [sample];
+  matchesState.resultsTotal = 1;
   matchesState.othersOffset = 0;
   // Bait-set logic is only a mismatch hint now; matching runs under the View.
   matchesState.baitLogic = await lookupBaitSetLogic(sample);
   renderLogicMismatch("m", matchesState.baitLogic);
   showView("matches");
+  renderSelectedBar("m", sample);
+  $("#m-show").disabled = false;
+  renderMatchesResults();
   showMatches(0);
 }
 
@@ -564,28 +610,57 @@ function sampleLabel(s) {
   return `${s.primary_id} — ${s.cmo_sample_name} (${s.patient__cmo || "no patient"}, ${s.tumor_or_normal})`;
 }
 
+function renderMatchesResults() {
+  renderSampleResults(
+    "m",
+    matchesState.results,
+    matchesState.sample && matchesState.sample.id,
+    matchesState.resultsTotal,
+    (sample) => selectMatchesSample(sample)
+  );
+}
+
+/* Row click / preselect: make this sample the tab's downstream target.
+ * run=false selects without re-running the candidate query (the Show matches
+ * button is the explicit trigger in that flow); row clicks run immediately,
+ * mirroring openMatchesFor from the browse pages. */
+async function selectMatchesSample(sample, run = true) {
+  matchesState.sample = sample;
+  matchesState.othersOffset = 0;
+  matchesState.baitLogic = await lookupBaitSetLogic(sample);
+  renderLogicMismatch("m", matchesState.baitLogic);
+  renderSelectedBar("m", sample);
+  $("#m-show").disabled = false;
+  renderMatchesResults();
+  pushNav();
+  if (run) showMatches(0);
+  else hideMatchesPanels();
+}
+
 async function searchMatchesSamples() {
   const q = $("#m-q").value.trim();
   if (!q) return;
   try {
-    const results = await api(`/sample/?q=${encodeURIComponent(q)}&limit=25`);
-    const sel = $("#m-sample");
+    const { res, body } = await apiRes(`/sample/?q=${encodeURIComponent(q)}&limit=${SAMPLE_PICK_LIMIT}`);
+    const results = Array.isArray(body) ? body : [];
+    matchesState.results = results;
+    matchesState.resultsTotal = totalFromHeaders(res);
     if (!results.length) {
-      sel.innerHTML = "";
-      sel.disabled = true;
+      matchesState.sample = null;
+      renderSelectedBar("m", null);
       $("#m-show").disabled = true;
+      renderMatchesResults();
+      hideMatchesPanels();
       banner("info", `No samples match "${esc(q)}".`);
       return;
     }
-    sel.innerHTML = results.map((s) =>
-      `<option value="${s.id}">${esc(sampleLabel(s))}</option>`
-    ).join("");
-    sel.disabled = false;
-    $("#m-show").disabled = false;
-    matchesState.candidates = results;
-    matchesState.sample = results[0];
-    matchesState.baitLogic = await lookupBaitSetLogic(results[0]);
-    renderLogicMismatch("m", matchesState.baitLogic);
+    renderMatchesResults();
+    // Keep the current selection when it is among the results; otherwise
+    // preselect the top row (the old dropdown's implicit default) — the
+    // candidate query itself still only runs on Show matches or a row click.
+    if (!matchesState.sample || !results.some((s) => String(s.id) === String(matchesState.sample.id))) {
+      await selectMatchesSample(results[0], false);
+    }
   } catch (e) {
     banner("error", `Search failed: ${esc(e.message)}`, true);
   }
@@ -734,15 +809,6 @@ $("#m-q").addEventListener("keydown", (e) => {
   if (e.key === "Enter") searchMatchesSamples();
 });
 $("#m-show").addEventListener("click", () => showMatches());
-$("#m-sample").addEventListener("change", async (e) => {
-  const picked = matchesState.candidates.find((s) => s.id === e.target.value);
-  if (!picked) return;
-  matchesState.sample = picked;
-  matchesState.othersOffset = 0;
-  matchesState.baitLogic = await lookupBaitSetLogic(picked);
-  renderLogicMismatch("m", matchesState.baitLogic);
-  showMatches(0);
-});
 $("#m-others-prev").addEventListener("click", () => {
   if (!matchesState.data) return;
   showMatches(Math.max(0, matchesState.othersOffset - OTHERS_PAGE_SIZE));
@@ -2536,16 +2602,16 @@ applyHarmonyViewMode();
  * Only GET endpoints are used (sample lookup + possible-matches) — no
  * pairing row is ever created, updated, or overridden. */
 
-const tryState = { sample: null, candidates: [], busy: false, baitLogic: null };
+const tryState = { sample: null, candidates: [], resultsTotal: null, busy: false, baitLogic: null };
 
-function tryFillSelect(rows) {
-  tryState.candidates = rows;
-  const sel = $("#tq-sample");
-  sel.innerHTML = rows.map((s) =>
-    `<option value="${s.id}">${esc(sampleLabel(s))}</option>`
-  ).join("");
-  sel.disabled = rows.length === 0;
-  $("#tq-run").disabled = rows.length === 0;
+function tryRenderResults() {
+  renderSampleResults(
+    "tq",
+    tryState.candidates,
+    tryState.sample && tryState.sample.id,
+    tryState.resultsTotal,
+    (sample) => selectTrySample(sample)
+  );
 }
 
 async function trySearch() {
@@ -2554,18 +2620,22 @@ async function trySearch() {
   tryState.busy = true;
   $("#tq-lookup").disabled = true;
   try {
-    const rows = await api(`/sample/lookup?q=${encodeURIComponent(q)}&limit=25`);
+    const { res, body } = await apiRes(`/sample/lookup?q=${encodeURIComponent(q)}&limit=${SAMPLE_PICK_LIMIT}`);
+    const rows = Array.isArray(body) ? body : [];
+    tryState.candidates = rows;
+    tryState.resultsTotal = totalFromHeaders(res); // lookup sends no X-Total-Count: null
     if (!rows.length) {
       tryState.sample = null;
-      tryFillSelect([]);
+      renderSelectedBar("tq", null);
+      $("#tq-run").disabled = true;
+      tryRenderResults();
       $("#tq-summary").classList.add("hidden");
       $("#tq-result").classList.add("hidden");
       banner("info", `No sample matches "${esc(q)}" (primary_id / cmo_sample_name).`);
       return;
     }
-    tryFillSelect(rows);
+    tryRenderResults();
     const first = rows[0];
-    $("#tq-sample").value = first.id;
     await selectTrySample(first);
   } catch (e) {
     banner("error", `Sample lookup failed: ${esc(e.message)}`, true);
@@ -2578,6 +2648,8 @@ async function trySearch() {
 async function selectTrySample(sample) {
   tryState.sample = sample;
   $("#tq-run").disabled = false;
+  renderSelectedBar("tq", sample);
+  tryRenderResults();
   const kv = [
     ["primary_id", esc(sample.primary_id)],
     ["cmo_sample_name", esc(sample.cmo_sample_name)],
@@ -2769,10 +2841,6 @@ function renderTryExplainer(logicName) {
 $("#tq-lookup").addEventListener("click", trySearch);
 $("#tq-id").addEventListener("keydown", (e) => {
   if (e.key === "Enter") trySearch();
-});
-$("#tq-sample").addEventListener("change", (e) => {
-  const picked = tryState.candidates.find((s) => String(s.id) === e.target.value);
-  if (picked) selectTrySample(picked);
 });
 // No #tq-logic listener: the dry run always follows the topbar View
 // (rerenderPairingTabs re-runs it when the View changes).
