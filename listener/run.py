@@ -18,11 +18,11 @@ other down. The two clients keep separate durable consumers on the same
 JetStream stream, so the server fans the stream out independently —
 each durable has its own redelivery position (shadow mode).
 
-This module owns the process's SIGINT/SIGTERM handlers. The vendored
+This module owns the process's SIGINT/SIGTERM handlers. The upstream
 client installs process-wide handlers via ``signal.signal()`` inside
 ``start_consuming`` (each setting only its own stop event); with two
 clients the last one to start would win and the other consumer could
-never be told to stop (shutdown hangs). The vendored setup is disabled
+never be told to stop (shutdown hangs). The upstream setup is disabled
 and one consolidated handler here stops both clients.
 """
 import asyncio
@@ -115,9 +115,9 @@ def _install_signals(
     SmileClient.start_consuming() installs its own process-wide handlers
     via signal.signal(), each setting only that client's stop event;
     with two clients the last one to start would win and the other
-    consumer could never stop. Disable the vendored setup (the package
-    itself is not modified) and route every client's stop event from one
-    handler here.
+    consumer could never stop. Disable the upstream setup (the installed
+    package itself is not modified) and route every client's stop event
+    from one handler here.
 
     The handler is installed with loop.add_signal_handler rather than
     signal.signal: the callback must wake the event loop, and a bare

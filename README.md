@@ -198,9 +198,10 @@ always uses its own named volume `keycloak_db_data`):
 In production the app does **not** connect to NATS. SMILE publishes
 `cmo-new-request`, `cmo-sample-update` and `cmo-request-update`
 messages onto the `MDB_STREAM` JetStream stream, and a standalone
-**smile-listener** service — the vendored
-[mskcc/smile-client](https://github.com/mskcc/smile-client) copy in
-`listener/`, running as the `smile-listener` compose service — consumes
+**smile-listener** service — a standalone `listener/` service that
+pip-installs the upstream [mskcc/smile-client](https://github.com/mskcc/smile-client)
+package (pinned to a commit in `listener/Dockerfile`; no vendored copy in
+the repo), running as the `smile-listener` compose service — consumes
 them and POSTs each message to the app's internal `POST /v1/ingest/nats`
 endpoint. The endpoint is fail-closed: it rejects every request (403)
 unless `NATS_INGEST_TOKEN` is set, and the listener must send the same
