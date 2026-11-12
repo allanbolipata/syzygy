@@ -114,13 +114,41 @@
 <main id="view-patients" class="view hidden">
   <section class="panel">
     <h2>Patients</h2>
-    <div class="actions">
+    <div class="filters">
       <label>patient__cmo
         <input id="p-q" placeholder="partial match, e.g. C-EXAMPLE1">
+      </label>
+      <label>limit
+        <select id="p-limit">
+          <option>25</option>
+          <option>50</option>
+          <option selected>100</option>
+        </select>
       </label>
       <button id="p-search" class="primary">Search</button>
       <button id="p-clear">Clear</button>
     </div>
+    <details class="advanced-filters" id="p-advanced">
+      <summary>Advanced filters <span class="advanced-count hidden" id="p-advanced-count"></span></summary>
+      <div class="filters advanced-filters-grid" id="p-advanced-fields">
+        <label>species
+          <input id="p-species" name="species">
+        </label>
+        <label>sex
+          <input id="p-sex" name="sex">
+        </label>
+        <label>oncotree_code
+          <input id="p-oncotree_code" name="oncotree_code">
+        </label>
+        <label>diagnosis_date
+          <input id="p-diagnosis_date" name="diagnosis_date">
+        </label>
+        <label>request_id
+          <input id="p-request_id" name="request_id">
+        </label>
+      </div>
+    </details>
+    <p class="hint">Advanced filters are case-insensitive partial matches combined with AND. Metadata filters match the patient's derived value (tumor-priority, same as the metadata column); request_id matches patients with at least one sample in a matching request. Sample counts always cover ALL of a patient's samples.</p>
     <div class="table-head">
       <h3>Results</h3>
       <span id="p-count"></span>
@@ -136,6 +164,10 @@
         <tbody></tbody>
       </table>
       <p id="p-empty" class="empty">No patients found.</p>
+    </div>
+    <div class="pager">
+      <button id="p-prev">Prev</button>
+      <button id="p-next">Next</button>
     </div>
     <p class="hint">Click a row to open the patient's samples.</p>
   </section>
@@ -165,13 +197,38 @@
 <main id="view-requests" class="view hidden">
   <section class="panel">
     <h2>Requests</h2>
-    <div class="actions">
+    <div class="filters">
       <label>request_id
         <input id="r-q" placeholder="partial match, e.g. R-2024-001">
+      </label>
+      <label>limit
+        <select id="r-limit">
+          <option>25</option>
+          <option>50</option>
+          <option selected>100</option>
+        </select>
       </label>
       <button id="r-search" class="primary">Search</button>
       <button id="r-clear">Clear</button>
     </div>
+    <details class="advanced-filters" id="r-advanced">
+      <summary>Advanced filters <span class="advanced-count hidden" id="r-advanced-count"></span></summary>
+      <div class="filters advanced-filters-grid" id="r-advanced-fields">
+        <label>gene_panel
+          <input id="r-gene_panel" name="gene_panel">
+        </label>
+        <label>sample_type
+          <input id="r-sample_type" name="sample_type">
+        </label>
+        <label>bait_set
+          <input id="r-bait_set" name="bait_set">
+        </label>
+        <label>patient__cmo
+          <input id="r-patient__cmo" name="patient__cmo">
+        </label>
+      </div>
+    </details>
+    <p class="hint">Advanced filters are case-insensitive partial matches combined with AND; a request matches when at least one of its samples matches every given field. Sample counts always cover ALL of a request's samples.</p>
     <div class="table-head">
       <h3>Results</h3>
       <span id="r-count"></span>
@@ -187,6 +244,10 @@
         <tbody></tbody>
       </table>
       <p id="r-empty" class="empty">No requests found.</p>
+    </div>
+    <div class="pager">
+      <button id="r-prev">Prev</button>
+      <button id="r-next">Next</button>
     </div>
     <p class="hint">Click a row to open the request's samples and patients.</p>
   </section>

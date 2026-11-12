@@ -697,20 +697,65 @@ function submitOverride(normalId) {
 const patientsState = {
   results: [],
   total: null,
+  offset: 0,
+  limit: 100,
   pairings: null, // sample id -> {pairing logic name: [opposite samples]}
   patient: null,
   patientSamples: [],
 };
 
-async function loadPatients() {
+const PATIENT_ADVANCED_IDS = ["species", "sex", "oncotree_code", "diagnosis_date", "request_id"];
+
+/* Shared collapsible advanced-filter panel wiring (samples pattern from
+ * t_6c3a32bf): collapsing the <details> keeps values in the DOM; a closed
+ * panel shows an "(N active)" pill in its summary. */
+function bindAdvancedPanel(detailsEl, countEl, fieldSels) {
+  function update() {
+    let n = 0;
+    for (const sel of fieldSels) {
+      if ($(sel).value.trim()) n++;
+    }
+    if (!detailsEl.open && n > 0) {
+      countEl.textContent = `(${n} active)`;
+      countEl.classList.remove("hidden");
+    } else {
+      countEl.textContent = "";
+      countEl.classList.add("hidden");
+    }
+  }
+  detailsEl.addEventListener("toggle", update);
+  for (const sel of fieldSels) {
+    $(sel).addEventListener("input", update);
+  }
+  update();
+  return update;
+}
+
+const updatePatientAdvancedSummary = bindAdvancedPanel(
+  $("#p-advanced"),
+  $("#p-advanced-count"),
+  PATIENT_ADVANCED_IDS.map((id) => `#p-${id}`)
+);
+
+function patientsParams(offset) {
+  const p = new URLSearchParams();
+  p.set("limit", patientsState.limit);
+  p.set("offset", offset);
+  const q = $("#p-q").value.trim();
+  if (q) p.set("q", q);
+  for (const id of PATIENT_ADVANCED_IDS) {
+    const v = $(`#p-${id}`).value.trim();
+    if (v) p.set(id, v);
+  }
+  return p.toString();
+}
+
+async function loadPatients(offset = 0) {
   try {
-    const q = $("#p-q").value.trim();
-    const params = new URLSearchParams();
-    params.set("limit", 100);
-    if (q) params.set("q", q);
-    const { res, body } = await apiRes(`/patient/?${params}`);
+    const { res, body } = await apiRes(`/patient/?${patientsParams(offset)}`);
     patientsState.results = Array.isArray(body) ? body : [];
     patientsState.total = totalFromHeaders(res);
+    patientsState.offset = offset;
     renderPatients();
     return patientsState.results;
   } catch (e) {
@@ -736,7 +781,11 @@ function renderPatients() {
       </tr>`;
   }).join("");
   $("#p-empty").classList.toggle("hidden", rows.length > 0);
-  $("#p-count").textContent = countLabel(patientsState.total, rows, 0);
+  $("#p-count").textContent = countLabel(patientsState.total, rows, patientsState.offset);
+  $("#p-prev").disabled = patientsState.offset === 0;
+  $("#p-next").disabled = patientsState.total !== null
+    ? patientsState.offset + rows.length >= patientsState.total
+    : rows.length < patientsState.limit;
   tbody.querySelectorAll("tr[data-pid]").forEach((tr) => {
     tr.addEventListener("click", () => {
       const row = rows.find((p) => p.patient__cmo === tr.dataset.pid);
@@ -817,13 +866,30 @@ async function openPatient(row) {
   }
 }
 
-$("#p-search").addEventListener("click", loadPatients);
+$("#p-search").addEventListener("click", () => loadPatients(0));
 $("#p-q").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") loadPatients();
+  if (e.key === "Enter") loadPatients(0);
 });
+for (const id of PATIENT_ADVANCED_IDS) {
+  $(`#p-${id}`).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadPatients(0);
+  });
+}
+$("#p-limit").addEventListener("change", (e) => {
+  patientsState.limit = Number(e.target.value);
+  loadPatients(0);
+});
+$("#p-prev").addEventListener("click", () =>
+  loadPatients(Math.max(0, patientsState.offset - patientsState.limit))
+);
+$("#p-next").addEventListener("click", () =>
+  loadPatients(patientsState.offset + patientsState.limit)
+);
 $("#p-clear").addEventListener("click", () => {
   $("#p-q").value = "";
-  loadPatients();
+  for (const id of PATIENT_ADVANCED_IDS) $(`#p-${id}`).value = "";
+  updatePatientAdvancedSummary();
+  loadPatients(0);
 });
 $("#p-close").addEventListener("click", () => {
   closePatientDetail();
@@ -835,20 +901,40 @@ $("#p-close").addEventListener("click", () => {
 const requestsState = {
   results: [],
   total: null,
+  offset: 0,
+  limit: 100,
   request: null,
   requestSamples: [],
   requestPatients: [],
 };
 
-async function loadRequests() {
+const REQUEST_ADVANCED_IDS = ["gene_panel", "sample_type", "bait_set", "patient__cmo"];
+
+const updateRequestAdvancedSummary = bindAdvancedPanel(
+  $("#r-advanced"),
+  $("#r-advanced-count"),
+  REQUEST_ADVANCED_IDS.map((id) => `#r-${id}`)
+);
+
+function requestsParams(offset) {
+  const p = new URLSearchParams();
+  p.set("limit", requestsState.limit);
+  p.set("offset", offset);
+  const q = $("#r-q").value.trim();
+  if (q) p.set("q", q);
+  for (const id of REQUEST_ADVANCED_IDS) {
+    const v = $(`#r-${id}`).value.trim();
+    if (v) p.set(id, v);
+  }
+  return p.toString();
+}
+
+async function loadRequests(offset = 0) {
   try {
-    const q = $("#r-q").value.trim();
-    const params = new URLSearchParams();
-    params.set("limit", 100);
-    if (q) params.set("q", q);
-    const { res, body } = await apiRes(`/request/?${params}`);
+    const { res, body } = await apiRes(`/request/?${requestsParams(offset)}`);
     requestsState.results = Array.isArray(body) ? body : [];
     requestsState.total = totalFromHeaders(res);
+    requestsState.offset = offset;
     renderRequests();
     return requestsState.results;
   } catch (e) {
@@ -870,7 +956,11 @@ function renderRequests() {
       <td>${esc((r.sample_types || []).join(", "))}</td>
     </tr>`).join("");
   $("#r-empty").classList.toggle("hidden", rows.length > 0);
-  $("#r-count").textContent = countLabel(requestsState.total, rows, 0);
+  $("#r-count").textContent = countLabel(requestsState.total, rows, requestsState.offset);
+  $("#r-prev").disabled = requestsState.offset === 0;
+  $("#r-next").disabled = requestsState.total !== null
+    ? requestsState.offset + rows.length >= requestsState.total
+    : rows.length < requestsState.limit;
   tbody.querySelectorAll("tr[data-rid]").forEach((tr) => {
     tr.addEventListener("click", () => {
       const row = rows.find((r) => r.request_id === tr.dataset.rid);
@@ -966,13 +1056,30 @@ async function openPatientFromRequest(patientId) {
   }
 }
 
-$("#r-search").addEventListener("click", loadRequests);
+$("#r-search").addEventListener("click", () => loadRequests(0));
 $("#r-q").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") loadRequests();
+  if (e.key === "Enter") loadRequests(0);
 });
+for (const id of REQUEST_ADVANCED_IDS) {
+  $(`#r-${id}`).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadRequests(0);
+  });
+}
+$("#r-limit").addEventListener("change", (e) => {
+  requestsState.limit = Number(e.target.value);
+  loadRequests(0);
+});
+$("#r-prev").addEventListener("click", () =>
+  loadRequests(Math.max(0, requestsState.offset - requestsState.limit))
+);
+$("#r-next").addEventListener("click", () =>
+  loadRequests(requestsState.offset + requestsState.limit)
+);
 $("#r-clear").addEventListener("click", () => {
   $("#r-q").value = "";
-  loadRequests();
+  for (const id of REQUEST_ADVANCED_IDS) $(`#r-${id}`).value = "";
+  updateRequestAdvancedSummary();
+  loadRequests(0);
 });
 $("#r-close").addEventListener("click", () => {
   closeRequestDetail();
