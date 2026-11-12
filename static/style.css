@@ -90,6 +90,38 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   font-size: 0.8rem; color: var(--muted);
 }
 
+/* Samples view: collapsible "Advanced filters" section. Same visual
+ * treatment as the Pair Report's collapse controls — the pr-legend box
+ * (#f7f8fa rounded panel, accent summary) and the pr-group-count pill
+ * for the "(N active)" badge. Values are never cleared on collapse;
+ * <details> keeps them in the DOM. */
+details.advanced-filters {
+  margin: 0.1rem 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f7f8fa;
+  padding: 0.45rem 0.8rem 0.6rem;
+}
+.advanced-filters summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+.advanced-count {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.72rem;
+  background: #eceef1;
+  border-radius: 999px;
+  padding: 0.02rem 0.5rem;
+  margin-left: 0.35rem;
+}
+.advanced-filters .filters { margin: 0.55rem 0 0.15rem; }
+/* Gentle reveal when the section opens (toggle itself is native). */
+.advanced-filters[open] .advanced-filters-grid { animation: adv-filters-open 0.18s ease-out; }
+@keyframes adv-filters-open { from { opacity: 0; } to { opacity: 1; } }
+
 /* Pair Report: pairing-logic overview header — the primary control
  * (logic selector), its explainer blurb and the paired/unpaired strip.
  * Pairing triggers are API-only (no buttons here). Sits above the column

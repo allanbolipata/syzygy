@@ -33,33 +33,6 @@
       <label>search
         <input id="f-q" name="q" placeholder="any of primary_id, cmo name, patient, request">
       </label>
-      <label>primary_id
-        <input id="f-primary_id" name="primary_id">
-      </label>
-      <label>cmo_sample_name
-        <input id="f-cmo_sample_name" name="cmo_sample_name">
-      </label>
-      <label>patient__cmo
-        <input id="f-patient__cmo" name="patient__cmo">
-      </label>
-      <label>request_id
-        <input id="f-request_id" name="request_id">
-      </label>
-      <label>sample_type
-        <input id="f-sample_type" name="sample_type">
-      </label>
-      <label>gene_panel
-        <input id="f-gene_panel" name="gene_panel">
-      </label>
-      <label>bait_set
-        <input id="f-bait_set" name="bait_set">
-      </label>
-      <label>run_mode
-        <input id="f-run_mode" name="run_mode">
-      </label>
-      <label>file_group
-        <input id="f-file_group" name="file_group">
-      </label>
       <label>tumor_or_normal
         <select id="f-tumor_or_normal" name="tumor_or_normal">
           <option value="">any</option>
@@ -77,6 +50,38 @@
       <button type="button" class="primary" id="btn-search">Search</button>
       <button type="button" id="btn-clear">Clear</button>
     </div>
+    <details class="advanced-filters" id="s-advanced">
+      <summary>Advanced filters <span class="advanced-count hidden" id="s-advanced-count"></span></summary>
+      <div class="filters advanced-filters-grid" id="s-advanced-fields">
+        <label>primary_id
+          <input id="f-primary_id" name="primary_id">
+        </label>
+        <label>cmo_sample_name
+          <input id="f-cmo_sample_name" name="cmo_sample_name">
+        </label>
+        <label>patient__cmo
+          <input id="f-patient__cmo" name="patient__cmo">
+        </label>
+        <label>request_id
+          <input id="f-request_id" name="request_id">
+        </label>
+        <label>sample_type
+          <input id="f-sample_type" name="sample_type">
+        </label>
+        <label>gene_panel
+          <input id="f-gene_panel" name="gene_panel">
+        </label>
+        <label>bait_set
+          <input id="f-bait_set" name="bait_set">
+        </label>
+        <label>run_mode
+          <input id="f-run_mode" name="run_mode">
+        </label>
+        <label>file_group
+          <input id="f-file_group" name="file_group">
+        </label>
+      </div>
+    </details>
     <p class="hint">Field filters are case-insensitive partial matches combined with AND.</p>
   </section>
 

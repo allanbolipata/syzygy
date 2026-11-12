@@ -317,6 +317,7 @@ $("#btn-clear").addEventListener("click", () => {
   $("#f-q").value = "";
   for (const id of SAMPLE_FILTER_IDS) $(`#f-${id}`).value = "";
   $("#f-tumor_or_normal").value = "";
+  updateAdvancedSummary();
   loadSamples(0);
 });
 $("#f-limit").addEventListener("change", (e) => {
@@ -330,6 +331,36 @@ for (const el of ["#f-q", ...SAMPLE_FILTER_IDS.map((id) => `#f-${id}`)]) {
     if (e.key === "Enter") loadSamples(0);
   });
 }
+
+/* Samples "Advanced filters": collapsible <details>, closed by default.
+ * Collapsing never clears values (fields stay in the DOM inside <details>);
+ * when closed, the summary shows how many advanced fields have values,
+ * e.g. "Advanced filters (3 active)". Search semantics are untouched —
+ * samplesParams() still reads the same #f-* ids regardless of open state. */
+const sAdvanced = $("#s-advanced");
+const sAdvancedCount = $("#s-advanced-count");
+function activeAdvancedFilterCount() {
+  let n = 0;
+  for (const id of SAMPLE_FILTER_IDS) {
+    if ($(`#f-${id}`).value.trim()) n++;
+  }
+  return n;
+}
+function updateAdvancedSummary() {
+  const n = activeAdvancedFilterCount();
+  if (!sAdvanced.open && n > 0) {
+    sAdvancedCount.textContent = `(${n} active)`;
+    sAdvancedCount.classList.remove("hidden");
+  } else {
+    sAdvancedCount.textContent = "";
+    sAdvancedCount.classList.add("hidden");
+  }
+}
+sAdvanced.addEventListener("toggle", updateAdvancedSummary);
+for (const id of SAMPLE_FILTER_IDS) {
+  $(`#f-${id}`).addEventListener("input", updateAdvancedSummary);
+}
+updateAdvancedSummary();
 
 /* ---------- matches & overrides view ---------- */
 
