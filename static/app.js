@@ -105,6 +105,143 @@ const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", 
 let restoringNav = false;
 let PAIRING_LOGICS = [];
 
+/* ---------- session pairing-logic View (topbar #view-logic) ---------- *
+ * Mandatory + exclusive (card t_3e1444f0, spec updates 2026-11-11): the View
+ * IS the pairing logic for the pairing tabs (pairs, matches, try) — no
+ * per-tab logic dropdowns and no "ALL" state. viewLogic === null means
+ * nothing selected yet: the three pairing tabs are gated ("select a View
+ * first") while browse tabs stay usable. Persisted in localStorage so the
+ * choice survives tab switches, reloads and navigation. Browse tabs
+ * (samples/patients/requests/pooled) ignore the View entirely. */
+const VIEW_LOGIC_KEY = "syzygy.logic_view";
+const PAIRING_VIEWS = ["pairs", "matches", "try"];
+const VIEW_GATE_IDS = { pairs: "pairs-gate", matches: "matches-gate", try: "try-gate" };
+const VIEW_TAG_IDS = { pairs: "pr-view-label", matches: "m-view-label", try: "tq-view-label" };
+let viewLogic = null;
+
+function activeLogics() {
+  return PAIRING_LOGICS.filter((l) => l.active);
+}
+
+/* Options = ACTIVE logics only. An explicit "Select a logic…" placeholder
+ * exists only while nothing is chosen (it is a required-selection prompt,
+ * not an ALL state). */
+function renderViewSelect() {
+  const actives = activeLogics();
+  const sel = $("#view-logic");
+  if (!actives.length) {
+    sel.innerHTML = `<option value="" disabled selected>No active pairing logics</option>`;
+    return;
+  }
+  sel.innerHTML =
+    (viewLogic ? "" : `<option value="" selected>Select a logic…</option>`) +
+    actives.map((l) => `<option value="${esc(l.name)}">${esc(l.name)}</option>`).join("");
+  if (viewLogic) sel.value = viewLogic;
+}
+
+function renderViewTags() {
+  for (const id of Object.values(VIEW_TAG_IDS)) {
+    const el = $(`#${id}`);
+    if (el) el.textContent = viewLogic ? `View: ${viewLogic}` : "no View selected";
+  }
+}
+
+function gatePairingTabs() {
+  const has = !!viewLogic;
+  document.querySelectorAll(".tab[data-tab]").forEach((b) => {
+    if (!PAIRING_VIEWS.includes(b.dataset.tab)) return;
+    b.disabled = !has;
+    b.title = has ? "" : "Select a pairing logic in the topbar first";
+  });
+  for (const id of Object.values(VIEW_GATE_IDS)) $(`#${id}`).classList.toggle("hidden", has);
+}
+
+function applyViewState() {
+  renderViewSelect();
+  renderViewTags();
+  gatePairingTabs();
+}
+
+/* First-visit resolution: saved localStorage value (only if it still names
+ * an ACTIVE logic) → server's settings.default_pairing_logic_name (only if
+ * it resolves to an active logic) → unselected (pairing tabs gated). The
+ * default is not written to localStorage: a first-visit preselection keeps
+ * following the server default until the user actively picks one. */
+async function resolveInitialViewLogic() {
+  let name = null;
+  try { name = localStorage.getItem(VIEW_LOGIC_KEY); } catch (_) { /* private mode */ }
+  if (name && !activeLogics().some((l) => l.name === name)) name = null;
+  if (!name) {
+    try {
+      const r = await api("/pairing-logic/default");
+      const def = r && r.name;
+      if (def && activeLogics().some((l) => l.name === def)) name = def;
+    } catch (_) { /* endpoint unavailable: leave unselected */ }
+  }
+  return name;
+}
+
+/* User picked a View (topbar change): persist + re-render every pairing tab
+ * immediately — no per-tab override exists anywhere. */
+function setViewLogic(name) {
+  viewLogic = name || null;
+  try {
+    if (viewLogic) localStorage.setItem(VIEW_LOGIC_KEY, viewLogic);
+    else localStorage.removeItem(VIEW_LOGIC_KEY);
+  } catch (_) { /* localStorage unavailable: session-scoped only */ }
+  applyViewState();
+  rerenderPairingTabs();
+}
+
+function rerenderPairingTabs() {
+  if (!viewLogic) {
+    pairsState.logic = null;
+    return;
+  }
+  // Pair Report: fresh full list under the new logic (loadPairs drops the
+  // stale search + prefetch; mirrors the old per-tab logic-change sequence).
+  pairsState.logic = viewLogic;
+  resetPrSearch();
+  renderPrGroups();
+  renderPrLogicExplainer();
+  applyHarmonyViewMode();
+  loadPairs();
+  // Matches: candidate scope always follows the View's logic.
+  renderLogicMismatch("m", matchesState.baitLogic);
+  if (matchesState.sample) {
+    matchesState.othersOffset = 0;
+    showMatches(0);
+  }
+  // Try: explainer and (if a sample is open) the read-only dry run follow.
+  renderTryExplainer(viewLogic);
+  renderLogicMismatch("tq", tryState.baitLogic);
+  if (tryState.sample) runTry();
+}
+
+/* Non-blocking hint when the open sample's bait-set logic differs from the
+ * View (spec update 2): matching / dry run still run under the View. */
+function renderLogicMismatch(prefix, baitLogic) {
+  const el = $(`#${prefix}-logic-mismatch`);
+  if (!el) return;
+  if (viewLogic && baitLogic && baitLogic.toLowerCase() !== viewLogic.toLowerCase()) {
+    el.innerHTML =
+      `This sample's bait set belongs to the <strong>${esc(baitLogic)}</strong> logic, ` +
+      `but the session View is <strong>${esc(viewLogic)}</strong> — matching and pairing ` +
+      `here run under the View's logic.`;
+    el.classList.remove("hidden");
+  } else {
+    el.innerHTML = "";
+    el.classList.add("hidden");
+  }
+}
+
+$("#view-logic").addEventListener("change", (e) => {
+  setViewLogic(e.target.value);
+  if (!viewLogic && PAIRING_VIEWS.includes(currentViewName())) {
+    banner("info", "Select a pairing logic in the topbar View first — the pairing tabs need one.", true);
+  }
+});
+
 function currentViewName() {
   const el = document.querySelector("main.view:not(.hidden)");
   return el ? el.id.replace("view-", "") : null;
@@ -146,6 +283,11 @@ function showView(name) {
   document.querySelectorAll("main.view").forEach((el) =>
     el.classList.toggle("hidden", el.id !== `view-${name}`)
   );
+  // Hash-restored or programmatic entry into a gated pairing tab: the gate
+  // panel inside the view says it; a banner makes it unmistakable.
+  if (PAIRING_VIEWS.includes(name) && !viewLogic) {
+    banner("info", "Select a pairing logic in the topbar <strong>View</strong> first — the pairing tabs need one.", true);
+  }
   pushNav();
 }
 
@@ -375,49 +517,32 @@ const matchesState = {
   candidates: [],
   othersOffset: 0,
   othersTotal: 0,
+  baitLogic: null, // the open sample's bait-set logic (mismatch-hint input)
 };
 
 async function loadLogics() {
   try {
+    // Inactive logics stay out of the View options (the View is active-only
+    // and is now the ONLY pairing-logic control; the old per-tab selectors
+    // listed inactive logics — that capability is deliberately dropped).
     const logics = await api("/pairing-logic/?limit=100");
-    $("#m-logic").innerHTML = logics.map((l) =>
-      `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
-    ).join("");
-    // Pairs page lists every logic (inactive ones can still own pairings).
-    $("#pr-logic").innerHTML = logics.map((l) =>
-      `<option value="${esc(l.name)}">${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
-    ).join("");
     PAIRING_LOGICS = logics;
-    renderPrGroups();
-    // Try Pairing: active logics only (the dry-run endpoint refuses
-    // inactive ones), same options as the Matches tab.
-    $("#tq-logic").innerHTML = logics.map((l) =>
-      `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
-    ).join("");
-    renderPrLogicExplainer();
-    // The select has its options now, so the HARMONY view-mode (its own
-    // column set in the panel, "Download CSV" label) can apply to the
-    // default logic — the init-time call ran before these options existed.
-    applyHarmonyViewMode();
+    renderViewSelect();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
 }
 
-/* Select the pairing logic assigned to the sample's bait set (server-side
-   bait_sets table), so the page doesn't default to the first logic. */
-async function applyBaitSetLogic(sample, logicSelId) {
-  if (!sample || !sample.bait_set) return false;
+/* Which pairing logic the sample's bait set is assigned to (server-side
+ * bait_sets table), or null when unknown. This is ONLY a hint input now —
+ * the topbar View is the single logic control (no per-tab preselection). */
+async function lookupBaitSetLogic(sample) {
+  if (!sample || !sample.bait_set) return null;
   try {
     const row = await api(`/bait-sets/lookup?name=${encodeURIComponent(sample.bait_set)}`);
-    if (!row) return false;
-    const logicSel = $(`#${logicSelId || "m-logic"}`);
-    const opt = [...logicSel.options].find((o) => o.value === row.pairing_logic && !o.disabled);
-    if (!opt) return false;
-    logicSel.value = opt.value;
-    return true;
-  } catch (e) {
-    return false;
+    return row ? row.pairing_logic : null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -427,19 +552,11 @@ async function openMatchesFor(sample) {
   sel.innerHTML = `<option value="${sample.id}" selected>${esc(sampleLabel(sample))}</option>`;
   sel.disabled = false;
   $("#m-show").disabled = false;
-  // Prefer the bait set's assigned logic, then the logic this sample is
-  // currently paired under, when known.
-  const byLogic = patientsState.pairings ? patientsState.pairings[sample.id] : null;
-  if (await applyBaitSetLogic(sample)) {
-    // bait-set logic selected
-  } else if (byLogic) {
-    const logicSel = $("#m-logic");
-    const known = Object.keys(byLogic)[0];
-    const opt = [...logicSel.options].find((o) => o.value === known && !o.disabled);
-    if (opt) logicSel.value = opt.value;
-  }
-  showView("matches");
   matchesState.othersOffset = 0;
+  // Bait-set logic is only a mismatch hint now; matching runs under the View.
+  matchesState.baitLogic = await lookupBaitSetLogic(sample);
+  renderLogicMismatch("m", matchesState.baitLogic);
+  showView("matches");
   showMatches(0);
 }
 
@@ -467,7 +584,8 @@ async function searchMatchesSamples() {
     $("#m-show").disabled = false;
     matchesState.candidates = results;
     matchesState.sample = results[0];
-    await applyBaitSetLogic(results[0]);
+    matchesState.baitLogic = await lookupBaitSetLogic(results[0]);
+    renderLogicMismatch("m", matchesState.baitLogic);
   } catch (e) {
     banner("error", `Search failed: ${esc(e.message)}`, true);
   }
@@ -475,7 +593,7 @@ async function searchMatchesSamples() {
 
 async function showMatches(offset) {
   const sample = matchesState.sample;
-  const logic = $("#m-logic").value;
+  const logic = viewLogic; // the View IS the logic (no per-tab selector)
   $("#m-dmp-warning").classList.toggle("hidden", !isDmpLogic(logic));
   if (!sample || !logic) return;
   if (matchesState.busy) return;
@@ -621,7 +739,8 @@ $("#m-sample").addEventListener("change", async (e) => {
   if (!picked) return;
   matchesState.sample = picked;
   matchesState.othersOffset = 0;
-  await applyBaitSetLogic(picked);
+  matchesState.baitLogic = await lookupBaitSetLogic(picked);
+  renderLogicMismatch("m", matchesState.baitLogic);
   showMatches(0);
 });
 $("#m-others-prev").addEventListener("click", () => {
@@ -666,12 +785,14 @@ $("#m-others").addEventListener("click", (e) => {
 function submitOverride(normalId) {
   const data = matchesState.data;
   const allow = $("#m-allow-overrides").checked;
-  const logic = $("#m-logic").value;
+  const logic = viewLogic; // the View IS the logic (no per-tab selector)
   if (isDmpLogic(logic)) {
     banner("error",
-      "The DMP logic is automatic-only: use the “Run DMP pairing” button on " +
-      "the Pairs tab, or switch to another logic (e.g. ARGOS) to pin a " +
-      "DMP tumor to a non-DMP normal.", true);
+      "The DMP logic is automatic-only: overrides are not offered under a " +
+      "DMP View. The intended manual workflow is pinning an ARGOS " +
+      "(or other-logic) tumor to a same-patient DMP normal — switch the " +
+      "topbar View to that logic and override from the tumor's candidate " +
+      "list.", true);
     return;
   }
   const payload = {
@@ -1528,7 +1649,7 @@ function selectionFor(logicName) {
   return pairsState.selected[logicName];
 }
 function activeLogicName() {
-  return pairsState.logic || $("#pr-logic").value || null;
+  return pairsState.logic || viewLogic || null;
 }
 
 /* HARMONY view mode: the CSV/TSV format switch doesn't apply — HARMONY's
@@ -2075,7 +2196,7 @@ async function loadHarmonyPage(page) {
 }
 
 async function loadPairs() {
-  const logic = $("#pr-logic").value;
+  const logic = viewLogic;
   if (!logic) return;
   // A fresh load (init, tab re-entry, logic change, post-pairing refresh)
   // starts at page 1; any cached prefetch belongs to the previous
@@ -2269,17 +2390,8 @@ async function loadPrOverviewStats() {
   }
 }
 
-$("#pr-logic").addEventListener("change", () => {
-  // Sync the state before re-rendering: activeLogicName() prefers
-  // pairsState.logic, which loadPairs() sets when it runs — the blurb
-  // would otherwise keep the previous logic's text.
-  pairsState.logic = $("#pr-logic").value;
-  // A stale filter would otherwise carry into the new logic's rows.
-  resetPrSearch();
-  renderPrLogicExplainer();
-  applyHarmonyViewMode();
-  loadPairs();
-});
+/* The old #pr-logic per-tab change handler is gone: a View change runs the
+ * identical sequence via setViewLogic() → rerenderPairingTabs(). */
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
   if (pairsState.page > 0) loadReportPage(pairsState.page - 1);
@@ -2424,7 +2536,7 @@ applyHarmonyViewMode();
  * Only GET endpoints are used (sample lookup + possible-matches) — no
  * pairing row is ever created, updated, or overridden. */
 
-const tryState = { sample: null, candidates: [], busy: false };
+const tryState = { sample: null, candidates: [], busy: false, baitLogic: null };
 
 function tryFillSelect(rows) {
   tryState.candidates = rows;
@@ -2486,15 +2598,16 @@ async function selectTrySample(sample) {
   $("#tq-summary-kv").innerHTML = kv.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   $("#tq-summary").classList.remove("hidden");
   pushNav();
-  // Preselect the sample's own bait-set logic when known; otherwise
-  // keep whatever logic the user already picked.
-  await applyBaitSetLogic(sample, "tq-logic");
-  renderTryExplainer($("#tq-logic").value);
+  // The dry run always uses the View's logic; the sample's own bait-set
+  // logic only feeds the non-blocking mismatch hint (spec update 2).
+  tryState.baitLogic = await lookupBaitSetLogic(sample);
+  renderLogicMismatch("tq", tryState.baitLogic);
+  renderTryExplainer(viewLogic);
 }
 
 async function runTry() {
   const sample = tryState.sample;
-  const logic = $("#tq-logic").value;
+  const logic = viewLogic; // the View IS the logic (no per-tab selector)
   if (!sample || !logic || tryState.busy) return;
   tryState.busy = true;
   $("#tq-run").disabled = true;
@@ -2661,7 +2774,8 @@ $("#tq-sample").addEventListener("change", (e) => {
   const picked = tryState.candidates.find((s) => String(s.id) === e.target.value);
   if (picked) selectTrySample(picked);
 });
-$("#tq-logic").addEventListener("change", (e) => renderTryExplainer(e.target.value));
+// No #tq-logic listener: the dry run always follows the topbar View
+// (rerenderPairingTabs re-runs it when the View changes).
 $("#tq-run").addEventListener("click", runTry);
 
 /* ---------- auth: current user + sign-out ---------- */
@@ -2698,8 +2812,20 @@ $("#logout-btn").addEventListener("click", signOut);
 (async function init() {
   loadCurrentUser();
   await loadLogics();
-  if ($("#tq-logic").value) renderTryExplainer($("#tq-logic").value);
-  loadPairs();
+  // Resolve the session View: saved localStorage choice → server default
+  // (if active) → unselected (pairing tabs gated). Don't persist an
+  // auto-resolved default — only an explicit user pick is saved, so a
+  // first-visit View keeps following the server default until Allan picks.
+  viewLogic = await resolveInitialViewLogic();
+  applyViewState();
+  if (viewLogic) {
+    pairsState.logic = viewLogic;
+    renderPrGroups();
+    renderPrLogicExplainer();
+    applyHarmonyViewMode();
+    renderTryExplainer(viewLogic);
+    loadPairs();
+  }
   loadSamples(0);
   loadPatients();
   loadRequests();

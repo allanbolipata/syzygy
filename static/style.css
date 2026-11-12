@@ -49,6 +49,30 @@ nav { display: flex; gap: 0.4rem; }
 }
 .tab.active { color: var(--accent); border-color: var(--line); background: #eef2fb; }
 .tab:hover { color: var(--accent); }
+/* Pairing tabs are gated until the topbar View has a logic selected. */
+.tab:disabled { opacity: 0.45; cursor: not-allowed; }
+.tab:disabled:hover { color: var(--muted); }
+
+/* Session-wide pairing-logic View selector (topbar). */
+.view-select { display: flex; align-items: baseline; gap: 0.45rem; }
+.view-select > label { color: var(--muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }
+#view-logic { font-weight: 600; color: var(--accent); }
+
+/* "Select a View first" state shown inside each pairing tab. */
+.logic-gate {
+  margin: 0.4rem 0 0.9rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid #e5d3a8;
+  border-radius: 6px;
+  background: #fbf5e6;
+  color: var(--warn);
+}
+
+/* "View: <logic>" tag next to pairing-tab headings. */
+.view-tag { color: var(--accent); }
+
+/* Non-blocking hint when the open sample's bait-set logic differs from the View. */
+.logic-mismatch { color: var(--warn); }
 
 #banner { padding: 0 1.2rem; }
 #banner .msg {

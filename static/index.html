@@ -18,6 +18,10 @@
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
     <button class="tab" data-tab="try">Try Pairing</button>
   </nav>
+  <div class="view-select" title="Session-wide pairing logic — drives Pair Report, Matches &amp; Overrides and Try Pairing; persists across tabs and reloads">
+    <label for="view-logic">View</label>
+    <select id="view-logic"></select>
+  </div>
   <div class="user-area">
     <span id="current-user"></span>
     <button id="logout-btn">Sign out</button>
@@ -291,14 +295,16 @@
 </main>
 
 <main id="view-pairs" class="view hidden">
+  <div id="pairs-gate" class="logic-gate hidden">
+    <strong>Pair Report is waiting for a View.</strong> Select a pairing logic
+    in the topbar <strong>View</strong> selector first — the View drives this
+    tab (and Matches &amp; Overrides / Try Pairing) for the whole session.
+  </div>
   <section class="panel">
-    <h2>Pair Report</h2>
+    <h2>Pair Report <span class="sub view-tag" id="pr-view-label"></span></h2>
     <section class="pr-overview">
       <div class="pr-overview-row">
-        <label class="pr-overview-sel">
-          pairing logic
-          <select id="pr-logic"></select>
-        </label>
+        <span class="pr-overview-sel" id="pr-view-note" title="The topbar View select is the pairing logic for every pairing tab">logic from topbar View</span>
         <span id="pr-overview-stats" class="pr-stats"></span>
       </div>
       <div id="pr-logic-explain" class="pr-explain"></div>
@@ -462,8 +468,13 @@
 </main>
 
 <main id="view-matches" class="view hidden">
+  <div id="matches-gate" class="logic-gate hidden">
+    <strong>Matches &amp; Overrides is waiting for a View.</strong> Select a
+    pairing logic in the topbar <strong>View</strong> selector first — the
+    View drives this tab (and Pair Report / Try Pairing) for the whole session.
+  </div>
   <section class="panel">
-    <h2>Pick a sample</h2>
+    <h2>Pick a sample <span class="sub view-tag" id="m-view-label"></span></h2>
     <div class="actions">
       <label>search
         <input id="m-q" placeholder="partial match on primary_id / cmo name / patient / request">
@@ -474,11 +485,9 @@
       <label>sample
         <select id="m-sample" disabled></select>
       </label>
-      <label>pairing logic
-        <select id="m-logic"></select>
-      </label>
       <button id="m-show" class="primary" disabled>Show matches</button>
     </div>
+    <p id="m-logic-mismatch" class="hint logic-mismatch hidden"></p>
   </section>
 
   <section id="m-summary" class="panel hidden">
@@ -516,10 +525,14 @@
       Overrides (tumor &rarr; pinned normal) are recorded via <code>POST /pairing/trigger</code>.
     </p>
     <p id="m-dmp-warning" class="hint hidden">
-      The DMP logic is automatic-only: DMP tumors pair with their DMP
-      normals via the <em>Run DMP pairing</em> button on the Pairs tab.
-      To pin a DMP tumor to a non-DMP normal, switch to another logic
-      (e.g. ARGOS) first.
+      DMP samples never pair automatically under non-DMP logics. The intended
+      manual workflow is pinning an ARGOS (or other-logic) <em>tumor</em> to a
+      same-patient DMP <em>normal</em> — it appears in that tumor's candidate
+      list tagged &ldquo;DMP: manual pairing only&rdquo;. DMP tumors pair
+      automatically under the DMP logic; pinning a DMP tumor to a non-DMP
+      normal is possible but not the intended workflow. To change logic,
+      switch the topbar <strong>View</strong> — it applies to every pairing
+      tab.
     </p>
     <label class="check">
       <input type="checkbox" id="m-allow-overrides">
@@ -529,11 +542,17 @@
 </main>
 
 <main id="view-try" class="view hidden">
+  <div id="try-gate" class="logic-gate hidden">
+    <strong>Try Pairing is waiting for a View.</strong> Select a pairing logic
+    in the topbar <strong>View</strong> selector first — the View drives this
+    tab (and Pair Report / Matches &amp; Overrides) for the whole session.
+  </div>
   <section class="panel">
-    <h2>Try pairing <span class="sub">(dry run)</span></h2>
+    <h2>Try pairing <span class="sub">(dry run)</span> <span class="sub view-tag" id="tq-view-label"></span></h2>
     <p class="hint">
       Read-only &mdash; shows what the pairing cascade <em>would</em> do for one
-      sample under the chosen logic. Nothing is created, updated, or overridden.
+      sample under the topbar <strong>View</strong>'s logic. Nothing is created,
+      updated, or overridden.
     </p>
     <div class="actions">
       <label>sample
@@ -543,12 +562,10 @@
       <label>sample (matched)
         <select id="tq-sample" disabled></select>
       </label>
-      <label>pairing logic
-        <select id="tq-logic"></select>
-      </label>
       <button id="tq-run" class="primary" disabled>Run dry run</button>
     </div>
-    <p class="hint">Lookup matches primary_id and cmo_sample_name case-insensitively; the sample&rsquo;s bait-set logic is preselected when known.</p>
+    <p id="tq-logic-mismatch" class="hint logic-mismatch hidden"></p>
+    <p class="hint">Lookup matches primary_id and cmo_sample_name case-insensitively; the dry run always uses the topbar View's logic &mdash; a hint appears when the sample's bait set belongs to a different logic.</p>
   </section>
 
   <section id="tq-summary" class="panel hidden">
