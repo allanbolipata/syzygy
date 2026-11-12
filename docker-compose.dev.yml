@@ -1,11 +1,12 @@
 # Local-development override, layered ON docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 #
-# It adds the two services the app needs locally — its Postgres (the
-# production file bundles no database) and a dev Keycloak with its own
-# Postgres — and overrides the app's env with dev values. Production
-# runs docker-compose.yml alone and points DATABASE_URL / KEYCLOAK_URL
-# / KEYCLOAK_CLIENT_SECRET at external services.
+# The app's Postgres service (`db`) now lives in the production file;
+# this override only adapts it for local development (dev credentials,
+# the host-published port, the dev network). It also adds the services
+# production does not bundle: a dev Keycloak with its own Postgres, and
+# the dev NATS stack. Production runs docker-compose.yml alone and
+# points KEYCLOAK_URL / KEYCLOAK_CLIENT_SECRET at external services.
 name: syzygy
 
 # ONE place the cohort result subject lives: a single YAML alias feeds both
@@ -108,28 +109,27 @@ services:
       - syzygy-dev
     restart: unless-stopped
 
-  # Dev-only database, NOT part of the production stack.
+  # The app's Postgres service is defined in docker-compose.yml (the
+  # production stack ships with it); this override only adapts it for
+  # local development. It must NOT re-declare the service's volumes or
+  # healthcheck: compose files concatenate list-valued keys, so a
+  # second declaration would put two mounts at
+  # /var/lib/postgresql/data and an invalid healthcheck.
+  #
+  # With PG_DATA_DIR unset (the dev default), the base file's mount
+  # resolves to the named volume db_data, so dev data stays a named
+  # volume and `docker compose down -v` still wipes it.
   db:
-    image: postgres:17
-    container_name: syzygy-db
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
       POSTGRES_DB: app
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d app"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
     ports:
       # 5435, not 5432: the host's own Postgres owns 5432 and serves
       # other dev databases (beagle).
       - "5435:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
     networks:
       - syzygy-dev
-    restart: unless-stopped
 
   # Dev-only Keycloak. Production points KEYCLOAK_URL at the externally
   # managed org Keycloak instead.
