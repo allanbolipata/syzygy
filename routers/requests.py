@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,15 @@ from schemas import RequestRead
 router = APIRouter(prefix="/request", tags=["requests"])
 
 
+def _apply_request_filters(stmt, q):
+    """Filter clauses shared by the page query and the total query, so
+    the reported total always reflects the currently active filter set."""
+    stmt = stmt.where(Sample.request_id.is_not(None))
+    if q is not None:
+        stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
+    return stmt
+
+
 def _request_page(db: Session, limit, offset, q):
     """One row per request: id + sample/tumor/normal counts.
 
@@ -19,7 +28,7 @@ def _request_page(db: Session, limit, offset, q):
     database level, so a paginated call never loads more than ``limit``
     requests' worth of group rows. Dialect-agnostic (Postgres + SQLite).
     """
-    stmt = (
+    stmt = _apply_request_filters(
         select(
             Sample.request_id,
             func.count().label("sample_count"),
@@ -29,18 +38,23 @@ def _request_page(db: Session, limit, offset, q):
             func.sum(case((Sample.tumor_or_normal == "NORMAL", 1), else_=0)).label(
                 "normal_count"
             ),
-        )
-        .where(Sample.request_id.is_not(None))
-        .group_by(Sample.request_id)
-    )
-    if q is not None:
-        stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
-    stmt = stmt.order_by(Sample.request_id)
+        ),
+        q,
+    ).group_by(Sample.request_id).order_by(Sample.request_id)
     if offset is not None:
         stmt = stmt.offset(offset)
     if limit is not None:
         stmt = stmt.limit(limit)
     return db.execute(stmt).all()
+
+
+def _request_total(db: Session, q) -> int:
+    """Pre-pagination number of request groups under the current filters
+    (COUNT over the same filtered GROUP BY that produces the page)."""
+    groups = _apply_request_filters(select(Sample.request_id), q).group_by(
+        Sample.request_id
+    )
+    return db.scalar(select(func.count()).select_from(groups.subquery()))
 
 
 @router.get("/", response_model=list[RequestRead])
@@ -49,6 +63,7 @@ def list_requests(
     offset: Optional[int] = Query(None, ge=0),
     q: Optional[str] = None,
     db: Session = Depends(get_db),
+    response: Response = None,
 ):
     """Requests derived from samples (``request_id`` non-null), sorted by
     request_id. ``q`` is a case-insensitive partial match on request_id.
@@ -60,7 +75,16 @@ def list_requests(
     Counts come from a SQL GROUP BY with DB-level limit/offset; the
     distinct lists are then computed in Python over only the current
     page's samples.
+
+    The ``X-Total-Count`` response header reports the total number of
+    request groups matching the current filters, independent of
+    ``limit``/``offset`` (pre-pagination). ``response`` defaults to
+    ``None`` so direct-call tests (repo convention) can pass a plain
+    ``Response()`` to capture the header.
     """
+    total = _request_total(db, q)
+    if response is not None:
+        response.headers["X-Total-Count"] = str(total)
     rows = _request_page(db, limit, offset, q)
     if not rows:
         return []

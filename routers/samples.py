@@ -1,8 +1,8 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from bait_sets import resolve_bait_set_logic
@@ -45,33 +45,27 @@ def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
     return sample
 
 
-@router.get("/", response_model=list[SampleRead])
-def list_samples(
-    limit: Optional[int] = Query(None, ge=1),
-    offset: Optional[int] = Query(None, ge=0),
-    q: Optional[str] = None,
-    primary_id: Optional[str] = None,
-    cmo_sample_name: Optional[str] = None,
-    patient__cmo: Optional[str] = None,
-    request_id: Optional[str] = None,
-    sample_type: Optional[str] = None,
-    gene_panel: Optional[str] = None,
-    bait_set: Optional[str] = None,
-    run_mode: Optional[str] = None,
-    file_group: Optional[str] = None,
-    tumor_or_normal: Optional[TumorOrNormal] = None,
-    no_patient: Optional[bool] = None,
-    db: Session = Depends(get_db),
+def _samples_filtered_query(
+    *,
+    q: Optional[str],
+    primary_id: Optional[str],
+    cmo_sample_name: Optional[str],
+    patient__cmo: Optional[str],
+    request_id: Optional[str],
+    sample_type: Optional[str],
+    gene_panel: Optional[str],
+    bait_set: Optional[str],
+    run_mode: Optional[str],
+    file_group: Optional[str],
+    tumor_or_normal: Optional[TumorOrNormal],
+    no_patient: Optional[bool],
 ):
-    """List samples, newest first, with optional field filters.
+    """Filtered ``SELECT`` on ``Sample`` — no ordering or pagination.
 
-    ``q`` matches any of ``primary_id``, ``cmo_sample_name``,
-    ``patient__cmo``, or ``request_id``. The per-field filters are
-    case-insensitive substring matches; ``tumor_or_normal`` is exact;
-    ``no_patient`` restricts to samples with a null patient__cmo (e.g.
-    pooled normals). All filters combine with AND.
+    Shared by the page query and the ``X-Total-Count`` query so the
+    reported total always reflects the currently active filter set.
     """
-    stmt = select(Sample).order_by(Sample.created_date.desc(), Sample.id.desc())
+    stmt = select(Sample)
     if q is not None:
         like = f"%{q}%"
         stmt = stmt.where(
@@ -99,6 +93,60 @@ def list_samples(
         stmt = stmt.where(Sample.patient__cmo.is_(None))
     if tumor_or_normal is not None:
         stmt = stmt.where(Sample.tumor_or_normal == tumor_or_normal.value)
+    return stmt
+
+
+@router.get("/", response_model=list[SampleRead])
+def list_samples(
+    limit: Optional[int] = Query(None, ge=1),
+    offset: Optional[int] = Query(None, ge=0),
+    q: Optional[str] = None,
+    primary_id: Optional[str] = None,
+    cmo_sample_name: Optional[str] = None,
+    patient__cmo: Optional[str] = None,
+    request_id: Optional[str] = None,
+    sample_type: Optional[str] = None,
+    gene_panel: Optional[str] = None,
+    bait_set: Optional[str] = None,
+    run_mode: Optional[str] = None,
+    file_group: Optional[str] = None,
+    tumor_or_normal: Optional[TumorOrNormal] = None,
+    no_patient: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    response: Response = None,
+):
+    """List samples, newest first, with optional field filters.
+
+    ``q`` matches any of ``primary_id``, ``cmo_sample_name``,
+    ``patient__cmo``, or ``request_id``. The per-field filters are
+    case-insensitive substring matches; ``tumor_or_normal`` is exact;
+    ``no_patient`` restricts to samples with a null patient__cmo (e.g.
+    pooled normals). All filters combine with AND.
+
+    The ``X-Total-Count`` response header reports the total number of
+    rows matching the current filters, independent of ``limit``/
+    ``offset`` (pre-pagination). ``response`` defaults to ``None`` so
+    direct-call tests (repo convention) can pass a plain ``Response()``
+    to capture the header.
+    """
+    base = _samples_filtered_query(
+        q=q,
+        primary_id=primary_id,
+        cmo_sample_name=cmo_sample_name,
+        patient__cmo=patient__cmo,
+        request_id=request_id,
+        sample_type=sample_type,
+        gene_panel=gene_panel,
+        bait_set=bait_set,
+        run_mode=run_mode,
+        file_group=file_group,
+        tumor_or_normal=tumor_or_normal,
+        no_patient=no_patient,
+    )
+    total = db.scalar(select(func.count()).select_from(base.subquery()))
+    if response is not None:
+        response.headers["X-Total-Count"] = str(total)
+    stmt = base.order_by(Sample.created_date.desc(), Sample.id.desc())
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:

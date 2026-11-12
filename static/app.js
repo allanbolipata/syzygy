@@ -49,7 +49,7 @@ function banner(kind, html, sticky) {
   if (!sticky) bannerTimer = setTimeout(() => (el.innerHTML = ""), 8000);
 }
 
-async function api(path, opts) {
+async function apiRes(path, opts) {
   const res = await fetch(API + path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
   let body = null;
   try { body = await res.json(); } catch (_) { /* non-JSON */ }
@@ -66,7 +66,30 @@ async function api(path, opts) {
     }
     throw new Error(detail);
   }
-  return body;
+  return { res, body };
+}
+
+async function api(path, opts) {
+  return (await apiRes(path, opts)).body;
+}
+
+/* Total from the X-Total-Count header (listing endpoints), or null when
+ * absent (older backend / non-listing calls). */
+function totalFromHeaders(res) {
+  const raw = res.headers.get("X-Total-Count");
+  if (raw === null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/* "Showing 1–50 of 1,234" from the pre-pagination total; falls back to
+ * the old per-page wording when the header is missing. */
+function countLabel(total, rows, offset) {
+  if (!rows.length) return "";
+  if (total === null) return `${rows.length} on this page`;
+  const from = (offset || 0) + 1;
+  const to = (offset || 0) + rows.length;
+  return `Showing ${from}–${to} of ${total.toLocaleString("en-US")}`;
 }
 
 /* ---------- view navigation (tabs + back button) ---------- */
@@ -219,7 +242,7 @@ function navigateToRequest(requestId) {
 
 /* ---------- samples view ---------- */
 
-const samplesState = { limit: 50, offset: 0, results: [] };
+const samplesState = { limit: 50, offset: 0, results: [], total: null };
 
 const SAMPLE_FILTER_IDS = [
   "primary_id", "cmo_sample_name", "patient__cmo", "request_id",
@@ -243,8 +266,9 @@ function samplesParams(offset) {
 
 async function loadSamples(offset) {
   try {
-    const results = await api(`/sample/?${samplesParams(offset)}`);
-    samplesState.results = results;
+    const { res, body } = await apiRes(`/sample/?${samplesParams(offset)}`);
+    samplesState.results = Array.isArray(body) ? body : [];
+    samplesState.total = totalFromHeaders(res);
     samplesState.offset = offset;
     renderSamples();
   } catch (e) {
@@ -274,9 +298,12 @@ function renderSamples() {
       <td>${fmtDate(s.sequencing_date)}</td>
     </tr>`).join("");
   $("#s-empty").classList.toggle("hidden", rows.length > 0);
-  $("#s-count").textContent = rows.length ? `${rows.length} on this page` : "";
+  $("#s-count").textContent = countLabel(samplesState.total, rows, samplesState.offset);
   $("#s-prev").disabled = samplesState.offset === 0;
-  $("#s-next").disabled = rows.length < samplesState.limit;
+  $("#s-next").disabled =
+    samplesState.total !== null
+      ? samplesState.offset + rows.length >= samplesState.total
+      : rows.length < samplesState.limit;
   tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
     tr.addEventListener("click", () => {
       const sample = rows.find((s) => s.id === tr.dataset.id);
@@ -638,6 +665,7 @@ function submitOverride(normalId) {
 
 const patientsState = {
   results: [],
+  total: null,
   pairings: null, // sample id -> {pairing logic name: [opposite samples]}
   patient: null,
   patientSamples: [],
@@ -649,7 +677,9 @@ async function loadPatients() {
     const params = new URLSearchParams();
     params.set("limit", 100);
     if (q) params.set("q", q);
-    patientsState.results = await api(`/patient/?${params}`);
+    const { res, body } = await apiRes(`/patient/?${params}`);
+    patientsState.results = Array.isArray(body) ? body : [];
+    patientsState.total = totalFromHeaders(res);
     renderPatients();
     return patientsState.results;
   } catch (e) {
@@ -675,6 +705,7 @@ function renderPatients() {
       </tr>`;
   }).join("");
   $("#p-empty").classList.toggle("hidden", rows.length > 0);
+  $("#p-count").textContent = countLabel(patientsState.total, rows, 0);
   tbody.querySelectorAll("tr[data-pid]").forEach((tr) => {
     tr.addEventListener("click", () => {
       const row = rows.find((p) => p.patient__cmo === tr.dataset.pid);
@@ -772,6 +803,7 @@ $("#p-close").addEventListener("click", () => {
 
 const requestsState = {
   results: [],
+  total: null,
   request: null,
   requestSamples: [],
   requestPatients: [],
@@ -783,7 +815,9 @@ async function loadRequests() {
     const params = new URLSearchParams();
     params.set("limit", 100);
     if (q) params.set("q", q);
-    requestsState.results = await api(`/request/?${params}`);
+    const { res, body } = await apiRes(`/request/?${params}`);
+    requestsState.results = Array.isArray(body) ? body : [];
+    requestsState.total = totalFromHeaders(res);
     renderRequests();
     return requestsState.results;
   } catch (e) {
@@ -805,6 +839,7 @@ function renderRequests() {
       <td>${esc((r.sample_types || []).join(", "))}</td>
     </tr>`).join("");
   $("#r-empty").classList.toggle("hidden", rows.length > 0);
+  $("#r-count").textContent = countLabel(requestsState.total, rows, 0);
   tbody.querySelectorAll("tr[data-rid]").forEach((tr) => {
     tr.addEventListener("click", () => {
       const row = rows.find((r) => r.request_id === tr.dataset.rid);
