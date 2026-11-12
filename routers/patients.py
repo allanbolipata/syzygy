@@ -4,8 +4,10 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import and_, case, cast, func, or_, select, String
 from sqlalchemy.orm import Session
 
+from bait_sets import logic_membership_condition
 from database import get_db
-from models import Sample
+from models import PairingLogic, Sample
+from pairing_service import resolve_filter_logic
 from schemas import PatientRead
 
 
@@ -73,6 +75,7 @@ def _patient_advanced_having(
     oncotree_code: Optional[str],
     diagnosis_date: Optional[str],
     request_id: Optional[str],
+    logic: Optional[PairingLogic] = None,
 ):
     """HAVING clauses for the advanced patient filters (AND-combined)."""
     having = []
@@ -87,6 +90,12 @@ def _patient_advanced_having(
             having.append(_metadata_match_having(PATIENT_META_FILTERS[param], value))
     if request_id is not None:
         having.append(_any_sample_matching(Sample.request_id.ilike(f"%{request_id}%")))
+    if logic is not None:
+        # Group-level pairing-logic filter: the patient is included when
+        # >=1 of its samples belongs to the logic family; the group's
+        # counts still cover ALL of its samples (Allan's 2026-11-11
+        # all-samples counting decision, reaffirmed 2026-11-12).
+        having.append(_any_sample_matching(logic_membership_condition(logic)))
     return having
 
 
@@ -99,6 +108,7 @@ def _apply_patient_filters(
     oncotree_code: Optional[str] = None,
     diagnosis_date: Optional[str] = None,
     request_id: Optional[str] = None,
+    logic: Optional[PairingLogic] = None,
 ):
     """Filter clauses shared by the page query and the total query, so
     the reported total always reflects the currently active filter set.
@@ -118,6 +128,7 @@ def _apply_patient_filters(
         oncotree_code=oncotree_code,
         diagnosis_date=diagnosis_date,
         request_id=request_id,
+        logic=logic,
     )
     if having:
         stmt = stmt.having(and_(*having))
@@ -171,6 +182,7 @@ def list_patients(
     oncotree_code: Optional[str] = None,
     diagnosis_date: Optional[str] = None,
     request_id: Optional[str] = None,
+    pairing_logic: Optional[str] = None,
     db: Session = Depends(get_db),
     response: Response = None,
 ):
@@ -191,6 +203,13 @@ def list_patients(
       carries the key at all).
     - ``request_id`` matches patients having at least one sample whose
       request_id partial-matches.
+    - ``pairing_logic`` (e.g. ``ARGOS``/``TEMPO``/``ACCESS``/``DMP``)
+      matches patients having at least one sample of that logic family
+      (sample membership = registered bait_sets assignment; the DMP logic
+      also owns bait_set-NULL ``sample_type`` ``'DMP'`` samples). Omitted
+      / blank / ``ALL`` = no restriction; unknown name -> 400. Counts and
+      ``requests`` stay all-samples under this filter too (2026-11-11
+      counting decision).
     All filters combine with AND.
 
     Counts come from a SQL GROUP BY with DB-level limit/offset; the
@@ -209,6 +228,7 @@ def list_patients(
         "oncotree_code": oncotree_code,
         "diagnosis_date": diagnosis_date,
         "request_id": request_id,
+        "logic": resolve_filter_logic(db, pairing_logic),
     }
     rows = _patient_page(db, limit, offset, q=q, **advanced)
 

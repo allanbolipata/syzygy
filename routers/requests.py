@@ -4,8 +4,10 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
+from bait_sets import logic_membership_condition
 from database import get_db
-from models import Sample
+from models import PairingLogic, Sample
+from pairing_service import resolve_filter_logic
 from schemas import RequestRead
 
 
@@ -27,6 +29,7 @@ def _request_advanced_having(
     sample_type: Optional[str],
     bait_set: Optional[str],
     patient__cmo: Optional[str],
+    logic: Optional[PairingLogic] = None,
 ):
     """HAVING clauses for the advanced request filters (AND-combined):
     the request matches when at least one of its samples carries a
@@ -42,6 +45,12 @@ def _request_advanced_having(
             having.append(
                 _any_sample_matching(getattr(Sample, field).ilike(f"%{value}%"))
             )
+    if logic is not None:
+        # Group-level pairing-logic filter: the request is included when
+        # >=1 of its samples belongs to the logic family; the group's
+        # counts still cover ALL of its samples (Allan's 2026-11-11
+        # all-samples counting decision, reaffirmed 2026-11-12).
+        having.append(_any_sample_matching(logic_membership_condition(logic)))
     return having
 
 
@@ -53,6 +62,7 @@ def _apply_request_filters(
     sample_type: Optional[str] = None,
     bait_set: Optional[str] = None,
     patient__cmo: Optional[str] = None,
+    logic: Optional[PairingLogic] = None,
 ):
     """Filter clauses shared by the page query and the total query, so
     the reported total always reflects the currently active filter set.
@@ -71,6 +81,7 @@ def _apply_request_filters(
         sample_type=sample_type,
         bait_set=bait_set,
         patient__cmo=patient__cmo,
+        logic=logic,
     )
     if having:
         stmt = stmt.having(and_(*having))
@@ -123,6 +134,7 @@ def list_requests(
     sample_type: Optional[str] = None,
     bait_set: Optional[str] = None,
     patient__cmo: Optional[str] = None,
+    pairing_logic: Optional[str] = None,
     db: Session = Depends(get_db),
     response: Response = None,
 ):
@@ -138,6 +150,11 @@ def list_requests(
     samples): ``gene_panel``, ``sample_type``, ``bait_set`` and
     ``patient__cmo`` are case-insensitive partial matches — a request
     matches when at least one of its samples matches each given field.
+    ``pairing_logic`` (e.g. ``ARGOS``/``TEMPO``/``ACCESS``/``DMP``)
+    matches requests having at least one sample of that logic family
+    (sample membership = registered bait_sets assignment; the DMP logic
+    also owns bait_set-NULL ``sample_type`` ``'DMP'`` samples). Omitted /
+    blank / ``ALL`` = no restriction; unknown name -> 400.
     All filters combine with AND.
 
     Counts come from a SQL GROUP BY with DB-level limit/offset; the
@@ -155,6 +172,7 @@ def list_requests(
         "sample_type": sample_type,
         "bait_set": bait_set,
         "patient__cmo": patient__cmo,
+        "logic": resolve_filter_logic(db, pairing_logic),
     }
     rows = _request_page(db, limit, offset, q=q, **advanced)
 

@@ -7,7 +7,14 @@ from sqlalchemy import exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import BaitSet, PairingLogic, PairingTable, Sample, utcnow
+from models import (
+    DMP_LOGIC_NAME,
+    BaitSet,
+    PairingLogic,
+    PairingTable,
+    Sample,
+    utcnow,
+)
 from bait_sets import classify_bait_set, resolve_bait_set_logic
 from pairing_strategies import get_pairing_strategy, strategies
 from schemas import TumorOrNormal
@@ -60,6 +67,38 @@ def resolve_pairing_logic(
 
     if logic is not None:
         _ensure_active(logic)
+    return logic
+
+
+def resolve_filter_logic(db: Session, pairing_logic: Optional[str]) -> Optional[PairingLogic]:
+    """Resolve the optional ``pairing_logic`` *listing-filter* param.
+
+    Shared by GET /sample/, GET /patient/ and GET /request/. Unlike
+    ``resolve_pairing_logic`` (pairing *execution*, which requires an
+    active logic):
+
+    - ``None`` / blank / ``ALL`` (any case) -> ``None``: no restriction
+      (the listings' pre-pagination default behavior is untouched).
+    - a known name -> that logic, active *or inactive* — browse filters
+      are read-only, so an inactive logic may still scope a listing.
+      Match order: exact name, ``PAIRING_LOGIC_ALIASES`` fallback, then a
+      case-insensitive name match (hand-typed query params shouldn't 400
+      on case; an exact match always wins).
+    - an unknown name -> HTTP 400 (client error, so a typo never
+      masquerades as an empty result set).
+    """
+    if pairing_logic is None or not pairing_logic.strip():
+        return None
+    name = pairing_logic.strip()
+    if name.upper() == "ALL":
+        return None
+    logic = find_logic_by_name(db, name)
+    if logic is None:
+        logic = db.scalar(
+            select(PairingLogic).where(func.lower(PairingLogic.name) == name.lower())
+        )
+    if logic is None:
+        raise HTTPException(status_code=400, detail=f"Unknown pairing logic '{name}'")
     return logic
 
 
@@ -512,12 +551,12 @@ def trigger_pairing_for_unpaired_tumors(
 # Automatic DMP pairing (POST /pairing/trigger-dmp)
 # ---------------------------------------------------------------------------
 
-#: Name of the pairing logic under which DMP samples pair automatically.
-#: The DMP strategy is strictly DMP-group scoped (DMP tumor <-> DMP
-#: normal, two-tier same-pool / same-IM_ver matching), so running it in
-#: bulk can only create DMP-DMP pairings and never touches other sample
-#: groups.
-DMP_LOGIC_NAME = "DMP"
+#: Name of the pairing logic under which DMP samples pair automatically
+#: (DMP_LOGIC_NAME, defined in models.py so the SQL-side listing filters
+#: can use it without a circular import). The DMP strategy is strictly
+#: DMP-group scoped (DMP tumor <-> DMP normal, two-tier same-pool /
+#: same-IM_ver matching), so running it in bulk can only create DMP-DMP
+#: pairings and never touches other sample groups.
 
 
 def trigger_dmp_pairing(db: Session) -> dict:
