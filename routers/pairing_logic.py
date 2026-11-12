@@ -1,17 +1,34 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import get_db, settings
 from models import PairingLogic
 from pairing_strategies import strategies
 from schemas import PairingLogicCreate, PairingLogicRead
 
 
 router = APIRouter(prefix="/pairing-logic", tags=["pairing-logic"])
+
+
+class PairingLogicDefault(BaseModel):
+    name: Optional[str] = None
+
+
+@router.get("/default", response_model=PairingLogicDefault)
+def pairing_logic_default():
+    """The configured default pairing-logic name (settings.default_pairing_logic_name).
+
+    Serves the topbar View selector's first-visit preselection (card
+    t_3e1444f0): the client preselects this name only when it resolves to an
+    ACTIVE logic; otherwise the View starts unselected and the pairing tabs
+    stay gated. Passed through verbatim — no activation check server-side.
+    """
+    return PairingLogicDefault(name=settings.default_pairing_logic_name)
 
 
 @router.get("/", response_model=list[PairingLogicRead])

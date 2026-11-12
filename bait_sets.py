@@ -5,10 +5,10 @@ ACCESS; "HEMEPACT" or "IMPACT" in the name -> ARGOS (case-insensitive).
 """
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
-from models import BaitSet, PairingLogic
+from models import DMP_LOGIC_NAME, BaitSet, PairingLogic, Sample
 
 TEMPO_BAIT_SETS = (
     "Agilent_v4_51MB_Human_hg19_BAITS",
@@ -80,3 +80,44 @@ def resolve_bait_set_logic(db: Session, name: Optional[str]) -> Optional[Pairing
     db.add(BaitSet(bait_set=name.strip(), pairing_logic_id=logic.id))
     db.commit()
     return logic
+
+
+def logic_membership_condition(logic: PairingLogic):
+    """SQL boolean condition on a ``samples`` row: the sample belongs to
+    ``logic``'s family (listing-filter semantics, pure SQL — no
+    per-row Python resolution).
+
+    Membership rules (mirroring ``resolve_bait_set_logic``'s *registered*
+    side, which is what a SQL-side join can express):
+
+    - the sample's ``bait_set`` matches, case-insensitively, a
+      ``bait_sets`` row whose ``pairing_logic_id`` is ``logic.id``;
+    - the DMP logic additionally owns samples with ``bait_set`` NULL and
+      ``sample_type`` ``'DMP'`` — DMP samples carry no bait-set key.
+
+    Known wrinkle (flagged per card): samples whose ``bait_set`` is NOT
+    registered in ``bait_sets`` belong to no logic filter — they are only
+    visible when the filter is omitted/ALL — even when ``classify_bait_set``
+    would match a name rule for them. ``resolve_bait_set_logic`` registers
+    such names lazily (on ingest/pairing), so imported data is normally
+    registered; a never-resolved bait set stays invisible to logic filters.
+    """
+    registered = (
+        select(BaitSet.id)
+        .where(
+            BaitSet.pairing_logic_id == logic.id,
+            Sample.bait_set.is_not(None),
+            func.lower(BaitSet.bait_set) == func.lower(Sample.bait_set),
+        )
+        .correlate(Sample)
+        .exists()
+    )
+    if logic.name.strip().upper() == DMP_LOGIC_NAME:
+        return or_(
+            registered,
+            and_(
+                Sample.bait_set.is_(None),
+                Sample.sample_type == DMP_LOGIC_NAME,
+            ),
+        )
+    return registered

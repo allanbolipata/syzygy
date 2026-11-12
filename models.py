@@ -13,6 +13,14 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: Name of the pairing logic under which DMP samples pair automatically
+#: (see pairing_service.DMP_LOGIC_NAME comment / trigger_dmp_pairing).
+#: Lives on the models layer so SQL-side listing filters (bait_sets
+#: logic_membership_condition) can reference it without importing
+#: pairing_service (which itself imports bait_sets).
+DMP_LOGIC_NAME = "DMP"
+
+
 class PairingLogic(Base):
     __tablename__ = "pairing_logic"
 

@@ -5,12 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from bait_sets import resolve_bait_set_logic
+from bait_sets import logic_membership_condition, resolve_bait_set_logic
 from database import get_db, settings
-from models import Sample
+from models import PairingLogic, Sample
 from pairing_service import (
     MAX_OTHER_MATCHES_LIMIT,
     possible_matches,
+    resolve_filter_logic,
     resolve_pairing_logic,
     trigger_pairing,
     trigger_pairing_for_normal,
@@ -59,6 +60,7 @@ def _samples_filtered_query(
     file_group: Optional[str],
     tumor_or_normal: Optional[TumorOrNormal],
     no_patient: Optional[bool],
+    logic: Optional[PairingLogic] = None,
 ):
     """Filtered ``SELECT`` on ``Sample`` — no ordering or pagination.
 
@@ -93,6 +95,10 @@ def _samples_filtered_query(
         stmt = stmt.where(Sample.patient__cmo.is_(None))
     if tumor_or_normal is not None:
         stmt = stmt.where(Sample.tumor_or_normal == tumor_or_normal.value)
+    if logic is not None:
+        # pairing-logic family membership (SQL-side bait_sets join + the
+        # DMP null-bait_set rule; see bait_sets.logic_membership_condition).
+        stmt = stmt.where(logic_membership_condition(logic))
     return stmt
 
 
@@ -112,6 +118,7 @@ def list_samples(
     file_group: Optional[str] = None,
     tumor_or_normal: Optional[TumorOrNormal] = None,
     no_patient: Optional[bool] = None,
+    pairing_logic: Optional[str] = None,
     db: Session = Depends(get_db),
     response: Response = None,
 ):
@@ -123,12 +130,24 @@ def list_samples(
     ``no_patient`` restricts to samples with a null patient__cmo (e.g.
     pooled normals). All filters combine with AND.
 
+    ``pairing_logic`` restricts to samples belonging to one pairing-logic
+    family (e.g. ``ARGOS``): the sample's ``bait_set`` must match a
+    registered ``bait_sets`` assignment for that logic (case-insensitive),
+    and the ``DMP`` logic additionally owns ``bait_set``-NULL samples of
+    ``sample_type`` ``'DMP'``. Samples whose bait set carries no
+    registered assignment belong to no family and only appear when the
+    filter is omitted. Omitted / blank / ``ALL`` = no restriction. An
+    unknown logic name is a 400. Listing filters never affect pairing
+    candidate scope (``possible-matches`` / pairing triggers stay
+    logic-agnostic).
+
     The ``X-Total-Count`` response header reports the total number of
     rows matching the current filters, independent of ``limit``/
     ``offset`` (pre-pagination). ``response`` defaults to ``None`` so
     direct-call tests (repo convention) can pass a plain ``Response()``
     to capture the header.
     """
+    logic = resolve_filter_logic(db, pairing_logic)
     base = _samples_filtered_query(
         q=q,
         primary_id=primary_id,
@@ -142,6 +161,7 @@ def list_samples(
         file_group=file_group,
         tumor_or_normal=tumor_or_normal,
         no_patient=no_patient,
+        logic=logic,
     )
     total = db.scalar(select(func.count()).select_from(base.subquery()))
     if response is not None:

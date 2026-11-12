@@ -105,6 +105,143 @@ const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", 
 let restoringNav = false;
 let PAIRING_LOGICS = [];
 
+/* ---------- session pairing-logic View (topbar #view-logic) ---------- *
+ * Mandatory + exclusive (card t_3e1444f0, spec updates 2026-11-11): the View
+ * IS the pairing logic for the pairing tabs (pairs, matches, try) — no
+ * per-tab logic dropdowns and no "ALL" state. viewLogic === null means
+ * nothing selected yet: the three pairing tabs are gated ("select a View
+ * first") while browse tabs stay usable. Persisted in localStorage so the
+ * choice survives tab switches, reloads and navigation. Browse tabs
+ * (samples/patients/requests/pooled) ignore the View entirely. */
+const VIEW_LOGIC_KEY = "syzygy.logic_view";
+const PAIRING_VIEWS = ["pairs", "matches", "try"];
+const VIEW_GATE_IDS = { pairs: "pairs-gate", matches: "matches-gate", try: "try-gate" };
+const VIEW_TAG_IDS = { pairs: "pr-view-label", matches: "m-view-label", try: "tq-view-label" };
+let viewLogic = null;
+
+function activeLogics() {
+  return PAIRING_LOGICS.filter((l) => l.active);
+}
+
+/* Options = ACTIVE logics only. An explicit "Select a logic…" placeholder
+ * exists only while nothing is chosen (it is a required-selection prompt,
+ * not an ALL state). */
+function renderViewSelect() {
+  const actives = activeLogics();
+  const sel = $("#view-logic");
+  if (!actives.length) {
+    sel.innerHTML = `<option value="" disabled selected>No active pairing logics</option>`;
+    return;
+  }
+  sel.innerHTML =
+    (viewLogic ? "" : `<option value="" selected>Select a logic…</option>`) +
+    actives.map((l) => `<option value="${esc(l.name)}">${esc(l.name)}</option>`).join("");
+  if (viewLogic) sel.value = viewLogic;
+}
+
+function renderViewTags() {
+  for (const id of Object.values(VIEW_TAG_IDS)) {
+    const el = $(`#${id}`);
+    if (el) el.textContent = viewLogic ? `View: ${viewLogic}` : "no View selected";
+  }
+}
+
+function gatePairingTabs() {
+  const has = !!viewLogic;
+  document.querySelectorAll(".tab[data-tab]").forEach((b) => {
+    if (!PAIRING_VIEWS.includes(b.dataset.tab)) return;
+    b.disabled = !has;
+    b.title = has ? "" : "Select a pairing logic in the topbar first";
+  });
+  for (const id of Object.values(VIEW_GATE_IDS)) $(`#${id}`).classList.toggle("hidden", has);
+}
+
+function applyViewState() {
+  renderViewSelect();
+  renderViewTags();
+  gatePairingTabs();
+}
+
+/* First-visit resolution: saved localStorage value (only if it still names
+ * an ACTIVE logic) → server's settings.default_pairing_logic_name (only if
+ * it resolves to an active logic) → unselected (pairing tabs gated). The
+ * default is not written to localStorage: a first-visit preselection keeps
+ * following the server default until the user actively picks one. */
+async function resolveInitialViewLogic() {
+  let name = null;
+  try { name = localStorage.getItem(VIEW_LOGIC_KEY); } catch (_) { /* private mode */ }
+  if (name && !activeLogics().some((l) => l.name === name)) name = null;
+  if (!name) {
+    try {
+      const r = await api("/pairing-logic/default");
+      const def = r && r.name;
+      if (def && activeLogics().some((l) => l.name === def)) name = def;
+    } catch (_) { /* endpoint unavailable: leave unselected */ }
+  }
+  return name;
+}
+
+/* User picked a View (topbar change): persist + re-render every pairing tab
+ * immediately — no per-tab override exists anywhere. */
+function setViewLogic(name) {
+  viewLogic = name || null;
+  try {
+    if (viewLogic) localStorage.setItem(VIEW_LOGIC_KEY, viewLogic);
+    else localStorage.removeItem(VIEW_LOGIC_KEY);
+  } catch (_) { /* localStorage unavailable: session-scoped only */ }
+  applyViewState();
+  rerenderPairingTabs();
+}
+
+function rerenderPairingTabs() {
+  if (!viewLogic) {
+    pairsState.logic = null;
+    return;
+  }
+  // Pair Report: fresh full list under the new logic (loadPairs drops the
+  // stale search + prefetch; mirrors the old per-tab logic-change sequence).
+  pairsState.logic = viewLogic;
+  resetPrSearch();
+  renderPrGroups();
+  renderPrLogicExplainer();
+  applyHarmonyViewMode();
+  loadPairs();
+  // Matches: candidate scope always follows the View's logic.
+  renderLogicMismatch("m", matchesState.baitLogic);
+  if (matchesState.sample) {
+    matchesState.othersOffset = 0;
+    showMatches(0);
+  }
+  // Try: explainer and (if a sample is open) the read-only dry run follow.
+  renderTryExplainer(viewLogic);
+  renderLogicMismatch("tq", tryState.baitLogic);
+  if (tryState.sample) runTry();
+}
+
+/* Non-blocking hint when the open sample's bait-set logic differs from the
+ * View (spec update 2): matching / dry run still run under the View. */
+function renderLogicMismatch(prefix, baitLogic) {
+  const el = $(`#${prefix}-logic-mismatch`);
+  if (!el) return;
+  if (viewLogic && baitLogic && baitLogic.toLowerCase() !== viewLogic.toLowerCase()) {
+    el.innerHTML =
+      `This sample's bait set belongs to the <strong>${esc(baitLogic)}</strong> logic, ` +
+      `but the session View is <strong>${esc(viewLogic)}</strong> — matching and pairing ` +
+      `here run under the View's logic.`;
+    el.classList.remove("hidden");
+  } else {
+    el.innerHTML = "";
+    el.classList.add("hidden");
+  }
+}
+
+$("#view-logic").addEventListener("change", (e) => {
+  setViewLogic(e.target.value);
+  if (!viewLogic && PAIRING_VIEWS.includes(currentViewName())) {
+    banner("info", "Select a pairing logic in the topbar View first — the pairing tabs need one.", true);
+  }
+});
+
 function currentViewName() {
   const el = document.querySelector("main.view:not(.hidden)");
   return el ? el.id.replace("view-", "") : null;
@@ -146,6 +283,11 @@ function showView(name) {
   document.querySelectorAll("main.view").forEach((el) =>
     el.classList.toggle("hidden", el.id !== `view-${name}`)
   );
+  // Hash-restored or programmatic entry into a gated pairing tab: the gate
+  // panel inside the view says it; a banner makes it unmistakable.
+  if (PAIRING_VIEWS.includes(name) && !viewLogic) {
+    banner("info", "Select a pairing logic in the topbar <strong>View</strong> first — the pairing tabs need one.", true);
+  }
   pushNav();
 }
 
@@ -191,15 +333,16 @@ async function restoreFromHash() {
         else banner("error", `Sample ${esc(id)} not found.`, true);
       }
     } else if (view === "try" && id) {
-      const rows = await api(`/sample/lookup?q=${encodeURIComponent(id)}&limit=25`);
+      const rows = await api(`/sample/lookup?q=${encodeURIComponent(id)}&limit=${SAMPLE_PICK_LIMIT}`);
       const row = rows.find((x) =>
         x.primary_id.toLowerCase() === id.toLowerCase() ||
         x.cmo_sample_name.toLowerCase() === id.toLowerCase()
       );
       if (row) {
         $("#tq-id").value = id;
-        tryFillSelect(rows);
-        $("#tq-sample").value = row.id;
+        tryState.candidates = rows;
+        tryState.resultsTotal = null;
+        tryRenderResults();
         await selectTrySample(row);
       } else banner("error", `Sample ${esc(id)} not found.`, true);
     }
@@ -219,6 +362,9 @@ document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
 /* ---------- cross-view navigation (patient__cmo / request_id links) ---------- */
 
 function navigateToPatient(patientId) {
+  // Reset-then-prefill: a stale Patients advanced filter would AND against
+  // the prefilled search and the landing would find no patient row.
+  clearPatientQueries();
   $("#p-q").value = patientId;
   showView("patients");
   loadPatients().then((results) => {
@@ -230,6 +376,9 @@ function navigateToPatient(patientId) {
 }
 
 function navigateToRequest(requestId) {
+  // Reset-then-prefill (see navigateToPatient): clears the Requests
+  // advanced filters before the prefilled search runs.
+  clearRequestQueries();
   $("#r-q").value = requestId;
   showView("requests");
   loadRequests().then((results) => {
@@ -238,6 +387,72 @@ function navigateToRequest(requestId) {
     if (row) openRequest(row);
     else banner("error", `No request found with id ${esc(requestId)}.`, true);
   });
+}
+
+/* Sample links in the Pair Report go to the Samples tab (card t_d8720219):
+ * the landing contract is RESET-THEN-PREFILL — the full Samples query state
+ * (simple search, every advanced filter field, the tumor_or_normal select)
+ * is cleared first, then #f-q is prefilled with the sample's primary_id and
+ * the listing reloads; the exact row is focused (scroll + flash) when it is
+ * on the loaded page. Reset first because samplesParams() ANDs #f-q with
+ * every advanced field: a stale advanced filter from a previous Samples
+ * session used to combine with the prefilled id and land on zero results.
+ * Accepts a full sample record (PAIR/DMP tables) or a bare search term
+ * (HARMONY rows carry primary_id strings only). No role-select special
+ * case survives the reset; the topbar View selector is still never touched. */
+function navigateToSampleInSamples(sampleOrTerm) {
+  const term = typeof sampleOrTerm === "string"
+    ? sampleOrTerm
+    : String((sampleOrTerm && sampleOrTerm.primary_id) || "");
+  if (!term) return;
+  clearSampleQueries();
+  $("#f-q").value = term;
+  showView("samples");
+  loadSamples(0).then(() => focusSampleRow(term));
+}
+
+/* Highlight + scroll to the Samples-listing row whose primary_id matches
+ * exactly (case-insensitive). When the prefilled search surfaces only
+ * partial candidates (no exact row), the prefilled search itself is the
+ * fallback focus — no error, matching the "search prefilled (or direct row
+ * focus)" contract. */
+function focusSampleRow(term) {
+  const want = String(term).toLowerCase();
+  const row = (samplesState.results || []).find(
+    (s) => String(s.primary_id || "").toLowerCase() === want
+  );
+  if (!row) return;
+  const tr = document.querySelector(
+    `#samples-table tbody tr[data-id="${CSS.escape(String(row.id))}"]`
+  );
+  if (!tr) return;
+  document.querySelectorAll("#samples-table tbody tr.row-flash")
+    .forEach((el) => el.classList.remove("row-flash"));
+  tr.classList.add("row-flash");
+  tr.scrollIntoView({ block: "center" });
+  setTimeout(() => tr.classList.remove("row-flash"), 1600);
+}
+
+/* DMP patient ids are conditional links (card t_d8720219): the Patients tab
+ * lists patient__cmo groups, so a DMP id counts as a "matching patient" only
+ * when some sample carrying that patient__dmp also has a patient__cmo. The
+ * Pair Report row usually carries that proof directly (its own sample record
+ * has patient__cmo — use it, no query); otherwise ask the Samples listing
+ * for a sample with the same patient__dmp. If nothing resolves, the click is
+ * a no-op (stay on the Pair Report) with an info banner; the cell's tooltip
+ * states the conditional behaviour up front. */
+async function navigateToDmpPatient(dmpId, directCmo) {
+  if (directCmo) return navigateToPatient(directCmo);
+  try {
+    const rows = await api(`/sample/?q=${encodeURIComponent(dmpId)}&limit=200`);
+    const want = String(dmpId).toLowerCase();
+    const hit = (rows || []).find((s) =>
+      s.patient__cmo && s.patient__dmp &&
+      String(s.patient__dmp).toLowerCase() === want
+    );
+    if (hit) return navigateToPatient(hit.patient__cmo);
+  } catch (_) { /* unreachable listing = treated as no match: no-op below */ }
+  banner("info", `No patient record matches DMP patient ${esc(dmpId)} — staying in the Pair Report.`, true);
 }
 
 /* ---------- samples view ---------- */
@@ -312,12 +527,21 @@ function renderSamples() {
   });
 }
 
-$("#btn-search").addEventListener("click", () => loadSamples(0));
-$("#btn-clear").addEventListener("click", () => {
+/* Full Samples query reset: every control samplesParams() reads — simple
+ * search, advanced filter fields, tumor_or_normal select. Shared by the
+ * Clear button and navigateToSampleInSamples (Pair Report links reset the
+ * listing before prefilling, so a stale advanced filter can never AND
+ * against the prefilled id). Function declaration: hoisted, so the
+ * navigation helpers defined earlier may call it. */
+function clearSampleQueries() {
   $("#f-q").value = "";
   for (const id of SAMPLE_FILTER_IDS) $(`#f-${id}`).value = "";
   $("#f-tumor_or_normal").value = "";
   updateAdvancedSummary();
+}
+$("#btn-search").addEventListener("click", () => loadSamples(0));
+$("#btn-clear").addEventListener("click", () => {
+  clearSampleQueries();
   loadSamples(0);
 });
 $("#f-limit").addEventListener("change", (e) => {
@@ -372,74 +596,94 @@ const matchesState = {
   sample: null,
   data: null,
   busy: false,
-  candidates: [],
+  results: [], // the current lookup rows shown in the results panel
+  resultsTotal: null, // X-Total-Count for those rows (null when absent)
   othersOffset: 0,
   othersTotal: 0,
+  baitLogic: null, // the open sample's bait-set logic (mismatch-hint input)
 };
 
 async function loadLogics() {
   try {
+    // Inactive logics stay out of the View options (the View is active-only
+    // and is now the ONLY pairing-logic control; the old per-tab selectors
+    // listed inactive logics — that capability is deliberately dropped).
     const logics = await api("/pairing-logic/?limit=100");
-    $("#m-logic").innerHTML = logics.map((l) =>
-      `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
-    ).join("");
-    // Pairs page lists every logic (inactive ones can still own pairings).
-    $("#pr-logic").innerHTML = logics.map((l) =>
-      `<option value="${esc(l.name)}">${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
-    ).join("");
     PAIRING_LOGICS = logics;
-    renderPrGroups();
-    // Try Pairing: active logics only (the dry-run endpoint refuses
-    // inactive ones), same options as the Matches tab.
-    $("#tq-logic").innerHTML = logics.map((l) =>
-      `<option value="${esc(l.name)}"${l.active ? "" : " disabled"}>${esc(l.name)}${l.active ? "" : " (inactive)"}</option>`
-    ).join("");
-    renderPrLogicExplainer();
-    // The select has its options now, so the HARMONY view-mode (its own
-    // column set in the panel, "Download CSV" label) can apply to the
-    // default logic — the init-time call ran before these options existed.
-    applyHarmonyViewMode();
+    renderViewSelect();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
 }
 
-/* Select the pairing logic assigned to the sample's bait set (server-side
-   bait_sets table), so the page doesn't default to the first logic. */
-async function applyBaitSetLogic(sample, logicSelId) {
-  if (!sample || !sample.bait_set) return false;
+/* Which pairing logic the sample's bait set is assigned to (server-side
+ * bait_sets table), or null when unknown. This is ONLY a hint input now —
+ * the topbar View is the single logic control (no per-tab preselection). */
+async function lookupBaitSetLogic(sample) {
+  if (!sample || !sample.bait_set) return null;
   try {
     const row = await api(`/bait-sets/lookup?name=${encodeURIComponent(sample.bait_set)}`);
-    if (!row) return false;
-    const logicSel = $(`#${logicSelId || "m-logic"}`);
-    const opt = [...logicSel.options].find((o) => o.value === row.pairing_logic && !o.disabled);
-    if (!opt) return false;
-    logicSel.value = opt.value;
-    return true;
-  } catch (e) {
-    return false;
+    return row ? row.pairing_logic : null;
+  } catch (_) {
+    return null;
   }
+}
+
+/* Shared sample results panel (card t_4f824f62): the Matches & Overrides and
+ * Try Pairing search boxes render a clickable results table in the p-detail
+ * visual language (panel + click rows) instead of the old dropdowns. Rows are
+ * capped at SAMPLE_PICK_LIMIT; a hint appears when the list is truncated.
+ * Clicking a row selects that sample for the tab's downstream action. */
+const SAMPLE_PICK_LIMIT = 50;
+
+function renderSampleResults(prefix, rows, selectedId, total, onSelect) {
+  $(`#${prefix}-results`).classList.remove("hidden");
+  const tbody = $(`#${prefix}-results-table tbody`);
+  tbody.innerHTML = rows.map((s) => `
+    <tr class="click${selectedId != null && String(s.id) === String(selectedId) ? " selected" : ""}" data-id="${esc(s.id)}">
+      <td>${esc(s.primary_id)}</td>
+      <td>${esc(s.cmo_sample_name)}</td>
+      <td>${esc(s.patient__cmo || "—")}</td>
+      <td>${esc(s.request_id || "—")}</td>
+      <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
+    </tr>`).join("");
+  $(`#${prefix}-results-empty`).classList.toggle("hidden", rows.length > 0);
+  $(`#${prefix}-results-count`).textContent = countLabel(total, rows, 0);
+  const capped = total !== null ? total > rows.length : rows.length >= SAMPLE_PICK_LIMIT;
+  $(`#${prefix}-results-more`).classList.toggle("hidden", !capped);
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const sample = rows.find((s) => String(s.id) === tr.dataset.id);
+      if (sample) onSelect(sample);
+    });
+  });
+}
+
+/* "selected" summary line above a pairing tab's downstream buttons. */
+function renderSelectedBar(prefix, sample) {
+  const bar = $(`#${prefix}-selected-bar`);
+  if (!sample) {
+    bar.classList.add("hidden");
+    return;
+  }
+  $(`#${prefix}-selected-text`).innerHTML = sampleLabel(sample);
+  bar.classList.remove("hidden");
 }
 
 async function openMatchesFor(sample) {
   matchesState.sample = sample;
-  const sel = $("#m-sample");
-  sel.innerHTML = `<option value="${sample.id}" selected>${esc(sampleLabel(sample))}</option>`;
-  sel.disabled = false;
-  $("#m-show").disabled = false;
-  // Prefer the bait set's assigned logic, then the logic this sample is
-  // currently paired under, when known.
-  const byLogic = patientsState.pairings ? patientsState.pairings[sample.id] : null;
-  if (await applyBaitSetLogic(sample)) {
-    // bait-set logic selected
-  } else if (byLogic) {
-    const logicSel = $("#m-logic");
-    const known = Object.keys(byLogic)[0];
-    const opt = [...logicSel.options].find((o) => o.value === known && !o.disabled);
-    if (opt) logicSel.value = opt.value;
-  }
-  showView("matches");
+  // A sample arriving from another page: the results panel shows it as the
+  // selected row — it is exactly how the user reached this tab.
+  matchesState.results = [sample];
+  matchesState.resultsTotal = 1;
   matchesState.othersOffset = 0;
+  // Bait-set logic is only a mismatch hint now; matching runs under the View.
+  matchesState.baitLogic = await lookupBaitSetLogic(sample);
+  renderLogicMismatch("m", matchesState.baitLogic);
+  showView("matches");
+  renderSelectedBar("m", sample);
+  $("#m-show").disabled = false;
+  renderMatchesResults();
   showMatches(0);
 }
 
@@ -447,27 +691,57 @@ function sampleLabel(s) {
   return `${s.primary_id} — ${s.cmo_sample_name} (${s.patient__cmo || "no patient"}, ${s.tumor_or_normal})`;
 }
 
+function renderMatchesResults() {
+  renderSampleResults(
+    "m",
+    matchesState.results,
+    matchesState.sample && matchesState.sample.id,
+    matchesState.resultsTotal,
+    (sample) => selectMatchesSample(sample)
+  );
+}
+
+/* Row click / preselect: make this sample the tab's downstream target.
+ * run=false selects without re-running the candidate query (the Show matches
+ * button is the explicit trigger in that flow); row clicks run immediately,
+ * mirroring openMatchesFor from the browse pages. */
+async function selectMatchesSample(sample, run = true) {
+  matchesState.sample = sample;
+  matchesState.othersOffset = 0;
+  matchesState.baitLogic = await lookupBaitSetLogic(sample);
+  renderLogicMismatch("m", matchesState.baitLogic);
+  renderSelectedBar("m", sample);
+  $("#m-show").disabled = false;
+  renderMatchesResults();
+  pushNav();
+  if (run) showMatches(0);
+  else hideMatchesPanels();
+}
+
 async function searchMatchesSamples() {
   const q = $("#m-q").value.trim();
   if (!q) return;
   try {
-    const results = await api(`/sample/?q=${encodeURIComponent(q)}&limit=25`);
-    const sel = $("#m-sample");
+    const { res, body } = await apiRes(`/sample/?q=${encodeURIComponent(q)}&limit=${SAMPLE_PICK_LIMIT}`);
+    const results = Array.isArray(body) ? body : [];
+    matchesState.results = results;
+    matchesState.resultsTotal = totalFromHeaders(res);
     if (!results.length) {
-      sel.innerHTML = "";
-      sel.disabled = true;
+      matchesState.sample = null;
+      renderSelectedBar("m", null);
       $("#m-show").disabled = true;
+      renderMatchesResults();
+      hideMatchesPanels();
       banner("info", `No samples match "${esc(q)}".`);
       return;
     }
-    sel.innerHTML = results.map((s) =>
-      `<option value="${s.id}">${esc(sampleLabel(s))}</option>`
-    ).join("");
-    sel.disabled = false;
-    $("#m-show").disabled = false;
-    matchesState.candidates = results;
-    matchesState.sample = results[0];
-    await applyBaitSetLogic(results[0]);
+    renderMatchesResults();
+    // Keep the current selection when it is among the results; otherwise
+    // preselect the top row (the old dropdown's implicit default) — the
+    // candidate query itself still only runs on Show matches or a row click.
+    if (!matchesState.sample || !results.some((s) => String(s.id) === String(matchesState.sample.id))) {
+      await selectMatchesSample(results[0], false);
+    }
   } catch (e) {
     banner("error", `Search failed: ${esc(e.message)}`, true);
   }
@@ -475,7 +749,7 @@ async function searchMatchesSamples() {
 
 async function showMatches(offset) {
   const sample = matchesState.sample;
-  const logic = $("#m-logic").value;
+  const logic = viewLogic; // the View IS the logic (no per-tab selector)
   $("#m-dmp-warning").classList.toggle("hidden", !isDmpLogic(logic));
   if (!sample || !logic) return;
   if (matchesState.busy) return;
@@ -616,14 +890,6 @@ $("#m-q").addEventListener("keydown", (e) => {
   if (e.key === "Enter") searchMatchesSamples();
 });
 $("#m-show").addEventListener("click", () => showMatches());
-$("#m-sample").addEventListener("change", async (e) => {
-  const picked = matchesState.candidates.find((s) => s.id === e.target.value);
-  if (!picked) return;
-  matchesState.sample = picked;
-  matchesState.othersOffset = 0;
-  await applyBaitSetLogic(picked);
-  showMatches(0);
-});
 $("#m-others-prev").addEventListener("click", () => {
   if (!matchesState.data) return;
   showMatches(Math.max(0, matchesState.othersOffset - OTHERS_PAGE_SIZE));
@@ -666,12 +932,14 @@ $("#m-others").addEventListener("click", (e) => {
 function submitOverride(normalId) {
   const data = matchesState.data;
   const allow = $("#m-allow-overrides").checked;
-  const logic = $("#m-logic").value;
+  const logic = viewLogic; // the View IS the logic (no per-tab selector)
   if (isDmpLogic(logic)) {
     banner("error",
-      "The DMP logic is automatic-only: use the “Run DMP pairing” button on " +
-      "the Pairs tab, or switch to another logic (e.g. ARGOS) to pin a " +
-      "DMP tumor to a non-DMP normal.", true);
+      "The DMP logic is automatic-only: overrides are not offered under a " +
+      "DMP View. The intended manual workflow is pinning an ARGOS " +
+      "(or other-logic) tumor to a same-patient DMP normal — switch the " +
+      "topbar View to that logic and override from the tumor's candidate " +
+      "list.", true);
     return;
   }
   const payload = {
@@ -885,10 +1153,15 @@ $("#p-prev").addEventListener("click", () =>
 $("#p-next").addEventListener("click", () =>
   loadPatients(patientsState.offset + patientsState.limit)
 );
-$("#p-clear").addEventListener("click", () => {
+/* Full Patients query reset (simple search + advanced fields): shared by
+ * the Clear button and navigateToPatient. */
+function clearPatientQueries() {
   $("#p-q").value = "";
   for (const id of PATIENT_ADVANCED_IDS) $(`#p-${id}`).value = "";
   updatePatientAdvancedSummary();
+}
+$("#p-clear").addEventListener("click", () => {
+  clearPatientQueries();
   loadPatients(0);
 });
 $("#p-close").addEventListener("click", () => {
@@ -1075,10 +1348,15 @@ $("#r-prev").addEventListener("click", () =>
 $("#r-next").addEventListener("click", () =>
   loadRequests(requestsState.offset + requestsState.limit)
 );
-$("#r-clear").addEventListener("click", () => {
+/* Full Requests query reset (simple search + advanced fields): shared by
+ * the Clear button and navigateToRequest. */
+function clearRequestQueries() {
   $("#r-q").value = "";
   for (const id of REQUEST_ADVANCED_IDS) $(`#r-${id}`).value = "";
   updateRequestAdvancedSummary();
+}
+$("#r-clear").addEventListener("click", () => {
+  clearRequestQueries();
   loadRequests(0);
 });
 $("#r-close").addEventListener("click", () => {
@@ -1295,7 +1573,7 @@ const PAIR_COLUMNS = [
   { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id, link: (r) => sampleLink(r.normal) },
   { key: "tumor_bait_set", header: "BAIT_SET", group: "Tumor sample", text: (r) => r.tumor.bait_set || "" },
   { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "", link: (r) => patientLink(r.tumor && r.tumor.patient__cmo) },
-  { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "" },
+  { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "", link: (r) => dmpPatientLink(r.tumor && r.tumor.patient__dmp, r.tumor && r.tumor.patient__cmo) },
   { key: "tumor_anon_id", header: "TUMOR_ANON_ID", group: "Tumor sample", text: (r) => r.tumor.anon_id || "" },
   { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name), link: (r) => sampleLink(r.tumor) },
   { key: "tumor_role", header: "TUMOR_ROLE", group: "Tumor sample", text: (r) => r.tumor.tumor_or_normal || "" },
@@ -1312,7 +1590,7 @@ const PAIR_COLUMNS = [
   { key: "tumor_id", header: "TUMOR_ID", group: "Tumor sample", text: (r) => r.tumor.id },
   { key: "normal_bait_set", header: "NORMAL_BAIT_SET", group: "Normal sample", text: (r) => r.normal.bait_set || "" },
   { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "", link: (r) => patientLink(r.normal && r.normal.patient__cmo) },
-  { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "" },
+  { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "", link: (r) => dmpPatientLink(r.normal && r.normal.patient__dmp, r.normal && r.normal.patient__cmo) },
   { key: "normal_anon_id", header: "NORMAL_ANON_ID", group: "Normal sample", text: (r) => r.normal.anon_id || "" },
   { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name), link: (r) => sampleLink(r.normal) },
   { key: "normal_role", header: "NORMAL_ROLE", group: "Normal sample", text: (r) => r.normal.tumor_or_normal || "" },
@@ -1402,7 +1680,7 @@ function dmpCells(r) {
 const dmpText = (key) => (r) => dmpCells(r)[key];
 const DMP_COLUMNS = [
   { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: dmpText("tumor_sample"), link: (r) => sampleLink(r.tumor) },
-  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient") },
+  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient"), link: (r) => { const v = dmpCells(r).patient; return v === DMP_NA ? null : dmpPatientLink(v, r.tumor && r.tumor.patient__cmo); } },
   { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: dmpText("tumor_idx") },
   { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: dmpText("tumor_IM_ver") },
   { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: dmpText("tumor_bamname") },
@@ -1421,7 +1699,7 @@ const DMP_COLUMNS = [
  * panel and as tooltips on the column headers). */
 const DMP_LEGEND = {
   tumor_sample: "The DMP tumor's sample name (primary_id)",
-  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name",
+  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name; links to the patient detail when a patient record matches this DMP id",
   tumor_idx: "Tumor index parsed from the sample name (second-to-last dash segment, e.g. T01); NA when unparseable",
   tumor_IM_ver: "IM version parsed from the sample name (last dash segment, e.g. IM7); NA when unparseable",
   tumor_bamname: "bamname from the DMP record's additional_metadata; falls back to anon_id",
@@ -1528,7 +1806,7 @@ function selectionFor(logicName) {
   return pairsState.selected[logicName];
 }
 function activeLogicName() {
-  return pairsState.logic || $("#pr-logic").value || null;
+  return pairsState.logic || viewLogic || null;
 }
 
 /* HARMONY view mode: the CSV/TSV format switch doesn't apply — HARMONY's
@@ -1613,6 +1891,27 @@ function harmonyCellText(r, key) {
   return pairText(v);
 }
 
+/* HARMONY identifier columns are clickable like the other Pair Report
+ * variants (card t_d8720219). The frame carries primary_id STRINGS for the
+ * sample-name columns (no sample records to resolve), so their links pass
+ * the name as the Samples-tab search term; the patient column is
+ * coalesce(tumor, normal).patient__dmp — a DMP id — so it goes through the
+ * same conditional DMP-patient flow (no-op when no patient record matches).
+ * The bam-path columns keep their em-dash placeholder rendering untouched. */
+function harmonyCellHtml(r, key) {
+  const text = harmonyCellText(r, key);
+  if (text === "") return "";
+  if (text !== "\\u2014" && (key === "normal_sample" || key === "tumor_sample")) {
+    // No role hint: the Samples landing resets the query state (including
+    // the role select) instead of relaxing it, so the column key carries no
+    // extra meaning for navigation.
+    return `<span class="nav-link" data-goto-sample="${esc(text)}" title="${esc(PAIR_LINK_TITLES.sample)}">${esc(text)}</span>`;
+  }
+  if (text !== "\u2014" && key === "patient")
+    return `<span class="nav-link" data-nav-dmp-patient="${esc(text)}" title="${esc(PAIR_LINK_TITLES["dmp-patient"])}">${esc(text)}</span>`;
+  return esc(text);
+}
+
 /* URLSearchParams for GET /pairing/harmony/: the same 1-based page/size and
  * search query as reportPageParams (the harmony endpoint takes the same page
  * contract), minus the report-only ones — pairing_logic_name is implicit
@@ -1628,26 +1927,47 @@ function harmonyPageParams(page, pageSize) {
   if (q) params.set("q", q);
   return params;
 }
-/* Clickable identifier cells in the pair table. A column model may
- * declare an optional ``link`` that resolves a row to a navigation
- * target: a sample (its Matches & Overrides page), a patient (the
- * Patients view) or a request (the Requests view). The cell renders as
- * the app's standard nav-link only when the target resolves and the cell
- * has a value; otherwise it stays plain text. Sample links carry the
- * row's sample id; the #pairs-table click handler below resolves the full
- * sample object from pairsState.rows (openMatchesFor needs more than the
- * id — e.g. bait_set for logic preselection). */
+/* Clickable identifier cells in the Pair Report table (card t_d8720219).
+ * A column model may declare an optional ``link`` that resolves a row to a
+ * navigation target:
+ * - kind "sample"      → the Samples tab: the listing's query state is
+ *   reset (simple search, advanced filters, role select) and #f-q is
+ *   prefilled with the sample's primary_id, exact row focused. The cell
+ *   carries the record id; the #pairs-table handler resolves the full sample
+ *   from pairsState.rows (PAIR/DMP rows), and falls back to treating the
+ *   value as a search term for the HARMONY table, whose rows carry
+ *   primary_id strings only.
+ * - kind "patient"     → the Patients tab with the detail panel opened
+ *   (navigateToPatient, same as clicking a patient row).
+ * - kind "request"     → the Requests tab with the request detail opened.
+ * - kind "dmp-patient" → conditional: navigates only when a patient record
+ *   matches the DMP id (the row's own patient__cmo if present, else a
+ *   Samples-listing lookup); otherwise the click is a no-op with an info
+ *   banner. The tooltip states this up front.
+ * Cells render as the app's standard nav-link (underlined accent text) only
+ * when the target resolves and the cell has a value; otherwise plain text. */
 const sampleLink = (s) => (s && s.id != null ? { kind: "sample", id: s.id } : null);
 const patientLink = (id) => (id ? { kind: "patient", id } : null);
 const requestLink = (id) => (id ? { kind: "request", id } : null);
+const dmpPatientLink = (dmpId, cmoId) =>
+  (dmpId ? { kind: "dmp-patient", id: dmpId, cmo: cmoId || null } : null);
+const PAIR_LINK_TITLES = {
+  sample: "Open this sample in the Samples tab",
+  patient: "Open this patient\u2019s detail",
+  request: "Open this request\u2019s detail",
+  "dmp-patient": "Open the matching patient\u2019s detail — only when a patient record matches this DMP id",
+};
 
 function pairCellHtml(r, c) {
   const raw = c.text(r);
   const link = c.link ? c.link(r) : null;
   if (!link || pairText(raw) === "") return `<td>${esc(raw)}</td>`;
-  const attr = link.kind === "sample" ? "data-sample-id"
-    : link.kind === "patient" ? "data-nav-patient" : "data-nav-request";
-  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
+  const attr = link.kind === "sample" ? "data-goto-sample"
+    : link.kind === "patient" ? "data-nav-patient"
+    : link.kind === "request" ? "data-nav-request" : "data-nav-dmp-patient";
+  const cmo = link.kind === "dmp-patient" && link.cmo
+    ? ` data-nav-cmo="${esc(String(link.cmo))}"` : "";
+  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}"${cmo} title="${esc(PAIR_LINK_TITLES[link.kind])}">${esc(raw)}</span></td>`;
 }
 
 /* HARMONY: normal-oriented table over the CHECKED HARMONY columns (via
@@ -1680,7 +2000,7 @@ function renderHarmonyTable() {
       const divider = prev !== null && prev !== r.normal_sample
         ? ` style="border-top:2px solid #c3ccd6"` : "";
       return `<tr>${cols.map((c) =>
-        `<td${divider}>${esc(harmonyCellText(r, c.key))}</td>`).join("")}</tr>`;
+        `<td${divider}>${harmonyCellHtml(r, c.key)}</td>`).join("")}</tr>`;
     }).join("");
   $("#pr-prev").disabled = pairsState.page === 0;
   $("#pr-next").disabled = pairsState.page >= maxPage;
@@ -2075,7 +2395,7 @@ async function loadHarmonyPage(page) {
 }
 
 async function loadPairs() {
-  const logic = $("#pr-logic").value;
+  const logic = viewLogic;
   if (!logic) return;
   // A fresh load (init, tab re-entry, logic change, post-pairing refresh)
   // starts at page 1; any cached prefetch belongs to the previous
@@ -2269,17 +2589,8 @@ async function loadPrOverviewStats() {
   }
 }
 
-$("#pr-logic").addEventListener("change", () => {
-  // Sync the state before re-rendering: activeLogicName() prefers
-  // pairsState.logic, which loadPairs() sets when it runs — the blurb
-  // would otherwise keep the previous logic's text.
-  pairsState.logic = $("#pr-logic").value;
-  // A stale filter would otherwise carry into the new logic's rows.
-  resetPrSearch();
-  renderPrLogicExplainer();
-  applyHarmonyViewMode();
-  loadPairs();
-});
+/* The old #pr-logic per-tab change handler is gone: a View change runs the
+ * identical sequence via setViewLogic() → rerenderPairingTabs(). */
 $("#pr-download").addEventListener("click", downloadPairs);
 $("#pr-prev").addEventListener("click", () => {
   if (pairsState.page > 0) loadReportPage(pairsState.page - 1);
@@ -2394,23 +2705,35 @@ $("#pr-cols-none").addEventListener("click", () => setSelectionForActive([]));
 $("#pr-cols-default").addEventListener("click", () =>
   setSelectionForActive([...defaultSelectionFor(activeLogicName())]));
 
-/* Identifier links in the pair table: same delegation pattern as the
- * Matches view — patient/request spans navigate via the existing helpers,
- * a sample span resolves the full sample object from the loaded rows and
- * opens its Matches & Overrides page. */
+/* Identifier links in the Pair Report table (all three column sets):
+ * - sample links navigate to the Samples tab (card t_d8720219): the value
+ *   is resolved to the full record from pairsState.rows when the frame
+ *   carries one (PAIR/DMP rows) and handed to navigateToSampleInSamples;
+ *   HARMONY rows carry names only, so the value is used as the search term.
+ *   The Samples listing's query state is reset before the prefilled search
+ *   runs, so a stale advanced filter never hides the link target.
+ *   (Pair Report sample links deliberately land on the Samples listing, not
+ *   on Matches & Overrides like row clicks on browse pages do.)
+ * - patient/request links reuse the existing cross-view helpers, which
+ *   reset the target tab's query state, prefill its search, and open the
+ *   detail panel.
+ * - DMP patient links resolve first (row's own patient__cmo, else a
+ *   Samples-listing lookup) and no-op with a banner when no patient record
+ *   matches. */
 $("#pairs-table").addEventListener("click", (e) => {
-  const el = e.target.closest("[data-nav-patient],[data-nav-request],[data-sample-id]");
+  const el = e.target.closest("[data-goto-sample],[data-nav-patient],[data-nav-request],[data-nav-dmp-patient]");
   if (!el) return;
   if (el.dataset.navPatient != null) return navigateToPatient(el.dataset.navPatient);
   if (el.dataset.navRequest != null) return navigateToRequest(el.dataset.navRequest);
-  if (el.dataset.sampleId != null) {
-    const id = String(el.dataset.sampleId);
+  if (el.dataset.navDmpPatient != null) return navigateToDmpPatient(el.dataset.navDmpPatient, el.dataset.navCmo || null);
+  if (el.dataset.gotoSample != null) {
+    const v = el.dataset.gotoSample;
     const row = pairsState.rows.find(
-      (r) => (r.tumor && String(r.tumor.id) === id) || (r.normal && String(r.normal.id) === id)
+      (r) => (r.tumor && String(r.tumor.id) === v) || (r.normal && String(r.normal.id) === v)
     );
-    const sample = row && ((row.tumor && String(row.tumor.id) === id ? row.tumor : null)
-      || (row.normal && String(row.normal.id) === id ? row.normal : null));
-    if (sample) return openMatchesFor(sample);
+    const sample = row && ((row.tumor && String(row.tumor.id) === v ? row.tumor : null)
+      || (row.normal && String(row.normal.id) === v ? row.normal : null));
+    return navigateToSampleInSamples(sample || v);
   }
 });
 
@@ -2424,16 +2747,16 @@ applyHarmonyViewMode();
  * Only GET endpoints are used (sample lookup + possible-matches) — no
  * pairing row is ever created, updated, or overridden. */
 
-const tryState = { sample: null, candidates: [], busy: false };
+const tryState = { sample: null, candidates: [], resultsTotal: null, busy: false, baitLogic: null };
 
-function tryFillSelect(rows) {
-  tryState.candidates = rows;
-  const sel = $("#tq-sample");
-  sel.innerHTML = rows.map((s) =>
-    `<option value="${s.id}">${esc(sampleLabel(s))}</option>`
-  ).join("");
-  sel.disabled = rows.length === 0;
-  $("#tq-run").disabled = rows.length === 0;
+function tryRenderResults() {
+  renderSampleResults(
+    "tq",
+    tryState.candidates,
+    tryState.sample && tryState.sample.id,
+    tryState.resultsTotal,
+    (sample) => selectTrySample(sample)
+  );
 }
 
 async function trySearch() {
@@ -2442,18 +2765,22 @@ async function trySearch() {
   tryState.busy = true;
   $("#tq-lookup").disabled = true;
   try {
-    const rows = await api(`/sample/lookup?q=${encodeURIComponent(q)}&limit=25`);
+    const { res, body } = await apiRes(`/sample/lookup?q=${encodeURIComponent(q)}&limit=${SAMPLE_PICK_LIMIT}`);
+    const rows = Array.isArray(body) ? body : [];
+    tryState.candidates = rows;
+    tryState.resultsTotal = totalFromHeaders(res); // lookup sends no X-Total-Count: null
     if (!rows.length) {
       tryState.sample = null;
-      tryFillSelect([]);
+      renderSelectedBar("tq", null);
+      $("#tq-run").disabled = true;
+      tryRenderResults();
       $("#tq-summary").classList.add("hidden");
       $("#tq-result").classList.add("hidden");
       banner("info", `No sample matches "${esc(q)}" (primary_id / cmo_sample_name).`);
       return;
     }
-    tryFillSelect(rows);
+    tryRenderResults();
     const first = rows[0];
-    $("#tq-sample").value = first.id;
     await selectTrySample(first);
   } catch (e) {
     banner("error", `Sample lookup failed: ${esc(e.message)}`, true);
@@ -2466,6 +2793,8 @@ async function trySearch() {
 async function selectTrySample(sample) {
   tryState.sample = sample;
   $("#tq-run").disabled = false;
+  renderSelectedBar("tq", sample);
+  tryRenderResults();
   const kv = [
     ["primary_id", esc(sample.primary_id)],
     ["cmo_sample_name", esc(sample.cmo_sample_name)],
@@ -2486,15 +2815,16 @@ async function selectTrySample(sample) {
   $("#tq-summary-kv").innerHTML = kv.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   $("#tq-summary").classList.remove("hidden");
   pushNav();
-  // Preselect the sample's own bait-set logic when known; otherwise
-  // keep whatever logic the user already picked.
-  await applyBaitSetLogic(sample, "tq-logic");
-  renderTryExplainer($("#tq-logic").value);
+  // The dry run always uses the View's logic; the sample's own bait-set
+  // logic only feeds the non-blocking mismatch hint (spec update 2).
+  tryState.baitLogic = await lookupBaitSetLogic(sample);
+  renderLogicMismatch("tq", tryState.baitLogic);
+  renderTryExplainer(viewLogic);
 }
 
 async function runTry() {
   const sample = tryState.sample;
-  const logic = $("#tq-logic").value;
+  const logic = viewLogic; // the View IS the logic (no per-tab selector)
   if (!sample || !logic || tryState.busy) return;
   tryState.busy = true;
   $("#tq-run").disabled = true;
@@ -2657,11 +2987,8 @@ $("#tq-lookup").addEventListener("click", trySearch);
 $("#tq-id").addEventListener("keydown", (e) => {
   if (e.key === "Enter") trySearch();
 });
-$("#tq-sample").addEventListener("change", (e) => {
-  const picked = tryState.candidates.find((s) => String(s.id) === e.target.value);
-  if (picked) selectTrySample(picked);
-});
-$("#tq-logic").addEventListener("change", (e) => renderTryExplainer(e.target.value));
+// No #tq-logic listener: the dry run always follows the topbar View
+// (rerenderPairingTabs re-runs it when the View changes).
 $("#tq-run").addEventListener("click", runTry);
 
 /* ---------- auth: current user + sign-out ---------- */
@@ -2698,8 +3025,20 @@ $("#logout-btn").addEventListener("click", signOut);
 (async function init() {
   loadCurrentUser();
   await loadLogics();
-  if ($("#tq-logic").value) renderTryExplainer($("#tq-logic").value);
-  loadPairs();
+  // Resolve the session View: saved localStorage choice → server default
+  // (if active) → unselected (pairing tabs gated). Don't persist an
+  // auto-resolved default — only an explicit user pick is saved, so a
+  // first-visit View keeps following the server default until Allan picks.
+  viewLogic = await resolveInitialViewLogic();
+  applyViewState();
+  if (viewLogic) {
+    pairsState.logic = viewLogic;
+    renderPrGroups();
+    renderPrLogicExplainer();
+    applyHarmonyViewMode();
+    renderTryExplainer(viewLogic);
+    loadPairs();
+  }
   loadSamples(0);
   loadPatients();
   loadRequests();
