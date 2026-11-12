@@ -3,10 +3,14 @@
 Canonical list of the NATS JetStream subjects Syzygy consumes and publishes,
 all on the single stream **`MDB_STREAM`**.
 
-Naming convention: `MDB_STREAM.<server|consumers>.<source>.<event>`
+Naming convention (actual gateway topics, agreed 2026-11-12):
 
-- `server.*` — inbound gateway events destined for the app
-- `consumers.*` — consumer-facing topics (the cohort flow)
+- `server.<gateway>.*` — inbound gateway events destined for the app
+- `syzygy.inbound.*` — inbound cohort topics destined for syzygy
+- `server.syzygy.outbound.*` — syzygy's own published results. Syzygy is
+  the only publisher in this subtree, and the legacy listener filter is
+  deliberately scoped to `server.cpt-gateway.>` so it does NOT consume
+  our own publications back (ack-always would make that 422 noise).
 
 Status legend:
 
@@ -44,10 +48,10 @@ Live on `dev`. Consumed by the smile-listener (durable `syzygy` on
 
 ## Inbound — tempo (cohort flow)
 
-On `feature/cohort-tempo`. Consumed by the listener's tempo client
-(durable `syzygy-tmp` on `MDB_STREAM.consumers.tempo.>`).
+Live on `dev`. Consumed by the listener's tempo client
+(durable `syzygy-tmp` on `MDB_STREAM.syzygy.inbound.>`).
 
-- **`MDB_STREAM.consumers.tempo.cohort-validate`** — single cohort topic
+- **`MDB_STREAM.syzygy.inbound.tempo-cohort-validate`** — single cohort topic
   (consolidates the earlier `new-cohort-submit` + `cohort-update` split).
   Cohort request, new or update: JSON-schema validate → classify against the
   DB → write CRF only on a clean pass → stage the validation report.
@@ -67,9 +71,9 @@ background outbox flusher for retries; report carries `Nats-Msg-Id` =
 cohort id (ccs_cohort_utils idempotency convention) and a
 `Nats-Msg-Subject` header for legacy parity.
 
-- **`MDB_STREAM.consumers.tempo.cohort-result`** — cohort validation report
-  (pass, or problem-sample findings). **Placeholder name pending the
-  meeting agreement.** Centralized in one place: the
+- **`MDB_STREAM.server.syzygy.outbound.tempo-cohort-result`** — cohort
+  validation report (pass, or problem-sample findings). **Agreed name
+  (2026-11-12).** Centralized in one place: the
   `x-cohort-result-subject` alias in `docker-compose.dev.yml` feeds both the
   app setting (`NATS_COHORT_RESULT_SUBJECT`) and the listener
   (`NATS_RESULT_SUBJECT`), so a rename is a one-line change.
@@ -77,7 +81,7 @@ cohort id (ccs_cohort_utils idempotency convention) and a
 ## Durables
 
 - `syzygy` — `MDB_STREAM.server.cpt-gateway.>` (legacy SMILE path)
-- `syzygy-tmp` — `MDB_STREAM.consumers.tempo.>` (cohort path)
+- `syzygy-tmp` — `MDB_STREAM.syzygy.inbound.>` (cohort path)
 
 Both run in one listener process (`listener/run.py`), independently
 supervised with restart backoff; separate JetStream fan-outs, so each keeps
@@ -98,16 +102,23 @@ subjects** above.
 
 1. **Acela route (DMP sample):** establish the route with the Acela service;
    decide whether `MDB_STREAM.server.dmp-gateway.dmp-sample` is renamed to
-   reflect the real source.
-2. **`cohort-result` subject name:** confirm at the meeting; currently a
-   placeholder (see single rename point above).
+   reflect the real source. Note: the legacy durable's filter is now
+   `server.cpt-gateway.>` (excludes `server.syzygy.outbound.`), so the
+   agreed DMP subject also needs its own filter/durable or a deliberate
+   filter widening — being on the stream is not the same as being consumed.
 
 ## Settled
 
-- **Cohort topic:** one topic, `MDB_STREAM.consumers.tempo.cohort-validate`
-  (was `new-cohort-submit` + `cohort-update`). The two settings
+- **Cohort topic:** one topic,
+  `MDB_STREAM.syzygy.inbound.tempo-cohort-validate` (was
+  `new-cohort-submit` + `cohort-update`, and the interim placeholder name
+  `MDB_STREAM.consumers.tempo.cohort-validate`). The two settings
   (`nats_cohort_submit_subject` / `nats_cohort_update_subject`) collapse to
   one, and the two handlers become one.
+- **Tempo subject naming (2026-11-12):** inbound
+  `MDB_STREAM.syzygy.inbound.tempo-cohort-validate`, outbound
+  `MDB_STREAM.server.syzygy.outbound.tempo-cohort-result` — the actual
+  gateway-agreed topics, replacing the `consumers.tempo.*` placeholders.
 - **CRF re-send semantics:** locked in — once a CRF is made, its data rows
   are never rewritten; later `cohort-validate` events only refresh the
   header (merge).

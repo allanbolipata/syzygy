@@ -9,8 +9,8 @@ consumed message to the app's internal ingest endpoint.
 
 Two SmileClients run in one process, one asyncio task each:
 
-* legacy — ``MDB_STREAM.server.>``            (durable ``syzygy``)
-* tempo  — ``MDB_STREAM.consumers.tempo.>``    (durable ``syzygy-tmp``)
+* legacy — ``MDB_STREAM.server.cpt-gateway.>``  (durable ``syzygy``)
+* tempo  — ``MDB_STREAM.syzygy.inbound.>``      (durable ``syzygy-tmp``)
 
 Each client is supervised independently: a dead consumer task is
 restarted with backoff, and a failure of one client never takes the
@@ -84,10 +84,14 @@ def build_config() -> dict:
     return _build_config(
         filter_env="NATS_FILTER_SUBJECT",
         durable_env="NATS_DURABLE",
-        # Broad by default: the cmo subjects and the DMP sample subject
-        # live under different second-level tokens (cpt-gateway vs
-        # dmp-gateway), so one wildcard covers both.
-        default_filter="MDB_STREAM.server.>",
+        # Scoped to the cpt-gateway subtree. The agreed outbound result
+        # subject lives under server.syzygy.outbound., so a broad
+        # server.> filter would make this durable consume our OWN
+        # published results (ack-always turns that into 422 noise, not a
+        # loop). The DMP route is not agreed yet (docs/nats_topics.md);
+        # when it lands it needs its own filter/durable or a widening by
+        # explicit agreement.
+        default_filter="MDB_STREAM.server.cpt-gateway.>",
         default_durable="syzygy",
     )
 
@@ -98,7 +102,7 @@ def build_tempo_config() -> dict:
     return _build_config(
         filter_env="NATS_TEMPO_FILTER_SUBJECT",
         durable_env="NATS_TEMPO_DURABLE",
-        default_filter="MDB_STREAM.consumers.tempo.>",
+        default_filter="MDB_STREAM.syzygy.inbound.>",
         default_durable="syzygy-tmp",
     )
 

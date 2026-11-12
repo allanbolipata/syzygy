@@ -31,8 +31,8 @@ SUBJECTS = {
     "new-request": "MDB_STREAM.server.cpt-gateway.cmo-new-request",
     "request-update": "MDB_STREAM.server.cpt-gateway.cmo-request-update",
     "update-sample": "MDB_STREAM.server.cpt-gateway.cmo-sample-update",
-    "cohort-validate": "MDB_STREAM.consumers.tempo.cohort-validate",
-    "cohort-result": "MDB_STREAM.consumers.tempo.cohort-result",
+    "cohort-validate": "MDB_STREAM.syzygy.inbound.tempo-cohort-validate",
+    "cohort-result": "MDB_STREAM.server.syzygy.outbound.tempo-cohort-result",
 }
 _COHORT_REQUEST_SCHEMA = (
     Path(__file__).resolve().parent.parent

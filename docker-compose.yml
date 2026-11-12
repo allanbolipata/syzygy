@@ -112,8 +112,9 @@ services:
 
   # Standalone SMILE listener: the ONLY way inbound SMILE / DMP / cohort
   # messages reach the app (the app never connects to NATS itself). One
-  # process, two supervised JetStream consumers (legacy `MDB_STREAM.server.>`
-  # durable syzygy, tempo `MDB_STREAM.consumers.tempo.>` durable syzygy-tmp;
+  # process, two supervised JetStream consumers (legacy
+  # `MDB_STREAM.server.cpt-gateway.>` durable syzygy, tempo
+  # `MDB_STREAM.syzygy.inbound.>` durable syzygy-tmp;
   # see listener/run.py), each POSTing to the app's internal ingest
   # endpoint with X-NATS-Token. Consumers restart themselves with backoff;
   # `restart: unless-stopped` covers a hard crash.
@@ -130,7 +131,7 @@ services:
   #
   # The subject/durable defaults below match listener/run.py and
   # docs/nats_topics.md; override only by agreement (e.g. the cohort-result
-  # subject rename is still pending). COHORT_PUBLISH_ENABLED stays off by
+  # subject renames are now agreed — see docs/nats_topics.md). COHORT_PUBLISH_ENABLED stays off by
   # default: it arms the listener-side outbox flusher that republishes
   # staged cohort reports to NATS_RESULT_SUBJECT.
   smile-listener:
@@ -139,16 +140,16 @@ services:
     image: syzygy-smile-listener
     environment:
       NATS_URL: ${NATS_URL:?set NATS_URL, e.g. nats://prod-nats-host:4222 (the org SMILE gateway)}
-      NATS_FILTER_SUBJECT: ${NATS_FILTER_SUBJECT:-MDB_STREAM.server.>}
+      NATS_FILTER_SUBJECT: ${NATS_FILTER_SUBJECT:-MDB_STREAM.server.cpt-gateway.>}
       NATS_DURABLE: ${NATS_DURABLE:-syzygy}
-      NATS_TEMPO_FILTER_SUBJECT: ${NATS_TEMPO_FILTER_SUBJECT:-MDB_STREAM.consumers.tempo.>}
+      NATS_TEMPO_FILTER_SUBJECT: ${NATS_TEMPO_FILTER_SUBJECT:-MDB_STREAM.syzygy.inbound.>}
       NATS_TEMPO_DURABLE: ${NATS_TEMPO_DURABLE:-syzygy-tmp}
       # In-network app target (the prod app serves 8000; 8123 is dev-only).
       SYZYGY_APP_URL: ${SYZYGY_APP_URL:-http://app:8000}
       # Same host variable as the app's NATS_INGEST_TOKEN above — the two
       # sides structurally cannot drift.
       SYZYGY_NATS_TOKEN: ${NATS_INGEST_TOKEN:?set NATS_INGEST_TOKEN, the shared X-NATS-Token secret for the smile-listener}
-      NATS_RESULT_SUBJECT: ${NATS_RESULT_SUBJECT:-MDB_STREAM.consumers.tempo.cohort-result}
+      NATS_RESULT_SUBJECT: ${NATS_RESULT_SUBJECT:-MDB_STREAM.server.syzygy.outbound.tempo-cohort-result}
       COHORT_PUBLISH_ENABLED: ${COHORT_PUBLISH_ENABLED:-false}
       COHORT_FLUSH_INTERVAL: ${COHORT_FLUSH_INTERVAL:-30}
       # Optional NATS auth/TLS (run.py omits any that is empty; cert/key

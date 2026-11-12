@@ -2,7 +2,7 @@
 
 Publishes a valid, pairable fixture cohort to the live dev NATS server
 (``docker-compose.dev.yml`` stack) on
-``MDB_STREAM.consumers.tempo.cohort-validate`` and follows the full
+``MDB_STREAM.syzygy.inbound.tempo-cohort-validate`` and follows the full
 production path:
 
     dev NATS -> smile-listener (tempo durable) -> app /v1/ingest/nats
@@ -24,7 +24,7 @@ removed in a finally block; the generated CRF file is left in
 ``crf_output_dev/`` as evidence (it is uniquely named per run).
 
 Result subject: env ``NATS_RESULT_SUBJECT`` (default
-``MDB_STREAM.consumers.tempo.cohort-result``) — the same env var the
+``MDB_STREAM.server.syzygy.outbound.tempo-cohort-result``) — the same env var the
 listener uses, so a rename flows through one place.
 """
 import asyncio
@@ -55,9 +55,10 @@ DEV_DB_URL = os.environ.get(
     "postgresql+psycopg2://app:app@127.0.0.1:%d/app" % DEV_DB_PORT,
 )
 
-VALIDATE_SUBJECT = "MDB_STREAM.consumers.tempo.cohort-validate"
+VALIDATE_SUBJECT = "MDB_STREAM.syzygy.inbound.tempo-cohort-validate"
 RESULT_SUBJECT = os.environ.get(
-    "NATS_RESULT_SUBJECT", "MDB_STREAM.consumers.tempo.cohort-result"
+    "NATS_RESULT_SUBJECT",
+    "MDB_STREAM.server.syzygy.outbound.tempo-cohort-result",
 )
 RESULT_TIMEOUT_S = 60.0
 

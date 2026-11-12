@@ -15,8 +15,10 @@ name: syzygy
 # ONE place the cohort result subject lives: a single YAML alias feeds both
 # the app's nats_cohort_result_subject (via NATS_COHORT_RESULT_SUBJECT) and the
 # smile-listener's NATS_RESULT_SUBJECT, so a rename touches one line.
-# Placeholder pending the meeting agreement.
-x-cohort-result-subject: &cohort_result_subject "MDB_STREAM.consumers.tempo.cohort-result"
+# Agreed names (2026-11-12): inbound tempo-cohort-validate is under
+# MDB_STREAM.syzygy.inbound., our outbound result is under
+# MDB_STREAM.server.syzygy.outbound. — see docs/nats_topics.md.
+x-cohort-result-subject: &cohort_result_subject "MDB_STREAM.server.syzygy.outbound.tempo-cohort-result"
 
 services:
   app:
@@ -85,20 +87,24 @@ services:
 
   # Standalone smile-client consumers: one durable per client family,
   # both in a single process (see listener/run.py). The legacy consumer
-  # on the broad wildcard MDB_STREAM.server.> receives the cmo subjects
-  # and the DMP sample subject (different second-level tokens: cpt-gateway
-  # vs dmp-gateway); the tempo consumer on MDB_STREAM.consumers.tempo.>
-  # receives the cohort subjects. Separate durables, so JetStream fans the
-  # stream out independently (each keeps its own redelivery position).
+  # on MDB_STREAM.server.cpt-gateway.> receives the cmo subjects; the
+  # tempo consumer on MDB_STREAM.syzygy.inbound.> receives the cohort
+  # subjects. The legacy filter is deliberately NOT the broad server.>:
+  # our own outbound result subject lives under server.syzygy.outbound.
+  # and would otherwise be consumed back (422 noise). The DMP sample
+  # subject (server.dmp-gateway.dmp-sample) is unrouted until the Acela
+  # route is agreed — it then needs its own filter/durable. Separate
+  # durables, so JetStream fans the stream out independently (each keeps
+  # its own redelivery position).
   # Each POSTs its messages to the app's internal ingest endpoint.
   smile-listener:
     build: ./listener
     command: ["python", "/app/run.py"]
     environment:
       NATS_URL: nats://nats:4222
-      NATS_FILTER_SUBJECT: "MDB_STREAM.server.>"
+      NATS_FILTER_SUBJECT: "MDB_STREAM.server.cpt-gateway.>"
       NATS_DURABLE: "syzygy"
-      NATS_TEMPO_FILTER_SUBJECT: "MDB_STREAM.consumers.tempo.>"
+      NATS_TEMPO_FILTER_SUBJECT: "MDB_STREAM.syzygy.inbound.>"
       NATS_TEMPO_DURABLE: "syzygy-tmp"
       SYZYGY_APP_URL: http://app:8123
       SYZYGY_NATS_TOKEN: dev-syzygy-nats-token

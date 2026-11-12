@@ -29,7 +29,7 @@ from listener.nats_publisher import (
     result_subject,
 )
 
-SUBJECT = "MDB_STREAM.consumers.tempo.cohort-result"
+SUBJECT = "MDB_STREAM.server.syzygy.outbound.tempo-cohort-result"
 APP_URL = "http://app:8123"
 
 

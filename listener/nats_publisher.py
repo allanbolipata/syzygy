@@ -28,8 +28,8 @@ logger = logging.getLogger("nats_publisher")
 # Result subject the report is published to. In dev, ONE compose variable
 # (docker-compose.dev.yml) feeds both the app's nats_cohort_result_subject and
 # this listener's NATS_RESULT_SUBJECT, so a rename touches one place. The
-# default below is the same placeholder, pending the meeting agreement.
-DEFAULT_RESULT_SUBJECT = "MDB_STREAM.consumers.tempo.cohort-result"
+# default below is the agreed outbound subject (2026-11-12).
+DEFAULT_RESULT_SUBJECT = "MDB_STREAM.server.syzygy.outbound.tempo-cohort-result"
 
 # App-internal publish-outbox endpoints (routers/publish_outbox.py).
 PENDING_PATH = "/v1/publish-outbox/pending"
