@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -1721,6 +1721,13 @@ class _RecordingSession:
         self.queries.append((str(stmt), len(rows)))
         return _ResultProxy(rows)
 
+    def scalar(self, stmt, *args, **kwargs):
+        value = self._session.scalar(stmt, *args, **kwargs)
+        # A SELECT of a single scalar (e.g. func.count()) returns exactly one
+        # row; 0 only when the query produced no row at all.
+        self.queries.append((str(stmt), 1 if value is not None else 0))
+        return value
+
 
 def _seed_scaled_patients(db, prefix: str, n_patients: int, per_patient: int = 5):
     """Bulk-seed patients: 3 TUMOR + 2 NORMAL samples each, with a unique
@@ -1752,7 +1759,8 @@ def test_list_patients_sql_aggregation_scale(db):
     _seed_scaled_patients(db, "SCALE-PAT", 2000)  # 10,000 samples
 
     rec = _RecordingSession(db)
-    page = list_patients(limit=10, offset=100, q="SCALE-PAT", db=rec)
+    r = Response()
+    page = list_patients(limit=10, offset=100, q="SCALE-PAT", db=rec, response=r)
 
     # Correct page contents: 10 patients, exact counts, requests, metadata.
     expected_ids = [f"SCALE-PAT-{i:05d}" for i in range(100, 110)]
@@ -1762,17 +1770,27 @@ def test_list_patients_sql_aggregation_scale(db):
         assert p.requests == [f"{p.patient__cmo}-R0", f"{p.patient__cmo}-R2", f"{p.patient__cmo}-R4"]
         assert p.metadata == {"species": "Mouse"}
 
-    # Boundedness: exactly 2 queries. The first is a GROUP BY that returns
+    # X-Total-Count is the pre-pagination group total taken from the scalar.
+    assert r.headers["X-Total-Count"] == "2000"
+
+    # Boundedness: exactly 3 queries. The first is a GROUP BY that returns
     # only the 10 page rows (not 10,000); the second fetches only the
-    # page's samples (10 x 5 = 50), not the whole table.
-    assert len(rec.queries) == 2
+    # page's samples (10 x 5 = 50); the third is the totals scalar COUNT,
+    # which must return exactly 1 row — NOT the 10,000-row group set a
+    # naive Python-side total would fetch (the anti-pattern these tests
+    # exist to catch).
+    assert len(rec.queries) == 3
     first_sql, first_rows = rec.queries[0]
     second_sql, second_rows = rec.queries[1]
+    third_sql, third_rows = rec.queries[2]
     assert "GROUP BY" in first_sql.upper()
     assert "LIMIT" in first_sql.upper() and "OFFSET" in first_sql.upper()
     assert first_rows == 10
     assert "IN (" in second_sql.upper()
     assert second_rows == 10 * 5
+    assert "COUNT" in third_sql.upper()
+    assert "GROUP BY" in third_sql.upper()  # COUNT wraps the filtered GROUP BY
+    assert third_rows == 1
 
 
 def _seed_scaled_requests(db, prefix: str, n_requests: int, per_request: int = 5):
@@ -1802,25 +1820,36 @@ def test_list_requests_sql_aggregation_scale(db):
     _seed_scaled_requests(db, "SCALE-REQ", 2000)  # 10,000 samples
 
     rec = _RecordingSession(db)
-    page = list_requests(limit=10, offset=100, q="SCALE-REQ", db=rec)
+    r = Response()
+    page = list_requests(limit=10, offset=100, q="SCALE-REQ", db=rec, response=r)
 
     expected_ids = [f"SCALE-REQ-{i:05d}" for i in range(100, 110)]
-    assert [r.request_id for r in page] == expected_ids
-    for r in page:
-        assert (r.sample_count, r.tumor_count, r.normal_count) == (5, 2, 3)
-        i = r.request_id.rsplit("-", 1)[1]
-        assert r.patients == sorted([f"PAT-S-{i}-0", f"PAT-S-{i}-1"])
-        assert r.sample_types == ["blood", "tissue"]
-        assert r.gene_panels == ["PANEL-A", "PANEL-B"]
+    assert [req.request_id for req in page] == expected_ids
+    for req in page:
+        assert (req.sample_count, req.tumor_count, req.normal_count) == (5, 2, 3)
+        i = req.request_id.rsplit("-", 1)[1]
+        assert req.patients == sorted([f"PAT-S-{i}-0", f"PAT-S-{i}-1"])
+        assert req.sample_types == ["blood", "tissue"]
+        assert req.gene_panels == ["PANEL-A", "PANEL-B"]
 
-    assert len(rec.queries) == 2
+    # X-Total-Count is the pre-pagination group total taken from the scalar.
+    assert r.headers["X-Total-Count"] == "2000"
+
+    # Boundedness: 3 queries (page GROUP BY, page-samples IN(...), totals
+    # scalar COUNT). The COUNT must return exactly 1 row, never the
+    # 10,000-row group set.
+    assert len(rec.queries) == 3
     first_sql, first_rows = rec.queries[0]
     second_sql, second_rows = rec.queries[1]
+    third_sql, third_rows = rec.queries[2]
     assert "GROUP BY" in first_sql.upper()
     assert "LIMIT" in first_sql.upper() and "OFFSET" in first_sql.upper()
     assert first_rows == 10
     assert "IN (" in second_sql.upper()
     assert second_rows == 10 * 5
+    assert "COUNT" in third_sql.upper()
+    assert "GROUP BY" in third_sql.upper()  # COUNT wraps the filtered GROUP BY
+    assert third_rows == 1
 
 
 def test_list_patients_pagination_edges(db):

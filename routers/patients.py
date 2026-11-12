@@ -86,21 +86,25 @@ def list_patients(
     ``None`` so direct-call tests (repo convention) can pass a plain
     ``Response()`` to capture the header.
     """
+    rows = _patient_page(db, limit, offset, q)
+
+    by_patient: dict[str, list[Sample]] = {}
+    if rows:
+        patient__cmos = [row.patient__cmo for row in rows]
+        samples = db.scalars(
+            select(Sample).where(Sample.patient__cmo.in_(patient__cmos))
+        ).all()
+        for s in samples:
+            by_patient.setdefault(s.patient__cmo, []).append(s)
+
+    # Totals issued last: a bounded scalar COUNT (exactly 1 row) over the
+    # same filtered GROUP BY — never the full group set.
     total = _patient_total(db, q)
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
-    rows = _patient_page(db, limit, offset, q)
+
     if not rows:
         return []
-
-    patient__cmos = [row.patient__cmo for row in rows]
-    samples = db.scalars(
-        select(Sample).where(Sample.patient__cmo.in_(patient__cmos))
-    ).all()
-
-    by_patient: dict[str, list[Sample]] = {}
-    for s in samples:
-        by_patient.setdefault(s.patient__cmo, []).append(s)
 
     patients: list[PatientRead] = []
     for row in rows:

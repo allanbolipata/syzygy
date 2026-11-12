@@ -82,21 +82,25 @@ def list_requests(
     ``None`` so direct-call tests (repo convention) can pass a plain
     ``Response()`` to capture the header.
     """
+    rows = _request_page(db, limit, offset, q)
+
+    by_request: dict[str, list[Sample]] = {}
+    if rows:
+        request_ids = [row.request_id for row in rows]
+        samples = db.scalars(
+            select(Sample).where(Sample.request_id.in_(request_ids))
+        ).all()
+        for s in samples:
+            by_request.setdefault(s.request_id, []).append(s)
+
+    # Totals issued last: a bounded scalar COUNT (exactly 1 row) over the
+    # same filtered GROUP BY — never the full group set.
     total = _request_total(db, q)
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
-    rows = _request_page(db, limit, offset, q)
+
     if not rows:
         return []
-
-    request_ids = [row.request_id for row in rows]
-    samples = db.scalars(
-        select(Sample).where(Sample.request_id.in_(request_ids))
-    ).all()
-
-    by_request: dict[str, list[Sample]] = {}
-    for s in samples:
-        by_request.setdefault(s.request_id, []).append(s)
 
     requests: list[RequestRead] = []
     for row in rows:
