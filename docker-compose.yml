@@ -1,8 +1,16 @@
 # Syzygy app — production base.
 #
-# This is the minimal stack: the app plus its Postgres (`db`), so a
+# This is the production stack: the app, its Postgres (`db`), and the
+# standalone smile-listener (the ONLY path by which SMILE / DMP / cohort
+# messages reach the app — the app itself never connects to NATS), so a
 # production deployment is a single `docker compose up -d`. Keycloak
-# remains EXTERNAL (org-managed).
+# remains EXTERNAL (org-managed), and so does NATS/JetStream: the
+# listener's NATS_URL points at the org-run SMILE gateway server.
+#
+# `listener/init_nats_stream.py` (the dev stack's nats-init bootstrap)
+# is deliberately NOT bundled here: in production MDB_STREAM belongs to
+# the gateway team and must not be mutated from this stack without their
+# agreement (docs/nats_topics.md).
 #
 # The database data lives on the HOST, not in the container:
 #   - set PG_DATA_DIR to a host directory → bind mount (recommended
@@ -18,6 +26,7 @@
 # For a production run, set the required variables on the command line
 # (shell environment wins over any .env in this directory):
 #   DATABASE_URL=... KEYCLOAK_URL=... KEYCLOAK_CLIENT_SECRET=*** \
+#     NATS_URL=... NATS_INGEST_TOKEN=*** \
 #     docker compose up -d
 name: syzygy
 
@@ -45,6 +54,11 @@ services:
       # Read from the environment or this directory's .env (compose loads
       # .env automatically). Never commit the value.
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      # Shared secret for the listener's POSTs to /v1/ingest/nats and the
+      # publish-outbox drain (sent as X-NATS-Token). Fail-closed: unset
+      # DISABLES both endpoints. The SAME variable feeds the listener's
+      # SYZYGY_NATS_TOKEN below, so the two sides cannot drift.
+      NATS_INGEST_TOKEN: ${NATS_INGEST_TOKEN:?set NATS_INGEST_TOKEN, the shared X-NATS-Token secret for the smile-listener}
     ports:
       - "8000:8000"
     depends_on:
@@ -94,6 +108,63 @@ services:
     # For host access, uncomment (the dev file maps 5435:5432 instead):
     # ports:
     #   - "5432:5432"
+    restart: unless-stopped
+
+  # Standalone SMILE listener: the ONLY way inbound SMILE / DMP / cohort
+  # messages reach the app (the app never connects to NATS itself). One
+  # process, two supervised JetStream consumers (legacy `MDB_STREAM.server.>`
+  # durable syzygy, tempo `MDB_STREAM.consumers.tempo.>` durable syzygy-tmp;
+  # see listener/run.py), each POSTing to the app's internal ingest
+  # endpoint with X-NATS-Token. Consumers restart themselves with backoff;
+  # `restart: unless-stopped` covers a hard crash.
+  #
+  # Run exactly ONE instance: the durable names fan out per-stream, so a
+  # second instance would share a durable and load-balance deliveries
+  # instead of shadowing. Also confirm no other org consumer (e.g. beagle)
+  # already holds durables named syzygy / syzygy-tmp on the prod stream.
+  #
+  # NATS_URL is REQUIRED and points at the org-run SMILE gateway's
+  # JetStream server — there is no bundled nats service in production and
+  # no nats-init bootstrap here (MDB_STREAM is the gateway team's stream;
+  # coordinate before creating/updating subjects on it).
+  #
+  # The subject/durable defaults below match listener/run.py and
+  # docs/nats_topics.md; override only by agreement (e.g. the cohort-result
+  # subject rename is still pending). COHORT_PUBLISH_ENABLED stays off by
+  # default: it arms the listener-side outbox flusher that republishes
+  # staged cohort reports to NATS_RESULT_SUBJECT.
+  smile-listener:
+    build:
+      context: ./listener
+    image: syzygy-smile-listener
+    environment:
+      NATS_URL: ${NATS_URL:?set NATS_URL, e.g. nats://prod-nats-host:4222 (the org SMILE gateway)}
+      NATS_FILTER_SUBJECT: ${NATS_FILTER_SUBJECT:-MDB_STREAM.server.>}
+      NATS_DURABLE: ${NATS_DURABLE:-syzygy}
+      NATS_TEMPO_FILTER_SUBJECT: ${NATS_TEMPO_FILTER_SUBJECT:-MDB_STREAM.consumers.tempo.>}
+      NATS_TEMPO_DURABLE: ${NATS_TEMPO_DURABLE:-syzygy-tmp}
+      # In-network app target (the prod app serves 8000; 8123 is dev-only).
+      SYZYGY_APP_URL: ${SYZYGY_APP_URL:-http://app:8000}
+      # Same host variable as the app's NATS_INGEST_TOKEN above — the two
+      # sides structurally cannot drift.
+      SYZYGY_NATS_TOKEN: ${NATS_INGEST_TOKEN:?set NATS_INGEST_TOKEN, the shared X-NATS-Token secret for the smile-listener}
+      NATS_RESULT_SUBJECT: ${NATS_RESULT_SUBJECT:-MDB_STREAM.consumers.tempo.cohort-result}
+      COHORT_PUBLISH_ENABLED: ${COHORT_PUBLISH_ENABLED:-false}
+      COHORT_FLUSH_INTERVAL: ${COHORT_FLUSH_INTERVAL:-30}
+      # Optional NATS auth/TLS (run.py omits any that is empty; cert/key
+      # paths are IN-container, so mount them if used):
+      # NATS_USERNAME: ${NATS_USERNAME:-}
+      # NATS_PASSWORD: ${NATS_PASSWORD:-}
+      # NATS_SSL_CERTFILE: ${NATS_SSL_CERTFILE:-}
+      # NATS_SSL_KEYFILE: ${NATS_SSL_KEYFILE:-}
+      # NATS_ROOT_CA: ${NATS_ROOT_CA:-}
+    # service_started, not service_healthy: the compose-merged dev stack
+    # reports the in-container app unhealthy (its healthcheck probes 8000
+    # while dev serves 8123), and the listener tolerates a briefly absent
+    # app anyway (failed POSTs are retried / left pending).
+    depends_on:
+      app:
+        condition: service_started
     restart: unless-stopped
 
 volumes:

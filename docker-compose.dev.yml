@@ -5,8 +5,11 @@
 # this override only adapts it for local development (dev credentials,
 # the host-published port, the dev network). It also adds the services
 # production does not bundle: a dev Keycloak with its own Postgres, and
-# the dev NATS stack. Production runs docker-compose.yml alone and
-# points KEYCLOAK_URL / KEYCLOAK_CLIENT_SECRET at external services.
+# the dev NATS server + stream bootstrap (the smile-listener service
+# itself ships in the production file; this file only overrides its
+# environment for the local nats container). Production runs
+# docker-compose.yml alone and points KEYCLOAK_URL / KEYCLOAK_CLIENT_SECRET
+# at external services.
 name: syzygy
 
 # ONE place the cohort result subject lives: a single YAML alias feeds both
