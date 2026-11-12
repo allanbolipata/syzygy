@@ -7,9 +7,12 @@ clicks land on the Samples tab with #f-q prefilled and the exact row
 focused; patient / request clicks reuse the existing cross-view helpers
 (prefill + open the detail panel); DMP patient ids are conditional links —
 they navigate only when a patient record matches, else no-op with an info
-banner and an explanatory tooltip. Navigation preserves target-tab state:
-it touches only the search box needed to surface the target and never the
-topbar View selector.
+banner and an explanatory tooltip. Navigation RESETS target-tab query
+state before prefilling: the simple search, every advanced filter field,
+and the Samples role select are cleared first — a stale advanced filter
+ANDs against the prefilled id and used to land on zero results (bugfix:
+Pair Report sample clicks with active Samples advanced filters). The
+topbar View selector is never touched.
 """
 import re
 from pathlib import Path
@@ -122,13 +125,46 @@ def test_samples_navigation_prefills_search_and_reloads():
     assert "loadSamples(0).then(() => focusSampleRow(term))" in SAMPLE_NAV
 
 
-def test_role_select_relaxed_only_on_conflict():
-    # A role filter that hides the link target is relaxed to "any" (Pair
-    # Report links target both tumors and normals); it is never tightened,
-    # and a non-conflicting selection is preserved.
-    assert 'const sel = $("#f-tumor_or_normal");' in SAMPLE_NAV
-    assert 'if (role && sel.value && sel.value !== String(role).toUpperCase()) sel.value = "";' in SAMPLE_NAV
-    assert 'el.dataset.role || null' in PAIRS_HANDLER
+def test_samples_navigation_clears_stale_queries_before_prefill():
+    # Regression: a Samples advanced filter left over from a previous
+    # session ANDed against the prefilled id (samplesParams combines them)
+    # and the landing showed no results. Navigation must reset the full
+    # Samples query state first, then prefill the simple search.
+    assert "clearSampleQueries()" in SAMPLE_NAV
+    assert SAMPLE_NAV.index("clearSampleQueries()") < SAMPLE_NAV.index('$("#f-q").value = term;')
+    # The role-select relaxation special case is retired: the shared reset
+    # already clears #f-tumor_or_normal, so no targeted handling survives.
+    assert "f-tumor_or_normal" not in SAMPLE_NAV
+    assert "el.dataset.role" not in PAIRS_HANDLER
+    # The shared reset covers every control samplesParams() reads.
+    clear = _slice("function clearSampleQueries", '$("#f-limit")')
+    assert '$("#f-q").value = "";' in clear
+    assert "for (const id of SAMPLE_FILTER_IDS)" in clear
+    assert '$("#f-tumor_or_normal").value = "";' in clear
+    assert "updateAdvancedSummary()" in clear
+    # Clear button and navigation share the one reset.
+    clear_btn = _slice('$("#btn-clear")', '$("#f-limit")')
+    assert "clearSampleQueries()" in clear_btn
+
+
+def test_patient_request_navigation_clears_stale_queries():
+    # Same defect class on the Patients / Requests tabs: their advanced
+    # filter panels AND against the prefilled search, so navigation resets
+    # the target listing's query state first.
+    nav_patient = _slice("function navigateToPatient", "function navigateToRequest")
+    nav_request = _slice("function navigateToRequest", "/* Sample links in the Pair Report")
+    assert "clearPatientQueries()" in nav_patient
+    assert nav_patient.index("clearPatientQueries()") < nav_patient.index('$("#p-q").value = patientId;')
+    assert "clearRequestQueries()" in nav_request
+    assert nav_request.index("clearRequestQueries()") < nav_request.index('$("#r-q").value = requestId;')
+    p_clear = _slice("function clearPatientQueries", '$("#p-clear")')
+    assert '$("#p-q").value = "";' in p_clear
+    assert "PATIENT_ADVANCED_IDS" in p_clear
+    assert "updatePatientAdvancedSummary()" in p_clear
+    r_clear = _slice("function clearRequestQueries", '$("#r-clear")')
+    assert '$("#r-q").value = "";' in r_clear
+    assert "REQUEST_ADVANCED_IDS" in r_clear
+    assert "updateRequestAdvancedSummary()" in r_clear
 
 
 def test_row_focus_uses_flash_and_scroll():
@@ -172,9 +208,9 @@ def test_harmony_identifier_columns_link():
     assert 'key === "normal_sample" || key === "tumor_sample"' in HARMONY_CELL
     assert 'data-nav-dmp-patient="' in HARMONY_CELL
     assert 'key === "patient"' in HARMONY_CELL
-    # The column key is the role hint for the Samples landing.
-    assert 'data-role="${role}"' in HARMONY_CELL
-    assert '? "TUMOR" : "NORMAL"' in HARMONY_CELL
+    # Role-hint plumbing is gone: the Samples landing resets query state
+    # (role select included) instead of relaxing it per link.
+    assert "data-role" not in HARMONY_CELL
     # bam-path columns keep their untouched em-dash placeholder rendering.
     assert "\\u2014" in HARMONY_CELL
 

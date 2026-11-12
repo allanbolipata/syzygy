@@ -362,6 +362,9 @@ document.querySelectorAll(".tab[data-tab]").forEach((btn) => {
 /* ---------- cross-view navigation (patient__cmo / request_id links) ---------- */
 
 function navigateToPatient(patientId) {
+  // Reset-then-prefill: a stale Patients advanced filter would AND against
+  // the prefilled search and the landing would find no patient row.
+  clearPatientQueries();
   $("#p-q").value = patientId;
   showView("patients");
   loadPatients().then((results) => {
@@ -373,6 +376,9 @@ function navigateToPatient(patientId) {
 }
 
 function navigateToRequest(requestId) {
+  // Reset-then-prefill (see navigateToPatient): clears the Requests
+  // advanced filters before the prefilled search runs.
+  clearRequestQueries();
   $("#r-q").value = requestId;
   showView("requests");
   loadRequests().then((results) => {
@@ -384,27 +390,22 @@ function navigateToRequest(requestId) {
 }
 
 /* Sample links in the Pair Report go to the Samples tab (card t_d8720219):
- * prefill the simple-search box (#f-q) with the sample's primary_id and
- * reload the listing; the exact row is then focused (scroll + flash) when
- * it is on the loaded page. Accepts a full sample record (PAIR/DMP tables)
- * or a bare search term (HARMONY rows carry primary_id strings, not
- * records, or bare search terms (HARMONY rows carry primary_id strings
- * only). Like the patient/request helpers, navigation sets only the controls
- * needed to surface the target — the topbar View selector and the tab's
- * advanced filters are left untouched; the only exception is the simple
- * tumor_or_normal select: when it contradicts the target sample's known
- * role (Pair Report rows pair tumors with normals), it is relaxed to "any"
- * so the click always lands (filters are never tightened to fit a link). */
-function navigateToSampleInSamples(sampleOrTerm, expectedRole) {
+ * the landing contract is RESET-THEN-PREFILL — the full Samples query state
+ * (simple search, every advanced filter field, the tumor_or_normal select)
+ * is cleared first, then #f-q is prefilled with the sample's primary_id and
+ * the listing reloads; the exact row is focused (scroll + flash) when it is
+ * on the loaded page. Reset first because samplesParams() ANDs #f-q with
+ * every advanced field: a stale advanced filter from a previous Samples
+ * session used to combine with the prefilled id and land on zero results.
+ * Accepts a full sample record (PAIR/DMP tables) or a bare search term
+ * (HARMONY rows carry primary_id strings only). No role-select special
+ * case survives the reset; the topbar View selector is still never touched. */
+function navigateToSampleInSamples(sampleOrTerm) {
   const term = typeof sampleOrTerm === "string"
     ? sampleOrTerm
     : String((sampleOrTerm && sampleOrTerm.primary_id) || "");
   if (!term) return;
-  const role = typeof sampleOrTerm === "string"
-    ? expectedRole
-    : (sampleOrTerm.tumor_or_normal || expectedRole);
-  const sel = $("#f-tumor_or_normal");
-  if (role && sel.value && sel.value !== String(role).toUpperCase()) sel.value = "";
+  clearSampleQueries();
   $("#f-q").value = term;
   showView("samples");
   loadSamples(0).then(() => focusSampleRow(term));
@@ -526,12 +527,21 @@ function renderSamples() {
   });
 }
 
-$("#btn-search").addEventListener("click", () => loadSamples(0));
-$("#btn-clear").addEventListener("click", () => {
+/* Full Samples query reset: every control samplesParams() reads — simple
+ * search, advanced filter fields, tumor_or_normal select. Shared by the
+ * Clear button and navigateToSampleInSamples (Pair Report links reset the
+ * listing before prefilling, so a stale advanced filter can never AND
+ * against the prefilled id). Function declaration: hoisted, so the
+ * navigation helpers defined earlier may call it. */
+function clearSampleQueries() {
   $("#f-q").value = "";
   for (const id of SAMPLE_FILTER_IDS) $(`#f-${id}`).value = "";
   $("#f-tumor_or_normal").value = "";
   updateAdvancedSummary();
+}
+$("#btn-search").addEventListener("click", () => loadSamples(0));
+$("#btn-clear").addEventListener("click", () => {
+  clearSampleQueries();
   loadSamples(0);
 });
 $("#f-limit").addEventListener("change", (e) => {
@@ -1143,10 +1153,15 @@ $("#p-prev").addEventListener("click", () =>
 $("#p-next").addEventListener("click", () =>
   loadPatients(patientsState.offset + patientsState.limit)
 );
-$("#p-clear").addEventListener("click", () => {
+/* Full Patients query reset (simple search + advanced fields): shared by
+ * the Clear button and navigateToPatient. */
+function clearPatientQueries() {
   $("#p-q").value = "";
   for (const id of PATIENT_ADVANCED_IDS) $(`#p-${id}`).value = "";
   updatePatientAdvancedSummary();
+}
+$("#p-clear").addEventListener("click", () => {
+  clearPatientQueries();
   loadPatients(0);
 });
 $("#p-close").addEventListener("click", () => {
@@ -1333,10 +1348,15 @@ $("#r-prev").addEventListener("click", () =>
 $("#r-next").addEventListener("click", () =>
   loadRequests(requestsState.offset + requestsState.limit)
 );
-$("#r-clear").addEventListener("click", () => {
+/* Full Requests query reset (simple search + advanced fields): shared by
+ * the Clear button and navigateToRequest. */
+function clearRequestQueries() {
   $("#r-q").value = "";
   for (const id of REQUEST_ADVANCED_IDS) $(`#r-${id}`).value = "";
   updateRequestAdvancedSummary();
+}
+$("#r-clear").addEventListener("click", () => {
+  clearRequestQueries();
   loadRequests(0);
 });
 $("#r-close").addEventListener("click", () => {
@@ -1881,11 +1901,11 @@ function harmonyCellText(r, key) {
 function harmonyCellHtml(r, key) {
   const text = harmonyCellText(r, key);
   if (text === "") return "";
-  if (text !== "\u2014" && (key === "normal_sample" || key === "tumor_sample")) {
-    // data-role tells the Samples landing which role select value would
-    // hide the target (the frame has no role field, the column is the hint).
-    const role = key === "tumor_sample" ? "TUMOR" : "NORMAL";
-    return `<span class="nav-link" data-goto-sample="${esc(text)}" data-role="${role}" title="${esc(PAIR_LINK_TITLES.sample)}">${esc(text)}</span>`;
+  if (text !== "\\u2014" && (key === "normal_sample" || key === "tumor_sample")) {
+    // No role hint: the Samples landing resets the query state (including
+    // the role select) instead of relaxing it, so the column key carries no
+    // extra meaning for navigation.
+    return `<span class="nav-link" data-goto-sample="${esc(text)}" title="${esc(PAIR_LINK_TITLES.sample)}">${esc(text)}</span>`;
   }
   if (text !== "\u2014" && key === "patient")
     return `<span class="nav-link" data-nav-dmp-patient="${esc(text)}" title="${esc(PAIR_LINK_TITLES["dmp-patient"])}">${esc(text)}</span>`;
@@ -1910,11 +1930,13 @@ function harmonyPageParams(page, pageSize) {
 /* Clickable identifier cells in the Pair Report table (card t_d8720219).
  * A column model may declare an optional ``link`` that resolves a row to a
  * navigation target:
- * - kind "sample"      → the Samples tab, #f-q prefilled with the sample's
- *   primary_id and the exact row focused. The cell carries the record id;
- *   the #pairs-table handler resolves the full sample from pairsState.rows
- *   (PAIR/DMP rows), and falls back to treating the value as a search term
- *   for the HARMONY table, whose rows carry primary_id strings only.
+ * - kind "sample"      → the Samples tab: the listing's query state is
+ *   reset (simple search, advanced filters, role select) and #f-q is
+ *   prefilled with the sample's primary_id, exact row focused. The cell
+ *   carries the record id; the #pairs-table handler resolves the full sample
+ *   from pairsState.rows (PAIR/DMP rows), and falls back to treating the
+ *   value as a search term for the HARMONY table, whose rows carry
+ *   primary_id strings only.
  * - kind "patient"     → the Patients tab with the detail panel opened
  *   (navigateToPatient, same as clicking a patient row).
  * - kind "request"     → the Requests tab with the request detail opened.
@@ -2688,10 +2710,13 @@ $("#pr-cols-default").addEventListener("click", () =>
  *   is resolved to the full record from pairsState.rows when the frame
  *   carries one (PAIR/DMP rows) and handed to navigateToSampleInSamples;
  *   HARMONY rows carry names only, so the value is used as the search term.
+ *   The Samples listing's query state is reset before the prefilled search
+ *   runs, so a stale advanced filter never hides the link target.
  *   (Pair Report sample links deliberately land on the Samples listing, not
  *   on Matches & Overrides like row clicks on browse pages do.)
  * - patient/request links reuse the existing cross-view helpers, which
- *   prefill the target tab's search and open the detail panel.
+ *   reset the target tab's query state, prefill its search, and open the
+ *   detail panel.
  * - DMP patient links resolve first (row's own patient__cmo, else a
  *   Samples-listing lookup) and no-op with a banner when no patient record
  *   matches. */
@@ -2708,7 +2733,7 @@ $("#pairs-table").addEventListener("click", (e) => {
     );
     const sample = row && ((row.tumor && String(row.tumor.id) === v ? row.tumor : null)
       || (row.normal && String(row.normal.id) === v ? row.normal : null));
-    return navigateToSampleInSamples(sample || v, el.dataset.role || null);
+    return navigateToSampleInSamples(sample || v);
   }
 });
 
