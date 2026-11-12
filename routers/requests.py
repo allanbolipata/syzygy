@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -12,16 +12,72 @@ from schemas import RequestRead
 router = APIRouter(prefix="/request", tags=["requests"])
 
 
-def _apply_request_filters(stmt, q):
+def _any_sample_matching(cond):
+    """Group-level (HAVING) condition: at least one sample in the group
+    satisfies ``cond``. Used instead of a row WHERE clause so an advanced
+    filter decides *which groups* appear while every group's counts still
+    cover ALL of its samples (Allan's 2026-11-11 decision: no logic
+    scoping of counts)."""
+    return func.sum(case((cond, 1), else_=0)) > 0
+
+
+def _request_advanced_having(
+    *,
+    gene_panel: Optional[str],
+    sample_type: Optional[str],
+    bait_set: Optional[str],
+    patient__cmo: Optional[str],
+):
+    """HAVING clauses for the advanced request filters (AND-combined):
+    the request matches when at least one of its samples carries a
+    case-insensitive partial match on each given field."""
+    having = []
+    for field, value in {
+        "gene_panel": gene_panel,
+        "sample_type": sample_type,
+        "bait_set": bait_set,
+        "patient__cmo": patient__cmo,
+    }.items():
+        if value is not None:
+            having.append(
+                _any_sample_matching(getattr(Sample, field).ilike(f"%{value}%"))
+            )
+    return having
+
+
+def _apply_request_filters(
+    stmt,
+    q,
+    *,
+    gene_panel: Optional[str] = None,
+    sample_type: Optional[str] = None,
+    bait_set: Optional[str] = None,
+    patient__cmo: Optional[str] = None,
+):
     """Filter clauses shared by the page query and the total query, so
-    the reported total always reflects the currently active filter set."""
+    the reported total always reflects the currently active filter set.
+
+    ``q`` restricts rows (request_id is group-level: every sample of a
+    request shares it, so restricting rows never shrinks a surviving
+    group's counts). The advanced filters are group-level HAVING clauses
+    on the unfiltered group rows — the request is included when at least
+    one of its samples matches, but its aggregate counts still cover ALL
+    of its samples."""
     stmt = stmt.where(Sample.request_id.is_not(None))
     if q is not None:
         stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
+    having = _request_advanced_having(
+        gene_panel=gene_panel,
+        sample_type=sample_type,
+        bait_set=bait_set,
+        patient__cmo=patient__cmo,
+    )
+    if having:
+        stmt = stmt.having(and_(*having))
     return stmt
 
 
-def _request_page(db: Session, limit, offset, q):
+def _request_page(db: Session, limit, offset, *, q, **advanced):
     """One row per request: id + sample/tumor/normal counts.
 
     Aggregation happens in SQL (GROUP BY) with limit/offset applied at the
@@ -40,6 +96,7 @@ def _request_page(db: Session, limit, offset, q):
             ),
         ),
         q,
+        **advanced,
     ).group_by(Sample.request_id).order_by(Sample.request_id)
     if offset is not None:
         stmt = stmt.offset(offset)
@@ -48,10 +105,10 @@ def _request_page(db: Session, limit, offset, q):
     return db.execute(stmt).all()
 
 
-def _request_total(db: Session, q) -> int:
+def _request_total(db: Session, *, q, **advanced) -> int:
     """Pre-pagination number of request groups under the current filters
-    (COUNT over the same filtered GROUP BY that produces the page)."""
-    groups = _apply_request_filters(select(Sample.request_id), q).group_by(
+    (COUNT over the same filtered+HAVING GROUP BY that produces the page)."""
+    groups = _apply_request_filters(select(Sample.request_id), q, **advanced).group_by(
         Sample.request_id
     )
     return db.scalar(select(func.count()).select_from(groups.subquery()))
@@ -62,6 +119,10 @@ def list_requests(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     q: Optional[str] = None,
+    gene_panel: Optional[str] = None,
+    sample_type: Optional[str] = None,
+    bait_set: Optional[str] = None,
+    patient__cmo: Optional[str] = None,
     db: Session = Depends(get_db),
     response: Response = None,
 ):
@@ -71,6 +132,13 @@ def list_requests(
     ``patients`` lists the distinct patient__cmo values across the request's
     samples (non-null); ``sample_types`` and ``gene_panels`` are the
     distinct values carried by the request's samples.
+
+    Advanced filters select which request groups appear; they never scope
+    the groups' counts (every row's counts cover ALL of the request's
+    samples): ``gene_panel``, ``sample_type``, ``bait_set`` and
+    ``patient__cmo`` are case-insensitive partial matches — a request
+    matches when at least one of its samples matches each given field.
+    All filters combine with AND.
 
     Counts come from a SQL GROUP BY with DB-level limit/offset; the
     distinct lists are then computed in Python over only the current
@@ -82,7 +150,13 @@ def list_requests(
     ``None`` so direct-call tests (repo convention) can pass a plain
     ``Response()`` to capture the header.
     """
-    rows = _request_page(db, limit, offset, q)
+    advanced = {
+        "gene_panel": gene_panel,
+        "sample_type": sample_type,
+        "bait_set": bait_set,
+        "patient__cmo": patient__cmo,
+    }
+    rows = _request_page(db, limit, offset, q=q, **advanced)
 
     by_request: dict[str, list[Sample]] = {}
     if rows:
@@ -95,7 +169,7 @@ def list_requests(
 
     # Totals issued last: a bounded scalar COUNT (exactly 1 row) over the
     # same filtered GROUP BY — never the full group set.
-    total = _request_total(db, q)
+    total = _request_total(db, q=q, **advanced)
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
 

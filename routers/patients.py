@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, cast, func, or_, select, String
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -15,17 +15,116 @@ router = APIRouter(prefix="/patient", tags=["patients"])
 # keys (runId, flowCellId, platform, ...) are deliberately excluded.
 PATIENT_META_KEYS = ("species", "sex", "oncotreeCode", "diagnosisDate")
 
+# Advanced-filter query param -> additional_metadata key it matches.
+PATIENT_META_FILTERS = {
+    "species": "species",
+    "sex": "sex",
+    "oncotree_code": "oncotreeCode",
+    "diagnosis_date": "diagnosisDate",
+}
 
-def _apply_patient_filters(stmt, q):
+
+def _meta_text(key: str):
+    """SQL text of ``additional_metadata[key]`` (dialect-agnostic JSON key
+    extraction: ``json_extract`` on SQLite, ``->`` + cast on Postgres).
+    Compiles to SQL NULL when ``additional_metadata`` is null or the key is
+    absent — so null-safe ``IS NOT NULL`` / ILIKE checks behave consistently."""
+    return cast(Sample.additional_metadata[key], String)
+
+
+def _any_sample_matching(cond):
+    """Group-level (HAVING) condition: at least one sample in the group
+    satisfies ``cond``. Used instead of a row WHERE clause so an advanced
+    filter decides *which groups* appear while every group's counts still
+    cover ALL of its samples (Allan's 2026-11-11 decision: no logic
+    scoping of counts)."""
+    return func.sum(case((cond, 1), else_=0)) > 0
+
+
+def _metadata_match_having(key: str, value: str):
+    """Group HAVING clause matching the patient's *derived* metadata value
+    (first non-null per key; tumor samples take priority — see
+    ``list_patients``).
+
+    Tumor-priority semantics, evaluated per group:
+    - matches if any TUMOR sample's value for ``key`` partial-matches, or
+    - no TUMOR sample carries ``key`` at all and some (NORMAL) sample's
+      value partial-matches.
+
+    ``value`` is a case-insensitive partial match.
+    """
+    like = f"%{value}%"
+    meta = _meta_text(key)
+    tumor_has_key = func.sum(
+        case((and_(Sample.tumor_or_normal == "TUMOR", meta.is_not(None)), 1), else_=0)
+    )
+    return or_(
+        _any_sample_matching(
+            and_(Sample.tumor_or_normal == "TUMOR", meta.ilike(like))
+        ),
+        and_(tumor_has_key == 0, _any_sample_matching(meta.ilike(like))),
+    )
+
+
+def _patient_advanced_having(
+    *,
+    species: Optional[str],
+    sex: Optional[str],
+    oncotree_code: Optional[str],
+    diagnosis_date: Optional[str],
+    request_id: Optional[str],
+):
+    """HAVING clauses for the advanced patient filters (AND-combined)."""
+    having = []
+    meta_values = {
+        "species": species,
+        "sex": sex,
+        "oncotree_code": oncotree_code,
+        "diagnosis_date": diagnosis_date,
+    }
+    for param, value in meta_values.items():
+        if value is not None:
+            having.append(_metadata_match_having(PATIENT_META_FILTERS[param], value))
+    if request_id is not None:
+        having.append(_any_sample_matching(Sample.request_id.ilike(f"%{request_id}%")))
+    return having
+
+
+def _apply_patient_filters(
+    stmt,
+    q,
+    *,
+    species: Optional[str] = None,
+    sex: Optional[str] = None,
+    oncotree_code: Optional[str] = None,
+    diagnosis_date: Optional[str] = None,
+    request_id: Optional[str] = None,
+):
     """Filter clauses shared by the page query and the total query, so
-    the reported total always reflects the currently active filter set."""
+    the reported total always reflects the currently active filter set.
+
+    ``q`` restricts rows (patient__cmo is group-level: every sample of a
+    patient shares it, so restricting rows never shrinks a surviving
+    group's counts). The advanced filters are group-level HAVING clauses
+    on the unfiltered group rows — the group is included when at least one
+    of its samples matches, but its aggregate counts still cover ALL of
+    its samples."""
     stmt = stmt.where(Sample.patient__cmo.is_not(None))
     if q is not None:
         stmt = stmt.where(Sample.patient__cmo.ilike(f"%{q}%"))
+    having = _patient_advanced_having(
+        species=species,
+        sex=sex,
+        oncotree_code=oncotree_code,
+        diagnosis_date=diagnosis_date,
+        request_id=request_id,
+    )
+    if having:
+        stmt = stmt.having(and_(*having))
     return stmt
 
 
-def _patient_page(db: Session, limit, offset, q):
+def _patient_page(db: Session, limit, offset, *, q, **advanced):
     """One row per patient: id + sample/tumor/normal counts.
 
     Aggregation happens in SQL (GROUP BY) with limit/offset applied at the
@@ -44,6 +143,7 @@ def _patient_page(db: Session, limit, offset, q):
             ),
         ),
         q,
+        **advanced,
     ).group_by(Sample.patient__cmo).order_by(Sample.patient__cmo)
     if offset is not None:
         stmt = stmt.offset(offset)
@@ -52,10 +152,10 @@ def _patient_page(db: Session, limit, offset, q):
     return db.execute(stmt).all()
 
 
-def _patient_total(db: Session, q) -> int:
+def _patient_total(db: Session, *, q, **advanced) -> int:
     """Pre-pagination number of patient groups under the current filters
-    (COUNT over the same filtered GROUP BY that produces the page)."""
-    groups = _apply_patient_filters(select(Sample.patient__cmo), q).group_by(
+    (COUNT over the same filtered+HAVING GROUP BY that produces the page)."""
+    groups = _apply_patient_filters(select(Sample.patient__cmo), q, **advanced).group_by(
         Sample.patient__cmo
     )
     return db.scalar(select(func.count()).select_from(groups.subquery()))
@@ -66,6 +166,11 @@ def list_patients(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     q: Optional[str] = None,
+    species: Optional[str] = None,
+    sex: Optional[str] = None,
+    oncotree_code: Optional[str] = None,
+    diagnosis_date: Optional[str] = None,
+    request_id: Optional[str] = None,
     db: Session = Depends(get_db),
     response: Response = None,
 ):
@@ -75,6 +180,18 @@ def list_patients(
     ``metadata`` holds patient-level fields derived from the patient's
     sample ``additional_metadata`` (first non-null value per key; tumor
     samples take priority).
+
+    Advanced filters select which patient groups appear; they never scope
+    the groups' counts (every row's counts cover ALL of the patient's
+    samples):
+    - ``species`` / ``sex`` / ``oncotree_code`` / ``diagnosis_date`` are
+      case-insensitive partial matches on the *derived* metadata value
+      (same key set as ``metadata``; tumor priority means a tumor value
+      matching wins, and a NORMAL value only matches when no tumor sample
+      carries the key at all).
+    - ``request_id`` matches patients having at least one sample whose
+      request_id partial-matches.
+    All filters combine with AND.
 
     Counts come from a SQL GROUP BY with DB-level limit/offset; the
     derived fields are then computed in Python over only the current
@@ -86,7 +203,14 @@ def list_patients(
     ``None`` so direct-call tests (repo convention) can pass a plain
     ``Response()`` to capture the header.
     """
-    rows = _patient_page(db, limit, offset, q)
+    advanced = {
+        "species": species,
+        "sex": sex,
+        "oncotree_code": oncotree_code,
+        "diagnosis_date": diagnosis_date,
+        "request_id": request_id,
+    }
+    rows = _patient_page(db, limit, offset, q=q, **advanced)
 
     by_patient: dict[str, list[Sample]] = {}
     if rows:
@@ -99,7 +223,7 @@ def list_patients(
 
     # Totals issued last: a bounded scalar COUNT (exactly 1 row) over the
     # same filtered GROUP BY — never the full group set.
-    total = _patient_total(db, q)
+    total = _patient_total(db, q=q, **advanced)
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
 
