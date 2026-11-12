@@ -383,6 +383,77 @@ function navigateToRequest(requestId) {
   });
 }
 
+/* Sample links in the Pair Report go to the Samples tab (card t_d8720219):
+ * prefill the simple-search box (#f-q) with the sample's primary_id and
+ * reload the listing; the exact row is then focused (scroll + flash) when
+ * it is on the loaded page. Accepts a full sample record (PAIR/DMP tables)
+ * or a bare search term (HARMONY rows carry primary_id strings, not
+ * records, or bare search terms (HARMONY rows carry primary_id strings
+ * only). Like the patient/request helpers, navigation sets only the controls
+ * needed to surface the target — the topbar View selector and the tab's
+ * advanced filters are left untouched; the only exception is the simple
+ * tumor_or_normal select: when it contradicts the target sample's known
+ * role (Pair Report rows pair tumors with normals), it is relaxed to "any"
+ * so the click always lands (filters are never tightened to fit a link). */
+function navigateToSampleInSamples(sampleOrTerm, expectedRole) {
+  const term = typeof sampleOrTerm === "string"
+    ? sampleOrTerm
+    : String((sampleOrTerm && sampleOrTerm.primary_id) || "");
+  if (!term) return;
+  const role = typeof sampleOrTerm === "string"
+    ? expectedRole
+    : (sampleOrTerm.tumor_or_normal || expectedRole);
+  const sel = $("#f-tumor_or_normal");
+  if (role && sel.value && sel.value !== String(role).toUpperCase()) sel.value = "";
+  $("#f-q").value = term;
+  showView("samples");
+  loadSamples(0).then(() => focusSampleRow(term));
+}
+
+/* Highlight + scroll to the Samples-listing row whose primary_id matches
+ * exactly (case-insensitive). When the prefilled search surfaces only
+ * partial candidates (no exact row), the prefilled search itself is the
+ * fallback focus — no error, matching the "search prefilled (or direct row
+ * focus)" contract. */
+function focusSampleRow(term) {
+  const want = String(term).toLowerCase();
+  const row = (samplesState.results || []).find(
+    (s) => String(s.primary_id || "").toLowerCase() === want
+  );
+  if (!row) return;
+  const tr = document.querySelector(
+    `#samples-table tbody tr[data-id="${CSS.escape(String(row.id))}"]`
+  );
+  if (!tr) return;
+  document.querySelectorAll("#samples-table tbody tr.row-flash")
+    .forEach((el) => el.classList.remove("row-flash"));
+  tr.classList.add("row-flash");
+  tr.scrollIntoView({ block: "center" });
+  setTimeout(() => tr.classList.remove("row-flash"), 1600);
+}
+
+/* DMP patient ids are conditional links (card t_d8720219): the Patients tab
+ * lists patient__cmo groups, so a DMP id counts as a "matching patient" only
+ * when some sample carrying that patient__dmp also has a patient__cmo. The
+ * Pair Report row usually carries that proof directly (its own sample record
+ * has patient__cmo — use it, no query); otherwise ask the Samples listing
+ * for a sample with the same patient__dmp. If nothing resolves, the click is
+ * a no-op (stay on the Pair Report) with an info banner; the cell's tooltip
+ * states the conditional behaviour up front. */
+async function navigateToDmpPatient(dmpId, directCmo) {
+  if (directCmo) return navigateToPatient(directCmo);
+  try {
+    const rows = await api(`/sample/?q=${encodeURIComponent(dmpId)}&limit=200`);
+    const want = String(dmpId).toLowerCase();
+    const hit = (rows || []).find((s) =>
+      s.patient__cmo && s.patient__dmp &&
+      String(s.patient__dmp).toLowerCase() === want
+    );
+    if (hit) return navigateToPatient(hit.patient__cmo);
+  } catch (_) { /* unreachable listing = treated as no match: no-op below */ }
+  banner("info", `No patient record matches DMP patient ${esc(dmpId)} — staying in the Pair Report.`, true);
+}
+
 /* ---------- samples view ---------- */
 
 const samplesState = { limit: 50, offset: 0, results: [], total: null };
@@ -1482,7 +1553,7 @@ const PAIR_COLUMNS = [
   { key: "normal_primary_id", header: "NORMAL_SAMPLE", group: "Normal sample", text: (r) => r.normal.primary_id, link: (r) => sampleLink(r.normal) },
   { key: "tumor_bait_set", header: "BAIT_SET", group: "Tumor sample", text: (r) => r.tumor.bait_set || "" },
   { key: "tumor_patient__cmo", header: "TUMOR_PATIENT__CMO", group: "Tumor sample", text: (r) => r.tumor.patient__cmo || "", link: (r) => patientLink(r.tumor && r.tumor.patient__cmo) },
-  { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "" },
+  { key: "tumor_patient__dmp", header: "TUMOR_PATIENT__DMP", group: "Tumor sample", text: (r) => r.tumor.patient__dmp || "", link: (r) => dmpPatientLink(r.tumor && r.tumor.patient__dmp, r.tumor && r.tumor.patient__cmo) },
   { key: "tumor_anon_id", header: "TUMOR_ANON_ID", group: "Tumor sample", text: (r) => r.tumor.anon_id || "" },
   { key: "tumor_cmo_sample_name", header: "TUMOR_CMO_SAMPLE_NAME", group: "Tumor sample", text: (r) => pairText(r.tumor.cmo_sample_name), link: (r) => sampleLink(r.tumor) },
   { key: "tumor_role", header: "TUMOR_ROLE", group: "Tumor sample", text: (r) => r.tumor.tumor_or_normal || "" },
@@ -1499,7 +1570,7 @@ const PAIR_COLUMNS = [
   { key: "tumor_id", header: "TUMOR_ID", group: "Tumor sample", text: (r) => r.tumor.id },
   { key: "normal_bait_set", header: "NORMAL_BAIT_SET", group: "Normal sample", text: (r) => r.normal.bait_set || "" },
   { key: "normal_patient__cmo", header: "NORMAL_PATIENT__CMO", group: "Normal sample", text: (r) => r.normal.patient__cmo || "", link: (r) => patientLink(r.normal && r.normal.patient__cmo) },
-  { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "" },
+  { key: "normal_patient__dmp", header: "NORMAL_PATIENT__DMP", group: "Normal sample", text: (r) => r.normal.patient__dmp || "", link: (r) => dmpPatientLink(r.normal && r.normal.patient__dmp, r.normal && r.normal.patient__cmo) },
   { key: "normal_anon_id", header: "NORMAL_ANON_ID", group: "Normal sample", text: (r) => r.normal.anon_id || "" },
   { key: "normal_cmo_sample_name", header: "NORMAL_CMO_SAMPLE_NAME", group: "Normal sample", text: (r) => pairText(r.normal.cmo_sample_name), link: (r) => sampleLink(r.normal) },
   { key: "normal_role", header: "NORMAL_ROLE", group: "Normal sample", text: (r) => r.normal.tumor_or_normal || "" },
@@ -1589,7 +1660,7 @@ function dmpCells(r) {
 const dmpText = (key) => (r) => dmpCells(r)[key];
 const DMP_COLUMNS = [
   { key: "tumor_sample", header: "tumor_sample", group: "Tumor", text: dmpText("tumor_sample"), link: (r) => sampleLink(r.tumor) },
-  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient") },
+  { key: "patient", header: "patient", group: "Tumor", text: dmpText("patient"), link: (r) => { const v = dmpCells(r).patient; return v === DMP_NA ? null : dmpPatientLink(v, r.tumor && r.tumor.patient__cmo); } },
   { key: "tumor_idx", header: "tumor_idx", group: "Tumor", text: dmpText("tumor_idx") },
   { key: "tumor_IM_ver", header: "tumor_IM_ver", group: "Tumor", text: dmpText("tumor_IM_ver") },
   { key: "tumor_bamname", header: "tumor_bamname", group: "Tumor", text: dmpText("tumor_bamname") },
@@ -1608,7 +1679,7 @@ const DMP_COLUMNS = [
  * panel and as tooltips on the column headers). */
 const DMP_LEGEND = {
   tumor_sample: "The DMP tumor's sample name (primary_id)",
-  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name",
+  patient: "patient__dmp from the DMP record; falls back to the P-\u2026 id parsed from the sample name; links to the patient detail when a patient record matches this DMP id",
   tumor_idx: "Tumor index parsed from the sample name (second-to-last dash segment, e.g. T01); NA when unparseable",
   tumor_IM_ver: "IM version parsed from the sample name (last dash segment, e.g. IM7); NA when unparseable",
   tumor_bamname: "bamname from the DMP record's additional_metadata; falls back to anon_id",
@@ -1800,6 +1871,27 @@ function harmonyCellText(r, key) {
   return pairText(v);
 }
 
+/* HARMONY identifier columns are clickable like the other Pair Report
+ * variants (card t_d8720219). The frame carries primary_id STRINGS for the
+ * sample-name columns (no sample records to resolve), so their links pass
+ * the name as the Samples-tab search term; the patient column is
+ * coalesce(tumor, normal).patient__dmp — a DMP id — so it goes through the
+ * same conditional DMP-patient flow (no-op when no patient record matches).
+ * The bam-path columns keep their em-dash placeholder rendering untouched. */
+function harmonyCellHtml(r, key) {
+  const text = harmonyCellText(r, key);
+  if (text === "") return "";
+  if (text !== "\u2014" && (key === "normal_sample" || key === "tumor_sample")) {
+    // data-role tells the Samples landing which role select value would
+    // hide the target (the frame has no role field, the column is the hint).
+    const role = key === "tumor_sample" ? "TUMOR" : "NORMAL";
+    return `<span class="nav-link" data-goto-sample="${esc(text)}" data-role="${role}" title="${esc(PAIR_LINK_TITLES.sample)}">${esc(text)}</span>`;
+  }
+  if (text !== "\u2014" && key === "patient")
+    return `<span class="nav-link" data-nav-dmp-patient="${esc(text)}" title="${esc(PAIR_LINK_TITLES["dmp-patient"])}">${esc(text)}</span>`;
+  return esc(text);
+}
+
 /* URLSearchParams for GET /pairing/harmony/: the same 1-based page/size and
  * search query as reportPageParams (the harmony endpoint takes the same page
  * contract), minus the report-only ones — pairing_logic_name is implicit
@@ -1815,26 +1907,45 @@ function harmonyPageParams(page, pageSize) {
   if (q) params.set("q", q);
   return params;
 }
-/* Clickable identifier cells in the pair table. A column model may
- * declare an optional ``link`` that resolves a row to a navigation
- * target: a sample (its Matches & Overrides page), a patient (the
- * Patients view) or a request (the Requests view). The cell renders as
- * the app's standard nav-link only when the target resolves and the cell
- * has a value; otherwise it stays plain text. Sample links carry the
- * row's sample id; the #pairs-table click handler below resolves the full
- * sample object from pairsState.rows (openMatchesFor needs more than the
- * id — e.g. bait_set for logic preselection). */
+/* Clickable identifier cells in the Pair Report table (card t_d8720219).
+ * A column model may declare an optional ``link`` that resolves a row to a
+ * navigation target:
+ * - kind "sample"      → the Samples tab, #f-q prefilled with the sample's
+ *   primary_id and the exact row focused. The cell carries the record id;
+ *   the #pairs-table handler resolves the full sample from pairsState.rows
+ *   (PAIR/DMP rows), and falls back to treating the value as a search term
+ *   for the HARMONY table, whose rows carry primary_id strings only.
+ * - kind "patient"     → the Patients tab with the detail panel opened
+ *   (navigateToPatient, same as clicking a patient row).
+ * - kind "request"     → the Requests tab with the request detail opened.
+ * - kind "dmp-patient" → conditional: navigates only when a patient record
+ *   matches the DMP id (the row's own patient__cmo if present, else a
+ *   Samples-listing lookup); otherwise the click is a no-op with an info
+ *   banner. The tooltip states this up front.
+ * Cells render as the app's standard nav-link (underlined accent text) only
+ * when the target resolves and the cell has a value; otherwise plain text. */
 const sampleLink = (s) => (s && s.id != null ? { kind: "sample", id: s.id } : null);
 const patientLink = (id) => (id ? { kind: "patient", id } : null);
 const requestLink = (id) => (id ? { kind: "request", id } : null);
+const dmpPatientLink = (dmpId, cmoId) =>
+  (dmpId ? { kind: "dmp-patient", id: dmpId, cmo: cmoId || null } : null);
+const PAIR_LINK_TITLES = {
+  sample: "Open this sample in the Samples tab",
+  patient: "Open this patient\u2019s detail",
+  request: "Open this request\u2019s detail",
+  "dmp-patient": "Open the matching patient\u2019s detail — only when a patient record matches this DMP id",
+};
 
 function pairCellHtml(r, c) {
   const raw = c.text(r);
   const link = c.link ? c.link(r) : null;
   if (!link || pairText(raw) === "") return `<td>${esc(raw)}</td>`;
-  const attr = link.kind === "sample" ? "data-sample-id"
-    : link.kind === "patient" ? "data-nav-patient" : "data-nav-request";
-  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}">${esc(raw)}</span></td>`;
+  const attr = link.kind === "sample" ? "data-goto-sample"
+    : link.kind === "patient" ? "data-nav-patient"
+    : link.kind === "request" ? "data-nav-request" : "data-nav-dmp-patient";
+  const cmo = link.kind === "dmp-patient" && link.cmo
+    ? ` data-nav-cmo="${esc(String(link.cmo))}"` : "";
+  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}"${cmo} title="${esc(PAIR_LINK_TITLES[link.kind])}">${esc(raw)}</span></td>`;
 }
 
 /* HARMONY: normal-oriented table over the CHECKED HARMONY columns (via
@@ -1867,7 +1978,7 @@ function renderHarmonyTable() {
       const divider = prev !== null && prev !== r.normal_sample
         ? ` style="border-top:2px solid #c3ccd6"` : "";
       return `<tr>${cols.map((c) =>
-        `<td${divider}>${esc(harmonyCellText(r, c.key))}</td>`).join("")}</tr>`;
+        `<td${divider}>${harmonyCellHtml(r, c.key)}</td>`).join("")}</tr>`;
     }).join("");
   $("#pr-prev").disabled = pairsState.page === 0;
   $("#pr-next").disabled = pairsState.page >= maxPage;
@@ -2572,23 +2683,32 @@ $("#pr-cols-none").addEventListener("click", () => setSelectionForActive([]));
 $("#pr-cols-default").addEventListener("click", () =>
   setSelectionForActive([...defaultSelectionFor(activeLogicName())]));
 
-/* Identifier links in the pair table: same delegation pattern as the
- * Matches view — patient/request spans navigate via the existing helpers,
- * a sample span resolves the full sample object from the loaded rows and
- * opens its Matches & Overrides page. */
+/* Identifier links in the Pair Report table (all three column sets):
+ * - sample links navigate to the Samples tab (card t_d8720219): the value
+ *   is resolved to the full record from pairsState.rows when the frame
+ *   carries one (PAIR/DMP rows) and handed to navigateToSampleInSamples;
+ *   HARMONY rows carry names only, so the value is used as the search term.
+ *   (Pair Report sample links deliberately land on the Samples listing, not
+ *   on Matches & Overrides like row clicks on browse pages do.)
+ * - patient/request links reuse the existing cross-view helpers, which
+ *   prefill the target tab's search and open the detail panel.
+ * - DMP patient links resolve first (row's own patient__cmo, else a
+ *   Samples-listing lookup) and no-op with a banner when no patient record
+ *   matches. */
 $("#pairs-table").addEventListener("click", (e) => {
-  const el = e.target.closest("[data-nav-patient],[data-nav-request],[data-sample-id]");
+  const el = e.target.closest("[data-goto-sample],[data-nav-patient],[data-nav-request],[data-nav-dmp-patient]");
   if (!el) return;
   if (el.dataset.navPatient != null) return navigateToPatient(el.dataset.navPatient);
   if (el.dataset.navRequest != null) return navigateToRequest(el.dataset.navRequest);
-  if (el.dataset.sampleId != null) {
-    const id = String(el.dataset.sampleId);
+  if (el.dataset.navDmpPatient != null) return navigateToDmpPatient(el.dataset.navDmpPatient, el.dataset.navCmo || null);
+  if (el.dataset.gotoSample != null) {
+    const v = el.dataset.gotoSample;
     const row = pairsState.rows.find(
-      (r) => (r.tumor && String(r.tumor.id) === id) || (r.normal && String(r.normal.id) === id)
+      (r) => (r.tumor && String(r.tumor.id) === v) || (r.normal && String(r.normal.id) === v)
     );
-    const sample = row && ((row.tumor && String(row.tumor.id) === id ? row.tumor : null)
-      || (row.normal && String(row.normal.id) === id ? row.normal : null));
-    if (sample) return openMatchesFor(sample);
+    const sample = row && ((row.tumor && String(row.tumor.id) === v ? row.tumor : null)
+      || (row.normal && String(row.normal.id) === v ? row.normal : null));
+    return navigateToSampleInSamples(sample || v, el.dataset.role || null);
   }
 });
 

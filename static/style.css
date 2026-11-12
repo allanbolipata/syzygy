@@ -346,6 +346,10 @@ td input {
 
 .nav-link { color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .nav-link:hover { color: #173c8a; }
+/* Pair Report → Samples landing: brief focus flash on the exact row
+ * (card t_d8720219); the animation ends on its own, JS drops the class. */
+@keyframes row-flash { 0%, 55% { background: #fff3c9; } 100% { background: transparent; } }
+tbody tr.row-flash { animation: row-flash 1.6s ease-out; }
 tbody tr.current { background: #f3f8ef; }
 /* Sample results panels (Matches & Overrides / Try Pairing): the picked row. */
 tbody tr.selected { background: #e8f0fe; box-shadow: inset 3px 0 0 var(--accent); }
