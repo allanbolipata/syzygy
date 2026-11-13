@@ -5,10 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from bait_sets import logic_membership_condition, resolve_bait_set_logic
-from database import get_db, settings
-from models import PairingLogic, Sample
-from pairing_service import (
+from syzygy.bait_sets import logic_membership_condition, resolve_bait_set_logic
+from syzygy.database import get_db, settings
+from syzygy.models import PairingLogic, Sample
+from syzygy.pairing_service import (
     MAX_OTHER_MATCHES_LIMIT,
     possible_matches,
     resolve_filter_logic,
@@ -16,7 +16,7 @@ from pairing_service import (
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from schemas import PossibleMatchesRead, SampleCreate, SampleRead, TumorOrNormal
+from syzygy.schemas import PossibleMatchesRead, SampleCreate, SampleRead, TumorOrNormal
 
 
 router = APIRouter(prefix="/sample", tags=["samples"])

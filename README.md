@@ -21,23 +21,42 @@ tooling (pytest, testcontainers). The Docker image installs only
 `requirements.txt` (runtime deps).
 
 Configuration comes from environment variables or a local `.env` file
-(gitignored; see `Settings` in `database.py`):
+(gitignored; see `Settings` in `syzygy/database.py`):
 
 - `DATABASE_URL` — SQLAlchemy database URL
   (default `postgresql+psycopg2://postgres:postgres@localhost:5432/postgres`)
 - `DEFAULT_PAIRING_LOGIC_NAME` — optional pairing logic applied
   automatically when samples are created
 
+## Repository layout
+
+    conftest.py                     pytest bootstrap (stays at the root)
+    syzygy/                         the app package
+      main.py                       FastAPI assembly (uvicorn target: syzygy.main:app)
+      database.py models.py schemas.py auth.py …  core app modules
+      cohort/                       cohort trio (request/report schemas, CRF, validation)
+      routers/                      /v1 endpoint routers
+      data/                         vendored data files — the cohort JSON schemas;
+                                    data-only, never importable code (chosen over a
+                                    schemas/ dir to end the old schemas.py name clash)
+    scripts/ static/ docs/ tests/  repo tools, web UI, docs, test suite (not packaged)
+    listener/                       standalone smile-listener service: its own image
+                                    and build context ./listener, NOT part of the package
+    requirements*.txt Dockerfile docker-compose*.yml   packaging/config at the root
+
+Run targets follow the package: `uvicorn main:app` became
+`uvicorn syzygy.main:app` (Dockerfile CMD and compose dev command included).
+
 ## Running
 
-    uvicorn main:app --reload
+    uvicorn syzygy.main:app --reload
 
 At startup the app creates any missing tables and seeds, idempotently:
 the default pairing logics (`ARGOS` → `argos`, `TEMPO` → `tempo`,
 `ACCESS` → `default`), pooled-machine reference rows for the `argos`
 pooled tier (`pairing_strategies.seed_pooled_machines`), and bait-set →
 primary pairing logic assignments (`bait_sets.seed_bait_sets`; explicit
-lists of known TEMPO and ACCESS bait sets). `models.py` defines the
+lists of known TEMPO and ACCESS bait sets). `syzygy/models.py` defines the
 complete schema; `create_all` builds it for new databases and never
 alters existing tables.
 
@@ -83,7 +102,7 @@ macOS/Windows, or the CLI on Linux) and Python 3.11+.
        python3 -m venv .venv && source .venv/bin/activate
        pip install -r requirements.txt
        docker compose -f docker-compose.yml -f docker-compose.dev.yml stop app
-       uvicorn main:app --reload
+       uvicorn syzygy.main:app --reload
 
 5. Allow-list your user and log in:
 
@@ -451,7 +470,7 @@ overrides, and a read-only Try Pairing dry-run tab, and lets you:
   candidates, mismatch reasons, and the candidate the cascade would
   pick — via `GET /v1/sample/{id}/possible-matches`; an explainer panel
   describes how the selected logic pairs, sourced from
-  `pairing_strategies.py`.
+  `syzygy/pairing_strategies.py`.
 
 Navigation state lives in the URL hash (`#/samples`,
 `#/patients/<patient__cmo>`, `#/requests/<request_id>`,
@@ -463,7 +482,7 @@ shared links all work; every navigation pushes a history entry.
 
 All `/v1` API endpoints require a Keycloak token. The app reads
 `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID` and
-`KEYCLOAK_CLIENT_SECRET` (see `Settings` in `database.py`); in
+`KEYCLOAK_CLIENT_SECRET` (see `Settings` in `syzygy/database.py`); in
 production `KEYCLOAK_URL` points at an externally managed Keycloak.
 The dev Keycloak in `docker-compose.dev.yml` is strictly for local
 development.
@@ -526,7 +545,7 @@ gets `403`. Provision users with:
        docker compose -f docker-compose.yml -f docker-compose.dev.yml stop app
        cp .env.example .env   # then set KEYCLOAK_CLIENT_SECRET
        source .venv/bin/activate
-       uvicorn main:app --reload
+       uvicorn syzygy.main:app --reload
 
    The `.env.example` defaults already match the compose ports.
 
@@ -545,7 +564,7 @@ to `.env`) and start only the services you need — `db`, plus
 `nats`/`nats-init`/`smile-listener` when testing ingest:
 
     podman compose -f docker-compose.yml -f docker-compose.dev.yml up -d db
-    DEV_AUTH_TOKEN=*** uvicorn main:app --reload
+    DEV_AUTH_TOKEN=*** uvicorn syzygy.main:app --reload
 
 `http://localhost:8000/login` then shows a *Sign in (local dev
 admin)* button; clicking it issues the `auth_token` cookie directly —
@@ -565,7 +584,7 @@ requires a token.
 
 ## Pairing strategies
 
-Strategies are registered in `pairing_strategies.py` and selected per
+Strategies are registered in `syzygy/pairing_strategies.py` and selected per
 pairing logic via `PairingLogic.strategy_name`; a logic's `config`
 dict customizes the strategy at use time.
 

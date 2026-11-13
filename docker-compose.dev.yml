@@ -31,7 +31,7 @@ services:
     # It is deliberately NOT published on the host: browser login stays on
     # the host-side uvicorn (issuer pitfall — the app must see the
     # browser-side Keycloak URL, which only works from the host).
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8123"]
+    command: ["uvicorn", "syzygy.main:app", "--host", "0.0.0.0", "--port", "8123"]
     environment:
       DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
       KEYCLOAK_URL: http://localhost:8080

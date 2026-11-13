@@ -6,10 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database import get_db, settings
-from models import PairingLogic
-from pairing_strategies import strategies
-from schemas import PairingLogicCreate, PairingLogicRead
+from syzygy.database import get_db, settings
+from syzygy.models import PairingLogic
+from syzygy.pairing_strategies import strategies
+from syzygy.schemas import PairingLogicCreate, PairingLogicRead
 
 
 router = APIRouter(prefix="/pairing-logic", tags=["pairing-logic"])

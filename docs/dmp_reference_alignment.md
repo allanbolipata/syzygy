@@ -276,7 +276,7 @@ ingest. Ingest stores the record as-is.
 
 ### Current state (for context — changed by tickets 3/8–5/8)
 
-Syzygy's existing `dmp` pairing strategy (`pairing_strategies.py`,
+Syzygy's existing `dmp` pairing strategy (`syzygy/pairing_strategies.py`,
 `DmpPairingStrategy`) pairs DMP tumors → DMP normals strictly inside the DMP
 group on **`(patient__dmp, gene_panel)`** (case-insensitive) and picks a
 **single deterministic winner** (first in `primary_id` string order). It has
@@ -379,7 +379,7 @@ sample_type, tissue_type, primary_site, project_name, part_c_consent,
 metastasis_site, somatic_calling_status, major_allele_contamination,
 minor_allele_contamination` — all 8/8 records carry every key). Linked
 `file_system.file` records carry `path` (non-empty for all 4 `.bam` files in
-the fixture) and `file_name`. Sources checked: `dmp_translator.py`,
+the fixture) and `file_name`. Sources checked: `syzygy/dmp_translator.py`,
 `scripts/import_beagle_dump.py`, `scripts/.beagle_ground_truth.example.json`
 (DMP sample rows: `primary_id`, `anon_id`, `patient__cmo`, `patient__dmp`,
 `tumor_or_normal`, `gene_panel`, `tumor_site`, `sample_type`,
@@ -418,10 +418,10 @@ the fixture) and `file_name`. Sources checked: `dmp_translator.py`,
 - Field audit: fixture probe (Django fixture format, `model`/`fields`
   records) over all 8 `file_system.filemetadata` records + their linked
   `file_system.file` records; cross-checked against
-  `dmp_translator.py` (`EXCLUDED_DMP_KEYS`, `PROMOTED_METADATA_KEYS`),
+  `syzygy/dmp_translator.py` (`EXCLUDED_DMP_KEYS`, `PROMOTED_METADATA_KEYS`),
   `scripts/import_beagle_dump.py` (import selects `fm.metadata` only),
   `scripts/.beagle_ground_truth.example.json`, and
-  `pairing_strategies.py` (`DmpPairingStrategy`, lines 1009–1142).
+  `syzygy/pairing_strategies.py` (`DmpPairingStrategy`, lines 1009–1142).
 
 ---
 

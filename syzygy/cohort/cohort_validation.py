@@ -45,11 +45,11 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from bait_sets import resolve_bait_set_logic
-from cohort_crf import normalize_id
-from models import PairingTable, Sample
-from pairing_service import possible_matches, trigger_pairing
-from schemas import TumorOrNormal
+from syzygy.bait_sets import resolve_bait_set_logic
+from syzygy.cohort.cohort_crf import normalize_id
+from syzygy.models import PairingTable, Sample
+from syzygy.pairing_service import possible_matches, trigger_pairing
+from syzygy.schemas import TumorOrNormal
 
 
 def _find_sample(db: Session, primary_id: Optional[str], cmo_id: Optional[str]) -> Optional[Sample]:

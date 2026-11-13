@@ -11,7 +11,7 @@ import copy
 import jsonschema
 import pytest
 
-from cohort_schema import strip_pi_name, validate_cohort_request, validate_report
+from syzygy.cohort.cohort_schema import strip_pi_name, validate_cohort_request, validate_report
 
 
 def _valid_payload():

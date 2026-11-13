@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-import cohort_crf
-from cohort_crf import clean_nones, normalize_id, prepare_cohort, to_crf, write_crf
+import syzygy.cohort.cohort_crf as cohort_crf
+from syzygy.cohort.cohort_crf import clean_nones, normalize_id, prepare_cohort, to_crf, write_crf
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "crf"
 

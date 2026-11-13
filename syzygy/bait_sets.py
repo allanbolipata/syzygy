@@ -8,7 +8,7 @@ from typing import Optional
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
-from models import DMP_LOGIC_NAME, BaitSet, PairingLogic, Sample
+from syzygy.models import DMP_LOGIC_NAME, BaitSet, PairingLogic, Sample
 
 TEMPO_BAIT_SETS = (
     "Agilent_v4_51MB_Human_hg19_BAITS",

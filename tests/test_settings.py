@@ -1,4 +1,4 @@
-from database import Settings
+from syzygy.database import Settings
 
 
 def test_keycloak_settings_round_trip():

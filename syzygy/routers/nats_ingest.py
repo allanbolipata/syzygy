@@ -15,8 +15,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database import get_db, settings
-from nats_ingest import dispatch
+from syzygy.database import get_db, settings
+from syzygy.nats_ingest import dispatch
 
 logger = logging.getLogger(__name__)
 

@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from sqlalchemy import Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from database import Base
+from syzygy.database import Base
 
 
 def utcnow() -> datetime:

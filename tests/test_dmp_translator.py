@@ -1,13 +1,13 @@
 import pytest
 
-from dmp_translator import (
+from syzygy.dmp_translator import (
     ASSAY_MAPPING,
     DMP_REF_COLUMNS,
     EXCLUDED_DMP_KEYS,
     remap_dmp_record,
     to_dmp_sample_kwargs,
 )
-from models import Sample
+from syzygy.models import Sample
 
 
 def _meta(**overrides):
@@ -142,8 +142,8 @@ def test_unknown_type_rejected():
 
 
 def test_argos_dmp_pairs_are_manual_pairing_only():
-    from models import Sample
-    from pairing_strategies import strategies
+    from syzygy.models import Sample
+    from syzygy.pairing_strategies import strategies
 
     def mk(**kw):
         base = dict(patient__cmo="C-1", gene_panel="IMPACT468", bait_set="IMPACT468")

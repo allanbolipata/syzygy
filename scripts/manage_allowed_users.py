@@ -21,7 +21,7 @@ list
 
 remove/enable on an unknown email print an error to stderr and exit
 non-zero. The database is selected by DATABASE_URL (env var or .env)
-via the settings in database.py -- no connection string is hardcoded
+via the settings in syzygy/database.py -- no connection string is hardcoded
 here.
 
 Usage
@@ -40,7 +40,7 @@ from sqlalchemy import select
 
 
 def _get_user(db, email: str):
-    from models import AllowedUser
+    from syzygy.models import AllowedUser
     return db.scalar(select(AllowedUser).where(AllowedUser.email == email))
 
 
@@ -51,7 +51,7 @@ def cmd_add(db, email: str, display_name: str | None = None) -> str:
     display_name (only when given) and set active=True. Returns a
     human-readable description of the action taken.
     """
-    from models import AllowedUser
+    from syzygy.models import AllowedUser
     user = _get_user(db, email)
     if user is None:
         user = AllowedUser(email=email, display_name=display_name)
@@ -106,7 +106,7 @@ def cmd_enable(db, email: str) -> str | None:
 
 def cmd_list(db) -> list:
     """Return all allow-list entries, ordered by email."""
-    from models import AllowedUser
+    from syzygy.models import AllowedUser
     return list(db.scalars(select(AllowedUser).order_by(AllowedUser.email)).all())
 
 
@@ -151,8 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    from database import Base, SessionLocal, engine
-    import models  # noqa: F401  (register AllowedUser on Base.metadata before create_all)
+    from syzygy.database import Base, SessionLocal, engine
+    import syzygy.models  # noqa: F401  (register AllowedUser on Base.metadata before create_all)
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()

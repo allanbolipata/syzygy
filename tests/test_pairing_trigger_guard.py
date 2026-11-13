@@ -3,8 +3,8 @@
 A bulk pairing pass holds one pooled DB connection for its whole multi-minute
 loop. Before the guard, a re-click (or a second tab) started a SECOND full pass
 and a second checkout, until the app raised ``QueuePool limit of size 5 overflow
-10 reached ... timeout 30.00`` mid-request. ``database.py`` now sizes the pool
-explicitly, ``main.py`` caps the sync-endpoint threadpool to fit inside it, and
+10 reached ... timeout 30.00`` mid-request. ``syzygy/database.py`` now sizes the pool
+explicitly, ``syzygy/main.py`` caps the sync-endpoint threadpool to fit inside it, and
 the trigger endpoints claim one pass per logic (409 otherwise). These tests pin
 all three so a later "optimization" cannot quietly undo any of them.
 """
@@ -15,10 +15,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-import database
-import routers.pairings as pairings
-from models import Base, PairingLogic
-from routers.pairings import (
+import syzygy.database as database
+import syzygy.routers.pairings as pairings
+from syzygy.models import Base, PairingLogic
+from syzygy.routers.pairings import (
     trigger_all_pairings_endpoint,
     trigger_dmp_pairing_endpoint,
     trigger_harmony_pairing_endpoint,

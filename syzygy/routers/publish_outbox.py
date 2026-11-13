@@ -20,8 +20,8 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from database import get_db, settings
-from models import PendingNatsPublish, utcnow
+from syzygy.database import get_db, settings
+from syzygy.models import PendingNatsPublish, utcnow
 
 logger = logging.getLogger(__name__)
 

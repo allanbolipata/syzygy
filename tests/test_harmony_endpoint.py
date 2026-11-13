@@ -29,19 +29,19 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import auth
-from auth import get_current_user
-from database import Base, get_db
-from main import app
-from models import PairingLogic, PairingTable, Sample
-from routers.pairings import (
+import syzygy.auth as auth
+from syzygy.auth import get_current_user
+from syzygy.database import Base, get_db
+from syzygy.main import app
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.routers.pairings import (
     REPORT_MAX_PAGE_SIZE,
     HARMONY_BAM_PATH_PLACEHOLDER,
     HARMONY_COLUMNS,
     HARMONY_FRAME_COLUMNS,
     _harmony_csv_consent,
 )
-from schemas import TumorOrNormal
+from syzygy.schemas import TumorOrNormal
 
 
 @pytest.fixture(scope="module")
@@ -303,7 +303,7 @@ def export_stream(db, engine, monkeypatch):
     same as the report export's fixture in tests/test_pairings_report.py.
     """
     monkeypatch.setattr(
-        "routers.pairings._open_stream_session", sessionmaker(bind=engine)
+        "syzygy.routers.pairings._open_stream_session", sessionmaker(bind=engine)
     )
 
 

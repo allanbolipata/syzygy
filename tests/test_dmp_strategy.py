@@ -28,16 +28,16 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import PairingLogic, PairingTable, Sample
-from pairing_service import (
+from syzygy.database import Base
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.pairing_service import (
     get_pairing_strategy,
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from pairing_strategies import DmpPairingStrategy, strategies
-from routers.samples import possible_matches_endpoint
-from schemas import TumorOrNormal
+from syzygy.pairing_strategies import DmpPairingStrategy, strategies
+from syzygy.routers.samples import possible_matches_endpoint
+from syzygy.schemas import TumorOrNormal
 
 
 @pytest.fixture(scope="module")
@@ -822,7 +822,7 @@ def test_argos_keeps_dmp_manual_reason(db, argos_logic):
 
 
 def test_lifespan_seeds_dmp_logic(tmp_path, monkeypatch):
-    import main as main_module
+    import syzygy.main as main_module
 
     test_engine = create_engine(f"sqlite:///{tmp_path / 'lifespan.db'}")
     test_session_factory = sessionmaker(bind=test_engine, expire_on_commit=False)

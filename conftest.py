@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pytest
 
-from database import settings
+from syzygy.database import settings
 
 
 @pytest.fixture(autouse=True)

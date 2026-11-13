@@ -7,7 +7,7 @@ from sqlalchemy import exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import (
+from syzygy.models import (
     DMP_LOGIC_NAME,
     BaitSet,
     PairingLogic,
@@ -15,9 +15,9 @@ from models import (
     Sample,
     utcnow,
 )
-from bait_sets import classify_bait_set, resolve_bait_set_logic
-from pairing_strategies import get_pairing_strategy, strategies
-from schemas import TumorOrNormal
+from syzygy.bait_sets import classify_bait_set, resolve_bait_set_logic
+from syzygy.pairing_strategies import get_pairing_strategy, strategies
+from syzygy.schemas import TumorOrNormal
 
 
 def _ensure_active(logic: PairingLogic) -> None:

@@ -19,7 +19,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Sample, utcnow
+from syzygy.models import Sample, utcnow
 
 
 def request_samples(db: Session, request_id: str) -> list[Sample]:

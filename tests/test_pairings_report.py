@@ -20,8 +20,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from models import Base, PairingLogic, PairingTable, Sample
-from routers.pairings import (
+from syzygy.models import Base, PairingLogic, PairingTable, Sample
+from syzygy.routers.pairings import (
     REPORT_DEFAULT_PAGE_SIZE,
     REPORT_MAX_PAGE_SIZE,
     pairing_report,
@@ -35,7 +35,7 @@ from routers.pairings import (
     DMP_DEFAULT_EXPORT_KEYS,
     PAIR_DEFAULT_EXPORT_KEYS,
 )
-from schemas import TumorOrNormal
+from syzygy.schemas import TumorOrNormal
 
 BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -569,7 +569,7 @@ def export_stream(db, engine, monkeypatch):
     redirecting that factory makes the stream see the fixture data.
     """
     monkeypatch.setattr(
-        "routers.pairings._open_stream_session", sessionmaker(bind=engine)
+        "syzygy.routers.pairings._open_stream_session", sessionmaker(bind=engine)
     )
 
 
@@ -901,7 +901,7 @@ class _StubBeagleEngine:
 def test_export_dmp_bam_exists_from_beagle_record(db, export_stream, monkeypatch):
     """bam_exists derives from the sample's beagle file record (spec f):
     non-empty path -> 1, empty/absent -> 0, resolved per export batch."""
-    import routers.pairings as pairings
+    import syzygy.routers.pairings as pairings
     monkeypatch.setattr(
         pairings.settings, "beagle_database_url",
         "postgresql+psycopg2://beagle:beagle@localhost/beagle",
@@ -928,7 +928,7 @@ def test_export_dmp_bam_exists_from_beagle_record(db, export_stream, monkeypatch
 
 
 def test_bam_exists_map_empty_when_beagle_unset(monkeypatch):
-    import routers.pairings as pairings
+    import syzygy.routers.pairings as pairings
     monkeypatch.setattr(pairings.settings, "beagle_database_url", None)
     monkeypatch.setattr(pairings, "_beagle_engine_cache", None)
     assert pairings._beagle_bam_exists_map({"P-1-T01-IM6"}) == {}

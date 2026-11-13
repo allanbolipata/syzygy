@@ -14,7 +14,7 @@ pub does a JetStream publish (js.publish) of the file contents to the
 matching subject. sub does a JetStream pull-subscribe (ephemeral consumer
 on stream MDB_STREAM) and prints the received messages. cohort-validate
 builds a synthetic cohort request (validated locally against
-schemas/cohort-request.schema.json) and publishes it to the cohort
+syzygy/data/cohort-request.schema.json) and publishes it to the cohort
 subject — pair it with `sub cohort-result` to watch the listener's
 validation report come back out of the dev stack.
 """
@@ -36,7 +36,8 @@ SUBJECTS = {
 }
 _COHORT_REQUEST_SCHEMA = (
     Path(__file__).resolve().parent.parent
-    / "schemas"
+    / "syzygy"
+    / "data"
     / "cohort-request.schema.json"
 )
 DEFAULT_SERVER = "nats://127.0.0.1:4222"

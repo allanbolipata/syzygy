@@ -16,11 +16,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import database
-from database import Base, Settings
-from models import Sample
-from nats_ingest import dispatch
-from routers.nats_ingest import NatsIngestIn, ingest_nats
+import syzygy.database as database
+from syzygy.database import Base, Settings
+from syzygy.models import Sample
+from syzygy.nats_ingest import dispatch
+from syzygy.routers.nats_ingest import NatsIngestIn, ingest_nats
 from sqlalchemy import select
 
 NEW_REQUEST = "MDB_STREAM.server.cpt-gateway.cmo-new-request"

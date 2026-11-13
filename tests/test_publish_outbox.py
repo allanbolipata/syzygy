@@ -16,10 +16,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import database
-from database import Base
-from models import PendingNatsPublish
-from routers.publish_outbox import MarkPublishedIn, list_pending, mark_published
+import syzygy.database as database
+from syzygy.database import Base
+from syzygy.models import PendingNatsPublish
+from syzygy.routers.publish_outbox import MarkPublishedIn, list_pending, mark_published
 
 T0 = datetime(2026, 10, 29, 12, 0, 0, tzinfo=timezone.utc)
 SUBJECT = "MDB_STREAM.server.cpt-gateway.cohort-report"

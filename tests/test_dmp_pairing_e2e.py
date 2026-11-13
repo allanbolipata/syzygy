@@ -31,14 +31,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import PairingLogic, PairingTable, Sample
-from pairing_service import (
+from syzygy.database import Base
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.pairing_service import (
     _get_latest_pairing,
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from schemas import TumorOrNormal
+from syzygy.schemas import TumorOrNormal
 
 
 @pytest.fixture(scope="module")

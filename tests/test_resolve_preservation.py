@@ -8,7 +8,7 @@ The gate rule: resolve_preservation returns
     apply to that side and it never blocks.
 """
 
-from pairing_strategies import resolve_preservation
+from syzygy.pairing_strategies import resolve_preservation
 
 
 # ---------------------------------------------------------------------------

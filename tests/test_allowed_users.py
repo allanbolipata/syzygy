@@ -6,8 +6,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import AllowedUser
+from syzygy.database import Base
+from syzygy.models import AllowedUser
 
 
 @pytest.fixture

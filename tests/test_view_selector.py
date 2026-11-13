@@ -20,10 +20,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import routers.pairing_logic as pairing_logic_module
-from auth import get_current_user
-from database import Base, get_db
-from main import app
+import syzygy.routers.pairing_logic as pairing_logic_module
+from syzygy.auth import get_current_user
+from syzygy.database import Base, get_db
+from syzygy.main import app
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INDEX_HTML = REPO_ROOT / "static" / "index.html"

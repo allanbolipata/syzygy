@@ -14,9 +14,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import PairingLogic, PairingTable, Sample
-from nats_ingest import handle_new_request, handle_sample_update
+from syzygy.database import Base
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.nats_ingest import handle_new_request, handle_sample_update
 
 NEW_REQUEST_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "nats" / "99908_C_new_request.json"

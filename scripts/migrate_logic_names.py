@@ -1,7 +1,7 @@
 """Migrate pairing-logic rows to the consolidated names.
 
 Groups related logics under one canonical row (see PAIRING_LOGIC_ALIASES
-in pairing_service.py):
+in syzygy/pairing_service.py):
 
 * ``argos`` (lowercase, pre-consolidation) -> renamed to ``ARGOS``;
   if both exist, the lowercase row's pairings move to ``ARGOS``.
@@ -41,8 +41,8 @@ def main() -> int:
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    from database import Base, SessionLocal, engine
-    from models import PairingLogic, PairingTable
+    from syzygy.database import Base, SessionLocal, engine
+    from syzygy.models import PairingLogic, PairingTable
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()

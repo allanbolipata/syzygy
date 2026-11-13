@@ -4,11 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from bait_sets import find_bait_set, resolve_bait_set_logic
-from database import get_db
-from models import BaitSet
-from pairing_service import find_logic_by_name
-from schemas import BaitSetRead, BaitSetUpsert
+from syzygy.bait_sets import find_bait_set, resolve_bait_set_logic
+from syzygy.database import get_db
+from syzygy.models import BaitSet
+from syzygy.pairing_service import find_logic_by_name
+from syzygy.schemas import BaitSetRead, BaitSetUpsert
 
 
 router = APIRouter(prefix="/bait-sets", tags=["bait-sets"])

@@ -19,10 +19,10 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from cohort_validation import classify_cohort
-from database import Base
-from models import BaitSet, PairingLogic, PairingTable, Sample
-from schemas import TumorOrNormal
+from syzygy.cohort.cohort_validation import classify_cohort
+from syzygy.database import Base
+from syzygy.models import BaitSet, PairingLogic, PairingTable, Sample
+from syzygy.schemas import TumorOrNormal
 
 
 @pytest.fixture(scope="module")

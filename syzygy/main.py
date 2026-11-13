@@ -9,20 +9,20 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
-from database import Base, SessionLocal, THREADPOOL_TOKENS, engine
-from models import PairingLogic
-from pairing_strategies import seed_pooled_machines
-from bait_sets import seed_bait_sets
-from auth import get_current_user, router as auth_router
-from routers.bait_sets import router as bait_sets_router
-from routers.machines import router as machines_router
-from routers.nats_ingest import router as nats_ingest_router
-from routers.patients import router as patients_router
-from routers.pairing_logic import router as pairing_logic_router
-from routers.pairings import router as pairings_router
-from routers.publish_outbox import router as publish_outbox_router
-from routers.requests import router as requests_router
-from routers.samples import router as samples_router
+from syzygy.database import Base, SessionLocal, THREADPOOL_TOKENS, engine
+from syzygy.models import PairingLogic
+from syzygy.pairing_strategies import seed_pooled_machines
+from syzygy.bait_sets import seed_bait_sets
+from syzygy.auth import get_current_user, router as auth_router
+from syzygy.routers.bait_sets import router as bait_sets_router
+from syzygy.routers.machines import router as machines_router
+from syzygy.routers.nats_ingest import router as nats_ingest_router
+from syzygy.routers.patients import router as patients_router
+from syzygy.routers.pairing_logic import router as pairing_logic_router
+from syzygy.routers.pairings import router as pairings_router
+from syzygy.routers.publish_outbox import router as publish_outbox_router
+from syzygy.routers.requests import router as requests_router
+from syzygy.routers.samples import router as samples_router
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -129,7 +129,7 @@ async def no_cache_ui(request: Request, call_next):
 # Basic web front end (static, no build step).
 app.mount(
     "/ui",
-    StaticFiles(directory=Path(__file__).resolve().parent / "static", html=True),
+    StaticFiles(directory=Path(__file__).resolve().parent.parent / "static", html=True),
     name="ui",
 )
 
@@ -142,8 +142,8 @@ def root() -> RedirectResponse:
 @app.get("/login", include_in_schema=False)
 def login() -> HTMLResponse:
     return HTMLResponse(
-        (Path(__file__).resolve().parent / "static" / "login.html").read_text(
-            encoding="utf-8"
-        ),
+        (
+            Path(__file__).resolve().parent.parent / "static" / "login.html"
+        ).read_text(encoding="utf-8"),
         media_type="text/html",
     )

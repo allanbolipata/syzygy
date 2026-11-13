@@ -18,8 +18,8 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from database import get_db, settings
-from models import AllowedUser
+from syzygy.database import get_db, settings
+from syzygy.models import AllowedUser
 
 # Cached JWKS, keyed by realm so each realm is fetched at most once.
 _jwks_cache: Dict[str, Dict[str, Any]] = {}
