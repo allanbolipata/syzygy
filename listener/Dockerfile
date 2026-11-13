@@ -24,7 +24,16 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Upstream smile-client pinned to a commit; --no-deps so its Django 2.2.28
 # setup.cfg pin is never resolved (requirements.txt carries our pins).
-RUN pip install --no-cache-dir --no-deps "smile_client @ git+https://github.com/mskcc/smile-client@548a394a180dde05a99dd3136b65552c93a8753c"
+# python:3.14-slim ships no git binary, which the git+https install needs, so
+# git is installed temporarily in this same layer and purged right after the
+# pip step. ca-certificates is installed too but KEPT — TLS to GitHub (build)
+# and NATS (runtime) needs it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && pip install --no-cache-dir --no-deps "smile_client @ git+https://github.com/mskcc/smile-client@548a394a180dde05a99dd3136b65552c93a8753c" \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get purge -y git \
+    && apt-get autoremove -y
 
 COPY smile_bridge.py /app/smile_bridge.py
 COPY nats_publisher.py /app/nats_publisher.py
