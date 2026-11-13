@@ -38,7 +38,8 @@ services:
     image: sample-pairing-app
     container_name: syzygy-app
     # The Dockerfile CMD runs uvicorn on port 8000, which matches the
-    # healthcheck below and the 8000:8000 port mapping.
+    # healthcheck below; the staging branch publishes it on host port
+    # 1337 (in-network listeners still reach the app at app:8000).
     environment:
       # Required: the database this app uses. The bundled `db` service
       # below is the default target in production; deployments may also
@@ -60,7 +61,7 @@ services:
       # SYZYGY_NATS_TOKEN below, so the two sides cannot drift.
       NATS_INGEST_TOKEN: ${NATS_INGEST_TOKEN:?set NATS_INGEST_TOKEN, the shared X-NATS-Token secret for the smile-listener}
     ports:
-      - "8000:8000"
+      - "1337:8000"
     depends_on:
       db:
         condition: service_healthy
