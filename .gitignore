@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.bak*
 docs/audit/
 scripts/.beagle_ground_truth.json
 AUDIT.md
