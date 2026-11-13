@@ -29,7 +29,7 @@ Live on `dev`. Consumed by the smile-listener (durable `syzygy` on
   request: inserts the request and its samples (`file_group = SMILE`,
   parses `requestJson` into `requestMetadata` / `requestStatus`); triggers
   automatic pairing when a TUMOR is pairable with an existing NORMAL.
-  Handler: `handle_new_request` in `nats_ingest.py`.
+  Handler: `handle_new_request` in `syzygy/nats_ingest.py`.
 - **`MDB_STREAM.server.cpt-gateway.cmo-request-update`** — update an existing
   request (new `requestJson` / status) in place. Handler:
   `handle_request_update`.
@@ -41,7 +41,7 @@ Live on `dev`. Consumed by the smile-listener (durable `syzygy` on
 
 - **`MDB_STREAM.server.dmp-gateway.dmp-sample`** — upsert DMP pair-sample
   records as-is (`dmp_translator.to_dmp_sample_kwargs`).
-  Handler: `handle_dmp_sample` in `nats_ingest.py`.
+  Handler: `handle_dmp_sample` in `syzygy/nats_ingest.py`.
   **The actual source service is Acela, not a "dmp-gateway" — this route
   still needs to be established with them**, so the subject name (and the
   source tier in it) are open for change once agreed.
@@ -124,6 +124,6 @@ subjects** above.
   header (merge).
 - **Mock coverage:** `scripts/mock_smile.py` pub/sub covers the 3 cmo +
   2 cohort subjects, plus a `cohort-validate` mode that builds a synthetic cohort
-  request (locally validated against `schemas/cohort-request.schema.json`)
+  request (locally validated against `syzygy/data/cohort-request.schema.json`)
   and publishes it — pair with `sub cohort-result` to watch the report
   round-trip through the dev stack.

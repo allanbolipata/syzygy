@@ -8,8 +8,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base, get_db
-from main import app
+from syzygy.database import Base, get_db
+from syzygy.main import app
 
 
 @pytest.fixture

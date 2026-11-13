@@ -9,10 +9,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import auth
-from database import Base, get_db
-from main import app
-from models import AllowedUser
+import syzygy.auth as auth
+from syzygy.database import Base, get_db
+from syzygy.main import app
+from syzygy.models import AllowedUser
 
 
 VALID_TOKEN = "valid.keycloak.token"

@@ -10,10 +10,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import Sample
-from routers.samples import lookup_samples_endpoint
-from schemas import SampleRead, TumorOrNormal
+from syzygy.database import Base
+from syzygy.models import Sample
+from syzygy.routers.samples import lookup_samples_endpoint
+from syzygy.schemas import SampleRead, TumorOrNormal
 
 
 @pytest.fixture(scope="module")

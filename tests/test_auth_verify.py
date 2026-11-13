@@ -11,8 +11,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-import auth
-from database import settings
+import syzygy.auth as auth
+from syzygy.database import settings
 
 REALM = "test-realm"
 CLIENT_ID = "syzygy"

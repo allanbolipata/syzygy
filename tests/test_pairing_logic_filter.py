@@ -34,14 +34,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from auth import get_current_user
-from database import Base, get_db
-from main import app
-from models import BaitSet, PairingLogic, Sample
-from routers.patients import list_patients
-from routers.requests import list_requests
-from routers.samples import list_samples, possible_matches_endpoint
-from schemas import TumorOrNormal
+from syzygy.auth import get_current_user
+from syzygy.database import Base, get_db
+from syzygy.main import app
+from syzygy.models import BaitSet, PairingLogic, Sample
+from syzygy.routers.patients import list_patients
+from syzygy.routers.requests import list_requests
+from syzygy.routers.samples import list_samples, possible_matches_endpoint
+from syzygy.schemas import TumorOrNormal
 
 TOTAL_HEADER = "X-Total-Count"
 

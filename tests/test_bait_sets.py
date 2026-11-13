@@ -5,14 +5,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from bait_sets import (
+from syzygy.bait_sets import (
     SEED_BAIT_SETS,
     classify_bait_set,
     resolve_bait_set_logic,
     seed_bait_sets,
 )
-from database import Base
-from models import BaitSet, PairingLogic
+from syzygy.database import Base
+from syzygy.models import BaitSet, PairingLogic
 
 
 @pytest.fixture

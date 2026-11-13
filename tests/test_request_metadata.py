@@ -5,9 +5,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import Sample
-from request_metadata import request_exists, request_samples, update_request_metadata
+from syzygy.database import Base
+from syzygy.models import Sample
+from syzygy.request_metadata import request_exists, request_samples, update_request_metadata
 
 
 @pytest.fixture

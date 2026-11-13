@@ -22,7 +22,7 @@ for _p in (REPO, SCRIPTS):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from database import Base
+from syzygy.database import Base
 from manage_allowed_users import (
     cmd_add,
     cmd_enable,
@@ -30,7 +30,7 @@ from manage_allowed_users import (
     cmd_remove,
     format_table,
 )
-from models import AllowedUser
+from syzygy.models import AllowedUser
 
 
 @pytest.fixture

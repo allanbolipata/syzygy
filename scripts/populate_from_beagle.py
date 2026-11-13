@@ -136,7 +136,7 @@ Usage
 
 Idempotent: wipes samples/pairings/pairing_logic, re-seeds logics
 (ARGOS/IMPACT -> argos strategy; TEMPO/CHRONOS -> tempo strategy; DMP
--> dmp strategy; ACCESS -> default strategy, as main.py lifespan does),
+-> dmp strategy; ACCESS -> default strategy, as syzygy/main.py lifespan does),
 seeds the tempo
 historical pairings, loads the selected dataset(s), retriggers pairing.
 """
@@ -423,7 +423,7 @@ def to_tempo_sample_kwargs(r: dict) -> dict:
 
 
 def _trigger(db, samples: list, logic, label: str, trigger_type: str = "automatic") -> int:
-    from models import Sample
+    from syzygy.models import Sample
     pair_count = 0
     for s in samples:
         if s.tumor_or_normal != "TUMOR":
@@ -460,10 +460,10 @@ def main() -> int:
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    from database import Base, SessionLocal, engine
-    from dmp_translator import to_dmp_sample_kwargs
-    from models import PairingLogic, PairingTable, Sample
-    from pairing_service import trigger_pairing  # noqa: F811  (rebind global)
+    from syzygy.database import Base, SessionLocal, engine
+    from syzygy.dmp_translator import to_dmp_sample_kwargs
+    from syzygy.models import PairingLogic, PairingTable, Sample
+    from syzygy.pairing_service import trigger_pairing  # noqa: F811  (rebind global)
 
     want_argos = args.scenario in ("argos", "both", "all")
     want_tempo = args.scenario in ("tempo", "both", "all")
@@ -594,7 +594,7 @@ def main() -> int:
 
 
 def validate(db, created: list, argos) -> int:
-    from models import PairingTable, Sample
+    from syzygy.models import PairingTable, Sample
 
     actual: dict[str, str | None] = {}
     for s in created:
@@ -635,7 +635,7 @@ def validate_tempo(db, tempo_samples: list, tempo_logic) -> int:
     truth derived from beagle's TEMPO/CHRONOS pairing logic.
     Exit 1 on any mismatch.
     """
-    from models import PairingTable, Sample
+    from syzygy.models import PairingTable, Sample
 
     actual: dict[str, str | None] = {}
     for s in tempo_samples:
@@ -694,8 +694,8 @@ def validate_dmp(db, dmp_samples: list, source_records: dict[str, dict]) -> int:
       not mapped to a column (verbatim, null/empty skipped).
     * Translation spot-checks on the fixture's tumor records.
     """
-    from dmp_translator import unmapped_metadata
-    from models import PairingLogic, PairingTable, Sample
+    from syzygy.dmp_translator import unmapped_metadata
+    from syzygy.models import PairingLogic, PairingTable, Sample
 
     n_pass = n_fail = 0
 

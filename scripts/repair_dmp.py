@@ -39,9 +39,9 @@ if _REPO not in sys.path:
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from database import engine
-from models import PairingLogic, PairingTable, Sample
-from pairing_service import trigger_pairing
+from syzygy.database import engine
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.pairing_service import trigger_pairing
 
 PINNED_TRIGGER_TYPES = ("manual", "override")
 

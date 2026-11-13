@@ -39,10 +39,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-import routers.pairings as pairings
-from dmp_translator import to_dmp_sample_kwargs
-from models import Base, PairingLogic, PairingTable, Sample
-from routers.pairings import export_pair_report, pairing_report
+import syzygy.routers.pairings as pairings
+from syzygy.dmp_translator import to_dmp_sample_kwargs
+from syzygy.models import Base, PairingLogic, PairingTable, Sample
+from syzygy.routers.pairings import export_pair_report, pairing_report
 
 CASES_DIR = Path(__file__).resolve().parent / "fixtures" / "dmp_reference_conformance" / "cases"
 NA = "NA"

@@ -6,10 +6,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from pairing_strategies import DEFAULT_POOLED_MACHINES, seed_pooled_machines
-from routers.machines import list_machines, upsert_machine
-from schemas import PooledMachineUpsert
+from syzygy.database import Base
+from syzygy.pairing_strategies import DEFAULT_POOLED_MACHINES, seed_pooled_machines
+from syzygy.routers.machines import list_machines, upsert_machine
+from syzygy.schemas import PooledMachineUpsert
 
 
 @pytest.fixture

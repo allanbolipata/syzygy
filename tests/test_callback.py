@@ -15,8 +15,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base, get_db, settings
-from main import app
+from syzygy.database import Base, get_db, settings
+from syzygy.main import app
 
 REALM = "test-realm"
 CLIENT_ID = "syzygy"

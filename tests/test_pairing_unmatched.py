@@ -14,9 +14,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import PairingLogic, PairingTable, Sample
-from routers.pairings import list_unmatched_dmp_samples
+from syzygy.database import Base
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.routers.pairings import list_unmatched_dmp_samples
 
 
 @pytest.fixture(scope="module")

@@ -1,8 +1,8 @@
 """Cohort request / validation-report schema helpers (T3).
 
 Vendors the two JSON schemas staged verbatim from ``mskcc/ccs_cohort_utils``
-(branch main, 6e92d89) in ``schemas/`` next to this file and exposes thin
-validation helpers on top:
+(branch main, 6e92d89) in ``syzygy/data/`` and exposes thin validation
+helpers on top:
 
 - ``strip_pi_name`` — drops the top-level keys the request schema rejects
   (``piName``) plus ``status``/``date`` (legacy stripped both before
@@ -27,9 +27,10 @@ The validator schema differs from upstream in exactly one place: the
 property is named ``passesCheck`` (upstream shipped ``passesAllChecks``
 against a ``required`` entry of ``passesCheck`` — a contract bug).
 
-Note: ``schemas/`` is a plain directory on purpose. The repo's ``schemas.py``
-module keeps precedence for ``import schemas`` (G12) — never add
-``schemas/__init__.py``.
+Note: the vendored JSON lives in ``syzygy/data/`` — deliberately NOT a
+``schemas/`` directory, whose old top-level placement shadow-confused the
+``schemas.py`` module (G12). ``data/`` is data-only: never put importable
+code there.
 """
 
 import json
@@ -37,15 +38,16 @@ from pathlib import Path
 
 import jsonschema
 
-from cohort_crf import clean_nones, prepare_cohort
+from syzygy.cohort.cohort_crf import clean_nones, prepare_cohort
 
-_SCHEMAS_DIR = Path(__file__).resolve().parent / "schemas"
+# syzygy/cohort/cohort_schema.py -> resolve up to the syzygy/ package dir.
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 _REQUEST_SCHEMA = json.loads(
-    (_SCHEMAS_DIR / "cohort-request.schema.json").read_text(encoding="utf-8")
+    (_DATA_DIR / "cohort-request.schema.json").read_text(encoding="utf-8")
 )
 _VALIDATOR_SCHEMA = json.loads(
-    (_SCHEMAS_DIR / "cohort-validator.schema.json").read_text(encoding="utf-8")
+    (_DATA_DIR / "cohort-validator.schema.json").read_text(encoding="utf-8")
 )
 
 _STRIPPED_KEYS = ("piName", "status", "date")

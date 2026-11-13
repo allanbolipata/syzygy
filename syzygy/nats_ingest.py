@@ -30,15 +30,15 @@ import jsonschema
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from database import settings
-from models import PairingTable, PendingNatsPublish, Sample
-from bait_sets import resolve_bait_set_logic
-from cohort_crf import write_crf
-from cohort_schema import validate_cohort_request, validate_report
-from cohort_validation import classify_cohort
-from dmp_translator import to_dmp_sample_kwargs
-from pairing_service import trigger_pairing, trigger_pairing_for_normal
-from request_metadata import request_exists, update_request_metadata
+from syzygy.database import settings
+from syzygy.models import PairingTable, PendingNatsPublish, Sample
+from syzygy.bait_sets import resolve_bait_set_logic
+from syzygy.cohort.cohort_crf import write_crf
+from syzygy.cohort.cohort_schema import validate_cohort_request, validate_report
+from syzygy.cohort.cohort_validation import classify_cohort
+from syzygy.dmp_translator import to_dmp_sample_kwargs
+from syzygy.pairing_service import trigger_pairing, trigger_pairing_for_normal
+from syzygy.request_metadata import request_exists, update_request_metadata
 
 logger = logging.getLogger(__name__)
 

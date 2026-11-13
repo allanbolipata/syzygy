@@ -4,11 +4,11 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import and_, case, cast, func, or_, select, String
 from sqlalchemy.orm import Session
 
-from bait_sets import logic_membership_condition
-from database import get_db
-from models import PairingLogic, Sample
-from pairing_service import resolve_filter_logic
-from schemas import PatientRead
+from syzygy.bait_sets import logic_membership_condition
+from syzygy.database import get_db
+from syzygy.models import PairingLogic, Sample
+from syzygy.pairing_service import resolve_filter_logic
+from syzygy.schemas import PatientRead
 
 
 router = APIRouter(prefix="/patient", tags=["patients"])

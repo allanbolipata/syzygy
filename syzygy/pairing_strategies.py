@@ -70,9 +70,9 @@ from fastapi import HTTPException
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from dmp_translator import remap_dmp_record
-from models import PairingLogic, PairingTable, PooledMachine, Sample
-from schemas import TumorOrNormal
+from syzygy.dmp_translator import remap_dmp_record
+from syzygy.models import PairingLogic, PairingTable, PooledMachine, Sample
+from syzygy.schemas import TumorOrNormal
 
 # Sentinel used to sort rows without a sequencing_date to the end. It is
 # never compared against a real (timezone-aware) timestamp: tuple

@@ -9,12 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import PairingLogic, PairingTable, Sample
-from pairing_service import trigger_pairing
-from pairing_strategies import seed_pooled_machines
-from routers.samples import possible_matches_endpoint
-from schemas import TumorOrNormal
+from syzygy.database import Base
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.pairing_service import trigger_pairing
+from syzygy.pairing_strategies import seed_pooled_machines
+from syzygy.routers.samples import possible_matches_endpoint
+from syzygy.schemas import TumorOrNormal
 
 
 @pytest.fixture(scope="module")

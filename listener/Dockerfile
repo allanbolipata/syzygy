@@ -1,8 +1,12 @@
 # Syzygy SMILE listener image.
 #
-# Vendored from mskcc/smile-client @ 548a394a180dde05a99dd3136b65552c93a8753c
-# (smile_client/ was copied verbatim into this directory on 2026-10-28 and
-# must not be modified here; refresh by re-copying from a fresh clone).
+# smile-client is NOT vendored in this repo anymore: the upstream
+# mskcc/smile-client package is pip-installed from git, pinned to commit
+# 548a394a180dde05a99dd3136b65552c93a8753c (see the RUN layer below).
+# --no-deps is required there: upstream setup.cfg pins Django==2.2.28,
+# which cannot install on the python:3.14 image, and that pin would break
+# a normal dependency-resolution install. The real pins (modern Django,
+# nats-py, docopt, httpx) live in listener/requirements.txt.
 #
 # This image serves two entry points:
 #   python /app/run.py             — standalone JetStream consumer (smile-client)
@@ -18,7 +22,19 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY smile_client/ /app/smile_client/
+# Upstream smile-client pinned to a commit; --no-deps so its Django 2.2.28
+# setup.cfg pin is never resolved (requirements.txt carries our pins).
+# python:3.14-slim ships no git binary, which the git+https install needs, so
+# git is installed temporarily in this same layer and purged right after the
+# pip step. ca-certificates is installed too but KEPT — TLS to GitHub (build)
+# and NATS (runtime) needs it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && pip install --no-cache-dir --no-deps "smile_client @ git+https://github.com/mskcc/smile-client@548a394a180dde05a99dd3136b65552c93a8753c" \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get purge -y git \
+    && apt-get autoremove -y
+
 COPY smile_bridge.py /app/smile_bridge.py
 COPY nats_publisher.py /app/nats_publisher.py
 COPY run.py /app/run.py

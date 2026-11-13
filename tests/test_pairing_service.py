@@ -9,11 +9,11 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import database
-import pairing_service
-from database import Base
-from models import BaitSet, PairingLogic, PairingTable, Sample
-from pairing_service import (
+import syzygy.database as database
+import syzygy.pairing_service as pairing_service
+from syzygy.database import Base
+from syzygy.models import BaitSet, PairingLogic, PairingTable, Sample
+from syzygy.pairing_service import (
     _create_pairing,
     _get_latest_pairing,
     count_unpaired,
@@ -24,9 +24,9 @@ from pairing_service import (
     trigger_pairing_for_normal,
     trigger_pairing_for_unpaired_tumors,
 )
-from pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
-from routers.pairing_logic import create_pairing_logic, list_pairing_logic
-from routers.pairings import (
+from syzygy.pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
+from syzygy.routers.pairing_logic import create_pairing_logic, list_pairing_logic
+from syzygy.routers.pairings import (
     evaluate_pairing_endpoint,
     list_pairings,
     trigger_all_pairings_endpoint,
@@ -34,10 +34,10 @@ from routers.pairings import (
     trigger_pairing_endpoint,
     unmatched_count_endpoint,
 )
-from routers.patients import PATIENT_META_KEYS, list_patients
-from routers.requests import list_requests
-from routers.samples import create_sample, list_samples
-from schemas import (
+from syzygy.routers.patients import PATIENT_META_KEYS, list_patients
+from syzygy.routers.requests import list_requests
+from syzygy.routers.samples import create_sample, list_samples
+from syzygy.schemas import (
     PairingLogicCreate,
     PairingTriggerCreate,
     PatientRead,
@@ -2485,7 +2485,7 @@ def test_list_pairing_logic_ties_broken_by_id(db):
 
 
 def test_health_endpoint():
-    from main import health
+    from syzygy.main import health
 
     assert health() == {"status": "ok"}
 

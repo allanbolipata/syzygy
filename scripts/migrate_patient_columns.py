@@ -20,7 +20,7 @@ from pathlib import Path
 
 # Make the repo root importable when run as a plain script
 # (``python scripts/migrate_patient_columns.py``): sys.path[0] is this
-# file's directory, not the repo root, so ``from database import ...``
+# file's directory, not the repo root, so ``from syzygy.database import ...``
 # would fail without this.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -115,7 +115,7 @@ def main() -> None:
     if len(sys.argv) > 1:
         url = sys.argv[1]
     else:
-        from database import settings
+        from syzygy.database import settings
 
         url = settings.database_url
     migrate(url)

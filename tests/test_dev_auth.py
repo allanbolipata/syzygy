@@ -13,9 +13,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import auth
-from database import Base, get_db, settings
-from main import app
+import syzygy.auth as auth
+from syzygy.database import Base, get_db, settings
+from syzygy.main import app
 
 DEV_TOKEN = "dev-secret-token"
 

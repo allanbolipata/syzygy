@@ -35,10 +35,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from dmp_translator import remap_dmp_record
-from database import SessionLocal, get_db, settings
-from models import PairingLogic, PairingTable, Sample
-from pairing_service import (
+from syzygy.dmp_translator import remap_dmp_record
+from syzygy.database import SessionLocal, get_db, settings
+from syzygy.models import PairingLogic, PairingTable, Sample
+from syzygy.pairing_service import (
     DMP_LOGIC_NAME,
     HARMONY_LOGIC_NAME,
     _is_dmp_strategy,
@@ -51,8 +51,8 @@ from pairing_service import (
     trigger_pairing,
     trigger_pairing_for_unpaired_tumors,
 )
-from pairing_strategies import get_pairing_strategy, strategies
-from schemas import (
+from syzygy.pairing_strategies import get_pairing_strategy, strategies
+from syzygy.schemas import (
     DmpReportStatsRead,
     DmpSummaryRead,
     DmpTriggerRead,

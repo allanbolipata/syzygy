@@ -5,9 +5,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database import get_db
-from models import PooledMachine
-from schemas import PooledMachineRead, PooledMachineUpsert
+from syzygy.database import get_db
+from syzygy.models import PooledMachine
+from syzygy.schemas import PooledMachineRead, PooledMachineUpsert
 
 
 router = APIRouter(prefix="/machines", tags=["machines"])

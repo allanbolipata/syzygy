@@ -19,10 +19,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-import routers.pairings as pairings
-from models import Base, PairingLogic, PairingTable, Sample
-from routers.pairings import pairing_report, pairing_report_stats
-from schemas import TumorOrNormal
+import syzygy.routers.pairings as pairings
+from syzygy.models import Base, PairingLogic, PairingTable, Sample
+from syzygy.routers.pairings import pairing_report, pairing_report_stats
+from syzygy.schemas import TumorOrNormal
 
 BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 

@@ -13,9 +13,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from models import Sample
-from nats_ingest import handle_request_update
+from syzygy.database import Base
+from syzygy.models import Sample
+from syzygy.nats_ingest import handle_request_update
 
 REQUEST_UPDATE_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "nats" / "99990_D_request_update.json"

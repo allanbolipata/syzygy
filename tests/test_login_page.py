@@ -10,7 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
+from syzygy.database import Base
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOGIN_HTML = REPO_ROOT / "static" / "login.html"

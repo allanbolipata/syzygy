@@ -71,10 +71,10 @@ if _REPO not in sys.path:
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
-from database import engine
-from dmp_translator import to_dmp_sample_kwargs
-from models import PairingLogic, Sample
-from pairing_service import trigger_pairing, trigger_pairing_for_normal
+from syzygy.database import engine
+from syzygy.dmp_translator import to_dmp_sample_kwargs
+from syzygy.models import PairingLogic, Sample
+from syzygy.pairing_service import trigger_pairing, trigger_pairing_for_normal
 
 # File group holding the DMP data structure.
 DMP_FILEGROUP = "DMP BAMs"

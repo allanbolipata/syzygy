@@ -48,7 +48,9 @@ import os
 import socket
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 import nats
@@ -87,7 +89,7 @@ PROVEN_NORMAL_SQL = """
 """
 
 
-def tcp_ok(url, timeout=3.0):
+def tcp_ok(url: str, timeout: float = 3.0) -> bool:
     """TCP-connect check against a nats:// or postgresql:// URL."""
     parsed = urlparse(url)
     host = parsed.hostname or "127.0.0.1"
@@ -99,10 +101,10 @@ def tcp_ok(url, timeout=3.0):
         return False
 
 
-def publish(server, subject, data):
+def publish(server: str, subject: str, data: bytes) -> tuple[str, int]:
     """JetStream-publish raw bytes to a subject; returns (stream, seq)."""
 
-    async def run():
+    async def run() -> tuple[str, int]:
         nc = await nats.connect(servers=[server])
         try:
             js = nc.jetstream()
@@ -114,7 +116,14 @@ def publish(server, subject, data):
     return asyncio.run(run())
 
 
-def poll(description, fn, timeout=INGEST_TIMEOUT):
+T = TypeVar("T")
+
+
+def poll(
+    description: str,
+    fn: Callable[[], T | None],
+    timeout: float = INGEST_TIMEOUT,
+) -> T:
     """Call fn() until it returns non-None; raise TimeoutError otherwise."""
     deadline = time.monotonic() + timeout
     while True:
@@ -126,7 +135,7 @@ def poll(description, fn, timeout=INGEST_TIMEOUT):
         time.sleep(POLL_INTERVAL)
 
 
-def check_99908(conn):
+def check_99908(conn: psycopg2.extensions.connection) -> list[Any] | None:
     """5 samples of 99908_C, file_group SMILE, request metadata present."""
     cur = conn.cursor()
     cur.execute(
@@ -147,7 +156,7 @@ def check_99908(conn):
     return rows
 
 
-def check_99908_c1(conn):
+def check_99908_c1(conn: psycopg2.extensions.connection) -> tuple[Any, ...] | None:
     """99908_C_1 flipped to TUMOR with sampleMetadataList preserved."""
     cur = conn.cursor()
     cur.execute(
@@ -164,13 +173,16 @@ def check_99908_c1(conn):
     return row
 
 
-def count_d2(conn):
+def count_d2(conn: psycopg2.extensions.connection) -> int:
     cur = conn.cursor()
     cur.execute("SELECT count(*) FROM samples WHERE request_id = '99990_D_2'")
-    return cur.fetchone()[0]
+    row = cur.fetchone()
+    return 0 if row is None else int(row[0])
 
 
-def check_synthetic_pairing(conn, tumor_primary_id):
+def check_synthetic_pairing(
+    conn: psycopg2.extensions.connection, tumor_primary_id: str
+) -> tuple[Any, ...] | None:
     cur = conn.cursor()
     cur.execute(
         """
@@ -188,7 +200,7 @@ def check_synthetic_pairing(conn, tumor_primary_id):
     return cur.fetchone()
 
 
-def _maybe_json(value):
+def _maybe_json(value: Any) -> Any:
     """psycopg2 returns json columns as strings; re-parse if needed."""
     if isinstance(value, str) and value[:1] in ("[", "{"):
         try:
@@ -198,7 +210,7 @@ def _maybe_json(value):
     return value
 
 
-def build_synthetic(normal):
+def build_synthetic(normal: tuple[Any, ...]) -> tuple[str, dict[str, Any]]:
     """A synthetic new-request whose TUMOR mirrors the given NORMAL."""
     (primary_id, patient__cmo, gene_panel, bait_set,
      run_mode, preservation, sample_origin, sample_type) = normal

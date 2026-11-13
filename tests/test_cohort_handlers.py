@@ -31,16 +31,16 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import nats_ingest
-from database import Base, settings
-from models import (
+import syzygy.nats_ingest as nats_ingest
+from syzygy.database import Base, settings
+from syzygy.models import (
     BaitSet,
     PairingLogic,
     PairingTable,
     PendingNatsPublish,
     Sample,
 )
-from schemas import TumorOrNormal
+from syzygy.schemas import TumorOrNormal
 
 
 @pytest.fixture(scope="module")
