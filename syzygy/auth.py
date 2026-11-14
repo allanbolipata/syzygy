@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 # Cached JWKS, keyed by realm so each realm is fetched at most once.
 _jwks_cache: Dict[str, Dict[str, Any]] = {}
+# realm -> time.monotonic() of the most recent JWKS (re)fetch, used to cap
+# how often an unknown kid can force a refetch of the certs endpoint.
+_jwks_fetched_at: Dict[str, float] = {}
+# Minimum seconds between JWKS (re)fetches for a realm.
+_JWKS_MIN_REFETCH_INTERVAL = 60.0
 
 
 class TokenError(Exception):
@@ -50,24 +55,60 @@ def _dev_user() -> dict:
     }
 
 
-def _get_jwks() -> dict:
-    """Fetch the realm's JWKS and cache it keyed by realm."""
-    realm = settings.keycloak_realm
-    if realm not in _jwks_cache:
-        url = f"{settings.keycloak_url}/realms/{realm}/protocol/openid-connect/certs"
+def _fetch_jwks(realm: str) -> dict:
+    """Fetch a realm's JWKS from Keycloak, cache it, and stamp the fetch
+    time. Raises TokenError if the endpoint is unreachable or returns an
+    HTTP error, so a Keycloak blip degrades to 401 (unauthenticated,
+    logged by the caller) rather than an unhandled 500.
+    """
+    url = f"{settings.keycloak_url}/realms/{realm}/protocol/openid-connect/certs"
+    try:
         response = httpx.get(url)
         response.raise_for_status()
-        # Real Keycloak realms expose more than one key (e.g. an
-        # RSA-OAEP 'use: enc' key alongside the RS256 'use: sig' key).
-        # PyJWK cannot build a signing key from an enc-only entry, so
-        # keep only keys that are usable for signature verification.
-        jwks = {
-            key["kid"]: jwt.PyJWK(key).key
-            for key in response.json().get("keys", [])
-            if key.get("use", "sig") == "sig"
-        }
-        _jwks_cache[realm] = jwks
+    except httpx.HTTPError as exc:
+        raise TokenError(
+            f"JWKS fetch failed for realm {realm!r}: {type(exc).__name__}"
+        ) from exc
+    # Real Keycloak realms expose more than one key (e.g. an
+    # RSA-OAEP 'use: enc' key alongside the RS256 'use: sig' key).
+    # PyJWK cannot build a signing key from an enc-only entry, so
+    # keep only keys that are usable for signature verification.
+    jwks = {
+        key["kid"]: jwt.PyJWK(key).key
+        for key in response.json().get("keys", [])
+        if key.get("use", "sig") == "sig"
+    }
+    _jwks_cache[realm] = jwks
+    _jwks_fetched_at[realm] = time.monotonic()
+    return jwks
+
+
+def _get_jwks() -> dict:
+    """Return the realm's cached JWKS, fetching it on first use."""
+    realm = settings.keycloak_realm
+    if realm not in _jwks_cache:
+        _fetch_jwks(realm)
     return _jwks_cache[realm]
+
+
+def _refetch_jwks(realm: str) -> bool:
+    """Rate-capped JWKS refetch, used after a kid cache-miss.
+
+    Keycloak may have rotated its signing keys since the cache was
+    populated; a fresh fetch is what lets post-rotation tokens verify
+    without an app restart. Returns True if a new fetch replaced the
+    cache. A too-soon refetch (within ``_JWKS_MIN_REFETCH_INTERVAL`` of
+    the last fetch) or a failed fetch returns False and leaves the
+    existing cached keys in place.
+    """
+    last = _jwks_fetched_at.get(realm)
+    if last is not None and (time.monotonic() - last) < _JWKS_MIN_REFETCH_INTERVAL:
+        return False
+    try:
+        _fetch_jwks(realm)
+    except TokenError:
+        return False
+    return True
 
 
 def verify_token(token: str) -> dict:
@@ -84,6 +125,13 @@ def verify_token(token: str) -> dict:
         raise TokenError("token is missing a 'kid' header")
 
     key = _get_jwks().get(kid)
+    if key is None:
+        # kid not in the cached JWKS: Keycloak may have rotated signing
+        # keys since the cache was populated. Refetch once (rate-capped)
+        # and retry before giving up — otherwise every token minted after
+        # a rotation 401s until the process restarts.
+        if _refetch_jwks(settings.keycloak_realm):
+            key = _jwks_cache[settings.keycloak_realm].get(kid)
     if key is None:
         raise TokenError(f"no JWKS key found for kid {kid!r}")
 
