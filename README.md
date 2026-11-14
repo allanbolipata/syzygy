@@ -66,6 +66,115 @@ Self-contained walkthrough from a fresh checkout to a working app.
 Prerequisites: Docker (engine + Compose plugin v2 — Docker Desktop on
 macOS/Windows, or the CLI on Linux) and Python 3.11+.
 
+### Quickstart: local dev with dummy data
+
+The fastest path to a running app with fixture data — no Keycloak client
+setup, no user allow-list. It seeds all five pairing logics (ACCESS, ARGOS,
+TEMPO, DMP, HARMONY) with synthetic samples and (optionally) replays the dev
+NATS fixtures through the real ingest chain, using the *Keycloak-free local
+login* (a static dev token; see the Authentication (Keycloak) section). Same
+prerequisites as the section above: Docker/Podman + Compose for the NATS
+step, Python 3.11+ for the app and the seed/mock scripts.
+
+1. Clone and configure. `.env.example` already sets every dev value this path
+   needs (`DATABASE_URL` on `127.0.0.1:5435`, `DEV_AUTH_TOKEN`,
+   `DEFAULT_PAIRING_LOGIC_NAME=ARGOS`, `CRF_OUTPUT_DIR=./crf_output_dev`,
+   `NATS_INGEST_TOKEN`), so no further `.env` edits are required:
+
+       git clone git@github.com:allanbolipata/syzygy.git
+       cd syzygy
+       cp .env.example .env
+
+   (For a zero-Docker seed-only session, set `DATABASE_URL` to the SQLite
+   default and skip steps 2 and 5.)
+
+2. Start the dev stack. The in-container `app` (port 8123, *not* published)
+   is the `smile-listener`'s NATS ingest target, so it stays up for step 5;
+   Keycloak is not started (this path uses dev-token login):
+
+       docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+           up -d db nats nats-init app smile-listener
+
+   (`podman compose ...` on Podman hosts.) The first run builds the app image
+   and creates the shared `syzygy-dev` network plus the `syzygy_db_data`
+   named volume, where all local data persists. Both the container app
+   (`db:5432`) and the host-side uvicorn (`127.0.0.1:5435`) point at the same
+   dev Postgres, so ingested and seeded data both appear in the host UI. Once
+   `nats-init` has finished, `curl http://127.0.0.1:8222/jsz` reports
+   `"streams": 1` (the `MDB_STREAM` stream the fixtures publish to).
+
+3. Run the app on the host and sign in with the dev token (no Keycloak
+   round trip, no allow-list row — see *Keycloak-free local login*):
+
+       python3 -m venv .venv && source .venv/bin/activate
+       pip install -r requirements.txt
+       uvicorn syzygy.main:app --reload
+
+   Open <http://localhost:8000/login> and click *Sign in (local dev admin)*.
+   The token (`dev-syzygy-token`) is also accepted as `Authorization: Bearer
+   dev-syzygy-token` for API scripts.
+
+4. Seed the fixture data — all five pairing logics with synthetic samples,
+   creating real `pairing_table` rows through the app's own per-tumor trigger.
+   Idempotent (safe to re-run); it prints a per-logic summary (OK/MISMATCH)
+   and totals. To wipe the seeded fixtures first, add `--reset`:
+
+       python scripts/seed_dev_data.py
+
+5. (Optional) Replay the dev NATS fixtures through the real ingest chain
+   (NATS → `smile-listener` → `POST /v1/ingest/nats`). Publishes all eight
+   payloads in `tests/fixtures/nats/dev/` in a deterministic ingest order
+   (new-requests → sample-update → request-update → dmp-sample →
+   cohort-validate), one per second; `--dry-run` prints the plan without
+   connecting to NATS:
+
+       python scripts/mock_smile.py pub-dir tests/fixtures/nats/dev
+
+**Expected state.** Step 4's summary is the ground truth for the seeded set
+(it reports **25 samples, 10 pairing rows, 3 unmatched tumors**, all `OK`);
+step 5 adds the `991xx` ingested fixtures. Per pairing logic:
+
+| Logic | Fixture | Pairs? | Why |
+|---|---|---|---|
+| ACCESS | C-DEV001 (tumor + normal, one request) | 1 row | patient/panel/bait hard keys match — same-request tier |
+| ACCESS | C-DEV002 (tumor's own request has no normal) | 1 row | other-request cascade finds a matching normal from another request |
+| ACCESS | C-DEV003 (bait v2 tumor vs bait v1 normal) | no pair | bait-set version mismatch (v2 vs v1) — the FFPE/frozen split is only the visible annotation |
+| ACCESS | 99102 (ingested tumor + normal) | 1 row | one request's tumor + normal → request-first tier |
+| ARGOS | C-DEV010 (NovaSeq 6000 + FFPE) | 1 row | run-mode bucket + preservation match (patient tier) |
+| ARGOS | C-DEV011 (HiSeq tumor vs NovaSeq normal) | no pair | run-mode **family** mismatch (hiseq vs novaseq), rejected by both the patient tier and the pooled tier. (A fine-bucket `novaseq_x` vs `novaseq` split *would* be rescued by the pooled tier, so the seeder uses a family mismatch for a deterministic unmatched case.) |
+| ARGOS | C-DEV012 (NovaSeq 6000 tumor, pooled `diana` normal) | 1 row | rescued by the pooled tier (no same-patient normal); `diana` resolves to the novaseq family |
+| ARGOS | 99101 (ingested) | 1 row | same run mode + preservation + bait set → automatic pairing |
+| TEMPO | C-DEV020 (NovaSeq X 1000 vs NovaSeq 6000) | 1 row | different fine run modes skip the run-mode tier → the **coarse exome bucket** pairs them |
+| TEMPO | C-DEV021 (HiSeq vs NovaSeq) | no pair | coarse run-mode mismatch (hiseq vs novaseq) |
+| TEMPO | 99103 (ingested) | 1 row | NovaSeq X 1000 vs NovaSeq 6000 → coarse (exome) bucket |
+| DMP | P-00DEV01 (same pool `POOL-A1`) | 1 row | tier-1 same-pool |
+| DMP | P-00DEV02 (diff pool, same `IM_ver`) | 1 row | tier-2 same-`IM_ver` rescue |
+| DMP | P-00DEV03 (two same-pool normals) | 2 rows | fan-out: the tumor pairs with both same-pool normals |
+| DMP | P-00DEV09 (ingested tumor + normal, pool `poolDEV9`) | none at ingest | DMP pairing is reference-alignment-driven, not ingest-triggered — run the DMP pairing trigger to pair them |
+| HARMONY | P-00HARM01 | 1 row | one DMP-shaped pair under the HARMONY logic |
+
+The ingested `99102` sample-update flips `99102_2` from Normal→Tumor (a
+known no-op — 99102 then has no Normal left, so no new pairing row); the
+`99101` request-update re-imports metadata with no pairing change; and
+`dev_cohort_validate` round-trips on the cohort subjects (validation only —
+no samples or pairs).
+
+**Where to look in the UI** (`/ui`): the **Samples** tab (search the
+`C-DEVxx` / `DEV-xxx` ids, or filter `file_group=dev-fixture` for the seeded
+set; the `991xx` ids are the ingested ones), the **Pair report** tab (pick a
+logic to list its current pairs and export CSV/TSV), and **Matches &
+overrides** (a sample's current match plus per-logic potential matches, with
+cascade tier and mismatch reasons).
+
+**Reset / full wipe:**
+
+       python scripts/seed_dev_data.py --reset
+       docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+
+`--reset` removes the seeded `dev-fixture` samples and their pairing rows
+(the ingested `991xx` fixtures survive it); `down -v` is the full clean slate
+(deletes the dev Postgres and Keycloak data volumes).
+
 ### Full local environment (app + database + Keycloak)
 
 1. Clone and configure:
