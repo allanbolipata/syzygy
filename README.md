@@ -176,6 +176,16 @@ file's `app` and `db` environment is overridable, so deployment-
 specific values can be injected the same way without editing the
 compose files.
 
+**Staging (this branch):** identical shape, two differences — the app
+is published on host port **1337** (`1337:8000`; in-network services
+still reach it at `app:8000`), and the listener uses **test durables**
+(`syzygy-staging` / `syzygy-tmp-staging`) so it can never share
+beagle's prod durables. Copy `staging.env.example` to `.env` on the
+staging host and fill it in. Until the gateway team provisions
+staging-scoped NATS subjects, bring the stack up without the listener:
+
+    docker compose up -d db app
+
 ### Pointing Postgres at a database
 
 The app's Postgres (`db` in the base file) stores its data in
