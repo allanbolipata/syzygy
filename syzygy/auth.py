@@ -6,6 +6,7 @@ token for this client.
 """
 
 import hmac
+import logging
 import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
@@ -20,6 +21,8 @@ from sqlalchemy.orm import Session
 
 from syzygy.database import get_db, settings
 from syzygy.models import AllowedUser
+
+logger = logging.getLogger(__name__)
 
 # Cached JWKS, keyed by realm so each realm is fetched at most once.
 _jwks_cache: Dict[str, Dict[str, Any]] = {}
@@ -145,7 +148,15 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], O
         return ("ok", _dev_user(), None)
     try:
         claims = verify_token(token)
-    except TokenError:
+    except TokenError as exc:
+        # Log the failure REASON (expired / signature / JWKS fetch /
+        # malformed) so auth failures are diagnosable from `docker logs`.
+        # Never log the token itself — scrub it defensively in case an
+        # exception message ever carries a fragment of it.
+        reason = str(exc)
+        if token:
+            reason = reason.replace(token, "<redacted-token>")
+        logger.warning("auth: token rejected: %s", reason)
         return ("unauthenticated", None, None)
 
     email = (claims.get("email") or "").lower()
