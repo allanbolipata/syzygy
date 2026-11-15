@@ -136,7 +136,10 @@ def pg_engine(pg_base_url):
     except Exception as e:
         pytest.skip(f"cannot create the test database (need CREATEDB): {e}")
 
-    test_url = str(u.set(database=TEST_DB_NAME))
+    # NOTE: str(URL) masks the password to "***" (SQLAlchemy renders URLs
+    # with hide_password=True by default) — the fresh test DB then rejects
+    # the masked password. Render unmasked explicitly.
+    test_url = u.set(database=TEST_DB_NAME).render_as_string(hide_password=False)
     eng = create_engine(test_url)
     Base.metadata.create_all(bind=eng)
     try:
@@ -185,11 +188,16 @@ def captured_sql(pg_engine):
         with lock:
             entries.append((statement, parameters))
 
-    sa_event.listens_for(pg_engine, "before_cursor_execute", _on_cursor_execute)
+    # NOTE: in SQLAlchemy 2.x, event.listens_for(target, ident, fn) is
+    # DECORATOR-ONLY — called with the function as a positional arg it
+    # silently registers nothing (returns a decorator that is discarded).
+    # Use event.listen() to register immediately; it returns None, so
+    # removal goes through event.remove(target, identifier, fn).
+    sa_event.listen(pg_engine, "before_cursor_execute", _on_cursor_execute)
     try:
         yield entries
     finally:
-        sa_event.remove(_on_cursor_execute, pg_engine, "before_cursor_execute")
+        sa_event.remove(pg_engine, "before_cursor_execute", _on_cursor_execute)
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +248,11 @@ def _explain_analyze_json(engine, statement: str, params: dict) -> dict:
     """EXPLAIN (ANALYZE, FORMAT JSON) of ``statement`` (psycopg2 pyformat
     placeholders) via a raw cursor on the engine's database. The analyzed
     plan reports actual rows per node — what the query really returns,
-    not a planner estimate."""
-    u = make_url(str(engine.url))
+    not a planner estimate.
+    NOTE: str(engine.url) masks the password to "***" (SQLAlchemy hides it
+    by default) — re-parse the UNMASKED URL or psycopg2 dials with "***".
+    """
+    u = make_url(engine.url.render_as_string(hide_password=False))
     import psycopg2
 
     conn = psycopg2.connect(
