@@ -20,6 +20,15 @@ from syzygy.pairing_strategies import get_pairing_strategy, strategies
 from syzygy.schemas import TumorOrNormal
 
 
+# Bulk passes (DMP / HARMONY) commit every ``N`` newly-paired tumors
+# instead of per created pairing: each per-row commit is a per-row
+# fsync, and stacking it over ~150k tumors is one of the stacked causes
+# of the hours-long bulk pass. A plain int default (not a FastAPI
+# ``Query``) so the service stays directly callable from tests without a
+# request context.
+BULK_PASS_COMMIT_BATCH_SIZE = 500
+
+
 def _ensure_active(logic: PairingLogic) -> None:
     if not logic.active:
         raise HTTPException(status_code=400, detail=f"Pairing logic '{logic.name}' is not active")
@@ -140,6 +149,7 @@ def _create_pairing(
     mismatched_keys: Optional[list] = None,
     notes: Optional[list] = None,
     multi_pair: bool = False,
+    commit: bool = True,
 ) -> PairingTable:
     pairing = PairingTable(
         tumor_id=tumor.id,
@@ -152,6 +162,13 @@ def _create_pairing(
         multi_pair=multi_pair,
     )
     db.add(pairing)
+    if not commit:
+        # Bulk-pass deferred commit: the caller (a bulk pairing pass) owns
+        # the transaction and commits every N newly-paired tumors, rolling
+        # back the open batch on failure — so the per-row commit/fsync is
+        # off the hot path. The row's Python-side defaults (id,
+        # created_date) are already set, so no refresh is needed.
+        return pairing
     try:
         db.commit()
     except IntegrityError:
@@ -203,6 +220,7 @@ def _trigger_multi_pair(
     trigger_type: str,
     normal_id: Optional[UUID],
     strict: bool,
+    commit: bool = True,
 ) -> Optional[PairingTable]:
     """The multi_pair (DMP) branch of ``trigger_pairing``: one row per
     match, no winner (docs/dmp_reference_alignment.md, section b).
@@ -238,6 +256,7 @@ def _trigger_multi_pair(
             trigger_type=trigger_type,
             mismatched_keys=reasons or None,
             multi_pair=True,
+            commit=commit,
         )
         # Race guard: a concurrent commit may have created this pair.
         if result.normal_id != normal.id:
@@ -273,6 +292,7 @@ def _trigger_multi_pair(
                 trigger_type=trigger_type,
                 notes=selection_notes or None,
                 multi_pair=True,
+                commit=commit,
             )
         )
     return created[0]
@@ -285,6 +305,7 @@ def trigger_pairing(
     trigger_type: str,
     normal_id: Optional[UUID] = None,
     strict: bool = False,
+    commit: bool = True,
 ) -> Optional[PairingTable]:
     """Create (or return) the current pairing rows for a tumor.
 
@@ -320,7 +341,8 @@ def trigger_pairing(
     strategy = get_pairing_strategy(pairing_logic)
     if getattr(strategy, "MULTI_PAIR", False):
         return _trigger_multi_pair(
-            db, strategy, tumor, pairing_logic, trigger_type, normal_id, strict
+            db, strategy, tumor, pairing_logic, trigger_type, normal_id, strict,
+            commit=commit,
         )
 
     existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
@@ -346,6 +368,7 @@ def trigger_pairing(
             pairing_logic,
             trigger_type=trigger_type,
             mismatched_keys=reasons or None,
+            commit=commit,
         )
         # Race guard: a concurrent commit may have won the "latest" slot.
         if result.normal_id != normal.id:
@@ -372,6 +395,7 @@ def trigger_pairing(
         pairing_logic,
         trigger_type=trigger_type,
         notes=selection.notes or None,
+        commit=commit,
     )
 
 
@@ -559,7 +583,9 @@ def trigger_pairing_for_unpaired_tumors(
 #: pairings and never touches other sample groups.
 
 
-def trigger_dmp_pairing(db: Session) -> dict:
+def trigger_dmp_pairing(
+    db: Session, batch_size: int = BULK_PASS_COMMIT_BATCH_SIZE
+) -> dict:
     """Bulk automatic DMP pairing under the DMP pairing logic.
 
     Every unpaired DMP tumor is paired with every matching DMP normal
@@ -574,6 +600,12 @@ def trigger_dmp_pairing(db: Session) -> dict:
     resolvable patient (neither ``patient__dmp`` nor a ``P-`` id in the
     sample name) cannot match (the strategy is patient-scoped) and are
     reported in ``missing_patient__dmp``.
+
+    Pairings are committed in batches: every ``batch_size`` newly-paired
+    tumors (default ``BULK_PASS_COMMIT_BATCH_SIZE``, 500) flushes a single
+    commit instead of a per-pairing commit/fsync. A mid-pass failure rolls
+    back only the open (unfinished) batch; pairings from already-committed
+    batches persist.
 
     Raises ``HTTPException(400)`` when no active pairing logic named
     "DMP" exists: the trigger has nothing to run against.
@@ -610,26 +642,42 @@ def trigger_dmp_pairing(db: Session) -> dict:
     new_pairings: list[PairingTable] = []
     strategy = get_pairing_strategy(logic)
     strategy_keys = getattr(strategy, "pairing_keys", None)
-    for tumor in tumors:
-        scanned += 1
-        if tumor.id in already_paired_ids:
-            already_paired += 1
-            continue
-        # Patient resolvable = stored patient__dmp or the reference's
-        # name-parse fallback (the strategy's remapped key, spec g).
-        if strategy_keys is not None:
-            has_patient = bool(strategy_keys(tumor)["patient"])
-        else:
-            has_patient = bool((tumor.patient__dmp or "").strip())
-        if not has_patient:
-            missing_patient += 1
-            continue
-        pairing = trigger_pairing(db, tumor, logic, "automatic")
-        if pairing is None:
-            unpaired += 1
-        else:
-            paired += 1
-            new_pairings.append(pairing)
+    since_commit = 0
+    try:
+        for tumor in tumors:
+            scanned += 1
+            if tumor.id in already_paired_ids:
+                already_paired += 1
+                continue
+            # Patient resolvable = stored patient__dmp or the reference's
+            # name-parse fallback (the strategy's remapped key, spec g).
+            if strategy_keys is not None:
+                has_patient = bool(strategy_keys(tumor)["patient"])
+            else:
+                has_patient = bool((tumor.patient__dmp or "").strip())
+            if not has_patient:
+                missing_patient += 1
+                continue
+            # commit=False defers the per-row commit: the pass owns the
+            # transaction and commits every ``batch_size`` newly-paired
+            # tumors, so the per-row fsync is off the hot path.
+            pairing = trigger_pairing(db, tumor, logic, "automatic", commit=False)
+            if pairing is None:
+                unpaired += 1
+            else:
+                paired += 1
+                new_pairings.append(pairing)
+                since_commit += 1
+                if since_commit >= batch_size:
+                    db.commit()
+                    since_commit = 0
+        if since_commit:
+            db.commit()
+    except Exception:
+        # A mid-pass failure rolls back only the open (unfinished) batch;
+        # pairings from already-committed batches persist.
+        db.rollback()
+        raise
 
     return {
         "pairing_logic": logic.name,
@@ -656,7 +704,9 @@ def trigger_dmp_pairing(db: Session) -> dict:
 HARMONY_LOGIC_NAME = "HARMONY"
 
 
-def trigger_harmony_pairing(db: Session) -> dict:
+def trigger_harmony_pairing(
+    db: Session, batch_size: int = BULK_PASS_COMMIT_BATCH_SIZE
+) -> dict:
     """Bulk automatic HARMONY pairing under the HARMONY pairing logic.
 
     Modeled on ``trigger_dmp_pairing`` but resolves the "HARMONY" logic
@@ -674,6 +724,12 @@ def trigger_harmony_pairing(db: Session) -> dict:
     the four outcome counts sum to ``scanned``. DMP tumors without
     ``patient__dmp`` cannot match (the strategy is patient-scoped) and are
     reported in ``missing_patient__dmp``.
+
+    Pairings are committed in batches: every ``batch_size`` newly-paired
+    tumors (default ``BULK_PASS_COMMIT_BATCH_SIZE``, 500) flushes a single
+    commit instead of a per-pairing commit/fsync. A mid-pass failure rolls
+    back only the open (unfinished) batch; pairings from already-committed
+    batches persist.
 
     Raises ``HTTPException(400)`` when no active pairing logic named
     "HARMONY" exists: the trigger has nothing to run against.
@@ -709,20 +765,36 @@ def trigger_harmony_pairing(db: Session) -> dict:
 
     scanned = already_paired = missing_patient = paired = unpaired = 0
     new_pairings: list[PairingTable] = []
-    for tumor in tumors:
-        scanned += 1
-        if tumor.id in already_paired_ids:
-            already_paired += 1
-            continue
-        if not (tumor.patient__dmp or "").strip():
-            missing_patient += 1
-            continue
-        pairing = trigger_pairing(db, tumor, logic, "automatic")
-        if pairing is None:
-            unpaired += 1
-        else:
-            paired += 1
-            new_pairings.append(pairing)
+    since_commit = 0
+    try:
+        for tumor in tumors:
+            scanned += 1
+            if tumor.id in already_paired_ids:
+                already_paired += 1
+                continue
+            if not (tumor.patient__dmp or "").strip():
+                missing_patient += 1
+                continue
+            # commit=False defers the per-row commit: the pass owns the
+            # transaction and commits every ``batch_size`` newly-paired
+            # tumors, so the per-row fsync is off the hot path.
+            pairing = trigger_pairing(db, tumor, logic, "automatic", commit=False)
+            if pairing is None:
+                unpaired += 1
+            else:
+                paired += 1
+                new_pairings.append(pairing)
+                since_commit += 1
+                if since_commit >= batch_size:
+                    db.commit()
+                    since_commit = 0
+        if since_commit:
+            db.commit()
+    except Exception:
+        # A mid-pass failure rolls back only the open (unfinished) batch;
+        # pairings from already-committed batches persist.
+        db.rollback()
+        raise
 
     return {
         "pairing_logic": logic.name,
