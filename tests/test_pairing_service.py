@@ -1,4 +1,5 @@
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 import syzygy.database as database
 import syzygy.pairing_service as pairing_service
+import syzygy.routers.pairings as pairings
 from syzygy.database import Base
 from syzygy.models import BaitSet, PairingLogic, PairingTable, Sample
 from syzygy.pairing_service import (
@@ -3104,16 +3106,45 @@ def test_manual_trigger_endpoint_refuses_dmp_logic(db):
     ) is None
 
 
-def test_trigger_dmp_endpoint_pairs(db):
+def test_trigger_dmp_endpoint_pairs(db, pg_engine, monkeypatch):
     _dmp_logic(db)
     tumor = _dmp_sample(db, "P-0000008-T1-X1", "P-0000008", TumorOrNormal.TUMOR.value)
     normal = _dmp_sample(db, "P-0000008-N1-X1", "P-0000008")
 
-    result = trigger_dmp_pairing_endpoint(db=db)
+    # The endpoint now returns a job id immediately and runs the pass on a
+    # worker thread that opens its own session via SessionLocal — point it
+    # at the test engine, then poll the status endpoint to the final state.
+    monkeypatch.setattr(
+        pairings, "SessionLocal", sessionmaker(bind=pg_engine, expire_on_commit=False)
+    )
+    trigger = trigger_dmp_pairing_endpoint(db=db)
+    assert trigger["pairing_logic"] == "DMP"
+    assert trigger["status"] == "pending"
 
-    assert result["paired"] == 1
-    (pairing,) = result["new_pairings"]
+    deadline = time.monotonic() + 10.0
+    status = None
+    while True:
+        status = pairings.pairing_job_status_endpoint(trigger["job_id"])
+        if status["status"] in ("completed", "failed"):
+            break
+        assert time.monotonic() < deadline, f"job not terminal: {status}"
+        time.sleep(0.02)
+    assert status["status"] == "completed", status
+    assert status["scanned"] == 1
+    assert status["paired"] == 1
+    assert status["unpaired"] == 0
+
+    db.expire_all()
+    rows = db.scalars(
+        select(PairingTable).where(
+            PairingTable.pairing_logic_id == db.scalar(
+                select(PairingLogic.id).where(PairingLogic.name == "DMP")
+            )
+        )
+    ).all()
+    (pairing,) = rows
     assert (pairing.tumor_id, pairing.normal_id) == (tumor.id, normal.id)
+    assert pairing.trigger_type == "automatic"
 
 
 # ---------------------------------------------------------------------------

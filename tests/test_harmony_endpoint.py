@@ -20,6 +20,7 @@ a TestClient wired via ``dependency_overrides`` (no lifespan run).
 import csv
 import io
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import syzygy.auth as auth
+import syzygy.routers.pairings as pairings
 from syzygy.auth import get_current_user
 from syzygy.database import Base, get_db
 from syzygy.main import app
@@ -89,7 +91,7 @@ def harmony_logic(db):
 
 
 @pytest.fixture
-def client(db):
+def client(db, engine, monkeypatch):
     # Wire the app to the in-memory session and satisfy the router-level
     # auth dependency without contacting Keycloak.
     def override_get_db():
@@ -100,11 +102,45 @@ def client(db):
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_user
+    # The background pairing-job worker opens its OWN session via
+    # SessionLocal — point it at the test engine, not the app's real one.
+    monkeypatch.setattr(
+        pairings, "SessionLocal", sessionmaker(bind=engine, expire_on_commit=False)
+    )
     # Bare client (no context manager): the app lifespan is not run, so no
     # real database engine is used.
     yield TestClient(app)
     app.dependency_overrides.pop(get_db, None)
     app.dependency_overrides.pop(get_current_user, None)
+
+
+def _wait_job(client, job_id, deadline=10.0):
+    """Poll the status endpoint until the background job is in a terminal
+    state (completed or failed)."""
+    end = time.monotonic() + deadline
+    status = None
+    while True:
+        status = client.get(f"/v1/pairing/trigger-status/{job_id}").json()
+        if status["status"] in ("completed", "failed"):
+            return status
+        if time.monotonic() >= end:
+            raise AssertionError(f"pairing job {job_id} not terminal: {status}")
+        time.sleep(0.02)
+
+
+def _trigger(client, path, label=None):
+    """POST a bulk pairing trigger (background job) and wait for its final
+    state; return the final status dict."""
+    trigger = client.post(path)
+    assert trigger.status_code == 200, trigger.text
+    job = trigger.json()
+    assert job["status"] == "pending"
+    assert job["job_id"]
+    if label is not None:
+        assert job["pairing_logic"] == label
+    final = _wait_job(client, job["job_id"])
+    assert final["status"] == "completed", final
+    return final
 
 
 def _dmp_sample(
@@ -158,13 +194,11 @@ def test_harmony_csv_exact_headers_and_row(client, db, dmp_logic, harmony_logic)
         db, "P-0001234-N01-IM6", "P-0001234", anon_id="anon-n1",
     )
 
-    trigger = client.post("/v1/pairing/trigger-harmony")
-    assert trigger.status_code == 200
-    body = trigger.json()
-    assert body["pairing_logic"] == "HARMONY"
-    assert body["paired"] == 1
-    assert body["unpaired"] == 0
-    assert body["scanned"] == 1
+    final = _trigger(client, "/v1/pairing/trigger-harmony", label="HARMONY")
+    assert final["paired"] == 1
+    assert final["unpaired"] == 0
+    assert final["scanned"] == 1
+    assert final["total"] == 1
 
     response = client.get("/v1/pairing/harmony/", params={"format": "csv"})
     assert response.status_code == 200
@@ -192,7 +226,7 @@ def test_harmony_json_default_returns_paged_frame(client, db, dmp_logic, harmony
     _dmp_sample(db, "P-0001234-T01-IM6", "P-0001234",
                 tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t1")
     _dmp_sample(db, "P-0001234-N01-IM6", "P-0001234", anon_id="anon-n1")
-    client.post("/v1/pairing/trigger-harmony")
+    _trigger(client, "/v1/pairing/trigger-harmony")
 
     response = client.get("/v1/pairing/harmony/")
     assert response.status_code == 200
@@ -225,9 +259,8 @@ def test_harmony_one_normal_many_tumors(client, db, dmp_logic, harmony_logic):
                 tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t2")
     _dmp_sample(db, "P-0001234-N01-IM6", "P-0001234", anon_id="anon-n1")
 
-    trigger = client.post("/v1/pairing/trigger-harmony")
-    assert trigger.status_code == 200
-    assert trigger.json()["paired"] == 2
+    final = _trigger(client, "/v1/pairing/trigger-harmony")
+    assert final["paired"] == 2
 
     response = client.get("/v1/pairing/harmony/", params={"format": "csv"})
     rows = _csv_rows(response)
@@ -261,11 +294,9 @@ def test_harmony_unmatched_normal_one_sided(client, db, dmp_logic, harmony_logic
     # A DMP normal of a different patient with no tumor counterpart: unmatched.
     _dmp_sample(db, "P-0009999-N01-IM6", "P-0009999", anon_id="anon-n9")
 
-    trigger = client.post("/v1/pairing/trigger-harmony")
-    assert trigger.status_code == 200
-    body = trigger.json()
-    assert body["paired"] == 1
-    assert body["unpaired"] == 0  # the unmatched side is a normal, not a tumor
+    final = _trigger(client, "/v1/pairing/trigger-harmony")
+    assert final["paired"] == 1
+    assert final["unpaired"] == 0  # the unmatched side is a normal, not a tumor
 
     response = client.get("/v1/pairing/harmony/", params={"format": "csv"})
     rows = _csv_rows(response)
@@ -320,9 +351,8 @@ def _seed_harmony_frame(client, db):
                 tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t2")
     _dmp_sample(db, "P-1000-N01-IM6", "P-1000", anon_id="anon-n1")
     _dmp_sample(db, "P-2000-N01-IM6", "P-2000", anon_id="anon-n2")
-    trigger = client.post("/v1/pairing/trigger-harmony")
-    assert trigger.status_code == 200
-    assert trigger.json()["paired"] == 2  # P-1000's two tumors; P-3000 has no normal
+    final = _trigger(client, "/v1/pairing/trigger-harmony")
+    assert final["paired"] == 2  # P-1000's two tumors; P-3000 has no normal
 
 
 def test_harmony_pages_cover_the_frame_once(client, db, dmp_logic, harmony_logic):
@@ -418,7 +448,7 @@ def test_harmony_search_covers_bam_names_and_consent(client, db, dmp_logic, harm
     _dmp_sample(db, "P-4000-T01-IM6", "P-4000",
                 tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t4", consent=True)
     _dmp_sample(db, "P-4000-N01-IM6", "P-4000", anon_id="anon-n4", consent=True)
-    client.post("/v1/pairing/trigger-harmony")
+    _trigger(client, "/v1/pairing/trigger-harmony")
 
     # bam name (anon_id) is searchable on either side.
     r = client.get("/v1/pairing/harmony/", params={"q": "anon-n2"}).json()
@@ -529,10 +559,8 @@ def test_harmony_trigger_does_not_touch_dmp_pairings(
     _dmp_sample(db, "P-0001234-N01-IM6", "P-0001234", anon_id="anon-n1")
 
     # First, create a DMP-logic pairing under the DMP logic.
-    dmp_trigger = client.post("/v1/pairing/trigger-dmp")
-    assert dmp_trigger.status_code == 200
-    assert dmp_trigger.json()["pairing_logic"] == "DMP"
-    assert dmp_trigger.json()["paired"] == 1
+    dmp_final = _trigger(client, "/v1/pairing/trigger-dmp", label="DMP")
+    assert dmp_final["paired"] == 1
 
     db.expire_all()
     dmp_before = _pairings_for_logic(db, dmp_logic.id)
@@ -541,10 +569,8 @@ def test_harmony_trigger_does_not_touch_dmp_pairings(
 
     # Now trigger HARMONY: it must create its own pairing row without
     # modifying any DMP-logic row.
-    harmony_trigger = client.post("/v1/pairing/trigger-harmony")
-    assert harmony_trigger.status_code == 200
-    assert harmony_trigger.json()["pairing_logic"] == "HARMONY"
-    assert harmony_trigger.json()["paired"] == 1
+    harmony_final = _trigger(client, "/v1/pairing/trigger-harmony", label="HARMONY")
+    assert harmony_final["paired"] == 1
 
     db.expire_all()
     dmp_after = _pairings_for_logic(db, dmp_logic.id)
@@ -649,7 +675,7 @@ def test_harmony_json_rows_always_carry_the_consent_key(client, db, dmp_logic, h
     _dmp_sample(db, "P-6000-N01-IM6", "P-6000", consent=False)
     _dmp_sample(db, "P-7000-T01-IM6", "P-7000", TumorOrNormal.TUMOR.value, consent=None)
     _dmp_sample(db, "P-7000-N01-IM6", "P-7000", consent=None)
-    assert client.post("/v1/pairing/trigger-harmony").json()["paired"] == 3
+    assert _trigger(client, "/v1/pairing/trigger-harmony")["paired"] == 3
 
     data = client.get("/v1/pairing/harmony/").json()
     assert data["total"] == 3
@@ -673,7 +699,7 @@ def test_harmony_csv_consent_renders_true_false_and_empty(client, db, dmp_logic,
     _dmp_sample(db, "P-6000-N01-IM6", "P-6000", consent=False)
     _dmp_sample(db, "P-7000-T01-IM6", "P-7000", TumorOrNormal.TUMOR.value, consent=None)
     _dmp_sample(db, "P-7000-N01-IM6", "P-7000", consent=None)
-    client.post("/v1/pairing/trigger-harmony")
+    _trigger(client, "/v1/pairing/trigger-harmony")
 
     rows = _csv_rows(client.get("/v1/pairing/harmony/", params={"format": "csv"}))
     header = rows[0]
@@ -709,7 +735,7 @@ def test_harmony_consent_comes_from_the_present_side_tumor_preferred(
     _dmp_sample(db, "P-8000-N01-IM6", "P-8000", consent=False)
     _dmp_sample(db, "P-8100-T01-IM6", "P-8100", TumorOrNormal.TUMOR.value, consent=None)
     _dmp_sample(db, "P-8100-N01-IM6", "P-8100", consent=True)
-    assert client.post("/v1/pairing/trigger-harmony").json()["paired"] == 2
+    assert _trigger(client, "/v1/pairing/trigger-harmony")["paired"] == 2
 
     rows = _csv_rows(client.get("/v1/pairing/harmony/", params={"format": "csv"}))
     header = rows[0]

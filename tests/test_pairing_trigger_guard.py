@@ -9,15 +9,20 @@ the trigger endpoints claim one pass per logic (409 otherwise). These tests pin
 all three so a later "optimization" cannot quietly undo any of them.
 """
 
+import time
+import threading
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import syzygy.database as database
+import syzygy.pairing_service as pairing_service
 import syzygy.routers.pairings as pairings
-from syzygy.models import Base, PairingLogic
+from syzygy.models import Base, PairingLogic, Sample
+from syzygy.pairing_strategies import seed_pooled_machines
 from syzygy.routers.pairings import (
     trigger_all_pairings_endpoint,
     trigger_dmp_pairing_endpoint,
@@ -54,6 +59,74 @@ def _logic(db, name):
     db.add(logic)
     db.commit()
     return logic
+
+
+def _dmp_tumor_and_normal(db, pid="P-4201"):
+    """A pairable DMP tumor + same-patient normal (the DMP strategy pairs
+    these via the same-patient / IM_ver tier)."""
+    tumor = Sample(
+        primary_id=f"{pid}-T01-IM6",
+        cmo_sample_name=f"{pid} tumor name",
+        patient__dmp=pid,
+        anon_id=f"anon-{pid}-t",
+        sample_type="DMP",
+        gene_panel="IMPACT468",
+        tumor_or_normal="TUMOR",
+        consent=False,
+    )
+    normal = Sample(
+        primary_id=f"{pid}-N01-IM6",
+        cmo_sample_name=f"{pid} normal name",
+        patient__dmp=pid,
+        anon_id=f"anon-{pid}-n",
+        sample_type="DMP",
+        gene_panel="IMPACT468",
+        tumor_or_normal="NORMAL",
+        consent=False,
+    )
+    db.add_all([tumor, normal])
+    db.commit()
+    db.refresh(tumor)
+    db.refresh(normal)
+    return tumor, normal
+
+
+def _bulk_result(logic_name, **overrides):
+    """A complete bulk-pass result dict (the worker's contract)."""
+    result = {
+        "pairing_logic": logic_name,
+        "scanned": 1,
+        "total": 1,
+        "already_paired": 0,
+        "missing_patient__dmp": 0,
+        "paired": 1,
+        "unpaired": 0,
+        "new_pairings": [],
+        "needs_follow_up": False,
+    }
+    result.update(overrides)
+    return result
+
+
+def _test_session_factory(db):
+    """A ``SessionLocal`` replacement bound to the test engine — the job
+    worker must never reach for the app's real engine."""
+    return sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+
+
+def _wait_job_terminal(job_id, deadline=5.0):
+    """Poll the status endpoint until the job reaches a terminal state."""
+    end = time.monotonic() + deadline
+    status = None
+    while True:
+        status = pairings.pairing_job_status_endpoint(job_id)
+        if status["status"] in ("completed", "failed"):
+            return status
+        if time.monotonic() >= end:
+            raise AssertionError(
+                f"job {job_id} not terminal within {deadline}s: {status}"
+            )
+        time.sleep(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -117,24 +190,59 @@ def test_second_harmony_trigger_is_rejected_without_a_second_pass(db, monkeypatc
     assert logic.id in pairings._active_pairing_passes
 
 
-def test_first_harmony_trigger_runs_and_then_releases(db, monkeypatch):
+def test_first_harmony_trigger_returns_job_id_and_worker_releases_the_claim(
+    db, monkeypatch
+):
+    """The endpoint returns a job id immediately; the pass runs on a worker
+    thread and releases its claim when the pass is done."""
     logic = _logic(db, "HARMONY")
     monkeypatch.setattr(
-        pairings, "trigger_harmony_pairing", lambda db: {"pairing_logic": "HARMONY"}
+        pairings,
+        "trigger_harmony_pairing",
+        lambda db, progress=None: _bulk_result("HARMONY"),
     )
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+
     result = trigger_harmony_pairing_endpoint(db=db)
-    assert result == {"pairing_logic": "HARMONY"}
+    assert result["pairing_logic"] == "HARMONY"
+    assert result["status"] == "pending"
+    assert result["job_id"]
+
+    status = _wait_job_terminal(result["job_id"])
+    assert status["status"] == "completed"
+    assert status["paired"] == 1
+    assert status["scanned"] == 1
+    assert status["total"] == 1
+    assert status["started_at"] is not None
+    assert status["finished_at"] is not None
+    # The claim is released once the worker's pass is done.
     assert logic.id not in pairings._active_pairing_passes
 
 
 def test_dmp_and_harmony_passes_do_not_block_each_other(db, monkeypatch):
-    """Separate pairing spaces get separate claims."""
+    """Separate pairing spaces get separate claims: a DMP job in flight must
+    not 409 a HARMONY trigger (and vice versa)."""
     _logic(db, "DMP")
     _logic(db, "HARMONY")
-    monkeypatch.setattr(pairings, "trigger_dmp_pairing", lambda db: {"paired": 1})
-    monkeypatch.setattr(pairings, "trigger_harmony_pairing", lambda db: {"paired": 2})
-    assert trigger_dmp_pairing_endpoint(db=db)["paired"] == 1
-    assert trigger_harmony_pairing_endpoint(db=db)["paired"] == 2
+    monkeypatch.setattr(
+        pairings, "trigger_dmp_pairing", lambda db, progress=None: _bulk_result("DMP")
+    )
+    monkeypatch.setattr(
+        pairings,
+        "trigger_harmony_pairing",
+        lambda db, progress=None: _bulk_result("HARMONY", paired=2),
+    )
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+
+    dmp_job = trigger_dmp_pairing_endpoint(db=db)
+    harmony_job = trigger_harmony_pairing_endpoint(db=db)
+    assert dmp_job["pairing_logic"] == "DMP"
+    assert harmony_job["pairing_logic"] == "HARMONY"
+
+    dmp_status = _wait_job_terminal(dmp_job["job_id"])
+    harmony_status = _wait_job_terminal(harmony_job["job_id"])
+    assert dmp_status["status"] == "completed" and dmp_status["paired"] == 1
+    assert harmony_status["status"] == "completed" and harmony_status["paired"] == 2
     assert pairings._active_pairing_passes == set()
 
 
@@ -158,9 +266,169 @@ def test_scoped_backfill_shares_the_claim_of_that_logics_trigger(db, monkeypatch
     """``trigger-all?pairing_logic_name=HARMONY`` pairs the same space as
     ``trigger-harmony``, so one claim has to cover both."""
     logic = _logic(db, "HARMONY")
-    monkeypatch.setattr(pairings, "trigger_harmony_pairing", lambda db: {"paired": 3})
-    assert trigger_harmony_pairing_endpoint(db=db)["paired"] == 3
+    monkeypatch.setattr(
+        pairings,
+        "trigger_harmony_pairing",
+        lambda db, progress=None: _bulk_result("HARMONY", paired=3),
+    )
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+    job = trigger_harmony_pairing_endpoint(db=db)
+    assert _wait_job_terminal(job["job_id"])["paired"] == 3
     pairings._active_pairing_passes.add(logic.id)  # a pass already in flight
     with pytest.raises(HTTPException) as exc:
         trigger_all_pairings_endpoint(pairing_logic_name="HARMONY", db=db)
     assert exc.value.status_code == 409
+
+
+def test_second_dmp_trigger_while_job_running_409s(db, monkeypatch):
+    """The overlap guard survives the async refactor: while the first pass is
+    running in the background, a second same-logic trigger still 409s — and
+    the first job finishes normally afterwards."""
+    _logic(db, "DMP")
+    seed_pooled_machines(db)
+    _dmp_tumor_and_normal(db)
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_trigger = pairing_service.trigger_pairing
+
+    def gated(db_session, tumor, logic_row, trigger_type, *args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+        release.wait(timeout=10)
+        return real_trigger(db_session, tumor, logic_row, trigger_type, *args, **kwargs)
+
+    monkeypatch.setattr(pairing_service, "trigger_pairing", gated)
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+
+    job = trigger_dmp_pairing_endpoint(db=db)
+    assert job["status"] == "pending"
+    assert entered.wait(timeout=5), "worker never entered the pass"
+
+    try:
+        # The pass is running: a second DMP trigger must 409.
+        with pytest.raises(HTTPException) as exc:
+            trigger_dmp_pairing_endpoint(db=db)
+        assert exc.value.status_code == 409
+        assert "already in progress" in exc.value.detail
+    finally:
+        release.set()
+
+    status = _wait_job_terminal(job["job_id"])
+    assert status["status"] == "completed"
+    assert status["paired"] == 1
+    assert status["scanned"] == 1
+    assert status["total"] == 1
+    assert status["needs_follow_up"] is False
+    assert not pairings._active_pairing_passes
+
+
+def test_status_reports_progress_while_running_and_final_state(db, monkeypatch):
+    """The status endpoint reports progress (scanned/total, paired, unpaired)
+    while a job runs and the final state when it is done."""
+    _logic(db, "DMP")
+    seed_pooled_machines(db)
+    for i in range(3):
+        _dmp_tumor_and_normal(db, pid=f"P-{i:04d}")
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_trigger = pairing_service.trigger_pairing
+    calls = []
+
+    def gated(db_session, tumor, logic_row, trigger_type, *args, **kwargs):
+        calls.append(tumor.id)
+        if len(calls) == 1 and not entered.is_set():
+            entered.set()
+            release.wait(timeout=10)
+        return real_trigger(db_session, tumor, logic_row, trigger_type, *args, **kwargs)
+
+    monkeypatch.setattr(pairing_service, "trigger_pairing", gated)
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+
+    job = trigger_dmp_pairing_endpoint(db=db)
+    assert job["status"] == "pending"
+    assert entered.wait(timeout=5), "worker never reached the first tumor"
+    try:
+        # Mid-pass: the job is running, the main list is known (total), and
+        # no tumor has settled yet (scanned still 0 — the gate blocks the
+        # first trigger_pairing call, so the first settle has not happened).
+        running = pairings.pairing_job_status_endpoint(job["job_id"])
+        assert running["status"] == "running"
+        assert running["started_at"] is not None
+        assert running["finished_at"] is None
+        assert running["total"] == 3
+        assert 0 <= running["scanned"] < 3
+        assert running["paired"] == 0
+    finally:
+        release.set()
+
+    final = _wait_job_terminal(job["job_id"])
+    assert final["status"] == "completed"
+    assert final["scanned"] == 3
+    assert final["total"] == 3
+    assert final["paired"] == 3
+    assert final["unpaired"] == 0
+    assert final["finished_at"] is not None
+    assert final["needs_follow_up"] is False
+
+
+def test_job_rescans_the_tumor_list_at_start_not_at_request_time(db, monkeypatch):
+    """The frozen-snapshot fix: the tumor list is (re-)scanned when the
+    worker starts the pass, not at HTTP-request time. A tumor ingested after
+    the trigger request — while the job is still pending — must be picked up."""
+    _logic(db, "DMP")
+    seed_pooled_machines(db)
+
+    opened = threading.Event()
+    release = threading.Event()
+    real_session_factory = _test_session_factory(db)
+
+    class GatedSessionLocal:
+        """Blocks the worker before it opens its session, i.e. between the
+        trigger request and the pass's tumor-list materialization."""
+
+        def __call__(self):
+            if not opened.is_set():
+                opened.set()
+            release.wait(timeout=10)
+            return real_session_factory()
+
+    monkeypatch.setattr(pairings, "SessionLocal", GatedSessionLocal())
+
+    job = trigger_dmp_pairing_endpoint(db=db)
+    assert job["status"] == "pending"
+    assert opened.wait(timeout=5), "worker never reached its session"
+    try:
+        # In-flight import: ingested after the trigger request, before the
+        # pass's main list is materialized.
+        _dmp_tumor_and_normal(db)
+    finally:
+        release.set()
+
+    status = _wait_job_terminal(job["job_id"])
+    # The mid-import tumor was scanned and paired: the list was re-scanned at
+    # job start, so the pre-request (empty) state did not freeze the pass.
+    assert status["status"] == "completed"
+    assert status["scanned"] == 1
+    assert status["total"] == 1
+    assert status["paired"] == 1
+
+
+def test_job_marks_failed_and_releases_claim_when_the_pass_raises(db, monkeypatch):
+    """A pass that blows up in the worker marks the job failed and releases
+    its claim, so a later trigger can start a fresh pass."""
+    logic = _logic(db, "HARMONY")
+
+    def boom(db, progress=None):
+        raise RuntimeError("pass exploded in the worker")
+
+    monkeypatch.setattr(pairings, "trigger_harmony_pairing", boom)
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+
+    job = trigger_harmony_pairing_endpoint(db=db)
+    status = _wait_job_terminal(job["job_id"])
+    assert status["status"] == "failed"
+    assert "pass exploded in the worker" in (status.get("error") or "")
+    assert status["finished_at"] is not None
+    assert logic.id not in pairings._active_pairing_passes
