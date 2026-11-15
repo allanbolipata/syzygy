@@ -27,7 +27,7 @@ plus the partial index:
         WHERE sample_type_norm = 'DMP';
 
 The expressions are immutable over the stored column types (COALESCE,
-regexp_match, trim/upper, jsonb_typeof, ->>). The text arguments carry an
+regexp_match, trim/upper, jsonb_typeof, ->, ->>). The text arguments carry an
 explicit COLLATE "C": in a database whose collation is not C/POSIX the
 planner treats upper/trim (and regexp_match) as collation-dependent
 STABLE, which GENERATED columns reject ("function upper(text) is not
@@ -93,10 +93,10 @@ GENERATED_COLUMNS: dict[str, str] = {
     ),
     "dmp_pool_id_key": (
         "CASE"
-        " WHEN jsonb_typeof(additional_metadata::jsonb, 'pool_id') = 'string'"
+        " WHEN jsonb_typeof(additional_metadata::jsonb -> 'pool_id') = 'string'"
         "   AND additional_metadata ->> 'pool_id' <> ''"
         " THEN additional_metadata ->> 'pool_id'"
-        " WHEN jsonb_typeof(additional_metadata::jsonb, 'project_name') = 'string'"
+        " WHEN jsonb_typeof(additional_metadata::jsonb -> 'project_name') = 'string'"
         "   AND additional_metadata ->> 'project_name' <> ''"
         " THEN additional_metadata ->> 'project_name'"
         " END"

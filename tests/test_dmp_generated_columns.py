@@ -134,9 +134,13 @@ def pg_engine(pg_base_url):
     Base.metadata.create_all(bind=eng)
     try:
         _load_migrate()(test_url)
-    except Exception as e:
+    except Exception:
+        # Postgres accepted the connection and the test-database setup,
+        # so a migration failure here is a real bug (invalid DDL,
+        # missing privilege, ...) — not an environment gap. Fail loudly
+        # instead of skipping so the host gate sees it.
         eng.dispose()
-        pytest.skip(f"generated-column migration failed (needs PG13+): {e}")
+        raise
     yield eng
     # Teardown: drop the throwaway database.
     eng.dispose()
