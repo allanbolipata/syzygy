@@ -75,7 +75,7 @@ def _psycopg2(url: str, dbname: str, autocommit: bool = False):
 
     u = make_url(url)
     conn = psycopg2.connect(
-        host=u.hostname or "localhost",
+        host=u.host or "localhost",
         port=u.port or 5432,
         user=u.username,
         password=u.password,

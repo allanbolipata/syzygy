@@ -27,8 +27,13 @@ plus the partial index:
         WHERE sample_type_norm = 'DMP';
 
 The expressions are immutable over the stored column types (COALESCE,
-regexp_match, trim/upper, jsonb_typeof, ->>), so all four columns are
-generated columns — no import-time persistence of pool_id is needed.
+regexp_match, trim/upper, jsonb_typeof, ->>). The text arguments carry an
+explicit COLLATE "C": in a database whose collation is not C/POSIX the
+planner treats upper/trim (and regexp_match) as collation-dependent
+STABLE, which GENERATED columns reject ("function upper(text) is not
+immutable"); forcing the C collation makes every variant accepted. For
+this pattern the matching is ASCII-literal (P-\d+, \w+ dash-delimited
+runs), so C-collation results are identical to any other collation.
 
 The name-parse pattern mirrors dmp_translator.remap_dmp_record exactly
 (re.search, leftmost, unanchored — same leftmost-match semantics as
@@ -72,9 +77,12 @@ _DMP_NAME_SQL = "'(P-\\d+)-(\\w+)-(\\w+)'"
 #: column name -> immutable generated expression (spec g).
 GENERATED_COLUMNS: dict[str, str] = {
     "dmp_patient_key": (
-        f"COALESCE(patient__dmp, (regexp_match(primary_id, {_DMP_NAME_SQL}))[1])"
+        'COALESCE(patient__dmp, (regexp_match(primary_id COLLATE "C", '
+        f"{_DMP_NAME_SQL}))[1])"
     ),
-    "dmp_ver_key": f"((regexp_match(primary_id, {_DMP_NAME_SQL}))[3])",
+    "dmp_ver_key": (
+        '((regexp_match(primary_id COLLATE "C", ' f"{_DMP_NAME_SQL}))[3])"
+    ),
     "dmp_pool_id_key": (
         "CASE"
         " WHEN jsonb_typeof(additional_metadata::jsonb, 'pool_id') = 'string'"
@@ -85,7 +93,7 @@ GENERATED_COLUMNS: dict[str, str] = {
         " THEN additional_metadata ->> 'project_name'"
         " END"
     ),
-    "sample_type_norm": "trim(upper(sample_type))",
+    "sample_type_norm": 'trim(upper(sample_type COLLATE "C"))',
 }
 
 EXPECTED_COLUMNS = frozenset(GENERATED_COLUMNS)
