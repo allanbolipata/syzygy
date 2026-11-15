@@ -72,6 +72,34 @@ class Sample(Base):
     # "DMP BAMs", "Pooled Normals"); None for rows created outside a beagle
     # import (dashboard fixtures, manual API creates).
     file_group: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    # DMP sargable pairing keys (DMP bulk-pairing performance, item 1).
+    # On Postgres these are GENERATED ALWAYS ... STORED columns (scripts/
+    # migrate_dmp_generated_columns.py) materializing the exact key
+    # expressions remap_dmp_record computes (docs/dmp_reference_alignment.md
+    # section g): dmp_patient_key = COALESCE(patient__dmp, group 1 of the
+    # (P-\d+) name parse), dmp_ver_key = group 3 (the IM_ver),
+    # dmp_pool_id_key = additional_metadata pool_id (non-empty string) else
+    # project_name, sample_type_norm = trim(upper(sample_type)). The DMP
+    # strategy's candidate query filters on them via a partial index over
+    # DMP rows instead of scanning the table. Generated columns recompute
+    # on every update of the source columns — never written by application
+    # code, and patient__dmp is never written either. On non-Postgres
+    # dialects (the SQLite test fallback) create_all makes these plain
+    # nullable columns left NULL; the strategy detects that (the generated
+    # columns are absent) and uses the legacy Python remap path, so
+    # behavior is identical.
+    dmp_patient_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, insertable=False, updatable=False
+    )
+    dmp_ver_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, insertable=False, updatable=False
+    )
+    dmp_pool_id_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, insertable=False, updatable=False
+    )
+    sample_type_norm: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, insertable=False, updatable=False
+    )
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
