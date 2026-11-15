@@ -39,9 +39,17 @@ The name-parse pattern mirrors dmp_translator.remap_dmp_record exactly
 (re.search, leftmost, unanchored — same leftmost-match semantics as
 regexp_match). Note: Postgres regexp_match has identical group results
 to Python re.search for this pattern on ASCII ids (the greedy runs are
-dash-delimited and therefore forced); the legacy Python remap path
-stays authoritative for any divergence (the strategy falls back to it
-when a key is not a plain non-empty string).
+dash-delimited and therefore forced). One documented theoretical
+divergence: remap_dmp_record keeps a truthy non-string pool_id (JSON
+number/bool/dict) verbatim, while the generated column falls through to
+project_name for any value that is not a non-empty string. For that
+shape (a numeric pool_id whose text form collides with the stored
+project_name) the legacy Python remap path remains authoritative — the
+strategy's isinstance guard already routes non-string tumor pool keys
+to it; a non-string pool on the normal side would require the
+theoretical collision above to change a result. Real DMP
+pool_id / project_name values are strings, so the row sets are
+identical on real data and on the fixture corpus.
 
 patient__dmp itself is NEVER written by this migration or the pairing
 code.
