@@ -88,23 +88,28 @@ class Sample(Base):
     # nullable columns left NULL; the strategy detects that (the generated
     # columns are absent) and uses the legacy Python remap path, so
     # behavior is identical.
-    dmp_patient_key: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
-    dmp_ver_key: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
-    dmp_pool_id_key: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
-    sample_type_norm: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
+    dmp_patient_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
+    dmp_ver_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
+    dmp_pool_id_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
+    sample_type_norm: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 # Generated-key columns: on Postgres the migration turns these into
 # GENERATED ALWAYS AS ... STORED, so the ORM must never emit them in
-# INSERT/UPDATE. SQLAlchemy 2.x mapped_column() does not accept the
-# insertable/updatable kwargs, so set them on the Table's Column objects
-# after the class is defined (the same flags the legacy Column
-# constructor used to take).
-for _key_col in ("dmp_patient_key", "dmp_ver_key", "dmp_pool_id_key", "sample_type_norm"):
-    Sample.__table__.c[_key_col].insertable = False
-    Sample.__table__.c[_key_col].updatable = False
-del _key_col
+# INSERT/UPDATE. server_default=FetchedValue() (set on the mapped_column
+# above) is SQLAlchemy's marker for DB-generated values: the ORM omits
+# the columns from INSERT/UPDATE and fetches them back after INSERT.
+# It emits no DDL, so create_all on SQLite still makes plain nullable
+# columns (the documented legacy-path fallback).
 
 
 class PairingTable(Base):

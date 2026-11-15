@@ -126,7 +126,10 @@ def pg_engine(pg_base_url):
     except Exception as e:
         pytest.skip(f"cannot create the test database (need CREATEDB): {e}")
 
-    test_url = str(u.set(database=TEST_DB_NAME))
+    # NOTE: str(URL) masks the password to "***" (SQLAlchemy renders URLs
+    # with hide_password=True by default) — the fresh test DB then rejects
+    # the masked password. Render unmasked explicitly.
+    test_url = u.set(database=TEST_DB_NAME).render_as_string(hide_password=False)
     eng = create_engine(test_url)
     Base.metadata.create_all(bind=eng)
     try:
