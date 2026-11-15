@@ -373,6 +373,52 @@ def test_status_reports_progress_while_running_and_final_state(db, monkeypatch):
     assert final["needs_follow_up"] is False
 
 
+def test_end_of_pass_recheck_picks_up_mid_pass_ingest(db, monkeypatch):
+    """The frozen-snapshot fix, mid-pass half: a DMP tumor ingested WHILE
+    the pass is running (created on/after pass start, after the main list
+    is already materialized) is not in the main list — only the end-of-pass
+    re-check can see it. It must be swept by the re-check and paired, not
+    silently missed with an under-reported ``scanned`` (the staging bug)."""
+    _logic(db, "DMP")
+    seed_pooled_machines(db)
+    _dmp_tumor_and_normal(db, pid="P-5001")  # pre-pass tumor: in the main list
+
+    first_done = threading.Event()
+    release = threading.Event()
+    real_trigger = pairing_service.trigger_pairing
+    calls = []
+
+    def gated(db_session, tumor, logic_row, trigger_type, *args, **kwargs):
+        calls.append(tumor.id)
+        if len(calls) == 1 and not first_done.is_set():
+            first_done.set()
+            release.wait(timeout=10)
+        return real_trigger(db_session, tumor, logic_row, trigger_type, *args, **kwargs)
+
+    monkeypatch.setattr(pairing_service, "trigger_pairing", gated)
+    monkeypatch.setattr(pairings, "SessionLocal", _test_session_factory(db))
+
+    job = trigger_dmp_pairing_endpoint(db=db)
+    assert job["status"] == "pending"
+    # Block the worker on the first tumor's pairing: the main list is
+    # already materialized and the pass is mid-flight when the ingest lands.
+    assert first_done.wait(timeout=5), "worker never reached the first tumor"
+    try:
+        _dmp_tumor_and_normal(db, pid="P-5002")  # mid-pass ingest
+    finally:
+        release.set()
+
+    status = _wait_job_terminal(job["job_id"])
+    assert status["status"] == "completed", status
+    # Both tumors scanned and paired: the main list plus the re-check sweep.
+    assert status["scanned"] == 2, status
+    assert status["total"] == 2
+    assert status["paired"] == 2
+    assert status["unpaired"] == 0
+    assert status["needs_follow_up"] is False
+    assert not pairings._active_pairing_passes
+
+
 def test_job_rescans_the_tumor_list_at_start_not_at_request_time(db, monkeypatch):
     """The frozen-snapshot fix: the tumor list is (re-)scanned when the
     worker starts the pass, not at HTTP-request time. A tumor ingested after
