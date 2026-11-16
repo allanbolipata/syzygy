@@ -95,7 +95,10 @@ step, Python 3.11+ for the app and the seed/mock scripts.
        docker compose -f docker-compose.yml -f docker-compose.dev.yml \
            up -d db nats nats-init app smile-listener
 
-   (`podman compose ...` on Podman hosts.) The first run builds the app image
+   (`podman compose ...` on Podman hosts — if the first `up` appears to
+   stall silently during image pulls, that is `podman-compose`'s built-in
+   pull: interrupt it, `podman pull postgres:17 nats:2.15.2` manually, and
+   re-run the same `up`.) The first run builds the app image
    and creates the shared `syzygy-dev` network plus the `syzygy_db_data`
    named volume, where all local data persists. Both the container app
    (`db:5432`) and the host-side uvicorn (`127.0.0.1:5435`) point at the same
@@ -164,7 +167,11 @@ no samples or pairs).
 set; the `991xx` ids are the ingested ones), the **Pair report** tab (pick a
 logic to list its current pairs and export CSV/TSV), and **Matches &
 overrides** (a sample's current match plus per-logic potential matches, with
-cascade tier and mismatch reasons).
+cascade tier and mismatch reasons). Seeded DMP/HARMONY patients carry a
+synthetic CMO bridge (`C-DEV030`–`C-DEV032`, `C-DEV040`), so their Pair
+Report patient links navigate into the Patients tab; the ingested
+`P-00DEV9` deliberately has no bridge, so its link shows the no-match
+info banner instead.
 
 **Reset / full wipe:**
 
@@ -174,6 +181,13 @@ cascade tier and mismatch reasons).
 `--reset` removes the seeded `dev-fixture` samples and their pairing rows
 (the ingested `991xx` fixtures survive it); `down -v` is the full clean slate
 (deletes the dev Postgres and Keycloak data volumes).
+
+If the `db` container instead dies with `FATAL: database files are
+incompatible with server`, the `syzygy_db_data` volume was initialized by an
+older Postgres major version than the current image (major versions do not
+share on-disk formats, and the entrypoint skips initialization on a
+non-empty volume). Dev data is disposable: `down -v`, `up` again (the volume
+re-initializes on the next start), and re-seed.
 
 ### Full local environment (app + database + Keycloak)
 
