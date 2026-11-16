@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 jobs:
@@ -19,6 +19,35 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Run tests
         run: pytest -v
+
+  # The README quickstart is a contract; this job enforces it. Both
+  # .env.example incidents (redacted-password ***, missing NATS_URL)
+  # passed CI green because nothing ever touched the file untouched.
+  quickstart-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: .env.example must be complete and uncorrupted
+        run: |
+          if grep -q '\*\*\*@' .env.example; then
+            echo "::error::.env.example contains a redacted credential (***); a sandbox redactor corrupted a committed write."; exit 1; fi
+          cp .env.example .env
+          # Fails at parse time if any ${VAR:?required} in either compose
+          # file lacks a value (compose interpolates per-file, before merges).
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml config -q
+      - name: Zero-Docker seed smoke (README quickstart variant)
+        run: |
+          sed -i 's|^DATABASE_URL=.*|DATABASE_URL=sqlite:///./syzygy_smoke.db|' .env
+          python scripts/seed_dev_data.py | tee seed.log
+          grep -q "Total: 25 samples, 10 pairing rows, 3 unmatched tumors" seed.log \
+            || { echo "::error::seed ground-truth counts changed — update the README Expected state table in the same PR."; exit 1; }
 
   # The Postgres-backed modules (generated-column migration, DMP perf
   # guard) silently SKIP when DATABASE_URL is not Postgres — which is the

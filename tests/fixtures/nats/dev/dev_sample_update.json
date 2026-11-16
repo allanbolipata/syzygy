@@ -1,0 +1,127 @@
+{
+  "latestSampleMetadata": {
+    "sampleId": "99102",
+    "igoRequestId": "99102",
+    "primaryId": "99102_2",
+    "sampleName": "C-DEV02-N001",
+    "cmoPatientId": "C-DEV02",
+    "cmoSampleName": "C-DEV02-N001",
+    "tumorOrNormal": "TUMOR",
+    "genePanel": "MSK-ACCESS-468",
+    "baitSet": "MSK-ACCESS-v2_0-probesAllwFP",
+    "sampleType": "Frozen",
+    "preservation": "Frozen",
+    "sampleOrigin": "Tissue",
+    "sampleAliases": [
+      {
+        "value": "99102_2",
+        "namespace": "igoId"
+      },
+      {
+        "value": "EXT-DEV02-N001",
+        "namespace": "externalId"
+      },
+      {
+        "value": "C-DEV02-N001",
+        "namespace": "cmoSampleName"
+      }
+    ],
+    "libraries": [
+      {
+        "libraryName": "C-DEV02-N001-LIB1",
+        "libraryType": "DNA",
+        "runs": [
+          {
+            "runId": "DEVACCESS01",
+            "runDate": "2026-10-21",
+            "runMode": "NovaSeq 6000"
+          }
+        ]
+      }
+    ]
+  },
+  "sampleMetadataList": [
+    {
+      "sampleId": "99102",
+      "igoRequestId": "99102",
+      "primaryId": "99102_2",
+      "sampleName": "C-DEV02-N001",
+      "cmoPatientId": "C-DEV02",
+      "cmoSampleName": "C-DEV02-N001",
+      "tumorOrNormal": "NORMAL",
+      "genePanel": "MSK-ACCESS-468",
+      "baitSet": "MSK-ACCESS-v2_0-probesAllwFP",
+      "sampleType": "Frozen",
+      "preservation": "Frozen",
+      "sampleOrigin": "Tissue",
+      "sampleAliases": [
+        {
+          "value": "99102_2",
+          "namespace": "igoId"
+        },
+        {
+          "value": "EXT-DEV02-N001",
+          "namespace": "externalId"
+        },
+        {
+          "value": "C-DEV02-N001",
+          "namespace": "cmoSampleName"
+        }
+      ],
+      "libraries": [
+        {
+          "libraryName": "C-DEV02-N001-LIB1",
+          "libraryType": "DNA",
+          "runs": [
+            {
+              "runId": "DEVACCESS01",
+              "runDate": "2026-10-21",
+              "runMode": "NovaSeq 6000"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sampleId": "99102",
+      "igoRequestId": "99102",
+      "primaryId": "99102_2",
+      "sampleName": "C-DEV02-N001",
+      "cmoPatientId": "C-DEV02",
+      "cmoSampleName": "C-DEV02-N001",
+      "tumorOrNormal": "TUMOR",
+      "genePanel": "MSK-ACCESS-468",
+      "baitSet": "MSK-ACCESS-v2_0-probesAllwFP",
+      "sampleType": "Frozen",
+      "preservation": "Frozen",
+      "sampleOrigin": "Tissue",
+      "sampleAliases": [
+        {
+          "value": "99102_2",
+          "namespace": "igoId"
+        },
+        {
+          "value": "EXT-DEV02-N001",
+          "namespace": "externalId"
+        },
+        {
+          "value": "C-DEV02-N001",
+          "namespace": "cmoSampleName"
+        }
+      ],
+      "libraries": [
+        {
+          "libraryName": "C-DEV02-N001-LIB1",
+          "libraryType": "DNA",
+          "runs": [
+            {
+              "runId": "DEVACCESS01",
+              "runDate": "2026-10-21",
+              "runMode": "NovaSeq 6000"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
