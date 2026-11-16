@@ -67,7 +67,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Protocol, Sequence
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from syzygy.dmp_translator import remap_dmp_record
@@ -1046,6 +1046,60 @@ class TempoPairingStrategy(DefaultPairingStrategy):
         return list(db.scalars(select(Sample).where(*conds)).all())
 
 
+# -- DMP sargable candidate query (generated columns) ----------------------
+# The DMP strategy's candidate query filters on the remapped join keys.
+# On a Postgres database where scripts/migrate_dmp_generated_columns.py
+# has run, those keys are materialized as GENERATED ALWAYS ... STORED
+# columns (dmp_patient_key / dmp_ver_key / dmp_pool_id_key /
+# sample_type_norm) plus a partial index over the DMP rows, so the whole
+# filter is sargable SQL — no table scan, no Python re-filter. Everywhere
+# else (the SQLite test fallback, or a Postgres before the migration) the
+# strategy keeps the legacy path: SQL scopes on the stored column plus
+# NULL-column rows, and remap_dmp_record finishes the job in Python. The
+# generated expressions are the exact remap (docs/dmp_reference_alignment.
+# md, section g), so both paths return the same row sets.
+_GEN_COL_CACHE: Dict[tuple, bool] = {}
+_DMP_GEN_COLUMNS = (
+    "dmp_patient_key",
+    "dmp_ver_key",
+    "dmp_pool_id_key",
+    "sample_type_norm",
+)
+
+
+def _has_dmp_generated_columns(db: Session) -> bool:
+    """Whether ``samples`` carries the DMP generated-key columns.
+
+    Probed once per database and cached: a single information_schema
+    query on Postgres (non-Postgres dialects short-circuit to False
+    without touching the DB — SQLite cannot express generated columns).
+    Any probe failure falls back to the legacy path.
+    """
+    bind = db.get_bind()
+    dialect = bind.dialect.name
+    if dialect != "postgresql":
+        return False
+    url = bind.url
+    key = (dialect, url.database, url.host, url.port)
+    if key in _GEN_COL_CACHE:
+        return _GEN_COL_CACHE[key]
+    try:
+        n = db.execute(
+            text(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'samples' AND is_generated = 'ALWAYS' "
+                "AND column_name IN "
+                "('dmp_patient_key', 'dmp_ver_key', 'dmp_pool_id_key', "
+                "'sample_type_norm')"
+            )
+        ).scalar_one()
+        ok = n == len(_DMP_GEN_COLUMNS)
+    except Exception:
+        ok = False  # probe failed -> conservative legacy path
+    _GEN_COL_CACHE[key] = ok
+    return ok
+
+
 @register_pairing_strategy("dmp")
 class DmpPairingStrategy(DefaultPairingStrategy):
     """DMP pairing strategy aligned with the reference
@@ -1115,16 +1169,50 @@ class DmpPairingStrategy(DefaultPairingStrategy):
             "ver": rec["ver"] or "",
         }
 
+    def _gen_key_select(
+        self,
+        db: Session,
+        role: str,
+        patient: str,
+        pool_id: Optional[str] = None,
+        ver: Optional[str] = None,
+    ) -> List[Sample]:
+        """The sargable candidate query on the DMP generated-key columns.
+
+        DMP samples of ``role`` whose generated patient key equals
+        ``patient``, plus optional pool/ver key equalities, in
+        ``primary_id`` order. Every filter is a generated column, so the
+        partial index over the DMP rows does all the work and no Python
+        re-filter is needed (the generated expressions are the exact
+        remap, so the row sets are identical to the legacy path).
+        """
+        conds = [
+            Sample.tumor_or_normal == role,
+            Sample.sample_type_norm == "DMP",
+            Sample.dmp_patient_key == patient,
+        ]
+        if pool_id is not None:
+            conds.append(Sample.dmp_pool_id_key == pool_id)
+        if ver is not None:
+            conds.append(Sample.dmp_ver_key == ver)
+        return list(
+            db.scalars(select(Sample).where(*conds).order_by(Sample.primary_id)).all()
+        )
+
     def _same_patient_dmp(
         self, db: Session, role: str, patient: str
     ) -> List[Sample]:
         """DMP samples of ``role`` whose remapped patient equals ``patient``.
 
-        SQL scopes on the stored column (plus NULL-column rows, whose
-        patient comes from the reference name parse); the remap filter
-        finishes the job in Python, because the remapped key is not a
-        single SQL predicate.
+        Where the generated-key columns exist the whole filter is one
+        sargable predicate on ``dmp_patient_key`` (stored column wins,
+        name parse fills the NULLs — the exact remap). Otherwise the
+        legacy path: SQL scopes on the stored column (plus NULL-column
+        rows, whose patient comes from the reference name parse) and the
+        remap filter finishes the job in Python.
         """
+        if _has_dmp_generated_columns(db):
+            return self._gen_key_select(db, role, patient)
         stmt = (
             select(Sample)
             .where(
@@ -1148,6 +1236,18 @@ class DmpPairingStrategy(DefaultPairingStrategy):
         keys = self.pairing_keys(tumor)
         if not keys["patient"] or not keys["pool_id"]:
             return []
+        # The generated path binds keys["pool_id"] against a TEXT column.
+        # pairing_keys returns the raw JSON pool value, so a truthy
+        # non-string (a degenerate int/bool pool_id) would bind text=int
+        # and diverge from the legacy typed == ; fall back to the legacy
+        # path for those. Real DMP pool_id / project_name are strings, so
+        # this is the only guard the fast path needs (patient and ver are
+        # always str from the remap).
+        if _has_dmp_generated_columns(db) and isinstance(keys["pool_id"], str):
+            return self._gen_key_select(
+                db, TumorOrNormal.NORMAL.value, keys["patient"],
+                pool_id=keys["pool_id"],
+            )
         return [
             n
             for n in self._same_patient_dmp(
@@ -1176,6 +1276,11 @@ class DmpPairingStrategy(DefaultPairingStrategy):
             return tier1
         if not keys["ver"]:
             return []
+        if _has_dmp_generated_columns(db):
+            return self._gen_key_select(
+                db, TumorOrNormal.NORMAL.value, keys["patient"],
+                ver=keys["ver"],
+            )
         candidates = self._same_patient_dmp(
             db, TumorOrNormal.NORMAL.value, keys["patient"]
         )
