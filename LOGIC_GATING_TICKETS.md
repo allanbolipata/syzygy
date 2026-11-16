@@ -23,6 +23,13 @@ read from write.
    a separate boolean claim `"syzygy_admin": true` OR membership of `syzygy/admin`
    mapped to a second claim — C1 implements claim parsing for BOTH shapes:
    list claim + boolean admin claim).
+   **Claim names are CONFIGURATION, not code** (Allan's decision 2026-11-16,
+   option A: the org's Keycloak approach is not yet decided):
+   `Settings.logic_claim_name: str = "syzygy_logics"` and
+   `Settings.logic_admin_claim: str = "syzygy_admin"` (envs `LOGIC_CLAIM_NAME`,
+   `LOGIC_ADMIN_CLAIM`). When the org's Keycloak reality is known, adapting is
+   a `.env` change — no code churn. The whole lane dark-launches behind
+   `LOGIC_GATING_ENABLED=false` and may merge to `dev` inert.
 2. **Rollout flag:** `Settings.logic_gating_enabled: bool = False`
    (env `LOGIC_GATING_ENABLED`). When false, behavior is exactly today's
    (everyone sees everything) — the whole lane is dark-launched.
@@ -94,9 +101,10 @@ Verdict = exit code. Never edit code or tests. Never complete unless exit 0.
 ## Tickets
 
 ### C1 — auth core: claim → principal entitlements
-**Build:** `Settings.logic_gating_enabled` (+ env `LOGIC_GATING_ENABLED`);
-parse `syzygy_logics` list claim + `syzygy_admin` bool claim in
-`verify_token`/`_resolve_user`; attach `allowed_logics: set[str]` +
+**Build:** `Settings.logic_gating_enabled` (+ env `LOGIC_GATING_ENABLED`),
+`Settings.logic_claim_name` (default `syzygy_logics`),
+`Settings.logic_admin_claim` (default `syzygy_admin`); parse the list claim +
+admin bool claim **by the configured names** in `verify_token`/`_resolve_user`; attach `allowed_logics: set[str]` +
 `is_logic_admin: bool` to the principal dict; gating-disabled ⇒ full set;
 dev-admin ⇒ full set + admin; unknown logic names in claim are ignored (log a
 warning); `/auth/me` exposes both fields.
@@ -138,7 +146,10 @@ static-UI test asserting the toggle exists and is gated on the /auth/me field
 **Build:** app.js: logic selector options filtered by `/auth/me`
 `allowed_logics`; gated views hidden (UX only); admin-only buttons (triggers)
 hidden unless `is_logic_admin`. Docs: `docs/logic_gating_setup.md` — Keycloak
-group + mapper walkthrough (dev compose Keycloak AND prod guidance), env
+group + mapper walkthrough **written as a REFERENCE IMPLEMENTATION** (the
+org's Keycloak approach is undecided; state that up front, show the
+group-mapper recipe with the default claim names, and point at
+`LOGIC_CLAIM_NAME`/`LOGIC_ADMIN_CLAIM` as the adaptation knob), env
 flag, rollout order (populate groups → flip flag); README auth section pointer.
 **Accept:** static-UI tests for selector filtering; docs complete and
 copy-pasteable; suite green.
