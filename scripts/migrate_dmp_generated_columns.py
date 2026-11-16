@@ -1,4 +1,4 @@
-"""Idempotently add the DMP sargable pairing-key columns to ``samples``
+r"""Idempotently add the DMP sargable pairing-key columns to ``samples``
 (DMP bulk-pairing performance, item 1).
 
 Postgres GENERATED ... STORED columns that materialize the exact key
