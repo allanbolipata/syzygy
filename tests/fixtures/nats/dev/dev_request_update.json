@@ -1,0 +1,15 @@
+[
+  {
+    "igoRequestId": "99101",
+    "requestMetadataJson": "{\"requestMetadata\":{\"patient\":{\"cmoPatientId\":\"C-DEV01\",\"externalPatientId\":\"EXT-DEV01\",\"name\":\"Dev Argos Patient\",\"dob\":\"1980-01-15\",\"sex\":\"M\",\"diagnosis\":\"Lung Adenocarcinoma\",\"dateOfDiagnosis\":\"2026-09-10\"},\"patientOfRecord\":{\"value\":\"dev-01@example.org\",\"namespace\":\"email\"},\"requester\":{\"value\":\"dev-01@example.org\",\"namespace\":\"email\"},\"orderingPhysician\":{\"value\":\"dev-phys@example.org\",\"namespace\":\"email\"},\"clinicalNotes\":\"Dev fixture request: ARGOS pairing demo (IMPACT505 / IMPACT505_BAITS). Refreshed via the request-update demo.\",\"samples\":[{\"primaryId\":\"99101_1\",\"cmoSampleName\":\"C-DEV01-T001\",\"tumorOrNormal\":\"Tumor\",\"baitSet\":\"IMPACT505_BAITS\",\"genePanel\":\"IMPACT505\",\"preservation\":\"FFPE\",\"sampleOrigin\":\"Tissue\"},{\"primaryId\":\"99101_2\",\"cmoSampleName\":\"C-DEV01-N001\",\"tumorOrNormal\":\"Normal\",\"baitSet\":\"IMPACT505_BAITS\",\"genePanel\":\"IMPACT505\",\"preservation\":\"FFPE\",\"sampleOrigin\":\"Tissue\"}]}}",
+    "importDate": "2026-11-02T15:30:00Z",
+    "status": {
+      "validationStatus": "Validated",
+      "validationReport": {
+        "status": "Validated",
+        "validationNotes": "",
+        "validationWarnings": ""
+      }
+    }
+  }
+]
