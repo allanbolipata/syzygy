@@ -71,9 +71,10 @@ mutations. Listings (Layer B): `/v1/sample/`, `/v1/patient/`, `/v1/request/`,
 
 ## Verified lane facts (do not re-derive)
 
-- Baseline suite on this branch: **612 passed, 17 skipped** in ~4m11s
-  (`pytest -q` with the worktree `.venv`). Gate rule: **0 failed, skipped ≤ 17,
-  `git status --porcelain` empty**. Passed count GROWS as cards add tests.
+- Baseline suite on this branch (post-#30 rebase, b35b0ea+): **636 passed,
+  17 skipped** in ~4m15s (`pytest -q` with the worktree `.venv`). Gate rule:
+  **0 failed, skipped ≤ 17, `git status --porcelain` empty**. Passed count
+  GROWS as cards add tests. (Original pre-#30 baseline was 612/17.)
 - `tests/test_pairing_service.py` degrades to SQLite when testcontainers/Docker
   is unavailable — the suite is safe in the network-disabled worker sandbox.
 - NATS e2e tests self-skip via `skipif` when env absent.
