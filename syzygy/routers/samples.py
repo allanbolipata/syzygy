@@ -75,6 +75,7 @@ def _samples_filtered_query(
                 Sample.primary_id.ilike(like),
                 Sample.cmo_sample_name.ilike(like),
                 Sample.patient__cmo.ilike(like),
+                Sample.patient__dmp.ilike(like),
                 Sample.request_id.ilike(like),
             )
         )
