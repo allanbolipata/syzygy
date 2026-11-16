@@ -125,16 +125,23 @@ def _regular(primary_id, patient, request, sample_type, ton, panel, bait,
     )
 
 
-def _dmp(primary_id, patient_dmp, pool_id, ton) -> SampleSpec:
+def _dmp(primary_id, patient_dmp, pool_id, ton, patient_cmo=None) -> SampleSpec:
     """A DMP/HARMONY fixture sample.
 
     ``primary_id`` must carry a ``P-<digits>-<word>-IM<n>`` segment so the
     DMP translator's regex parses the IM_ver (group 3); the real patient id
     lives in the ``patient__dmp`` column, which is the DMP strategy's
     ``patient`` matching key.
+
+    ``patient_cmo`` is the optional CMO bridge: the Patients tab groups by
+    ``patient__cmo``, so a seeded DMP patient carrying one is navigable
+    from the Pair Report's patient link (card t_d8720219's direct-proof
+    path). It is inert for DMP/HARMONY pairing (those key on
+    ``patient__dmp`` + pool/IM_ver). The *ingested* ``P-00DEV9`` fixture
+    deliberately keeps no bridge so the no-match banner path stays exercised.
     """
     return SampleSpec(
-        primary_id=primary_id, patient__cmo=None, request_id=None,
+        primary_id=primary_id, patient__cmo=patient_cmo, request_id=None,
         sample_type="DMP", tumor_or_normal=ton, gene_panel="IMPACT468",
         bait_set="IMPACT468", patient__dmp=patient_dmp,
         additional_metadata={"pool_id": pool_id}, consent=False,
@@ -258,22 +265,22 @@ FIXTURES: list[Case] = [
         logic="DMP",
         label="P-00DEV01 tier-1 (same pool)",
         expected="pair",
-        tumor=_dmp("P-100001-T01-IM6", "P-00DEV01", "POOL-A1", "TUMOR"),
-        normals=[_dmp("P-100001-N01-IM6", "P-00DEV01", "POOL-A1", "NORMAL")]),
+        tumor=_dmp("P-100001-T01-IM6", "P-00DEV01", "POOL-A1", "TUMOR", patient_cmo="C-DEV030"),
+        normals=[_dmp("P-100001-N01-IM6", "P-00DEV01", "POOL-A1", "NORMAL", patient_cmo="C-DEV030")]),
     Case(
         logic="DMP",
         label="P-00DEV02 tier-2 (diff pool, same IM_ver)",
         expected="pair",
-        tumor=_dmp("P-100002-T01-IM6", "P-00DEV02", "POOL-B2", "TUMOR"),
-        normals=[_dmp("P-100002-N01-IM6", "P-00DEV02", "POOL-C2", "NORMAL")]),
+        tumor=_dmp("P-100002-T01-IM6", "P-00DEV02", "POOL-B2", "TUMOR", patient_cmo="C-DEV031"),
+        normals=[_dmp("P-100002-N01-IM6", "P-00DEV02", "POOL-C2", "NORMAL", patient_cmo="C-DEV031")]),
     Case(
         logic="DMP",
         label="P-00DEV03 fan-out (two same-pool normals)",
         expected="fanout(2)",
-        tumor=_dmp("P-100003-T01-IM6", "P-00DEV03", "POOL-D3", "TUMOR"),
+        tumor=_dmp("P-100003-T01-IM6", "P-00DEV03", "POOL-D3", "TUMOR", patient_cmo="C-DEV032"),
         normals=[
-            _dmp("P-100003-N01-IM6", "P-00DEV03", "POOL-D3", "NORMAL"),
-            _dmp("P-100003-N02-IM6", "P-00DEV03", "POOL-D3", "NORMAL"),
+            _dmp("P-100003-N01-IM6", "P-00DEV03", "POOL-D3", "NORMAL", patient_cmo="C-DEV032"),
+            _dmp("P-100003-N02-IM6", "P-00DEV03", "POOL-D3", "NORMAL", patient_cmo="C-DEV032"),
         ]),
 
     # ---- HARMONY: one DMP-shaped pair triggered under the HARMONY logic.
@@ -281,8 +288,8 @@ FIXTURES: list[Case] = [
         logic="HARMONY",
         label="P-00HARM01 harmony pair",
         expected="pair",
-        tumor=_dmp("P-100010-T01-IM6", "P-00HARM01", "POOL-H1", "TUMOR"),
-        normals=[_dmp("P-100010-N01-IM6", "P-00HARM01", "POOL-H1", "NORMAL")]),
+        tumor=_dmp("P-100010-T01-IM6", "P-00HARM01", "POOL-H1", "TUMOR", patient_cmo="C-DEV040"),
+        normals=[_dmp("P-100010-N01-IM6", "P-00HARM01", "POOL-H1", "NORMAL", patient_cmo="C-DEV040")]),
 ]
 
 
