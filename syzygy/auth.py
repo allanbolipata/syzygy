@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from syzygy.database import get_db, settings
-from syzygy.models import AllowedUser
+from syzygy.models import AllowedUser, PairingLogic
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +54,18 @@ def dev_auth_enabled() -> bool:
     return bool(settings.dev_auth_token)
 
 
-def _dev_user() -> dict:
+def _dev_user(db: Session) -> dict:
     """Identity for the dev-only local admin. No Keycloak token and no
     allowed_users row are involved; this path only exists when
-    ``dev_auth_token`` is set."""
+    ``dev_auth_token`` is set. The synthetic local identity is an admin:
+    full logic set + admin, gating enabled or not."""
     return {
         "sub": "dev-admin",
         "email": settings.dev_auth_email,
         "preferred_username": "dev-admin",
         "display_name": "Dev Admin (local)",
+        "allowed_logics": _known_logic_names(db),
+        "is_logic_admin": True,
     }
 
 
@@ -125,7 +128,10 @@ def _refetch_jwks(realm: str) -> bool:
 def verify_token(token: str) -> dict:
     """Decode a Keycloak JWT and return its identity claims.
 
-    Returns {"sub", "email", "preferred_username"} or raises TokenError.
+    Returns {"sub", "email", "preferred_username"}, plus the configured
+    logic-entitlement claims (``settings.logic_claim_name`` /
+    ``settings.logic_admin_claim``) when the token carries them — tokens
+    without those claims keep the three-key shape. Raises TokenError.
     """
     try:
         kid = jwt.get_unverified_header(token).get("kid")
@@ -166,11 +172,18 @@ def verify_token(token: str) -> dict:
     except jwt.PyJWTError as exc:
         raise TokenError(f"token verification failed: {exc}") from exc
 
-    return {
+    user = {
         "sub": claims.get("sub"),
         "email": claims.get("email"),
         "preferred_username": claims.get("preferred_username"),
     }
+    # Pass the entitlement claims through, BY THE CONFIGURED NAMES, so
+    # _user_from_claims can derive allowed_logics / is_logic_admin.
+    # Tokens without them are left untouched (the three-key shape).
+    for claim_name in (settings.logic_claim_name, settings.logic_admin_claim):
+        if claim_name in claims:
+            user[claim_name] = claims[claim_name]
+    return user
 
 
 def _extract_token(request: Request) -> Optional[str]:
@@ -245,6 +258,50 @@ def _set_session_cookies(
         )
 
 
+def _known_logic_names(db: Session) -> Set[str]:
+    """All pairing-logic names in the database — the full entitlement
+    set (every logic a principal can be granted)."""
+    return set(db.scalars(select(PairingLogic.name)).all())
+
+
+def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
+    """(allowed_logics, is_logic_admin) for a verified Keycloak token.
+
+    Claim names come from settings (``logic_claim_name`` /
+    ``logic_admin_claim``) so adapting to the org's Keycloak scheme is a
+    .env change, not a code change:
+    - gating disabled: the FULL set + admin — behavior is exactly
+      today's and /auth/me needs no flag knowledge;
+    - gating enabled (fail-closed): allowed logics are the configured
+      list claim intersected with the known logic names — an absent
+      claim yields an EMPTY set, and names the app does not know are
+      ignored with a warning. The admin flag is the configured boolean
+      claim.
+    """
+    known = _known_logic_names(db)
+    if not settings.logic_gating_enabled:
+        return known, True
+    raw = claims.get(settings.logic_claim_name)
+    if raw is None:
+        raw = []
+    elif not isinstance(raw, list):
+        # A non-list (e.g. a bare string) degrades to a single-element
+        # list rather than failing open.
+        raw = [raw]
+    allowed: Set[str] = set()
+    for name in raw:
+        if name in known:
+            allowed.add(name)
+        else:
+            logger.warning(
+                "auth: ignoring unknown pairing logic %r from %r claim",
+                name,
+                settings.logic_claim_name,
+            )
+    is_admin = bool(claims.get(settings.logic_admin_claim))
+    return allowed, is_admin
+
+
 def _user_from_claims(
     claims: dict, db: Session
 ) -> Tuple[str, Optional[dict], Optional[dict]]:
@@ -259,16 +316,16 @@ def _user_from_claims(
     )
     if user is None or not user.active:
         return ("forbidden", None, claims)
-    return (
-        "ok",
-        {
-            "sub": claims.get("sub"),
-            "email": claims.get("email"),
-            "preferred_username": claims.get("preferred_username"),
-            "display_name": user.display_name,
-        },
-        claims,
+    principal = {
+        "sub": claims.get("sub"),
+        "email": claims.get("email"),
+        "preferred_username": claims.get("preferred_username"),
+        "display_name": user.display_name,
+    }
+    principal["allowed_logics"], principal["is_logic_admin"] = _logic_entitlements(
+        claims, db
     )
+    return ("ok", principal, claims)
 
 
 def _attempt_silent_refresh(
@@ -362,7 +419,9 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], O
                         caller can explain why)
     - "ok"              valid token for an active allowed user; user is
                         {"sub", "email", "preferred_username",
-                         "display_name" (from the AllowedUser row)}
+                         "display_name" (from the AllowedUser row),
+                         "allowed_logics" (set[str]),
+                         "is_logic_admin" (bool)}
     """
     token = _extract_token(request)
     if token is None:
@@ -377,7 +436,7 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], O
             token.encode("utf-8"), settings.dev_auth_token.encode("utf-8")
         )
     ):
-        return ("ok", _dev_user(), None)
+        return ("ok", _dev_user(db), None)
     try:
         claims = verify_token(token)
     except TokenError as exc:
