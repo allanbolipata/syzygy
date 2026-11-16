@@ -1,4 +1,5 @@
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 import syzygy.database as database
 import syzygy.pairing_service as pairing_service
+import syzygy.routers.pairings as pairings
 from syzygy.database import Base
 from syzygy.models import BaitSet, PairingLogic, PairingTable, Sample
 from syzygy.pairing_service import (
@@ -20,6 +22,7 @@ from syzygy.pairing_service import (
     evaluate_logic,
     resolve_pairing_logic,
     trigger_dmp_pairing,
+    trigger_harmony_pairing,
     trigger_pairing,
     trigger_pairing_for_normal,
     trigger_pairing_for_unpaired_tumors,
@@ -3103,16 +3106,172 @@ def test_manual_trigger_endpoint_refuses_dmp_logic(db):
     ) is None
 
 
-def test_trigger_dmp_endpoint_pairs(db):
+def test_trigger_dmp_endpoint_pairs(db, pg_engine, monkeypatch):
     _dmp_logic(db)
     tumor = _dmp_sample(db, "P-0000008-T1-X1", "P-0000008", TumorOrNormal.TUMOR.value)
     normal = _dmp_sample(db, "P-0000008-N1-X1", "P-0000008")
 
-    result = trigger_dmp_pairing_endpoint(db=db)
+    # The endpoint now returns a job id immediately and runs the pass on a
+    # worker thread that opens its own session via SessionLocal — point it
+    # at the test engine, then poll the status endpoint to the final state.
+    monkeypatch.setattr(
+        pairings, "SessionLocal", sessionmaker(bind=pg_engine, expire_on_commit=False)
+    )
+    trigger = trigger_dmp_pairing_endpoint(db=db)
+    assert trigger["pairing_logic"] == "DMP"
+    assert trigger["status"] == "pending"
 
-    assert result["paired"] == 1
-    (pairing,) = result["new_pairings"]
+    deadline = time.monotonic() + 10.0
+    status = None
+    while True:
+        status = pairings.pairing_job_status_endpoint(trigger["job_id"])
+        if status["status"] in ("completed", "failed"):
+            break
+        assert time.monotonic() < deadline, f"job not terminal: {status}"
+        time.sleep(0.02)
+    assert status["status"] == "completed", status
+    assert status["scanned"] == 1
+    assert status["paired"] == 1
+    assert status["unpaired"] == 0
+
+    db.expire_all()
+    rows = db.scalars(
+        select(PairingTable).where(
+            PairingTable.pairing_logic_id == db.scalar(
+                select(PairingLogic.id).where(PairingLogic.name == "DMP")
+            )
+        )
+    ).all()
+    (pairing,) = rows
     assert (pairing.tumor_id, pairing.normal_id) == (tumor.id, normal.id)
+    assert pairing.trigger_type == "automatic"
+
+
+# ---------------------------------------------------------------------------
+# Bulk-pass batched commits (DMP perf 2/4): commit every N tumors instead of
+# per pairing; a mid-pass failure rolls back only the unfinished batch.
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_dmp_batched_commits_idempotent_across_batches(db):
+    """A small batch_size forces several commits in one pass; a re-run must
+    still skip every already-paired tumor (idempotency across committed
+    batches) and produce no duplicate rows."""
+    _dmp_logic(db)
+    # 5 DMP tumors, each with its own same-patient normal -> all 5 pair.
+    for i in range(1, 6):
+        _dmp_sample(db, f"P-{i:07d}-T1-X1", f"P-{i:07d}", TumorOrNormal.TUMOR.value)
+        _dmp_sample(db, f"P-{i:07d}-N1-X1", f"P-{i:07d}")
+
+    first = trigger_dmp_pairing(db, batch_size=2)
+    assert first["scanned"] == 5
+    assert first["paired"] == 5
+    assert first["already_paired"] == 0
+    assert first["unpaired"] == 0
+    assert len(first["new_pairings"]) == 5
+
+    db.expire_all()
+    # All 5 rows are durable (committed across batches of 2/2/1).
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.latest.is_(True)
+            )
+        )
+        == 5
+    )
+
+    second = trigger_dmp_pairing(db, batch_size=2)
+    assert second["scanned"] == 5
+    assert second["already_paired"] == 5
+    assert second["paired"] == 0
+    assert second["new_pairings"] == []
+
+    db.expire_all()
+    # No duplicates: still exactly 5 rows.
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.latest.is_(True)
+            )
+        )
+        == 5
+    )
+
+
+def test_trigger_dmp_mid_pass_failure_rolls_back_only_unfinished_batch(
+    db, monkeypatch
+):
+    """A mid-pass failure rolls back only the open (unfinished) batch: the
+    pairings from already-committed batches persist, and the pairing created
+    after the last commit (the unfinished batch) is rolled back."""
+    _dmp_logic(db)
+    # 4 DMP tumors, each with its own same-patient normal -> all 4 would pair.
+    for i in range(1, 5):
+        _dmp_sample(db, f"P-{i:07d}-T1-X1", f"P-{i:07d}", TumorOrNormal.TUMOR.value)
+        _dmp_sample(db, f"P-{i:07d}-N1-X1", f"P-{i:07d}")
+
+    real_trigger = pairing_service.trigger_pairing
+    calls = {"n": 0}
+
+    def fake_trigger(db_session, tumor, logic, trigger_type, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 4:
+            raise RuntimeError("simulated mid-pass failure")
+        return real_trigger(db_session, tumor, logic, trigger_type, *args, **kwargs)
+
+    monkeypatch.setattr(pairing_service, "trigger_pairing", fake_trigger)
+
+    with pytest.raises(RuntimeError, match="simulated mid-pass failure"):
+        trigger_dmp_pairing(db, batch_size=2)
+
+    db.expire_all()
+    # Exactly one committed batch of 2 persists; the 3rd pairing (created
+    # after the last commit, in the unfinished batch) was rolled back and
+    # the 4th tumor never paired.
+    persisted = db.scalars(
+        select(PairingTable.tumor_id).where(PairingTable.latest.is_(True))
+    ).all()
+    assert len(persisted) == 2
+
+
+def test_trigger_harmony_batched_commits_idempotent_across_batches(db):
+    """The HARMONY bulk pass batches commits the same way as DMP: a re-run
+    skips every already-paired tumor across committed batches, no dupes."""
+    _dmp_logic(db, name="HARMONY")
+    for i in range(1, 6):
+        _dmp_sample(db, f"P-{i:07d}-T1-X1", f"P-{i:07d}", TumorOrNormal.TUMOR.value)
+        _dmp_sample(db, f"P-{i:07d}-N1-X1", f"P-{i:07d}")
+
+    first = trigger_harmony_pairing(db, batch_size=2)
+    assert first["paired"] == 5
+    assert first["already_paired"] == 0
+    assert len(first["new_pairings"]) == 5
+
+    db.expire_all()
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.latest.is_(True)
+            )
+        )
+        == 5
+    )
+
+    second = trigger_harmony_pairing(db, batch_size=2)
+    assert second["already_paired"] == 5
+    assert second["paired"] == 0
+    assert second["new_pairings"] == []
+
+    db.expire_all()
+    assert (
+        db.scalar(
+            select(func.count()).select_from(PairingTable).where(
+                PairingTable.latest.is_(True)
+            )
+        )
+        == 5
+    )
 
 
 # ---------------------------------------------------------------------------
