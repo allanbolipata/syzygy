@@ -16,6 +16,11 @@ strategy's matching keys differ, and any key mismatches are recorded in the
 pairing's ``mismatched_keys``. Re-running the same file is idempotent: a
 tumor already pinned to the same normal keeps its pairing untouched.
 
+When a tumor has more than one candidate normal that passes the strategy's
+matching keys, the curated pair from the file is still pinned, and the
+multiplicity is surfaced as a ``MULTI`` line (and in the ``--log`` file)
+listing the candidate normals and which one the cascade would have picked.
+
 The file's NORMAL_ID/TUMOR_ID columns are cmoSampleNames; the API's
 normal_id/tumor_id fields are sample UUIDs — this script is the mapping
 layer between the two.
@@ -133,6 +138,40 @@ def resolve_sample(
         )
     cache[key] = exact[0]["id"]
     return cache[key]
+
+
+def candidate_normal_summary(
+    client: "httpx.Client", base: str, tumor_id: str, logic: str
+) -> tuple[int, list[str], Optional[str]]:
+    """Summarize a tumor's candidate normals via possible-matches.
+
+    Returns ``(matched_count, matched_names, cascade_pick)``: how many
+    candidate normals pass every matching key of the strategy (the
+    currently-paired normal counts too when it carries no
+    ``mismatched_keys``), their display names (page-bounded), and which
+    candidate the strategy's cascade would pick. Informational only —
+    a curated pair from the pairing file is pinned regardless; callers
+    must not let a failure here block the import.
+    """
+    resp = client.get(
+        f"{base}/v1/sample/{tumor_id}/possible-matches",
+        params={"pairing_logic_name": logic},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    names: list[str] = []
+    cascade_pick: Optional[str] = None
+    count = int(data.get("other_matches_matched", 0))
+    current = data.get("current_match") or {}
+    if current and not current.get("mismatched_keys"):
+        count += 1
+        names.append(current["sample"]["cmo_sample_name"])
+    for cand in data.get("other_matches", []):
+        if cand.get("matched"):
+            names.append(cand["sample"]["cmo_sample_name"])
+            if cand.get("would_be_selected"):
+                cascade_pick = cand["sample"]["cmo_sample_name"]
+    return count, names, cascade_pick
 
 
 def extract_beagle_run_mode_rules(path: str) -> dict[str, str]:
@@ -341,6 +380,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cache: dict[tuple[str, str], str] = {}
     pinned = 0
     mismatched = 0
+    multi = 0
     failed = 0
     log_rows: list[tuple[str, str, str, str]] = []
 
@@ -361,8 +401,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 failed += 1
                 continue
 
+            multi_note = None
+            try:
+                n_matched, names, pick = candidate_normal_summary(
+                    client, base, tumor_id, args.logic)
+                if n_matched > 1:
+                    if len(names) < n_matched:
+                        shown = f"{', '.join(names)} (+{n_matched - len(names)} more)"
+                    else:
+                        shown = ", ".join(names)
+                    extra = f"; cascade would pick {pick}" if pick else ""
+                    multi_note = (f"tumor has {n_matched} matching candidate "
+                                  f"normals ({shown}{extra}); pinning curated "
+                                  f"{normal_name}")
+                    print(f"MULTI {label}: {multi_note}")
+                    multi += 1
+            except httpx.HTTPError:
+                pass  # informational only — never block the curated pin
+
             if args.dry_run:
-                print(f"OK    {label}: resolves (dry run)")
+                note = f" — {multi_note}" if multi_note else ""
+                print(f"OK    {label}: resolves (dry run){note}")
+                if multi_note:
+                    log_rows.append(("MULTI", normal_name, tumor_name, multi_note))
                 pinned += 1
                 continue
 
@@ -389,9 +450,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             if keys:
                 mismatched += 1
                 detail = "; ".join(keys)
+                if multi_note:
+                    detail = f"{detail} | {multi_note}"
                 print(f"WARN  {label}: paired under {pairing['pairing_logic']} "
                       f"with mismatched keys: {detail}")
                 log_rows.append(("MISMATCH", normal_name, tumor_name, detail))
+            elif multi_note:
+                print(f"OK    {label}: paired under {pairing['pairing_logic']} "
+                      f"— {multi_note}")
+                log_rows.append(("MULTI", normal_name, tumor_name, multi_note))
+                pinned += 1
             else:
                 pinned += 1
                 print(f"OK    {label}: paired under {pairing['pairing_logic']}")
@@ -409,7 +477,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     total = len(rows)
     print(
         f"\n{args.logic}: {pinned} pinned, {mismatched} pinned-with-mismatch, "
-        f"{failed} failed (of {total} rows)"
+        f"{multi} with multiple candidate normals, {failed} failed "
+        f"(of {total} rows)"
         + (" [dry run]" if args.dry_run else "")
     )
     return 1 if failed else 0
