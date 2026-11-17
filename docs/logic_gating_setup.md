@@ -94,7 +94,10 @@ any Keycloak version):
    | Name | `syzygy logics` |
    | Token claim name | `syzygy_logics` |
    | **Full group path** | **OFF** |
-   | Include in **access token** | **ON** |
+   | **Add to access token** | **ON** |
+
+   (Keycloak ≤ 23 labeled this toggle *Include in access token*; 26 uses
+   *Add to access token* / *Add to ID token* / *Add to userinfo*.)
 
    → a user in `ARGOS` + `DMP` gets `"syzygy_logics": ["ARGOS", "DMP"]`;
    a user in no group gets `[]`.
@@ -114,14 +117,15 @@ any Keycloak version):
    | Token claim name | `syzygy_admin` |
    | User attribute | `syzygy_admin` |
    | Claim value type | **Boolean** |
+   | **Add to access token** | **ON** |
 
    → logic admins get `"syzygy_admin": true`; everyone else gets no claim.
 
-   > **No "Include in access token" toggle here.** In Keycloak 26 the *User
-   > Attribute* mapper form dropped that switch — mappers on the client's
-   > dedicated scope land in the access token by default. (The *Group
-   > Membership* form still shows the toggle; keep it ON there.) Verify the
-   > claim actually lands via the raw-token decode below.
+   > **Toggle label.** In Keycloak 26 the switches are labeled *Add to
+   > access token* / *Add to ID token* / *Add to userinfo* (≤ 23 called it
+   > *Include in access token*). If your *User Attribute* form shows no
+   > access-token switch, that is fine — dedicated-scope mappers land in the
+   > access token by default; verify the claim via the raw-token decode below.
 
 Notes:
 
@@ -237,7 +241,8 @@ That needs an **OpenID Connect Script (JavaScript) protocol mapper**:
   $claim = admin;
   ```
 
-  Both mappers: *Include in access token* ON. Adapt the regex / group
+  Both mappers: *Add to access token* ON (Keycloak ≤ 23: *Include in
+  access token*). Adapt the regex / group
   paths to the org's layout, and keep `LOGIC_CLAIM_NAME` /
   `LOGIC_ADMIN_CLAIM` pointing at the resulting claims.
 
