@@ -187,47 +187,48 @@ class TriggerAllRead(BaseModel):
     new_pairings: list[PairingRead]
 
 
-class DmpTriggerRead(BaseModel):
-    """Summary of a POST /pairing/trigger-dmp run.
+class PairingJobTriggerRead(BaseModel):
+    """POST /pairing/trigger-dmp | /trigger-harmony response.
 
-    ``scanned`` counts the DMP tumor samples processed; the four outcome
-    counts sum to it. ``missing_patient__dmp`` are DMP tumors without a
-    patient identifier that the DMP strategy cannot match.
-    ``new_pairings`` lists the pairings created by this run.
+    The bulk pass runs on a background worker thread (hours of work on
+    staging-scale data — it can no longer ride the HTTP request). The
+    response returns immediately with the job id; poll
+    ``GET /pairing/trigger-status/{job_id}`` for progress and the final
+    state. ``status`` is ``"pending"`` here: the worker flips it to
+    ``"running"`` the moment the pass starts.
     """
 
-    model_config = ConfigDict(from_attributes=True)
+    job_id: str
+    status: str
+    pairing_logic: str
 
+
+class PairingJobStatusRead(BaseModel):
+    """GET /pairing/trigger-status/{job_id} response.
+
+    ``status``: ``pending`` | ``running`` | ``completed`` | ``failed``.
+    While running, ``scanned``/``total`` track progress and ``paired`` /
+    ``unpaired`` / ``already_paired`` / ``missing_patient__dmp`` are the
+    outcomes so far; in a final state the counters are the pass's totals.
+    ``needs_follow_up`` (completed): DMP tumors were ingested while the
+    pass was running and are still unpaired after the end-of-pass
+    re-check — trigger another pass once the import settles (idempotent).
+    ``error`` carries the failure reason for ``failed`` jobs.
+    """
+
+    job_id: str
+    status: str
     pairing_logic: str
     scanned: int
+    total: int
     already_paired: int
     missing_patient__dmp: int
     paired: int
     unpaired: int
-    new_pairings: list[PairingRead]
-
-
-class HarmonyTriggerRead(BaseModel):
-    """Summary of a POST /pairing/trigger-harmony run.
-
-    HARMONY is its own pairing logic and pairing space (separate from the
-    DMP logic, which may drift independently); for now it reuses the DMP
-    strategy (DMP-group only, same ``patient__dmp`` and gene panel).
-    ``scanned`` counts the DMP tumor samples processed; the four outcome
-    counts sum to it. ``missing_patient__dmp`` are DMP tumors without a
-    patient identifier that the strategy cannot match.
-    ``new_pairings`` lists the HARMONY-logic pairings created by this run.
-    """
-
-    model_config = ConfigDict(from_attributes=True)
-
-    pairing_logic: str
-    scanned: int
-    already_paired: int
-    missing_patient__dmp: int
-    paired: int
-    unpaired: int
-    new_pairings: list[PairingRead]
+    needs_follow_up: bool
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+    error: Optional[str]
 
 
 class HarmonyRow(BaseModel):

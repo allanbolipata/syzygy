@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from itertools import islice
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 import csv
 import io
 import threading
@@ -62,12 +62,12 @@ from syzygy.pairing_strategies import get_pairing_strategy, strategies
 from syzygy.schemas import (
     DmpReportStatsRead,
     DmpSummaryRead,
-    DmpTriggerRead,
     DmpWarningsRead,
     EvaluateRead,
     HarmonyFrameRead,
     HarmonyRow,
-    HarmonyTriggerRead,
+    PairingJobStatusRead,
+    PairingJobTriggerRead,
     PairingRead,
     PairingReportRead,
     PairingReportRowRead,
@@ -1223,16 +1223,14 @@ _active_pairing_passes: set = set()
 _active_pairing_passes_lock = threading.Lock()
 
 
-@contextmanager
-def _pairing_pass(db: Session, logic: Optional[PairingLogic], label: str):
-    """Claim one bulk pairing pass.
+def _claim_pairing_pass(logic: Optional[PairingLogic], label: str) -> None:
+    """Claim one bulk pairing pass; raise 409 if it is already held.
 
     ``409`` when a pass for this logic is already running: the first pass keeps
     running even after the browser gives up, so a second click only adds work
     and another pooled connection. ``logic=None`` (the unscoped bulk backfill,
     or a trigger naming a logic row that does not exist) claims a shared key so
-    two bulk backfills cannot stack either. The claim is released on the way out
-    even if the pass raises.
+    two bulk backfills cannot stack either.
     """
     key = logic.id if logic is not None else None
     with _active_pairing_passes_lock:
@@ -1246,11 +1244,160 @@ def _pairing_pass(db: Session, logic: Optional[PairingLogic], label: str):
                 ),
             )
         _active_pairing_passes.add(key)
+
+
+def _release_pairing_pass_key(key) -> None:
+    """Release one held pass claim (no-op if the claim is already gone)."""
+    with _active_pairing_passes_lock:
+        _active_pairing_passes.discard(key)
+
+
+def _release_pairing_pass(logic: Optional[PairingLogic]) -> None:
+    _release_pairing_pass_key(logic.id if logic is not None else None)
+
+
+@contextmanager
+def _pairing_pass(db: Session, logic: Optional[PairingLogic], label: str):
+    """Run one SYNCHRONOUS bulk pairing pass under its claim.
+
+    The claim is released on the way out even if the pass raises. (The
+    background job triggers do not use this: they claim in the request and
+    release in the worker thread — see ``_run_pairing_job`` below.)
+    """
+    _claim_pairing_pass(logic, label)
     try:
         yield
     finally:
-        with _active_pairing_passes_lock:
-            _active_pairing_passes.discard(key)
+        _release_pairing_pass(logic)
+
+
+# ---------------------------------------------------------------------------
+# Background bulk pairing jobs (POST /pairing/trigger-dmp, /trigger-harmony)
+# ---------------------------------------------------------------------------
+# The bulk pass takes hours on staging-scale data, so the trigger endpoints
+# return a job id immediately and run the pass on a daemon worker thread.
+# The pass claim taken in the trigger request is held until the worker's
+# finally block releases it — that is what keeps a second trigger of the same
+# logic 409-ing while the job runs. The registry is the mutual-exclusion
+# primitive and, like it, per-process (a multi-worker deployment would need
+# a cross-process one); a process restart also loses the job records, which
+# is acceptable because the restart kills the worker thread and the pass
+# itself.
+_pairing_jobs: dict = {}
+_pairing_jobs_lock = threading.Lock()
+
+#: Keep the registry bounded: finished jobs are evicted oldest-first once the
+#: table grows past this many entries (job ids are unguessable UUIDs, and the
+#: counters of a finished job are also in the app logs).
+_MAX_PAIRING_JOBS = 1000
+
+
+def _register_pairing_job(pairing_logic: str) -> str:
+    """Create a pending job record and return its id."""
+    job_id = uuid4().hex
+    with _pairing_jobs_lock:
+        _pairing_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "pairing_logic": pairing_logic,
+            "scanned": 0,
+            "total": 0,
+            "already_paired": 0,
+            "missing_patient__dmp": 0,
+            "paired": 0,
+            "unpaired": 0,
+            "needs_follow_up": False,
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+        }
+        if len(_pairing_jobs) > _MAX_PAIRING_JOBS:
+            finished = sorted(
+                (
+                    (jid, j)
+                    for jid, j in _pairing_jobs.items()
+                    if j["status"] in ("completed", "failed")
+                ),
+                key=lambda p: (
+                    p[1]["finished_at"].timestamp()
+                    if p[1]["finished_at"]
+                    else float("-inf"),
+                    p[0],
+                ),
+            )
+            excess = len(_pairing_jobs) - _MAX_PAIRING_JOBS
+            for jid, _ in finished[:excess]:
+                _pairing_jobs.pop(jid, None)
+    return job_id
+
+
+def _drop_pairing_job(job_id: str) -> None:
+    with _pairing_jobs_lock:
+        _pairing_jobs.pop(job_id, None)
+
+
+def _job_progress_cb(job_id: str):
+    """The progress callback handed to the pass: publishes the counter
+    snapshot to this job's record (called once per scanned tumor — the pass's
+    hot loop — so the update is a dict merge under a lock, nothing more)."""
+
+    def cb(counts: dict) -> None:
+        with _pairing_jobs_lock:
+            job = _pairing_jobs.get(job_id)
+            if job is not None:
+                job.update(counts)
+
+    return cb
+
+
+def _finish_failed_job(job_id: str, error: str) -> None:
+    with _pairing_jobs_lock:
+        job = _pairing_jobs.get(job_id)
+        if job is not None:
+            job["status"] = "failed"
+            job["error"] = error
+            job["finished_at"] = datetime.now(timezone.utc)
+
+
+def _run_pairing_job(job_id: str, pass_key, run_fn) -> None:
+    """Worker-thread body: run one bulk pairing pass with its OWN session,
+    publish the counters to the job record, and release the pass claim when
+    the pass is done — whatever the outcome.
+
+    The session is created here (not passed in): the trigger request's session
+    is already closed, and a background thread must not ride a request-scoped
+    session. ``run_fn`` is the module-level ``trigger_dmp_pairing`` /
+    ``trigger_harmony_pairing`` (read from the module globals at call time so
+    tests can monkeypatch it).
+    """
+    db = SessionLocal()
+    try:
+        with _pairing_jobs_lock:
+            job = _pairing_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "running"
+                job["started_at"] = datetime.now(timezone.utc)
+        result = run_fn(db, progress=_job_progress_cb(job_id))
+        _invalidate_dmp_report_stats(db)
+        with _pairing_jobs_lock:
+            job = _pairing_jobs.get(job_id)
+            if job is not None:
+                job["scanned"] = result["scanned"]
+                job["total"] = result.get("total", result["scanned"])
+                job["already_paired"] = result["already_paired"]
+                job["missing_patient__dmp"] = result["missing_patient__dmp"]
+                job["paired"] = result["paired"]
+                job["unpaired"] = result["unpaired"]
+                job["needs_follow_up"] = result.get("needs_follow_up", False)
+                job["status"] = "completed"
+                job["finished_at"] = datetime.now(timezone.utc)
+    except HTTPException as exc:
+        _finish_failed_job(job_id, str(exc.detail))
+    except Exception as exc:  # noqa: BLE001 — the job must reach a terminal state
+        _finish_failed_job(job_id, f"{type(exc).__name__}: {exc}")
+    finally:
+        db.close()
+        _release_pairing_pass_key(pass_key)
 
 
 def _dmp_report_stats_cached(db: Session, logic: PairingLogic):
@@ -1543,23 +1690,78 @@ def trigger_all_pairings_endpoint(
         return result
 
 
-@router.post("/trigger-dmp", response_model=DmpTriggerRead)
+@router.post("/trigger-dmp", response_model=PairingJobTriggerRead)
 def trigger_dmp_pairing_endpoint(
     db: Session = Depends(get_db),
     logic_admin: None = Depends(require_logic_admin),
 ) -> dict:
-    """Run automatic DMP pairing under the DMP pairing logic.
+    """Trigger a bulk DMP pairing pass in the background.
+
+    The pass runs on a worker thread — it takes hours on staging-scale
+    data, so it can no longer ride the HTTP request — and this endpoint
+    returns the job id in well under a second. Poll
+    ``GET /pairing/trigger-status/{job_id}`` for progress
+    (``scanned``/``total``, ``paired``, ``unpaired``) and the final
+    state. The tumor list is (re-)scanned at job start — not when this
+    request arrives — so an in-flight import is picked up; the pass
+    re-checks for mid-pass ingests at its end and reports
+    ``needs_follow_up`` when more tumors arrived while it was running.
 
     Every unpaired DMP tumor is paired with its DMP normal (same
-    ``patient__dmp`` and gene panel) via the DMP strategy. Existing
-    pairings are never modified or replaced. DMP tumors without a
-    ``patient__dmp`` value cannot be matched and are reported in
-    ``missing_patient__dmp``.
+    ``patient__dmp`` and gene panel) via the DMP strategy; existing
+    pairings are never modified or replaced, and DMP tumors without a
+    resolvable ``patient__dmp`` value cannot be matched (reported in
+    ``missing_patient__dmp`` on the status endpoint).
+
+    A second trigger for the DMP logic while the pass is running returns
+    409 (the ``_active_pairing_passes`` overlap guard — per-process).
     """
-    with _pairing_pass(db, find_logic_by_name(db, DMP_LOGIC_NAME), "DMP"):
-        result = trigger_dmp_pairing(db)
-        _invalidate_dmp_report_stats(db)
-        return result
+    logic = find_logic_by_name(db, DMP_LOGIC_NAME)
+    if logic is None or not logic.active:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No active pairing logic named '{DMP_LOGIC_NAME}': the DMP "
+                "pairing trigger has nothing to run against."
+            ),
+        )
+    _claim_pairing_pass(logic, "DMP")
+    job_id = _register_pairing_job(logic.name)
+    try:
+        threading.Thread(
+            target=_run_pairing_job,
+            args=(job_id, logic.id, trigger_dmp_pairing),
+            name=f"pairing-job-dmp-{job_id[:8]}",
+            daemon=True,
+        ).start()
+    except Exception:
+        # The thread never started: undo the claim and the job record so
+        # the next trigger can proceed.
+        _drop_pairing_job(job_id)
+        _release_pairing_pass(logic)
+        raise
+    return {"job_id": job_id, "status": "pending", "pairing_logic": logic.name}
+
+
+@router.get("/trigger-status/{job_id}", response_model=PairingJobStatusRead)
+def pairing_job_status_endpoint(job_id: str) -> dict:
+    """Progress and final state of a background pairing job (see
+    ``POST /pairing/trigger-dmp`` / ``/trigger-harmony``).
+
+    ``status``: pending | running | completed | failed. While running,
+    ``scanned``/``total`` track progress and ``paired``/``unpaired`` are
+    the outcomes so far; in a final state the counters are the pass's
+    totals. Job records are per-process: a 404 means the id is unknown
+    (or the process restarted since the job ran).
+    """
+    with _pairing_jobs_lock:
+        job = _pairing_jobs.get(job_id)
+        snapshot = dict(job) if job is not None else None
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404, detail=f"No pairing job with id '{job_id}'"
+        )
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -1985,25 +2187,47 @@ def get_harmony_pairings(
     )
 
 
-@router.post("/trigger-harmony", response_model=HarmonyTriggerRead)
+@router.post("/trigger-harmony", response_model=PairingJobTriggerRead)
 def trigger_harmony_pairing_endpoint(
     db: Session = Depends(get_db),
     logic_admin: None = Depends(require_logic_admin),
 ) -> dict:
-    """Run automatic HARMONY pairing under the HARMONY pairing logic.
+    """Trigger a bulk HARMONY pairing pass in the background.
 
-    HARMONY is its own pairing logic and pairing space, separate from the
-    DMP logic (which may drift independently). For now it reuses the DMP
-    strategy (DMP-group only, same ``patient__dmp`` and gene panel): every
-    unpaired DMP tumor is paired with its best DMP normal, recorded under
-    the HARMONY logic id. Existing pairings are never modified or replaced.
-    DMP tumors without a ``patient__dmp`` value cannot be matched and are
-    reported in ``missing_patient__dmp``.
+    Same contract as ``POST /pairing/trigger-dmp`` — job id immediately,
+    progress via ``GET /pairing/trigger-status/{job_id}``, 409 while a
+    HARMONY pass is running — under the HARMONY logic and pairing space
+    (separate from the DMP logic, which may drift independently). For
+    now it reuses the DMP strategy (DMP-group only, same ``patient__dmp``
+    and gene panel): every unpaired DMP tumor is paired with its best
+    DMP normal, recorded under the HARMONY logic id; existing pairings
+    are never modified or replaced.
     """
-    with _pairing_pass(db, find_logic_by_name(db, HARMONY_LOGIC_NAME), "HARMONY"):
-        result = trigger_harmony_pairing(db)
-        _invalidate_dmp_report_stats(db)
-        return result
+    logic = find_logic_by_name(db, HARMONY_LOGIC_NAME)
+    if logic is None or not logic.active:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No active pairing logic named '{HARMONY_LOGIC_NAME}': the "
+                "HARMONY pairing trigger has nothing to run against."
+            ),
+        )
+    _claim_pairing_pass(logic, "HARMONY")
+    job_id = _register_pairing_job(logic.name)
+    try:
+        threading.Thread(
+            target=_run_pairing_job,
+            args=(job_id, logic.id, trigger_harmony_pairing),
+            name=f"pairing-job-harmony-{job_id[:8]}",
+            daemon=True,
+        ).start()
+    except Exception:
+        # The thread never started: undo the claim and the job record so
+        # the next trigger can proceed.
+        _drop_pairing_job(job_id)
+        _release_pairing_pass(logic)
+        raise
+    return {"job_id": job_id, "status": "pending", "pairing_logic": logic.name}
 
 
 @router.get("/unmatched-count/", response_model=UnmatchedCountRead)

@@ -13,6 +13,7 @@ from syzygy.database import Base, SessionLocal, THREADPOOL_TOKENS, engine
 from syzygy.models import PairingLogic
 from syzygy.pairing_strategies import seed_pooled_machines
 from syzygy.bait_sets import seed_bait_sets
+from syzygy.schema_check import find_missing_columns
 from syzygy.auth import get_current_user, router as auth_router
 from syzygy.routers.bait_sets import router as bait_sets_router
 from syzygy.routers.machines import router as machines_router
@@ -61,6 +62,16 @@ async def lifespan(app: FastAPI):
                 existing.strategy_name = strategy
         db.commit()
         seed_bait_sets(db)
+        # Loud boot-time warning for columns added by scripts/migrate_*.py
+        # that this database never had the migration run (create_all never
+        # ALTERs existing tables). Fail-loud, do not crash: the affected
+        # query paths still raise their own errors if used.
+        for table, column, script in find_missing_columns(engine):
+            logging.getLogger("syzygy.startup").warning(
+                "schema drift: %s.%s is missing — run "
+                "'python scripts/%s' against this database",
+                table, column, script,
+            )
     finally:
         db.close()
     yield

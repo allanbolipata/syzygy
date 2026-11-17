@@ -32,11 +32,22 @@ services:
     # the host-side uvicorn (issuer pitfall — the app must see the
     # browser-side Keycloak URL, which only works from the host).
     command: ["uvicorn", "syzygy.main:app", "--host", "0.0.0.0", "--port", "8123"]
+    # The base file publishes 1337->8000, but this dev override listens on
+    # 8123 — without this mapping the host cannot reach the container app
+    # at all (podman-compose concatenates list keys across files, so this
+    # ADDS a mapping rather than replacing; a second 1337 host port would
+    # collide, hence 8123).
+    ports:
+      - "8123:8123"
     environment:
       DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
       KEYCLOAK_URL: http://localhost:8080
       # Shared secret the smile-listener sends as X-NATS-Token.
       NATS_INGEST_TOKEN: dev-syzygy-nats-token
+      # Dev-only local login (same value as .env): lets CLI scripts run
+      # via `podman exec syzygy-app python scripts/...` authenticate with
+      # a Bearer token. NEVER add this to docker-compose.yml (production).
+      DEV_AUTH_TOKEN: ${DEV_AUTH_TOKEN:-}
       # Dev CRF output dir, bind-mounted to the host (./crf_output_dev)
       # so host-side tests can assert on the generated CRF files.
       CRF_OUTPUT_DIR: /app/crf_output_dev

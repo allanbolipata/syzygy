@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -18,6 +18,15 @@ from syzygy.models import (
 from syzygy.bait_sets import classify_bait_set, resolve_bait_set_logic
 from syzygy.pairing_strategies import get_pairing_strategy, strategies
 from syzygy.schemas import TumorOrNormal
+
+
+# Bulk passes (DMP / HARMONY) commit every ``N`` newly-paired tumors
+# instead of per created pairing: each per-row commit is a per-row
+# fsync, and stacking it over ~150k tumors is one of the stacked causes
+# of the hours-long bulk pass. A plain int default (not a FastAPI
+# ``Query``) so the service stays directly callable from tests without a
+# request context.
+BULK_PASS_COMMIT_BATCH_SIZE = 500
 
 
 def _ensure_active(logic: PairingLogic) -> None:
@@ -140,6 +149,7 @@ def _create_pairing(
     mismatched_keys: Optional[list] = None,
     notes: Optional[list] = None,
     multi_pair: bool = False,
+    commit: bool = True,
 ) -> PairingTable:
     pairing = PairingTable(
         tumor_id=tumor.id,
@@ -152,6 +162,13 @@ def _create_pairing(
         multi_pair=multi_pair,
     )
     db.add(pairing)
+    if not commit:
+        # Bulk-pass deferred commit: the caller (a bulk pairing pass) owns
+        # the transaction and commits every N newly-paired tumors, rolling
+        # back the open batch on failure — so the per-row commit/fsync is
+        # off the hot path. The row's Python-side defaults (id,
+        # created_date) are already set, so no refresh is needed.
+        return pairing
     try:
         db.commit()
     except IntegrityError:
@@ -203,6 +220,7 @@ def _trigger_multi_pair(
     trigger_type: str,
     normal_id: Optional[UUID],
     strict: bool,
+    commit: bool = True,
 ) -> Optional[PairingTable]:
     """The multi_pair (DMP) branch of ``trigger_pairing``: one row per
     match, no winner (docs/dmp_reference_alignment.md, section b).
@@ -238,6 +256,7 @@ def _trigger_multi_pair(
             trigger_type=trigger_type,
             mismatched_keys=reasons or None,
             multi_pair=True,
+            commit=commit,
         )
         # Race guard: a concurrent commit may have created this pair.
         if result.normal_id != normal.id:
@@ -273,6 +292,7 @@ def _trigger_multi_pair(
                 trigger_type=trigger_type,
                 notes=selection_notes or None,
                 multi_pair=True,
+                commit=commit,
             )
         )
     return created[0]
@@ -285,6 +305,7 @@ def trigger_pairing(
     trigger_type: str,
     normal_id: Optional[UUID] = None,
     strict: bool = False,
+    commit: bool = True,
 ) -> Optional[PairingTable]:
     """Create (or return) the current pairing rows for a tumor.
 
@@ -320,7 +341,8 @@ def trigger_pairing(
     strategy = get_pairing_strategy(pairing_logic)
     if getattr(strategy, "MULTI_PAIR", False):
         return _trigger_multi_pair(
-            db, strategy, tumor, pairing_logic, trigger_type, normal_id, strict
+            db, strategy, tumor, pairing_logic, trigger_type, normal_id, strict,
+            commit=commit,
         )
 
     existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
@@ -346,6 +368,7 @@ def trigger_pairing(
             pairing_logic,
             trigger_type=trigger_type,
             mismatched_keys=reasons or None,
+            commit=commit,
         )
         # Race guard: a concurrent commit may have won the "latest" slot.
         if result.normal_id != normal.id:
@@ -372,6 +395,7 @@ def trigger_pairing(
         pairing_logic,
         trigger_type=trigger_type,
         notes=selection.notes or None,
+        commit=commit,
     )
 
 
@@ -559,34 +583,50 @@ def trigger_pairing_for_unpaired_tumors(
 #: pairings and never touches other sample groups.
 
 
-def trigger_dmp_pairing(db: Session) -> dict:
-    """Bulk automatic DMP pairing under the DMP pairing logic.
+def _run_bulk_pair_pass(
+    db: Session,
+    logic_name: str,
+    batch_size: int = BULK_PASS_COMMIT_BATCH_SIZE,
+    progress: Optional[Callable[[dict], None]] = None,
+    tumor_has_patient: Optional[Callable[[Sample], bool]] = None,
+) -> dict:
+    """The shared bulk pairing pass behind the DMP and HARMONY triggers.
 
-    Every unpaired DMP tumor is paired with every matching DMP normal
-    under the two-tier rule (same patient, same pool first; else same
-    IM_ver rescue) — one row per match, no winner. Existing pairings
-    are never modified: a tumor that already has a latest pairing under
-    the DMP logic is skipped, whatever that pairing's trigger type is.
+    Both triggers scan the full DMP tumor group; they differ only in the
+    logic row they pair under and in how "patient resolvable" is decided
+    (``tumor_has_patient``).
 
-    Returns ``{"pairing_logic", "scanned", "already_paired",
-    "missing_patient__dmp", "paired", "unpaired", "new_pairings"}`` where
-    the four outcome counts sum to ``scanned``. DMP tumors with no
-    resolvable patient (neither ``patient__dmp`` nor a ``P-`` id in the
-    sample name) cannot match (the strategy is patient-scoped) and are
-    reported in ``missing_patient__dmp``.
+    ``progress``, when given, is called with a counter snapshot
+    (``scanned``, ``total``, ``already_paired``, ``missing_patient__dmp``,
+    ``paired``, ``unpaired``) after every scanned tumor settles — the
+    router's background-job status endpoint hooks into it.
 
-    Raises ``HTTPException(400)`` when no active pairing logic named
-    "DMP" exists: the trigger has nothing to run against.
+    Snapshot semantics (why the trigger runs as a background job):
+    the tumor list is materialized when this function RUNS. The router
+    invokes it from the worker thread, i.e. at job start — not when the
+    trigger's HTTP request arrives — so an in-flight import is picked up
+    by the main scan instead of being silently missed (the frozen
+    request-time snapshot used to under-report ``scanned`` on staging).
+    Tumors ingested MID-pass are handled by the end-of-pass re-check:
+    a second sweep over DMP tumors created on/after ``started_at``.
+    Anything still unpaired after that re-check — e.g. a tumor whose
+    normal is still being imported — is reported in ``needs_follow_up``;
+    trigger another pass once the import settles (idempotent: already-
+    paired tumors are skipped, only the unpaired are re-attempted).
     """
-    logic = find_logic_by_name(db, DMP_LOGIC_NAME)
+    logic = find_logic_by_name(db, logic_name)
     if logic is None or not logic.active:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"No active pairing logic named '{DMP_LOGIC_NAME}': the DMP "
-                "pairing trigger has nothing to run against."
+                f"No active pairing logic named '{logic_name}': the "
+                f"{logic_name} pairing trigger has nothing to run against."
             ),
         )
+
+    # Pass start: timestamp the pass so the end-of-pass re-check can find
+    # DMP tumors ingested mid-pass (created on/after this moment).
+    started_at = utcnow()
 
     # Tumors already carrying a latest pairing under this logic — one query
     # instead of a lookup per tumor.
@@ -606,40 +646,190 @@ def trigger_dmp_pairing(db: Session) -> dict:
         )
     ).all()
 
-    scanned = already_paired = missing_patient = paired = unpaired = 0
-    new_pairings: list[PairingTable] = []
     strategy = get_pairing_strategy(logic)
     strategy_keys = getattr(strategy, "pairing_keys", None)
-    for tumor in tumors:
-        scanned += 1
-        if tumor.id in already_paired_ids:
-            already_paired += 1
-            continue
+
+    def _default_has_patient(tumor: Sample) -> bool:
         # Patient resolvable = stored patient__dmp or the reference's
         # name-parse fallback (the strategy's remapped key, spec g).
         if strategy_keys is not None:
-            has_patient = bool(strategy_keys(tumor)["patient"])
-        else:
-            has_patient = bool((tumor.patient__dmp or "").strip())
-        if not has_patient:
-            missing_patient += 1
-            continue
-        pairing = trigger_pairing(db, tumor, logic, "automatic")
-        if pairing is None:
-            unpaired += 1
-        else:
-            paired += 1
-            new_pairings.append(pairing)
+            return bool(strategy_keys(tumor)["patient"])
+        return bool((tumor.patient__dmp or "").strip())
 
+    if tumor_has_patient is None:
+        tumor_has_patient = _default_has_patient
+
+    scanned = already_paired = missing_patient = paired = unpaired = 0
+    total = len(tumors)
+    new_pairings: list[PairingTable] = []
+    since_commit = 0
+
+    def _report() -> None:
+        if progress is not None:
+            progress(
+                {
+                    "scanned": scanned,
+                    "total": total,
+                    "already_paired": already_paired,
+                    "missing_patient__dmp": missing_patient,
+                    "paired": paired,
+                    "unpaired": unpaired,
+                }
+            )
+
+    def _sweep(tumor_list, recheck_paired: bool = False) -> None:
+        nonlocal scanned, already_paired, missing_patient, paired, unpaired
+        nonlocal since_commit
+        for tumor in tumor_list:
+            scanned += 1
+            if tumor.id in already_paired_ids:
+                already_paired += 1
+                _report()
+                continue
+            # The re-check sweep re-validates pairing status per tumor:
+            # the pass-start snapshot above is stale for mid-pass ingests
+            # (a normal-side ingest may have paired the tumor while this
+            # pass was running).
+            if recheck_paired and _get_latest_pairing(db, tumor.id, logic.id) is not None:
+                already_paired += 1
+                _report()
+                continue
+            if not tumor_has_patient(tumor):
+                missing_patient += 1
+                _report()
+                continue
+            # commit=False defers the per-row commit: the pass owns the
+            # transaction and commits every ``batch_size`` newly-paired
+            # tumors, so the per-row fsync is off the hot path.
+            pairing = trigger_pairing(db, tumor, logic, "automatic", commit=False)
+            if pairing is None:
+                unpaired += 1
+            else:
+                paired += 1
+                new_pairings.append(pairing)
+                since_commit += 1
+                if since_commit >= batch_size:
+                    db.commit()
+                    since_commit = 0
+            _report()
+
+    stragglers = 0
+    # Publish the counters (with ``total``) as soon as the main list is
+    # materialized, so the status endpoint shows scanned/total from the very
+    # start of the pass — not only after the first tumor settles.
+    _report()
+    try:
+        _sweep(tumors)
+        if since_commit:
+            db.commit()
+            since_commit = 0
+        # End-of-pass re-check: DMP tumors ingested while this pass was
+        # running (created on/after ``started_at``) are not in the main
+        # list above — sweep them now, re-checking pairing status per
+        # tumor. ``main_ids`` keeps the re-check from ever re-scanning a
+        # main-list row (all of them predate ``started_at`` anyway).
+        main_ids = {t.id for t in tumors}
+        mid_pass = [
+            t
+            for t in db.scalars(
+                select(Sample).where(
+                    Sample.sample_type == "DMP",
+                    Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+                    Sample.created_date >= started_at,
+                )
+            ).all()
+            if t.id not in main_ids
+        ]
+        if mid_pass:
+            total += len(mid_pass)
+            _report()
+            _sweep(mid_pass, recheck_paired=True)
+            if since_commit:
+                db.commit()
+                since_commit = 0
+        # Final verification: DMP tumors ingested after the re-check sweep
+        # (or still unpairable mid-pass ingests, e.g. their normal is still
+        # being imported) are left to a follow-up pass — the pass cannot
+        # wait for an in-flight import to finish.
+        stragglers = db.scalar(
+            select(func.count())
+            .select_from(Sample)
+            .where(
+                Sample.sample_type == "DMP",
+                Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+                Sample.created_date >= started_at,
+                ~exists(
+                    select(PairingTable.id).where(
+                        PairingTable.tumor_id == Sample.id,
+                        PairingTable.pairing_logic_id == logic.id,
+                        PairingTable.latest.is_(True),
+                    )
+                ),
+            )
+        ) or 0
+    except Exception:
+        # A mid-pass failure rolls back only the open (unfinished) batch;
+        # pairings from already-committed batches persist.
+        db.rollback()
+        raise
+
+    _report()
     return {
         "pairing_logic": logic.name,
         "scanned": scanned,
+        "total": total,
         "already_paired": already_paired,
         "missing_patient__dmp": missing_patient,
         "paired": paired,
         "unpaired": unpaired,
         "new_pairings": new_pairings,
+        "needs_follow_up": stragglers > 0,
     }
+
+
+def trigger_dmp_pairing(
+    db: Session,
+    batch_size: int = BULK_PASS_COMMIT_BATCH_SIZE,
+    progress: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """Bulk automatic DMP pairing under the DMP pairing logic.
+
+    Every unpaired DMP tumor is paired with every matching DMP normal
+    under the two-tier rule (same patient, same pool first; else same
+    IM_ver rescue) — one row per match, no winner. Existing pairings
+    are never modified: a tumor that already has a latest pairing under
+    the DMP logic is skipped, whatever that pairing's trigger type is.
+
+    The tumor list is materialized when this function RUNS — the router
+    calls it from the background-job worker thread, i.e. at job start,
+    not when the trigger's HTTP request arrives — so an in-flight import
+    is picked up by the main scan (the old frozen request-time snapshot
+    silently missed those tumors). Tumors ingested mid-pass are re-checked
+    at the end of the pass; anything still unpaired after that is reported
+    in ``needs_follow_up`` and needs a follow-up pass (trigger again once
+    the import settles — the pass is idempotent and only re-attempts the
+    unpaired). ``progress`` (see ``_run_bulk_pair_pass``) reports the
+    counters to the status endpoint.
+
+    Returns ``{"pairing_logic", "scanned", "total", "already_paired",
+    "missing_patient__dmp", "paired", "unpaired", "new_pairings",
+    "needs_follow_up"}`` where the four outcome counts sum to ``scanned``.
+    DMP tumors with no resolvable patient (neither ``patient__dmp`` nor a
+    ``P-`` id in the sample name) cannot match (the strategy is
+    patient-scoped) and are reported in ``missing_patient__dmp``.
+
+    Pairings are committed in batches: every ``batch_size`` newly-paired
+    tumors (default ``BULK_PASS_COMMIT_BATCH_SIZE``, 500) flushes a single
+    commit instead of a per-pairing commit/fsync. A mid-pass failure rolls
+    back only the open (unfinished) batch; pairings from already-committed
+    batches persist.
+
+    Raises ``HTTPException(400)`` when no active pairing logic named
+    "DMP" exists: the trigger has nothing to run against.
+    """
+    return _run_bulk_pair_pass(
+        db, DMP_LOGIC_NAME, batch_size=batch_size, progress=progress
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +846,11 @@ def trigger_dmp_pairing(db: Session) -> dict:
 HARMONY_LOGIC_NAME = "HARMONY"
 
 
-def trigger_harmony_pairing(db: Session) -> dict:
+def trigger_harmony_pairing(
+    db: Session,
+    batch_size: int = BULK_PASS_COMMIT_BATCH_SIZE,
+    progress: Optional[Callable[[dict], None]] = None,
+) -> dict:
     """Bulk automatic HARMONY pairing under the HARMONY pairing logic.
 
     Modeled on ``trigger_dmp_pairing`` but resolves the "HARMONY" logic
@@ -669,70 +863,37 @@ def trigger_harmony_pairing(db: Session) -> dict:
     latest pairing under the HARMONY logic is skipped, whatever that
     pairing's trigger type is.
 
-    Returns ``{"pairing_logic", "scanned", "already_paired",
-    "missing_patient__dmp", "paired", "unpaired", "new_pairings"}`` where
-    the four outcome counts sum to ``scanned``. DMP tumors without
-    ``patient__dmp`` cannot match (the strategy is patient-scoped) and are
-    reported in ``missing_patient__dmp``.
+    Snapshot semantics are the same as the DMP trigger (see
+    ``_run_bulk_pair_pass``): the tumor list is materialized at job
+    start, mid-pass ingests are re-checked at the end of the pass, and
+    ``needs_follow_up`` reports anything left unpaired.
+
+    Returns ``{"pairing_logic", "scanned", "total", "already_paired",
+    "missing_patient__dmp", "paired", "unpaired", "new_pairings",
+    "needs_follow_up"}`` where the four outcome counts sum to ``scanned``.
+    DMP tumors without a stored ``patient__dmp`` cannot match (the
+    strategy is patient-scoped) and are reported in
+    ``missing_patient__dmp``.
+
+    Pairings are committed in batches: every ``batch_size`` newly-paired
+    tumors (default ``BULK_PASS_COMMIT_BATCH_SIZE``, 500) flushes a single
+    commit instead of a per-pairing commit/fsync. A mid-pass failure rolls
+    back only the open (unfinished) batch; pairings from already-committed
+    batches persist.
 
     Raises ``HTTPException(400)`` when no active pairing logic named
     "HARMONY" exists: the trigger has nothing to run against.
     """
-    logic = find_logic_by_name(db, HARMONY_LOGIC_NAME)
-    if logic is None or not logic.active:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"No active pairing logic named '{HARMONY_LOGIC_NAME}': the "
-                "HARMONY pairing trigger has nothing to run against."
-            ),
-        )
-
-    # Tumors already carrying a latest pairing under THIS (HARMONY) logic —
-    # one query instead of a lookup per tumor. DMP-logic pairings are a
-    # different pairing space and are deliberately not consulted here.
-    already_paired_ids = set(
-        db.scalars(
-            select(PairingTable.tumor_id).where(
-                PairingTable.pairing_logic_id == logic.id,
-                PairingTable.latest.is_(True),
-            )
-        ).all()
+    return _run_bulk_pair_pass(
+        db,
+        HARMONY_LOGIC_NAME,
+        batch_size=batch_size,
+        progress=progress,
+        # HARMONY keeps the stored-column patient check (no name-parse
+        # fallback): a tumor without ``patient__dmp`` is reported missing
+        # rather than attempted under a parsed key.
+        tumor_has_patient=lambda tumor: bool((tumor.patient__dmp or "").strip()),
     )
-
-    tumors = db.scalars(
-        select(Sample).where(
-            Sample.sample_type == "DMP",
-            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
-        )
-    ).all()
-
-    scanned = already_paired = missing_patient = paired = unpaired = 0
-    new_pairings: list[PairingTable] = []
-    for tumor in tumors:
-        scanned += 1
-        if tumor.id in already_paired_ids:
-            already_paired += 1
-            continue
-        if not (tumor.patient__dmp or "").strip():
-            missing_patient += 1
-            continue
-        pairing = trigger_pairing(db, tumor, logic, "automatic")
-        if pairing is None:
-            unpaired += 1
-        else:
-            paired += 1
-            new_pairings.append(pairing)
-
-    return {
-        "pairing_logic": logic.name,
-        "scanned": scanned,
-        "already_paired": already_paired,
-        "missing_patient__dmp": missing_patient,
-        "paired": paired,
-        "unpaired": unpaired,
-        "new_pairings": new_pairings,
-    }
 
 
 # ---------------------------------------------------------------------------

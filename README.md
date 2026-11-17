@@ -345,6 +345,37 @@ always uses its own named volume `keycloak_db_data`):
    database's container sits on `syzygy-dev`, reference it by its
    service or container name in the URL.
 
+## Schema migrations
+
+Schema changes ship as standalone idempotent scripts in
+`scripts/migrate_*.py`. Each script self-checks `information_schema`
+before touching anything, so running any of them — in any order, any
+number of times — against any database is safe. `Base.metadata.create_all`
+only builds *new* tables; it never ALTERs existing ones, so **after
+pulling a new version against an existing database, run the migration
+scripts** (each uses the app's configured `DATABASE_URL`, or pass one as
+an argument):
+
+    python scripts/migrate_patient_columns.py
+    python scripts/migrate_consent_column.py
+    python scripts/migrate_dmp_generated_columns.py
+    python scripts/migrate_logic_names.py
+
+Against a containerized deployment the container already has the scripts
+and the right `DATABASE_URL`:
+
+    docker exec syzygy-app python scripts/migrate_dmp_generated_columns.py
+
+The app also checks for known missing columns at every startup and logs
+one `schema drift: <table>.<column> is missing — run scripts/<script>`
+WARNING per gap (see `syzygy/schema_check.py`); a quiet boot log means
+the database is current.
+
+**Contributing rule:** when you add a new `scripts/migrate_*.py` that
+adds a column, add the corresponding `(table, column) -> script` line to
+`SCHEMA_REQUIREMENTS` in `syzygy/schema_check.py` — the startup check
+and its tests only know about what is listed there.
+
 ## Mocking the production SMILE flow (dev NATS)
 
 In production the app does **not** connect to NATS. SMILE publishes

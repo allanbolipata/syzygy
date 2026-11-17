@@ -72,8 +72,44 @@ class Sample(Base):
     # "DMP BAMs", "Pooled Normals"); None for rows created outside a beagle
     # import (dashboard fixtures, manual API creates).
     file_group: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    # DMP sargable pairing keys (DMP bulk-pairing performance, item 1).
+    # On Postgres these are GENERATED ALWAYS ... STORED columns (scripts/
+    # migrate_dmp_generated_columns.py) materializing the exact key
+    # expressions remap_dmp_record computes (docs/dmp_reference_alignment.md
+    # section g): dmp_patient_key = COALESCE(patient__dmp, group 1 of the
+    # (P-\d+) name parse), dmp_ver_key = group 3 (the IM_ver),
+    # dmp_pool_id_key = additional_metadata pool_id (non-empty string) else
+    # project_name, sample_type_norm = trim(upper(sample_type)). The DMP
+    # strategy's candidate query filters on them via a partial index over
+    # DMP rows instead of scanning the table. Generated columns recompute
+    # on every update of the source columns — never written by application
+    # code, and patient__dmp is never written either. On non-Postgres
+    # dialects (the SQLite test fallback) create_all makes these plain
+    # nullable columns left NULL; the strategy detects that (the generated
+    # columns are absent) and uses the legacy Python remap path, so
+    # behavior is identical.
+    dmp_patient_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
+    dmp_ver_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
+    dmp_pool_id_key: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
+    sample_type_norm: Mapped[Optional[str]] = mapped_column(
+        sa.Text, nullable=True, server_default=sa.FetchedValue()
+    )
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+# Generated-key columns: on Postgres the migration turns these into
+# GENERATED ALWAYS AS ... STORED, so the ORM must never emit them in
+# INSERT/UPDATE. server_default=FetchedValue() (set on the mapped_column
+# above) is SQLAlchemy's marker for DB-generated values: the ORM omits
+# the columns from INSERT/UPDATE and fetches them back after INSERT.
+# It emits no DDL, so create_all on SQLite still makes plain nullable
+# columns (the documented legacy-path fallback).
 
 
 class PairingTable(Base):
