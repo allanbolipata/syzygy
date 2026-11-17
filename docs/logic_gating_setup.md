@@ -82,7 +82,10 @@ any Keycloak version):
    > compose ships 26.8.1): *Clients* → `syzygy` → **Client scopes** tab →
    > **Assigned mappers** → *Add mapper* → *By configuration*. There is no
    > top-level *Mappers* menu item in ≥ 24; the sidebar's *Client scopes*
-   > section is for shared scopes, not client mappers.
+   > section is for shared scopes, not client mappers. In ≥ 24 client mappers
+   > live in the client's **dedicated scope**: *Clients* → `syzygy` →
+   > *Client Scopes* tab → *Edit* on `syzygy-dedicated` → *Assigned mappers*
+   > panel → *Add mapper* → *By configuration*.
 
 2. **Logics mapper** — *Group Membership* (path per the note above):
 
