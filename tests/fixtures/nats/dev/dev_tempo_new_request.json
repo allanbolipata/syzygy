@@ -1,0 +1,97 @@
+{
+  "igoRequestId": "99103",
+  "genePanel": "IDT_Exome_v2_FP",
+  "requestJson": "{\"requestMetadata\":{\"patient\":{\"cmoPatientId\":\"C-DEV03\",\"externalPatientId\":\"EXT-DEV03\",\"name\":\"Dev Tempo Patient\",\"dob\":\"1980-01-15\",\"sex\":\"M\",\"diagnosis\":\"Lung Adenocarcinoma\",\"dateOfDiagnosis\":\"2026-09-10\"},\"patientOfRecord\":{\"value\":\"dev-03@example.org\",\"namespace\":\"email\"},\"requester\":{\"value\":\"dev-03@example.org\",\"namespace\":\"email\"},\"orderingPhysician\":{\"value\":\"dev-phys@example.org\",\"namespace\":\"email\"},\"clinicalNotes\":\"Dev fixture request: TEMPO coarse-bucket pairing demo (IDT_Exome_v2_FP_BAITS; NovaSeq X 1000 vs NovaSeq 6000).\",\"samples\":[{\"primaryId\":\"99103_1\",\"cmoSampleName\":\"C-DEV03-T001\",\"tumorOrNormal\":\"Tumor\",\"baitSet\":\"IDT_Exome_v2_FP_BAITS\",\"genePanel\":\"IDT_Exome_v2_FP\",\"preservation\":\"FFPE\",\"sampleOrigin\":\"Tissue\"},{\"primaryId\":\"99103_2\",\"cmoSampleName\":\"C-DEV03-N001\",\"tumorOrNormal\":\"Normal\",\"baitSet\":\"IDT_Exome_v2_FP_BAITS\",\"genePanel\":\"IDT_Exome_v2_FP\",\"preservation\":\"FFPE\",\"sampleOrigin\":\"Tissue\"}]}}",
+  "status": {
+    "validationStatus": "Validated",
+    "validationReport": {
+      "status": "Validated",
+      "validationNotes": "",
+      "validationWarnings": ""
+    }
+  },
+  "samples": [
+    {
+      "sampleId": "99103",
+      "igoRequestId": "99103",
+      "primaryId": "99103_1",
+      "sampleName": "C-DEV03-T001",
+      "cmoPatientId": "C-DEV03",
+      "cmoSampleName": "C-DEV03-T001",
+      "tumorOrNormal": "Tumor",
+      "genePanel": "IDT_Exome_v2_FP",
+      "baitSet": "IDT_Exome_v2_FP_BAITS",
+      "sampleType": "FFPE",
+      "preservation": "FFPE",
+      "sampleOrigin": "Tissue",
+      "sampleAliases": [
+        {
+          "value": "99103_1",
+          "namespace": "igoId"
+        },
+        {
+          "value": "EXT-DEV03-T001",
+          "namespace": "externalId"
+        },
+        {
+          "value": "C-DEV03-T001",
+          "namespace": "cmoSampleName"
+        }
+      ],
+      "libraries": [
+        {
+          "libraryName": "C-DEV03-T001-LIB1",
+          "libraryType": "DNA",
+          "runs": [
+            {
+              "runId": "DEVTEMPO01",
+              "runDate": "2026-10-22",
+              "runMode": "NovaSeq X 1000"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sampleId": "99103",
+      "igoRequestId": "99103",
+      "primaryId": "99103_2",
+      "sampleName": "C-DEV03-N001",
+      "cmoPatientId": "C-DEV03",
+      "cmoSampleName": "C-DEV03-N001",
+      "tumorOrNormal": "Normal",
+      "genePanel": "IDT_Exome_v2_FP",
+      "baitSet": "IDT_Exome_v2_FP_BAITS",
+      "sampleType": "FFPE",
+      "preservation": "FFPE",
+      "sampleOrigin": "Tissue",
+      "sampleAliases": [
+        {
+          "value": "99103_2",
+          "namespace": "igoId"
+        },
+        {
+          "value": "EXT-DEV03-N001",
+          "namespace": "externalId"
+        },
+        {
+          "value": "C-DEV03-N001",
+          "namespace": "cmoSampleName"
+        }
+      ],
+      "libraries": [
+        {
+          "libraryName": "C-DEV03-N001-LIB1",
+          "libraryType": "DNA",
+          "runs": [
+            {
+              "runId": "DEVTEMPO01",
+              "runDate": "2026-10-22",
+              "runMode": "NovaSeq 6000"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

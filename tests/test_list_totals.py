@@ -77,7 +77,8 @@ def _sample(
     db,
     primary_id,
     *,
-    patient__cmo="C-1",
+    patient__cmo: "str | None" = "C-1",
+    patient__dmp: "str | None" = None,
     request_id=None,
     tumor_or_normal=TumorOrNormal.NORMAL,
     gene_panel="IMPACT468",
@@ -87,6 +88,7 @@ def _sample(
         primary_id=primary_id,
         cmo_sample_name=f"{primary_id}_name",
         patient__cmo=patient__cmo,
+        patient__dmp=patient__dmp,
         request_id=request_id,
         sample_type="tissue",
         gene_panel=gene_panel,
@@ -162,6 +164,27 @@ def test_samples_total_shrinks_with_filters(db):
     r = Response()
     rows = list_samples(q="does-not-exist", limit=2, offset=0, db=db, response=r)
     assert rows == [] and _total(r) == "0"
+
+
+def test_samples_q_searches_patient__dmp(db):
+    """DMP-only samples (no CMO bridge) must be findable by their DMP id.
+
+    The Patients tab is CMO-keyed by design, so the free-text search is
+    the only discovery path for patient__dmp-only patients; it also
+    backs the Pair Report's conditional DMP-patient navigation
+    (navigateToDmpPatient fallback in static/app.js).
+    """
+    _sample(db, "P-900001-T01-IM6", patient__cmo=None, patient__dmp="P-00TEST99")
+    _sample(db, "T-UNRELATED", patient__cmo="C-OTHER")
+
+    r = Response()
+    rows = list_samples(q="P-00TEST99", limit=None, offset=None, db=db, response=r)
+    assert [s.primary_id for s in rows] == ["P-900001-T01-IM6"] and _total(r) == "1"
+
+    # Case-insensitive substring, like the other q fields.
+    r = Response()
+    rows = list_samples(q="p-00test", limit=None, offset=None, db=db, response=r)
+    assert [s.primary_id for s in rows] == ["P-900001-T01-IM6"]
 
 
 def test_samples_total_no_patient_filter(db):

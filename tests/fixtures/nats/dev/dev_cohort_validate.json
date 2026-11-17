@@ -1,0 +1,27 @@
+{
+  "cohortId": "dev-cohort-991",
+  "type": "operational",
+  "projectTitle": "Dev cohort validate demo",
+  "projectSubtitle": "NATS dev fixture cohort (argos + tempo pairs)",
+  "status": "PASS",
+  "endUsers": [
+    "dev-01@example.org"
+  ],
+  "pmUsers": [
+    "pm-dev@example.org"
+  ],
+  "samples": [
+    {
+      "primaryId": "99101_1",
+      "normalPrimaryId": "99101_2",
+      "cmoId": "C-DEV01-T001",
+      "normalCmoId": "C-DEV01-N001"
+    },
+    {
+      "primaryId": "99103_1",
+      "normalPrimaryId": "99103_2",
+      "cmoId": "C-DEV03-T001",
+      "normalCmoId": "C-DEV03-N001"
+    }
+  ]
+}

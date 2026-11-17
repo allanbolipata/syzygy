@@ -1,0 +1,15 @@
+{
+  "sample": "P-00DEV09-N01-IM3",
+  "type": "N",
+  "assay": "IM3",
+  "anon_id": "dev09n01im3",
+  "patient": {
+    "cmo": "DEV09",
+    "dmp": "P-00DEV09"
+  },
+  "coverage": 98,
+  "project_name": "poolDEV9",
+  "sample_type": "0",
+  "external_id": "EXT-DEV09-N01",
+  "qc_status": "pass"
+}
