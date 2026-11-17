@@ -9,3 +9,4 @@ cryptography==50.0.2
 httpx==0.28.1
 jsonschema==4.26.0  # cohort request/report validation (cohort_schema.py)
 nats-py==2.16.0  # scripts/ only (mock_smile.py)
+alembic==1.20.1
