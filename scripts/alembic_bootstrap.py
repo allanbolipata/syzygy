@@ -13,10 +13,14 @@ Two entry states:
   matches the baseline, ``0001_baseline`` is **stamped** — never run,
   since it must not re-create what is already there.
 
-A database that already has an ``alembic_version`` table is simply
-brought to ``head`` (a no-op while the baseline is the head; later
-revisions apply through this branch). The script is idempotent: a
-second run prints what it found and changes nothing.
+After stamping the baseline on a legacy database, ``alembic upgrade
+head`` runs so the chain's later revisions (``0002_patient_columns``,
+``0003_consent``, ``0004_dmp_generated_columns`` — the Alembic twins of
+the legacy migrate scripts) apply *only what is missing*; on a
+fully migrated legacy database every one of them is a guarded no-op,
+so the database simply lands at head. A database that already has an
+``alembic_version`` table is likewise brought to ``head``. The script
+is idempotent: a second run prints what it found and changes nothing.
 
     python scripts/alembic_bootstrap.py
     python scripts/alembic_bootstrap.py <database-url>
@@ -39,6 +43,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: The revision stamped on existing databases (the chain's base).
 BASELINE_REVISION = "0001_baseline"
+
+#: The chain's head (ticket A2: 0002-0004 convert the legacy migrate
+#: scripts into revisions). Keep in lockstep with alembic/versions/.
+HEAD_REVISION = "0004_dmp_generated_columns"
 
 #: The four DMP key columns the baseline carries as GENERATED ... STORED
 #: (must stay in lockstep with alembic/versions/0001_baseline.py and
@@ -118,7 +126,16 @@ def bootstrap(database_url: str | None = None) -> str:
                 "re-run this bootstrap"
             )
         command.stamp(_alembic_config(url), BASELINE_REVISION)
-        return "existing database: schema matches the baseline — stamped " + BASELINE_REVISION
+        # Apply the later revisions (0002-0004, the Alembic twins of the
+        # legacy migrate scripts): on a fully migrated legacy database
+        # each is a guarded no-op, on a partially migrated one it
+        # applies only what is missing.
+        command.upgrade(_alembic_config(url), "head")
+        return (
+            "existing database: schema matches the baseline — stamped "
+            + BASELINE_REVISION
+            + " and ran alembic upgrade head"
+        )
     finally:
         engine.dispose()
 

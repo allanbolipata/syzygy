@@ -1,4 +1,5 @@
-"""Tests for the Alembic scaffold (ticket A1) and scripts/alembic_bootstrap.py.
+"""Tests for the Alembic scaffold (ticket A1), the A2 legacy-script
+revisions, and scripts/alembic_bootstrap.py.
 
 Postgres-backed: a fresh scratch database upgraded to ``head`` must
 produce the same column schema (the ``information_schema.columns``
@@ -6,9 +7,13 @@ snapshot) as ``Base.metadata.create_all`` — the baseline additionally
 carries the four DMP key columns as ``GENERATED ... STORED``, which
 create_all cannot express and is asserted separately. A database with
 the create_all schema must accept a stamp of ``0001_baseline`` with a
-no-op ``upgrade head`` afterwards. Skipped when DATABASE_URL is not a
-reachable Postgres (the test-postgres CI job fails on any skip — same
-convention as tests/test_schema_check.py).
+no-op ``upgrade head`` afterwards (head is ``0004_dmp_generated_columns``
+since ticket A2 — the later revisions are all guarded no-ops on an
+already-migrated schema). A legacy database (create_all + all the
+migrate scripts) must land at head after the bootstrap, with a no-op
+``upgrade head``. Skipped when DATABASE_URL is not a reachable
+Postgres (the test-postgres CI job fails on any skip — same convention
+as tests/test_schema_check.py).
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from sqlalchemy.engine import make_url
 
 from syzygy.database import Base, settings
 import syzygy.models  # noqa: F401  (register all tables on Base.metadata)
-from scripts.alembic_bootstrap import BASELINE_REVISION, bootstrap
+from scripts.alembic_bootstrap import BASELINE_REVISION, HEAD_REVISION, bootstrap
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_DB_PREFIX = "syzygy_alembic"
@@ -204,14 +209,17 @@ def test_pg_upgrade_head_matches_create_all(pg_url, scratch_db):
         # (create_all cannot express them — the documented divergence).
         assert _generated_columns(scratch_db) == EXPECTED_GENERATED
         assert _generated_columns(ca_url) == set()
-        assert _version_rows(scratch_db) == [BASELINE_REVISION]
+        # head is 0004_dmp_generated_columns (ticket A2); 0002-0004 are
+        # guarded no-ops on the schema the baseline just built.
+        assert _version_rows(scratch_db) == [HEAD_REVISION]
     finally:
         _drop_scratch_db(pg_url, ca_name)
 
 
 def test_pg_stamp_then_upgrade_is_noop(pg_url, scratch_db):
     """Accept: stamping the baseline on a create_all database and then
-    running ``upgrade head`` changes nothing (head is the baseline)."""
+    running ``upgrade head`` changes nothing (0002-0004 are all guarded
+    no-ops on the baseline schema; the version row ends at head)."""
     eng = create_engine(scratch_db)
     Base.metadata.create_all(eng)
     eng.dispose()
@@ -221,25 +229,25 @@ def test_pg_stamp_then_upgrade_is_noop(pg_url, scratch_db):
     _alembic(scratch_db, "upgrade", "head")
 
     assert _column_snapshot(scratch_db) == before
-    assert _version_rows(scratch_db) == [BASELINE_REVISION]
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
 
 
 def test_pg_bootstrap_fresh_is_idempotent(pg_url, scratch_db):
     """Accept: bootstrap on a fresh db runs ``upgrade head``; a second
     run changes nothing."""
     assert bootstrap(scratch_db).startswith("fresh database")
-    assert _version_rows(scratch_db) == [BASELINE_REVISION]
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
     snapshot = _column_snapshot(scratch_db)
 
     assert bootstrap(scratch_db).startswith("already under alembic")
     assert _column_snapshot(scratch_db) == snapshot
-    assert _version_rows(scratch_db) == [BASELINE_REVISION]
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
 
 
 def test_pg_bootstrap_existing_is_idempotent(pg_url, scratch_db):
     """Accept: bootstrap on a legacy database (create_all + the dmp
     generated-column migration — the production state) stamps the
-    baseline; a second run changes nothing."""
+    baseline and lands at head; a second run changes nothing."""
     eng = create_engine(scratch_db)
     Base.metadata.create_all(eng)
     eng.dispose()
@@ -248,12 +256,38 @@ def test_pg_bootstrap_existing_is_idempotent(pg_url, scratch_db):
     migrate_dmp(scratch_db)
 
     assert bootstrap(scratch_db).startswith("existing database")
-    assert _version_rows(scratch_db) == [BASELINE_REVISION]
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
     snapshot = _column_snapshot(scratch_db)
 
     assert bootstrap(scratch_db).startswith("already under alembic")
     assert _column_snapshot(scratch_db) == snapshot
-    assert _version_rows(scratch_db) == [BASELINE_REVISION]
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
+
+
+def test_pg_bootstrap_legacy_db_reaches_head(pg_url, scratch_db):
+    """Accept (A2): a legacy db (create_all + all the migrate scripts
+    run) → bootstrap → ``current`` shows head; ``upgrade head`` is a
+    no-op. migrate_logic_names is a data-only migration bound to the
+    app's own DATABASE_URL (no DDL, no revision) and is not part of
+    the schema state here."""
+    eng = create_engine(scratch_db)
+    Base.metadata.create_all(eng)
+    eng.dispose()
+    from scripts.migrate_consent_column import migrate as migrate_consent
+    from scripts.migrate_dmp_generated_columns import migrate as migrate_dmp
+    from scripts.migrate_patient_columns import migrate as migrate_patient
+
+    migrate_patient(scratch_db)
+    migrate_consent(scratch_db)
+    migrate_dmp(scratch_db)
+    before = _column_snapshot(scratch_db)
+
+    assert bootstrap(scratch_db).startswith("existing database")
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
+
+    _alembic(scratch_db, "upgrade", "head")
+    assert _column_snapshot(scratch_db) == before
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
 
 
 def test_pg_bootstrap_refuses_plain_column_db(pg_url, scratch_db):
