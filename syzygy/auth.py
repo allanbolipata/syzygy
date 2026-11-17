@@ -496,6 +496,88 @@ def get_current_user(
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
+# ---------------------------------------------------------------------------
+# Logic-entitlement endpoint gates (ticket C2: Layers A + C)
+# ---------------------------------------------------------------------------
+#
+# Two endpoint dependencies on top of get_current_user, BOTH no-ops while
+# settings.logic_gating_enabled is False (the dark-launch flag): behavior
+# is exactly today's until the org flips the flag in .env.
+#
+# Layer A — read gate: require_logic_access() checks the REQUESTED pairing
+#   logic against the principal's allowed_logics. The requested logic is
+#   the endpoint's own existing pairing_logic_name query/path param (the
+#   factory takes its name); endpoints scoped to one fixed logic without
+#   a param (the HARMONY frame) pass that name via ``logic`` instead.
+#
+# Layer C — write/admin gate: require_logic_admin() checks is_logic_admin
+#   on the trigger and pairing-logic mutation endpoints. Read != write:
+#   being able to see a logic's data does not grant the right to trigger
+#   pairing under it or to change the logic configuration.
+
+#: Stable 403 detail for a logic read the principal may not see (Layer A).
+LOGIC_ACCESS_DENIED_DETAIL = "Logic not accessible"
+#: Stable 403 detail for a trigger/config write the principal may not
+#: perform (Layer C).
+LOGIC_ADMIN_DENIED_DETAIL = "Logic admin required"
+
+
+def require_logic_access(
+    param: Optional[str] = "pairing_logic_name",
+    logic: Optional[str] = None,
+):
+    """Layer A dependency factory: gate a logic-scoped read endpoint.
+
+    The requested logic comes from the endpoint's existing query/path
+    param named ``param`` (default ``"pairing_logic_name"``). An endpoint
+    that is scoped to ONE fixed logic without a param (e.g. the HARMONY
+    frame, whose logic name is hard-coded) passes that name via ``logic``
+    and ``param=None``. When the param is absent there is no requested
+    logic to check and the request passes (the endpoint's own fallback
+    resolution applies).
+
+    While ``logic_gating_enabled`` is False this is a no-op. When enabled
+    and the requested logic is not in the principal's ``allowed_logics``,
+    403 with the stable ``LOGIC_ACCESS_DENIED_DETAIL``.
+    """
+
+    def dependency(
+        request: Request,
+        current_user: dict = Depends(get_current_user),
+    ) -> None:
+        if not settings.logic_gating_enabled:
+            return
+        requested = logic
+        if requested is None and param is not None:
+            requested = request.query_params.get(param)
+            if requested is None:
+                requested = request.path_params.get(param)
+        if requested is None:
+            return
+        if requested not in current_user.get("allowed_logics", set()):
+            raise HTTPException(
+                status_code=403, detail=LOGIC_ACCESS_DENIED_DETAIL
+            )
+
+    return dependency
+
+
+def require_logic_admin(
+    current_user: dict = Depends(get_current_user),
+) -> None:
+    """Layer C dependency: gate the trigger and pairing-logic mutation
+    endpoints on the admin entitlement — not mere visibility of a logic.
+
+    No-op while ``logic_gating_enabled`` is False; otherwise 403 with the
+    stable ``LOGIC_ADMIN_DENIED_DETAIL`` when the principal is not
+    ``is_logic_admin``.
+    """
+    if not settings.logic_gating_enabled:
+        return
+    if not current_user.get("is_logic_admin"):
+        raise HTTPException(status_code=403, detail=LOGIC_ADMIN_DENIED_DETAIL)
+
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # OAuth state -> expiry (time.monotonic), 300 s lifetime.

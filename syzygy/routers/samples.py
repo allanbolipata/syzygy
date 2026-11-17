@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from syzygy.auth import require_logic_access
 from syzygy.bait_sets import logic_membership_condition, resolve_bait_set_logic
 from syzygy.database import get_db, settings
 from syzygy.models import PairingLogic, Sample
@@ -212,6 +213,7 @@ def possible_matches_endpoint(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """The sample's current match and all potential matches.
 

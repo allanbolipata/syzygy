@@ -35,6 +35,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, aliased, joinedload
 
+from syzygy.auth import require_logic_access, require_logic_admin
 from syzygy.dmp_translator import remap_dmp_record
 from syzygy.database import SessionLocal, get_db, settings
 from syzygy.models import PairingLogic, PairingTable, Sample
@@ -176,6 +177,7 @@ def list_unmatched_dmp_samples(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """DMP samples that have no latest pairing under the given logic.
 
@@ -460,6 +462,7 @@ def pairing_report(
             "/pairing/report-stats/. Default true keeps the 5/8 contract."
         ),
     ),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """One page of the merged Pair Report list for the logic.
 
@@ -561,6 +564,7 @@ def pairing_report(
 def pairing_report_stats(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """The DMP summary counts + 5 QC warning buckets on their own (5/8).
 
@@ -1364,6 +1368,7 @@ def export_pair_report(
     ),
     fmt: str = Query("csv", description="csv or tsv"),
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """Stream the FULL merged Pair Report list for a logic as CSV/TSV.
 
@@ -1428,6 +1433,7 @@ def export_pair_report(
 def trigger_pairing_endpoint(
     payload: PairingTriggerCreate,
     db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
 ) -> PairingTable:
     tumor = db.get(Sample, payload.tumor_id)
     if tumor is None or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
@@ -1478,6 +1484,7 @@ def trigger_pairing_endpoint(
 def trigger_all_pairings_endpoint(
     pairing_logic_name: Optional[str] = None,
     db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
 ) -> dict:
     """Backfill pairings for every tumor that has no latest pairing yet.
 
@@ -1501,7 +1508,10 @@ def trigger_all_pairings_endpoint(
 
 
 @router.post("/trigger-dmp", response_model=DmpTriggerRead)
-def trigger_dmp_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+def trigger_dmp_pairing_endpoint(
+    db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
+) -> dict:
     """Run automatic DMP pairing under the DMP pairing logic.
 
     Every unpaired DMP tumor is paired with its DMP normal (same
@@ -1843,6 +1853,9 @@ def get_harmony_pairings(
         "unknown key is a 400 (rejected even when the frame is empty).",
     ),
     db: Session = Depends(get_db),
+    logic_access: None = Depends(
+        require_logic_access(param=None, logic=HARMONY_LOGIC_NAME)
+    ),
 ):
     """One page of the HARMONY pairing output, normal-oriented.
 
@@ -1937,7 +1950,10 @@ def get_harmony_pairings(
 
 
 @router.post("/trigger-harmony", response_model=HarmonyTriggerRead)
-def trigger_harmony_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+def trigger_harmony_pairing_endpoint(
+    db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
+) -> dict:
     """Run automatic HARMONY pairing under the HARMONY pairing logic.
 
     HARMONY is its own pairing logic and pairing space, separate from the
@@ -1958,6 +1974,7 @@ def trigger_harmony_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
 def unmatched_count_endpoint(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ) -> dict:
     """Per-logic unpaired count for the Pairing overview summary strip.
 
@@ -1972,6 +1989,7 @@ def unmatched_count_endpoint(
 def evaluate_pairing_endpoint(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ) -> dict:
     """Dry-run: how many of this logic's unpaired tumors would pair.
 
