@@ -111,6 +111,13 @@ any Keycloak version):
    name `syzygy_admin`, value `true`), then a second mapper — *User Attribute*
    (path per the note above):
 
+   > **Keycloak ≥ 26: the *Attributes* tab is hidden by default.** The
+   > built-in User Profile feature hides it unless unmanaged attributes are
+   > allowed. Enable once per realm: *Realm Settings* → *User Profile* tab →
+   > **Unmanaged attributes** → *Admin can edit* → Save. (Alternative:
+   > declare `syzygy_admin` as a managed attribute under *User Profile* →
+   > *Attributes* instead of loosening the policy.)
+
    | Field | Value |
    |---|---|
    | Name | `syzygy admin` |
