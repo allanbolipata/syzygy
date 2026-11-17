@@ -123,14 +123,41 @@ function activeLogics() {
   return PAIRING_LOGICS.filter((l) => l.active);
 }
 
-/* Options = ACTIVE logics only. An explicit "Select a logic…" placeholder
- * exists only while nothing is chosen (it is a required-selection prompt,
- * not an ALL state). */
-function renderViewSelect() {
+/* ---------- per-principal logic entitlements (ticket C5, UX only) ---------- *
+ * /auth/me is the UI's single source of truth for logic access:
+ * `allowed_logics` is the set of logics the server will serve this
+ * principal (the FULL set while LOGIC_GATING_ENABLED=false, so the client
+ * needs no knowledge of the flag), and `is_logic_admin` gates the
+ * trigger / pairing-logic write controls. The server enforces the real
+ * gates (403 "Logic not accessible" / "Logic admin required") — hiding
+ * things here is UX only. */
+function allowedLogicSet() {
+  return currentUser && Array.isArray(currentUser.allowed_logics)
+    ? new Set(currentUser.allowed_logics)
+    : null;
+}
+
+/* ACTIVE logics this principal may use as the View — the selector's option
+ * list. Null entitlements (no /auth/me response yet) render unfiltered. */
+function allowedActiveLogics() {
+  const allowed = allowedLogicSet();
   const actives = activeLogics();
+  return allowed ? actives.filter((l) => allowed.has(l.name)) : actives;
+}
+
+function isLogicAdmin() {
+  return !!(currentUser && currentUser.is_logic_admin === true);
+}
+
+/* Options = ACTIVE logics the principal is ALLOWED (entitlements from
+ * /auth/me — the full set while gating is disabled). An explicit "Select
+ * a logic…" placeholder exists only while nothing is chosen (it is a
+ * required-selection prompt, not an ALL state). */
+function renderViewSelect() {
+  const actives = allowedActiveLogics();
   const sel = $("#view-logic");
   if (!actives.length) {
-    sel.innerHTML = `<option value="" disabled selected>No active pairing logics</option>`;
+    sel.innerHTML = `<option value="" disabled selected>No accessible pairing logics</option>`;
     return;
   }
   sel.innerHTML =
@@ -162,20 +189,48 @@ function applyViewState() {
   gatePairingTabs();
 }
 
+/* C5 UX gate: when the principal has NO accessible pairing logic (the
+ * /auth/me set is known and filters the active list to nothing), hide the
+ * three pairing tabs entirely. A deep link can still land on one of them —
+ * settle on Samples instead of a view whose data fetch would 403. */
+function renderGatedViews() {
+  const gated = allowedLogicSet() !== null && !allowedActiveLogics().length;
+  document.querySelectorAll(".tab[data-tab]").forEach((b) => {
+    if (!PAIRING_VIEWS.includes(b.dataset.tab)) return;
+    b.classList.toggle("hidden", gated);
+  });
+  if (gated && PAIRING_VIEWS.includes(currentViewName())) {
+    history.replaceState(null, "", "#/samples");
+    showView("samples");
+  }
+}
+
+/* C5 UX gate: the override controls are a logic-ADMIN capability (Layer C,
+ * require_logic_admin server-side) — hidden for non-admins (UX only; the
+ * backend 403s either way). */
+function renderAdminControls() {
+  const admin = isLogicAdmin();
+  const wrap = $("#m-overrides-wrap");
+  if (wrap) wrap.classList.toggle("hidden", !admin);
+  const cb = $("#m-allow-overrides");
+  if (cb && !admin && cb.checked) cb.checked = false;
+}
+
 /* First-visit resolution: saved localStorage value (only if it still names
- * an ACTIVE logic) → server's settings.default_pairing_logic_name (only if
- * it resolves to an active logic) → unselected (pairing tabs gated). The
- * default is not written to localStorage: a first-visit preselection keeps
- * following the server default until the user actively picks one. */
+ * an ACTIVE logic the principal is ALLOWED) → server's
+ * settings.default_pairing_logic_name (only if it resolves to an active,
+ * allowed logic) → unselected (pairing tabs gated). The default is not
+ * written to localStorage: a first-visit preselection keeps following the
+ * server default until the user actively picks one. */
 async function resolveInitialViewLogic() {
   let name = null;
   try { name = localStorage.getItem(VIEW_LOGIC_KEY); } catch (_) { /* private mode */ }
-  if (name && !activeLogics().some((l) => l.name === name)) name = null;
+  if (name && !allowedActiveLogics().some((l) => l.name === name)) name = null;
   if (!name) {
     try {
       const r = await api("/pairing-logic/default");
       const def = r && r.name;
-      if (def && activeLogics().some((l) => l.name === def)) name = def;
+      if (def && allowedActiveLogics().some((l) => l.name === def)) name = def;
     } catch (_) { /* endpoint unavailable: leave unselected */ }
   }
   return name;
@@ -838,7 +893,9 @@ function renderMatches(data, logic) {
     const status = c.matched
       ? '<span class="badge ok">matches all keys</span>'
       : '<span class="badge bad">mismatch</span>';
-    const overrideBtn = isTumor
+    // Override is a logic-ADMIN capability (Layer C — require_logic_admin
+    // server-side): rendered only for admins (UX only, 403 either way).
+    const overrideBtn = isTumor && isLogicAdmin()
       ? `<button class="small danger" data-override="${cs.id}">Override</button>`
       : "";
     const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
@@ -3081,12 +3138,16 @@ $("#logout-btn").addEventListener("click", signOut);
 /* ---------- init ---------- */
 
 (async function init() {
-  loadCurrentUser();
+  // Entitlements first: the View selector options, the saved/default View
+  // validation, the pairing-tab visibility and the admin-only controls all
+  // key off /auth/me (ticket C5).
+  await loadCurrentUser();
   await loadLogics();
   // Resolve the session View: saved localStorage choice → server default
-  // (if active) → unselected (pairing tabs gated). Don't persist an
-  // auto-resolved default — only an explicit user pick is saved, so a
-  // first-visit View keeps following the server default until Allan picks.
+  // (if active AND allowed) → unselected (pairing tabs gated). Don't
+  // persist an auto-resolved default — only an explicit user pick is
+  // saved, so a first-visit View keeps following the server default until
+  // Allan picks.
   viewLogic = await resolveInitialViewLogic();
   applyViewState();
   if (viewLogic) {
@@ -3102,6 +3163,11 @@ $("#logout-btn").addEventListener("click", signOut);
   loadRequests();
   loadPooled(0);
   loadMachines();
-  if (location.hash) restoreFromHash();
+  if (location.hash) await restoreFromHash();
   else history.replaceState(null, "", "#/samples");
+  // C5 UX gates last, once both /auth/me and the logic list are known:
+  // hide the pairing tabs when nothing is accessible, and the admin-only
+  // override controls for non-admins.
+  renderGatedViews();
+  renderAdminControls();
 })();
