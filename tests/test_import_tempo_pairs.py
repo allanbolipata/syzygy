@@ -115,14 +115,17 @@ class FakeClient:
                 return FakeResponse({}, status_code=500, text="boom")
             return FakeResponse(self.possible_matches or {})
         self.get_calls.append(params)
-        name = params.get("cmo_sample_name", "")
         side = params.get("tumor_or_normal")
+        if "primary_id" in params:
+            field, query = "primary_id", params["primary_id"]
+        else:
+            field, query = "cmo_sample_name", params.get("cmo_sample_name", "")
         rows = [
             row
             for row_name, row_list in self.samples.items()
-            if name in row_name
             for row in row_list
             if row["tumor_or_normal"] == side
+            if query in row.get(field, row_name)
         ]
         return FakeResponse(rows)
 
@@ -133,8 +136,9 @@ class FakeClient:
         return FakeResponse({}, status_code=500, text="unexpected post")
 
 
-def _row(name, side, sid=None):
+def _row(name, side, sid=None, primary_id=None):
     return {"id": sid or f"uuid-{name}", "cmo_sample_name": name,
+            "primary_id": primary_id or f"P-{name}",
             "tumor_or_normal": side}
 
 
@@ -426,3 +430,47 @@ def test_main_dry_run_flags_multi(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "resolves (dry run) — tumor has 2 matching candidate normals" in out
     assert log_lines[1][0] == "MULTI"
+
+
+# --------------------------------------------------------------------------
+# primary_id lookup (--id-field)
+# --------------------------------------------------------------------------
+
+def test_resolve_by_primary_id():
+    # two records share the cmo name (the shaky inherited id) but have
+    # distinct primary_ids — primary_id resolution picks the right one
+    client = FakeClient({
+        "DUP": [
+            _row("DUP", "NORMAL", "uuid-a", primary_id="PID-1"),
+            _row("DUP", "NORMAL", "uuid-b", primary_id="PID-2"),
+        ],
+    })
+    assert itp.resolve_sample(
+        client, "b", "PID-1", "NORMAL", {}, id_field="primary_id") == "uuid-a"
+    assert itp.resolve_sample(
+        client, "b", "PID-2", "NORMAL", {}, id_field="primary_id") == "uuid-b"
+
+
+def test_resolve_primary_id_ambiguous():
+    client = FakeClient({
+        "X1": [_row("X1", "NORMAL", "uuid-a", primary_id="PID-DUP"),
+               _row("X2", "NORMAL", "uuid-b", primary_id="PID-DUP")],
+    })
+    with pytest.raises(ValueError, match="primary_id 'PID-DUP'.*ambiguous"):
+        itp.resolve_sample(client, "b", "PID-DUP", "NORMAL", {},
+                           id_field="primary_id")
+
+
+def test_main_id_field_primary_id(tmp_path, monkeypatch):
+    samples = {
+        "CMO-N1": [_row("CMO-N1", "NORMAL", primary_id="PID-N1")],
+        "CMO-T1": [_row("CMO-T1", "TUMOR", primary_id="PID-T1")],
+    }
+    posts = [FakeResponse({"pairing_logic": "TEMPO", "mismatched_keys": None})]
+    code, _, client = _run_main(
+        tmp_path, monkeypatch,
+        "NORMAL_ID\tTUMOR_ID\nPID-N1\tPID-T1\n", samples, posts,
+        extra=("--id-field", "primary_id"))
+    assert code == 0
+    assert all("primary_id" in c for c in client.get_calls)
+    assert client.post_calls[0]["tumor_id"] == "uuid-CMO-T1"

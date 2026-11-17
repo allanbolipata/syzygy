@@ -7,9 +7,9 @@ following non-empty line carries the two cmoSampleNames. Example::
     NORMAL_ID<TAB>TUMOR_ID
     DEV-020-N<TAB>DEV-020-T
 
-Each cmoSampleName is resolved to its sample UUID via
-``GET /v1/sample/?cmo_sample_name=...`` (exact match enforced client-side —
-the API filter is a case-insensitive substring), then the pair is pinned
+Each id is resolved to its sample UUID via ``GET /v1/sample/`` filtered by
+the lookup column (``--id-field``: ``cmo_sample_name`` default, or
+``primary_id`` — the stable registry id), then the pair is pinned
 under the pairing logic via ``POST /v1/pairing/trigger`` with a pinned
 ``normal_id`` (override semantics): the pair is created even when the
 strategy's matching keys differ, and any key mismatches are recorded in the
@@ -101,12 +101,17 @@ def resolve_sample(
     cmo_sample_name: str,
     tumor_or_normal: str,
     cache: dict[tuple[str, str], str],
+    id_field: str = "cmo_sample_name",
 ) -> str:
-    """Resolve a cmoSampleName to its sample UUID, enforcing exact match.
+    """Resolve an external sample id to its sample UUID, enforcing exact match.
 
-    ``tumor_or_normal`` is "TUMOR" or "NORMAL" and disambiguates names that
-    appear on more than one row. Raises ValueError when the name matches
-    zero or more than one sample of that side.
+    ``id_field`` selects the lookup hint column (``cmo_sample_name`` or
+    ``primary_id`` — the latter is the stable id from the sample registry).
+    The API filter is a case-insensitive substring on either column, so the
+    exact match is enforced client-side. ``tumor_or_normal`` is "TUMOR" or
+    "NORMAL" and disambiguates names that appear on more than one row.
+    Raises ValueError when the id matches zero or more than one sample of
+    that side.
     """
     key = (cmo_sample_name, tumor_or_normal)
     if key in cache:
@@ -115,25 +120,25 @@ def resolve_sample(
     resp = client.get(
         f"{base}/v1/sample/",
         params={
-            "cmo_sample_name": cmo_sample_name,
+            id_field: cmo_sample_name,
             "tumor_or_normal": tumor_or_normal,
         },
     )
     resp.raise_for_status()
     exact = [
         s for s in resp.json()
-        if s["cmo_sample_name"] == cmo_sample_name
+        if s[id_field] == cmo_sample_name
         and s["tumor_or_normal"] == tumor_or_normal
     ]
     if not exact:
         raise ValueError(
-            f"no {tumor_or_normal.lower()} sample with cmo_sample_name "
+            f"no {tumor_or_normal.lower()} sample with {id_field} "
             f"{cmo_sample_name!r}"
         )
     if len(exact) > 1:
         ids = ", ".join(s["id"] for s in exact)
         raise ValueError(
-            f"cmo_sample_name {cmo_sample_name!r} matches {len(exact)} "
+            f"{id_field} {cmo_sample_name!r} matches {len(exact)} "
             f"{tumor_or_normal.lower()} samples ({ids}); ambiguous"
         )
     cache[key] = exact[0]["id"]
@@ -308,6 +313,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="API bearer token (default $SYZYGY_API_TOKEN; dev: DEV_AUTH_TOKEN)",
     )
     parser.add_argument(
+        "--id-field", choices=("cmo_sample_name", "primary_id"),
+        default="cmo_sample_name",
+        help="column the file's ids resolve against (default %(default)s; "
+             "primary_id is the stable registry id)",
+    )
+    parser.add_argument(
         "--logic", default="TEMPO",
         help="pairing logic name (default %(default)s)",
     )
@@ -388,8 +399,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         for normal_name, tumor_name in rows:
             label = f"{normal_name} -> {tumor_name}"
             try:
-                normal_id = resolve_sample(client, base, normal_name, "NORMAL", cache)
-                tumor_id = resolve_sample(client, base, tumor_name, "TUMOR", cache)
+                normal_id = resolve_sample(
+                    client, base, normal_name, "NORMAL", cache, args.id_field)
+                tumor_id = resolve_sample(
+                    client, base, tumor_name, "TUMOR", cache, args.id_field)
             except httpx.HTTPError as exc:
                 print(f"FAIL  {label}: API error: {exc}", file=sys.stderr)
                 log_rows.append(("FAIL", normal_name, tumor_name, f"API error: {exc}"))
