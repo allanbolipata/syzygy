@@ -86,7 +86,20 @@ def pg_url():
     url = settings.database_url or ""
     if not url.startswith("postgresql"):
         pytest.skip("DATABASE_URL is not a postgresql URL (SQLite fallback)")
+    # The app's *default* DATABASE_URL is a Postgres URL even when no
+    # server exists (plain CI jobs) — probe like test_dmp_generated_columns
+    # does, and skip rather than error when unreachable.
+    try:
+        conn = _psycopg2(url, make_url_probe_db(url))
+        conn.close()
+    except Exception as exc:  # psycopg2.OperationalError and friends
+        pytest.skip(f"Postgres unreachable: {exc}")
     return url
+
+
+def make_url_probe_db(url: str) -> str:
+    from sqlalchemy.engine import make_url
+    return make_url(url).database or "postgres"
 
 
 @pytest.fixture()
