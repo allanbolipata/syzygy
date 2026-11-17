@@ -77,8 +77,14 @@ any Keycloak version):
    Assign users to the groups for the logics they should access (Admin
    console → *Users* → user → *Group membership* → *Add group membership*).
 
-2. **Logics mapper** — Admin console → *Clients* → `syzygy` → *Mappers* →
-   *Create mapper* → *Protocol mapper* → **Group Membership**:
+   > **Console path by version.** Keycloak ≤ 23: *Clients* → `syzygy` →
+   > *Mappers* → *Create mapper* → *Protocol mapper*. Keycloak ≥ 24 (the dev
+   > compose ships 26.8.1): *Clients* → `syzygy` → **Client scopes** tab →
+   > **Assigned mappers** → *Add mapper* → *By configuration*. There is no
+   > top-level *Mappers* menu item in ≥ 24; the sidebar's *Client scopes*
+   > section is for shared scopes, not client mappers.
+
+2. **Logics mapper** — *Group Membership* (path per the note above):
 
    | Field | Value |
    |---|---|
@@ -96,9 +102,8 @@ any Keycloak version):
 
 3. **Admin claim** — set a **user attribute** `syzygy_admin` = `true` on
    each logic-admin user (*Users* → user → *Attributes* → *Add attribute*:
-   name `syzygy_admin`, value `true`), then a second mapper — *Clients* →
-   `syzygy` → *Mappers* → *Create mapper* → *Protocol mapper* →
-   **User Attribute**:
+   name `syzygy_admin`, value `true`), then a second mapper — *User Attribute*
+   (path per the note above):
 
    | Field | Value |
    |---|---|
