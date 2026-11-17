@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import and_, case, cast, func, or_, select, String
 from sqlalchemy.orm import Session
 
-from syzygy.bait_sets import logic_membership_condition
+from syzygy.auth import get_current_user, gating_allowed_logics
+from syzygy.bait_sets import allowed_logics_condition, logic_membership_condition
 from syzygy.database import get_db
 from syzygy.models import PairingLogic, Sample
 from syzygy.pairing_service import resolve_filter_logic
@@ -76,6 +77,7 @@ def _patient_advanced_having(
     diagnosis_date: Optional[str],
     request_id: Optional[str],
     logic: Optional[PairingLogic] = None,
+    gating=None,
 ):
     """HAVING clauses for the advanced patient filters (AND-combined)."""
     having = []
@@ -96,6 +98,13 @@ def _patient_advanced_having(
         # counts still cover ALL of its samples (Allan's 2026-11-11
         # all-samples counting decision, reaffirmed 2026-11-12).
         having.append(_any_sample_matching(logic_membership_condition(logic)))
+    if gating is not None:
+        # Layer B entitlement filter (ticket C3): the patient is included
+        # when >=1 of its samples belongs to one of the principal's
+        # allowed logics — same group-membership semantics as the
+        # pairing_logic filter; the group's counts still cover ALL of
+        # its samples.
+        having.append(_any_sample_matching(gating))
     return having
 
 
@@ -109,6 +118,7 @@ def _apply_patient_filters(
     diagnosis_date: Optional[str] = None,
     request_id: Optional[str] = None,
     logic: Optional[PairingLogic] = None,
+    gating=None,
 ):
     """Filter clauses shared by the page query and the total query, so
     the reported total always reflects the currently active filter set.
@@ -129,6 +139,7 @@ def _apply_patient_filters(
         diagnosis_date=diagnosis_date,
         request_id=request_id,
         logic=logic,
+        gating=gating,
     )
     if having:
         stmt = stmt.having(and_(*having))
@@ -184,6 +195,7 @@ def list_patients(
     request_id: Optional[str] = None,
     pairing_logic: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
     response: Response = None,
 ):
     """Patients derived from samples (``patient__cmo`` non-null), sorted by
@@ -221,7 +233,14 @@ def list_patients(
     ``limit``/``offset`` (pre-pagination). ``response`` defaults to
     ``None`` so direct-call tests (repo convention) can pass a plain
     ``Response()`` to capture the header.
+
+    Layer B entitlement filter (ticket C3): while ``logic_gating_enabled``
+    is set, only patients with >=1 sample in one of the principal's
+    ``allowed_logics`` are listed (group counts stay all-samples); with
+    the flag off the listing is exactly today's.
     """
+    allowed = gating_allowed_logics(current_user)
+    gating = allowed_logics_condition(db, allowed) if allowed is not None else None
     advanced = {
         "species": species,
         "sex": sex,
@@ -229,6 +248,7 @@ def list_patients(
         "diagnosis_date": diagnosis_date,
         "request_id": request_id,
         "logic": resolve_filter_logic(db, pairing_logic),
+        "gating": gating,
     }
     rows = _patient_page(db, limit, offset, q=q, **advanced)
 

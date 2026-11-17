@@ -5,8 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from syzygy.auth import require_logic_access
-from syzygy.bait_sets import logic_membership_condition, resolve_bait_set_logic
+from syzygy.auth import get_current_user, gating_allowed_logics, require_logic_access
+from syzygy.bait_sets import (
+    allowed_logics_condition,
+    logic_membership_condition,
+    resolve_bait_set_logic,
+)
 from syzygy.database import get_db, settings
 from syzygy.models import PairingLogic, Sample
 from syzygy.pairing_service import (
@@ -62,11 +66,16 @@ def _samples_filtered_query(
     tumor_or_normal: Optional[TumorOrNormal],
     no_patient: Optional[bool],
     logic: Optional[PairingLogic] = None,
+    gating=None,
 ):
     """Filtered ``SELECT`` on ``Sample`` — no ordering or pagination.
 
     Shared by the page query and the ``X-Total-Count`` query so the
     reported total always reflects the currently active filter set.
+
+    ``gating`` is the Layer B condition (ticket C3): a SQL boolean
+    restricting rows to the principal's allowed logics (None = gating
+    disabled, no restriction).
     """
     stmt = select(Sample)
     if q is not None:
@@ -101,6 +110,11 @@ def _samples_filtered_query(
         # pairing-logic family membership (SQL-side bait_sets join + the
         # DMP null-bait_set rule; see bait_sets.logic_membership_condition).
         stmt = stmt.where(logic_membership_condition(logic))
+    if gating is not None:
+        # Layer B entitlement filter: rows belong to one of the
+        # principal's allowed logics (OR across logics; the DMP
+        # null-bait rule comes free from the helper).
+        stmt = stmt.where(gating)
     return stmt
 
 
@@ -122,6 +136,7 @@ def list_samples(
     no_patient: Optional[bool] = None,
     pairing_logic: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
     response: Response = None,
 ):
     """List samples, newest first, with optional field filters.
@@ -148,8 +163,17 @@ def list_samples(
     ``offset`` (pre-pagination). ``response`` defaults to ``None`` so
     direct-call tests (repo convention) can pass a plain ``Response()``
     to capture the header.
+
+    Layer B entitlement filter (ticket C3): while ``logic_gating_enabled``
+    is set, the listing is restricted to samples belonging to one of the
+    principal's ``allowed_logics`` (the DMP family includes bait_set-NULL
+    ``sample_type`` ``'DMP'`` samples via the membership helper); samples
+    of no registered family and of other logics are invisible. With the
+    flag off the listing is exactly today's (no restriction).
     """
     logic = resolve_filter_logic(db, pairing_logic)
+    allowed = gating_allowed_logics(current_user)
+    gating = allowed_logics_condition(db, allowed) if allowed is not None else None
     base = _samples_filtered_query(
         q=q,
         primary_id=primary_id,
@@ -164,6 +188,7 @@ def list_samples(
         tumor_or_normal=tumor_or_normal,
         no_patient=no_patient,
         logic=logic,
+        gating=gating,
     )
     total = db.scalar(select(func.count()).select_from(base.subquery()))
     if response is not None:

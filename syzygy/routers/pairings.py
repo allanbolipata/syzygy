@@ -35,7 +35,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from syzygy.auth import require_logic_access, require_logic_admin
+from syzygy.auth import (
+    get_current_user,
+    gating_allowed_logics,
+    require_logic_access,
+    require_logic_admin,
+)
+from syzygy.bait_sets import allowed_logics_condition
 from syzygy.dmp_translator import remap_dmp_record
 from syzygy.database import SessionLocal, get_db, settings
 from syzygy.models import PairingLogic, PairingTable, Sample
@@ -109,7 +115,20 @@ def list_pairings(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
+    """List pairings.
+
+    Layer B entitlement filter (ticket C3): while ``logic_gating_enabled``
+    is set, only pairings whose TUMOR or NORMAL sample belongs to one of
+    the principal's ``allowed_logics`` are listed (OR across the two
+    sides and across the logics; the DMP null-bait rule comes free from
+    the membership helper). A pairing created under logic X is visible
+    to principals of ANY of their logics when either side's sample
+    belongs to one of them — including a pairing created under an
+    unauthorized logic whose samples belong to an authorized family.
+    With the flag off the listing is exactly today's.
+    """
     stmt = select(PairingTable).options(
         joinedload(PairingTable.tumor),
         joinedload(PairingTable.normal),
@@ -141,6 +160,7 @@ def list_pairings(
         )
         if value is not None
     ]
+    tumor_alias = normal_alias = None
     if sample_filters:
         tumor_alias = aliased(Sample)
         normal_alias = aliased(Sample)
@@ -149,6 +169,22 @@ def list_pairings(
         tumor_conds = [getattr(tumor_alias, field) == value for field, value in sample_filters]
         normal_conds = [getattr(normal_alias, field) == value for field, value in sample_filters]
         stmt = stmt.where(or_(and_(*tumor_conds), and_(*normal_conds)))
+    # Layer B entitlement filter (ticket C3) — sample-side membership on
+    # BOTH join sides (see docstring). Reuses the aliases the attribute
+    # filters created when present; otherwise joins its own pair.
+    allowed = gating_allowed_logics(current_user)
+    if allowed is not None:
+        if tumor_alias is None:
+            tumor_alias = aliased(Sample)
+            normal_alias = aliased(Sample)
+            stmt = stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id)
+            stmt = stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id)
+        stmt = stmt.where(
+            or_(
+                allowed_logics_condition(db, allowed, sample=tumor_alias),
+                allowed_logics_condition(db, allowed, sample=normal_alias),
+            )
+        )
     if pairing_logic_id is not None:
         if db.get(PairingLogic, pairing_logic_id) is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")

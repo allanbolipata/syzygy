@@ -578,6 +578,34 @@ def require_logic_admin(
         raise HTTPException(status_code=403, detail=LOGIC_ADMIN_DENIED_DETAIL)
 
 
+# Layer B — data-level listing filter (ticket C3): the LISTING endpoints
+# (samples / patients / requests / pairings) are not scoped to one
+# requested logic, so no endpoint gate applies; instead the query itself
+# is intersected with the principal's allowed logics via
+# ``bait_sets.allowed_logics_condition``. gating_allowed_logics is the
+# shared switch: None while gating is disabled (dark-launch no-op —
+# listings behave exactly as today), otherwise the principal's allowed
+# logic names. Fail-closed (design point 3): a missing / non-dict
+# principal or one without an allowed_logics set yields an EMPTY set,
+# which the SQL helper turns into a falsy condition (no rows).
+
+
+def gating_allowed_logics(current_user) -> Optional[Set[str]]:
+    """The principal's allowed logic names for Layer B listing filters.
+
+    Returns None while ``logic_gating_enabled`` is False (no filter at
+    all); otherwise the ``allowed_logics`` set from the principal (an
+    empty set when the principal is missing or malformed — fail-closed).
+    """
+    if not settings.logic_gating_enabled:
+        return None
+    if isinstance(current_user, dict):
+        allowed = current_user.get("allowed_logics")
+        if isinstance(allowed, (set, frozenset, list, tuple)):
+            return set(allowed)
+    return set()
+
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # OAuth state -> expiry (time.monotonic), 300 s lifetime.
