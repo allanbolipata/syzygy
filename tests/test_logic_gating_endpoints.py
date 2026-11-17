@@ -367,13 +367,19 @@ def test_write_allowed(gate, db, case):
             ).count()
             == 1
         )
-    # trigger-all / trigger-dmp / trigger-harmony with zero in-scope
-    # samples: 200; new_pairings is the LIST of pairings created —
-    # empty for an empty db.
-    if case[0] in ("trigger-all", "trigger-dmp", "trigger-harmony"):
+    # trigger-all (sync) with zero in-scope samples: 200; new_pairings
+    # is the LIST of pairings created — empty for an empty db.
+    if case[0] == "trigger-all":
         body = response.json()
         assert body["scanned"] == 0
         assert body["new_pairings"] == []
+    # trigger-dmp / trigger-harmony are background jobs (post-dev-merge
+    # contract): 200 returns a job receipt immediately; the gating
+    # assertion is the 200 itself (admin passes Layer C).
+    if case[0] in ("trigger-dmp", "trigger-harmony"):
+        body = response.json()
+        assert body["job_id"]
+        assert body["status"] == "pending"
 
 
 # ---------------------------------------------------------------------------
