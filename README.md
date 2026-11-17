@@ -347,14 +347,45 @@ always uses its own named volume `keycloak_db_data`):
 
 ## Schema migrations
 
-Schema changes ship as standalone idempotent scripts in
-`scripts/migrate_*.py`. Each script self-checks `information_schema`
-before touching anything, so running any of them — in any order, any
-number of times — against any database is safe. `Base.metadata.create_all`
-only builds *new* tables; it never ALTERs existing ones, so **after
-pulling a new version against an existing database, run the migration
-scripts** (each uses the app's configured `DATABASE_URL`, or pass one as
-an argument):
+Schema changes are managed with [Alembic](https://alembic.sqlalchemy.org/):
+an ordered chain of revisions under `alembic/` plus an `alembic_version`
+table recording which ones a given database has. The URL is not
+hard-coded — `alembic/env.py` reads the same `DATABASE_URL` the app
+uses (`.env` / `syzygy.database.settings`); set `ALEMBIC_DATABASE_URL`
+for a one-off run against a different database. The chain starts at
+`0001_baseline`, a hand-written snapshot of the full current schema
+(`create_all` output plus the four DMP `GENERATED ... STORED` key
+columns, which autogenerate cannot express).
+
+**A new schema change:**
+
+    alembic revision -m "add the widget column"
+    # hand-review the generated revision before running it — autogenerate
+    # does NOT understand the DMP generated columns, so every revision is
+    # reviewed by hand (and those four columns are always hand-written).
+    alembic upgrade head
+
+**Bringing a database under Alembic** (existing or fresh):
+
+    python scripts/alembic_bootstrap.py
+
+On an existing database it spot-checks the schema via `information_schema`
+and **stamps** `0001_baseline` (the baseline is never *run* against a
+live database); on a fresh database it runs `alembic upgrade head`.
+Idempotent — a second run changes nothing. The app still runs
+`Base.metadata.create_all` at startup (it only builds *new* tables; it
+never ALTERs existing ones) and the startup drift check
+(`syzygy/schema_check.py`) still warns about missing columns.
+
+**Legacy databases (pre-Alembic):** schema changes also ship as
+standalone idempotent scripts in `scripts/migrate_*.py`, which remain
+for legacy databases during the transition. Each script self-checks
+`information_schema` before touching anything, so running any of them —
+in any order, any number of times — against any database is safe.
+`Base.metadata.create_all` only builds *new* tables; it never ALTERs
+existing ones, so **after pulling a new version against an existing
+database, run the migration scripts** (each uses the app's configured
+`DATABASE_URL`, or pass one as an argument):
 
     python scripts/migrate_patient_columns.py
     python scripts/migrate_consent_column.py
