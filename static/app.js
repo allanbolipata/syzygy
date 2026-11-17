@@ -970,6 +970,12 @@ const patientsState = {
   pairings: null, // sample id -> {pairing logic name: [opposite samples]}
   patient: null,
   patientSamples: [],
+  // "cmo" (default: CMO groups) | "dmp" (DMP-only groups, ticket C4:
+  // patient__dmp groups where patient__cmo IS NULL). The DMP-only option
+  // is only offered to principals whose /auth/me allowed_logics include
+  // DMP — the toggle is hidden otherwise and the mode is forced back to
+  // "cmo" (UX only; the backend enforces its own gate).
+  mode: "cmo",
 };
 
 const PATIENT_ADVANCED_IDS = ["species", "sex", "oncotree_code", "diagnosis_date", "request_id"];
@@ -1005,10 +1011,52 @@ const updatePatientAdvancedSummary = bindAdvancedPanel(
   PATIENT_ADVANCED_IDS.map((id) => `#p-${id}`)
 );
 
+/* DMP-only group view toggle (ticket C4). Shown only when the principal's
+ * /auth/me allowed_logics include "DMP" (full set while gating is
+ * disabled, so no flag knowledge is needed client-side). */
+function canSeeDmpLogic() {
+  return !!(
+    currentUser &&
+    Array.isArray(currentUser.allowed_logics) &&
+    currentUser.allowed_logics.includes("DMP")
+  );
+}
+
+function renderDmpOnlyToggle() {
+  const wrap = $("#p-mode-wrap");
+  if (!wrap) return;
+  wrap.classList.toggle("hidden", !canSeeDmpLogic());
+  if (!canSeeDmpLogic() && patientsState.mode === "dmp") {
+    patientsState.mode = "cmo";
+  }
+  $("#p-mode-cmo").classList.toggle("primary", patientsState.mode === "cmo");
+  $("#p-mode-dmp").classList.toggle("primary", patientsState.mode === "dmp");
+  // The group-key labels follow the active mode: q matches the group key
+  // (patient__cmo / patient__dmp) and the first column shows it.
+  $("#p-q-label").textContent = patientsState.mode === "dmp" ? "patient__dmp" : "patient__cmo";
+  $("#p-id-head").textContent = patientsState.mode === "dmp" ? "patient__dmp" : "patient__cmo";
+}
+
+function setPatientMode(mode) {
+  if (mode === patientsState.mode) return;
+  patientsState.mode = mode;
+  renderDmpOnlyToggle();
+  clearPatientQueries();
+  loadPatients(0);
+}
+
+$("#p-mode-cmo").addEventListener("click", () => setPatientMode("cmo"));
+$("#p-mode-dmp").addEventListener("click", () => setPatientMode("dmp"));
+
+function patientGroupKey(p) {
+  return patientsState.mode === "dmp" ? p.patient__dmp : p.patient__cmo;
+}
+
 function patientsParams(offset) {
   const p = new URLSearchParams();
   p.set("limit", patientsState.limit);
   p.set("offset", offset);
+  if (patientsState.mode === "dmp") p.set("dmp_only", "true");
   const q = $("#p-q").value.trim();
   if (q) p.set("q", q);
   for (const id of PATIENT_ADVANCED_IDS) {
@@ -1036,11 +1084,12 @@ function renderPatients() {
   const rows = patientsState.results;
   const tbody = $("#patients-table tbody");
   tbody.innerHTML = rows.map((p) => {
+    const id = patientGroupKey(p);
     const meta = Object.entries(p.metadata)
       .map(([k, v]) => `${esc(k)}: ${metaText(v)}`).join(", ");
     return `
-      <tr class="click" data-pid="${esc(p.patient__cmo)}">
-        <td>${esc(p.patient__cmo)}</td>
+      <tr class="click" data-pid="${esc(id)}">
+        <td>${esc(id)}</td>
         <td>${p.sample_count}</td>
         <td>${p.tumor_count}</td>
         <td>${p.normal_count}</td>
@@ -1056,8 +1105,16 @@ function renderPatients() {
     : rows.length < patientsState.limit;
   tbody.querySelectorAll("tr[data-pid]").forEach((tr) => {
     tr.addEventListener("click", () => {
-      const row = rows.find((p) => p.patient__cmo === tr.dataset.pid);
-      if (row) openPatient(row);
+      const row = rows.find((p) => patientGroupKey(p) === tr.dataset.pid);
+      if (!row) return;
+      if (patientsState.mode === "dmp") {
+        // DMP-only rows link to the Samples search prefilled with the dmp
+        // id (the Samples q matches patient__dmp); the reset-then-prefill
+        // helper also focuses the exact row when it is on the loaded page.
+        navigateToSampleInSamples(tr.dataset.pid);
+      } else {
+        openPatient(row);
+      }
     });
   });
 }
@@ -3009,6 +3066,7 @@ async function loadCurrentUser() {
   try {
     currentUser = await api("/auth/me");
     renderCurrentUser();
+    renderDmpOnlyToggle();
   } catch (_) {
     /* 401/403 already handled by api(): the user is being sent to /login. */
   }

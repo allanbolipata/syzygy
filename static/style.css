@@ -114,6 +114,23 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
   font-size: 0.8rem; color: var(--muted);
 }
 
+/* Patients tab: CMO-groups / DMP-only-groups toggle (ticket C4). A
+ * two-button segmented control; the active option takes the primary
+ * button treatment (renderDmpOnlyToggle toggles the .primary class). */
+.p-mode { display: flex; align-items: flex-end; gap: 0.4rem; }
+.p-mode-label {
+  font-size: 0.8rem; color: var(--muted);
+  padding-bottom: 0.5rem;
+}
+.p-mode-btn {
+  font: inherit;
+  padding: 0.35rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #fff;
+  cursor: pointer;
+}
+
 /* Samples view: collapsible "Advanced filters" section. Same visual
  * treatment as the Pair Report's collapse controls — the pr-legend box
  * (#f7f8fa rounded panel, accent summary) and the pr-group-count pill

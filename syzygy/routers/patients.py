@@ -1,13 +1,17 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import and_, case, cast, func, or_, select, String
 from sqlalchemy.orm import Session
 
-from syzygy.auth import get_current_user, gating_allowed_logics
+from syzygy.auth import (
+    LOGIC_ACCESS_DENIED_DETAIL,
+    get_current_user,
+    gating_allowed_logics,
+)
 from syzygy.bait_sets import allowed_logics_condition, logic_membership_condition
 from syzygy.database import get_db
-from syzygy.models import PairingLogic, Sample
+from syzygy.models import DMP_LOGIC_NAME, PairingLogic, Sample
 from syzygy.pairing_service import resolve_filter_logic
 from syzygy.schemas import PatientRead
 
@@ -112,6 +116,7 @@ def _apply_patient_filters(
     stmt,
     q,
     *,
+    group_key,
     species: Optional[str] = None,
     sex: Optional[str] = None,
     oncotree_code: Optional[str] = None,
@@ -123,15 +128,28 @@ def _apply_patient_filters(
     """Filter clauses shared by the page query and the total query, so
     the reported total always reflects the currently active filter set.
 
-    ``q`` restricts rows (patient__cmo is group-level: every sample of a
-    patient shares it, so restricting rows never shrinks a surviving
-    group's counts). The advanced filters are group-level HAVING clauses
-    on the unfiltered group rows — the group is included when at least one
-    of its samples matches, but its aggregate counts still cover ALL of
-    its samples."""
-    stmt = stmt.where(Sample.patient__cmo.is_not(None))
-    if q is not None:
-        stmt = stmt.where(Sample.patient__cmo.ilike(f"%{q}%"))
+    ``group_key`` is the column the groups key on — ``Sample.patient__cmo``
+    for the CMO view, ``Sample.patient__dmp`` for the DMP-only view
+    (ticket C4). ``q`` restricts rows on the group key (either column is
+    group-level: every sample of a patient shares it, so restricting rows
+    never shrinks a surviving group's counts). The advanced filters are
+    group-level HAVING clauses on the unfiltered group rows — the group is
+    included when at least one of its samples matches, but its aggregate
+    counts still cover ALL of its samples.
+    """
+    if group_key is Sample.patient__cmo:
+        stmt = stmt.where(Sample.patient__cmo.is_not(None))
+        if q is not None:
+            stmt = stmt.where(Sample.patient__cmo.ilike(f"%{q}%"))
+    else:
+        # DMP-only view: the PURE-DMP patients — patient__cmo IS NULL (the
+        # patients invisible to the CMO view) and patient__dmp set (a
+        # group with neither id is not a patient at all).
+        stmt = stmt.where(
+            and_(Sample.patient__cmo.is_(None), Sample.patient__dmp.is_not(None))
+        )
+        if q is not None:
+            stmt = stmt.where(Sample.patient__dmp.ilike(f"%{q}%"))
     having = _patient_advanced_having(
         species=species,
         sex=sex,
@@ -146,8 +164,8 @@ def _apply_patient_filters(
     return stmt
 
 
-def _patient_page(db: Session, limit, offset, *, q, **advanced):
-    """One row per patient: id + sample/tumor/normal counts.
+def _patient_page(db: Session, limit, offset, *, q, group_key, **advanced):
+    """One row per patient group: group id + sample/tumor/normal counts.
 
     Aggregation happens in SQL (GROUP BY) with limit/offset applied at the
     database level, so a paginated call never loads more than ``limit``
@@ -155,7 +173,7 @@ def _patient_page(db: Session, limit, offset, *, q, **advanced):
     """
     stmt = _apply_patient_filters(
         select(
-            Sample.patient__cmo,
+            group_key,
             func.count().label("sample_count"),
             func.sum(case((Sample.tumor_or_normal == "TUMOR", 1), else_=0)).label(
                 "tumor_count"
@@ -165,8 +183,9 @@ def _patient_page(db: Session, limit, offset, *, q, **advanced):
             ),
         ),
         q,
+        group_key=group_key,
         **advanced,
-    ).group_by(Sample.patient__cmo).order_by(Sample.patient__cmo)
+    ).group_by(group_key).order_by(group_key)
     if offset is not None:
         stmt = stmt.offset(offset)
     if limit is not None:
@@ -174,12 +193,12 @@ def _patient_page(db: Session, limit, offset, *, q, **advanced):
     return db.execute(stmt).all()
 
 
-def _patient_total(db: Session, *, q, **advanced) -> int:
+def _patient_total(db: Session, *, q, group_key, **advanced) -> int:
     """Pre-pagination number of patient groups under the current filters
     (COUNT over the same filtered+HAVING GROUP BY that produces the page)."""
-    groups = _apply_patient_filters(select(Sample.patient__cmo), q, **advanced).group_by(
-        Sample.patient__cmo
-    )
+    groups = _apply_patient_filters(
+        select(group_key), q, group_key=group_key, **advanced
+    ).group_by(group_key)
     return db.scalar(select(func.count()).select_from(groups.subquery()))
 
 
@@ -188,6 +207,7 @@ def list_patients(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     q: Optional[str] = None,
+    dmp_only: bool = False,
     species: Optional[str] = None,
     sex: Optional[str] = None,
     oncotree_code: Optional[str] = None,
@@ -198,8 +218,19 @@ def list_patients(
     current_user: dict = Depends(get_current_user),
     response: Response = None,
 ):
-    """Patients derived from samples (``patient__cmo`` non-null), sorted by
-    patient__cmo. ``q`` is a case-insensitive partial match on patient__cmo.
+    """Patient groups derived from samples, sorted by the group id.
+
+    Two views over the SAME row shape (``PatientRead``: group id +
+    sample/tumor/normal counts + requests + derived metadata):
+
+    - default (``dmp_only=false``): groups by ``patient__cmo`` (non-null),
+      i.e. the patients visible today;
+    - ``dmp_only=true`` (ticket C4): groups by ``patient__dmp`` where
+      ``patient__cmo IS NULL`` — the pure-DMP patients that are invisible
+      to the CMO view.
+
+    ``q`` is a case-insensitive partial match on the view's group id
+    (patient__cmo / patient__dmp respectively).
 
     ``metadata`` holds patient-level fields derived from the patient's
     sample ``additional_metadata`` (first non-null value per key; tumor
@@ -207,7 +238,7 @@ def list_patients(
 
     Advanced filters select which patient groups appear; they never scope
     the groups' counts (every row's counts cover ALL of the patient's
-    samples):
+    samples) — in both views:
     - ``species`` / ``sex`` / ``oncotree_code`` / ``diagnosis_date`` are
       case-insensitive partial matches on the *derived* metadata value
       (same key set as ``metadata``; tumor priority means a tumor value
@@ -238,9 +269,19 @@ def list_patients(
     is set, only patients with >=1 sample in one of the principal's
     ``allowed_logics`` are listed (group counts stay all-samples); with
     the flag off the listing is exactly today's.
+
+    DMP-only view gate (ticket C4): while ``logic_gating_enabled`` is set,
+    ``dmp_only=true`` is scoped to the DMP logic — a principal whose
+    ``allowed_logics`` does not include ``DMP`` gets 403 with the Layer A
+    stable ``LOGIC_ACCESS_DENIED_DETAIL`` (same as a logic-scoped read
+    they may not see). With the flag off the view is open to everyone
+    (dark-launch passthrough).
     """
     allowed = gating_allowed_logics(current_user)
+    if dmp_only and allowed is not None and DMP_LOGIC_NAME not in allowed:
+        raise HTTPException(status_code=403, detail=LOGIC_ACCESS_DENIED_DETAIL)
     gating = allowed_logics_condition(db, allowed) if allowed is not None else None
+    group_key = Sample.patient__dmp if dmp_only else Sample.patient__cmo
     advanced = {
         "species": species,
         "sex": sex,
@@ -250,20 +291,23 @@ def list_patients(
         "logic": resolve_filter_logic(db, pairing_logic),
         "gating": gating,
     }
-    rows = _patient_page(db, limit, offset, q=q, **advanced)
+    rows = _patient_page(db, limit, offset, q=q, group_key=group_key, **advanced)
 
-    by_patient: dict[str, list[Sample]] = {}
+    by_group: dict[str, list[Sample]] = {}
     if rows:
-        patient__cmos = [row.patient__cmo for row in rows]
+        group_ids = [getattr(row, "patient__dmp" if dmp_only else "patient__cmo") for row in rows]
         samples = db.scalars(
-            select(Sample).where(Sample.patient__cmo.in_(patient__cmos))
+            select(Sample).where(
+                (Sample.patient__dmp if dmp_only else Sample.patient__cmo).in_(group_ids)
+            )
         ).all()
         for s in samples:
-            by_patient.setdefault(s.patient__cmo, []).append(s)
+            group_id = s.patient__dmp if dmp_only else s.patient__cmo
+            by_group.setdefault(group_id, []).append(s)
 
     # Totals issued last: a bounded scalar COUNT (exactly 1 row) over the
     # same filtered GROUP BY — never the full group set.
-    total = _patient_total(db, q=q, **advanced)
+    total = _patient_total(db, q=q, group_key=group_key, **advanced)
     if response is not None:
         response.headers["X-Total-Count"] = str(total)
 
@@ -272,7 +316,8 @@ def list_patients(
 
     patients: list[PatientRead] = []
     for row in rows:
-        rows_for_patient = by_patient.get(row.patient__cmo, [])
+        group_id = row.patient__dmp if dmp_only else row.patient__cmo
+        rows_for_patient = by_group.get(group_id, [])
         tumors = [s for s in rows_for_patient if s.tumor_or_normal == "TUMOR"]
         normals = [s for s in rows_for_patient if s.tumor_or_normal == "NORMAL"]
 
@@ -286,7 +331,8 @@ def list_patients(
 
         patients.append(
             PatientRead(
-                patient__cmo=row.patient__cmo,
+                patient__cmo=None if dmp_only else row.patient__cmo,
+                patient__dmp=row.patient__dmp if dmp_only else None,
                 sample_count=row.sample_count,
                 tumor_count=row.tumor_count,
                 normal_count=row.normal_count,
