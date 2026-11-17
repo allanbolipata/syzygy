@@ -114,9 +114,14 @@ any Keycloak version):
    | Token claim name | `syzygy_admin` |
    | User attribute | `syzygy_admin` |
    | Claim value type | **Boolean** |
-   | Include in **access token** | **ON** |
 
    → logic admins get `"syzygy_admin": true`; everyone else gets no claim.
+
+   > **No "Include in access token" toggle here.** In Keycloak 26 the *User
+   > Attribute* mapper form dropped that switch — mappers on the client's
+   > dedicated scope land in the access token by default. (The *Group
+   > Membership* form still shows the toggle; keep it ON there.) Verify the
+   > claim actually lands via the raw-token decode below.
 
 Notes:
 
