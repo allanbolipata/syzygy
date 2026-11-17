@@ -38,17 +38,35 @@ def _write(tmp_path, text, name="pairs.tsv"):
 
 def test_parse_happy_path(tmp_path):
     path = _write(tmp_path, "NORMAL_ID\tTUMOR_ID\nN1\tT1\nN2\tT2\n")
-    assert itp.parse_pairs_file(path) == [("N1", "T1"), ("N2", "T2")]
+    assert itp.parse_pairs_file(path) == [
+        ("N1", "T1", None, None), ("N2", "T2", None, None)]
 
 
 def test_parse_crlf_blank_lines_and_case_header(tmp_path):
     path = _write(tmp_path, "normal_id\ttumor_id\r\n\r\nN1\tT1\r\n\r\n")
-    assert itp.parse_pairs_file(path) == [("N1", "T1")]
+    assert itp.parse_pairs_file(path) == [("N1", "T1", None, None)]
 
 
 def test_parse_strips_whitespace(tmp_path):
     path = _write(tmp_path, "NORMAL_ID\tTUMOR_ID\n  N1 \t T1 \n")
-    assert itp.parse_pairs_file(path) == [("N1", "T1")]
+    assert itp.parse_pairs_file(path) == [("N1", "T1", None, None)]
+
+
+def test_parse_extended_primary_columns(tmp_path):
+    path = _write(
+        tmp_path,
+        "NORMAL_ID\tTUMOR_ID\tNORMAL_PRIMARY_ID\tTUMOR_PRIMARY_ID\n"
+        "N1\tT1\tPID-N1\tPID-T1\n")
+    assert itp.parse_pairs_file(path) == [("N1", "T1", "PID-N1", "PID-T1")]
+
+
+def test_parse_extended_wrong_field_count(tmp_path):
+    path = _write(
+        tmp_path,
+        "NORMAL_ID\tTUMOR_ID\tNORMAL_PRIMARY_ID\tTUMOR_PRIMARY_ID\n"
+        "N1\tT1\tPID-N1\n")
+    with pytest.raises(ValueError, match="line 2"):
+        itp.parse_pairs_file(path)
 
 
 def test_parse_bad_header(tmp_path):
@@ -474,3 +492,24 @@ def test_main_id_field_primary_id(tmp_path, monkeypatch):
     assert code == 0
     assert all("primary_id" in c for c in client.get_calls)
     assert client.post_calls[0]["tumor_id"] == "uuid-CMO-T1"
+
+
+def test_main_extended_file_resolves_via_primary_despite_dup_names(
+        tmp_path, monkeypatch):
+    # the exact production failure shape: two NORMAL records share the
+    # shaky cmoSampleName, but their primary_ids are unique — the extended
+    # file's primary columns disambiguate without any flag
+    samples = {
+        "DUP-N": [
+            _row("DUP-N", "NORMAL", "uuid-a", primary_id="PID-A"),
+            _row("DUP-N", "NORMAL", "uuid-b", primary_id="PID-B"),
+        ],
+        "T1": [_row("T1", "TUMOR", primary_id="PID-T1")],
+    }
+    posts = [FakeResponse({"pairing_logic": "TEMPO", "mismatched_keys": None})]
+    code, _, client = _run_main(
+        tmp_path, monkeypatch,
+        "NORMAL_ID\tTUMOR_ID\tNORMAL_PRIMARY_ID\tTUMOR_PRIMARY_ID\n"
+        "DUP-N\tT1\tPID-B\tPID-T1\n", samples, posts)
+    assert code == 0
+    assert client.post_calls[0]["normal_id"] == "uuid-b"

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Import explicit tumor/normal pair assignments from a tab-delimited file.
 
-Input file: first line is the header ``NORMAL_ID<TAB>TUMOR_ID``; every
-following non-empty line carries the two cmoSampleNames. Example::
+Input file: first line is the header ``NORMAL_ID<TAB>TUMOR_ID`` (historical)
+or ``NORMAL_ID<TAB>TUMOR_ID<TAB>NORMAL_PRIMARY_ID<TAB>TUMOR_PRIMARY_ID``
+(beagle's extended tempo pairing file); every following non-empty line
+carries the ids. When the primary_id columns are present they take
+precedence for resolution (stable registry ids); the cmoSampleName columns
+remain the display labels. Example::
 
     NORMAL_ID<TAB>TUMOR_ID
     DEV-020-N<TAB>DEV-020-T
@@ -57,19 +61,24 @@ from typing import Optional
 import httpx
 
 EXPECTED_HEADER = ("NORMAL_ID", "TUMOR_ID")
+EXTENDED_HEADER = EXPECTED_HEADER + ("NORMAL_PRIMARY_ID", "TUMOR_PRIMARY_ID")
 
 #: Where the pairing log columns live; keep in sync with --log help.
 LOG_HEADER = ("status", "NORMAL_ID", "TUMOR_ID", "detail")
 
 
-def parse_pairs_file(path: str) -> list[tuple[str, str]]:
-    """Parse the TSV into (normal_name, tumor_name) rows.
+def parse_pairs_file(path: str) -> list[tuple]:
+    """Parse the TSV into (normal_name, tumor_name, normal_primary, tumor_primary) rows.
 
-    The first non-empty line must be the NORMAL_ID/TUMOR_ID header
-    (case-insensitive). Blank lines are skipped; a row without exactly two
-    tab-separated fields is a hard error (fail fast, don't guess).
+    The first non-empty line must be either the historical
+    ``NORMAL_ID<TAB>TUMOR_ID`` header or the extended
+    ``NORMAL_ID<TAB>TUMOR_ID<TAB>NORMAL_PRIMARY_ID<TAB>TUMOR_PRIMARY_ID``
+    header emitted by beagle's tempo operator (case-insensitive). Blank
+    lines are skipped; a row whose field count doesn't match its header or
+    contains empty cells is a hard error (fail fast, don't guess). Rows
+    from a historical 2-column file carry ``None`` in the primary slots.
     """
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple] = []
     with open(path, newline="") as fh:
         lines = [ln.rstrip("\r\n") for ln in fh]
 
@@ -77,21 +86,26 @@ def parse_pairs_file(path: str) -> list[tuple[str, str]]:
     if not content:
         raise ValueError(f"{path}: file is empty")
 
-    header = [cell.strip() for cell in content[0].split("\t")]
-    if tuple(h.upper() for h in header) != EXPECTED_HEADER:
+    header = [cell.strip().upper() for cell in content[0].split("\t")]
+    if tuple(header) == EXPECTED_HEADER:
+        width = 2
+    elif tuple(header) == EXTENDED_HEADER:
+        width = 4
+    else:
         raise ValueError(
-            f"{path}: expected header 'NORMAL_ID<TAB>TUMOR_ID', "
+            f"{path}: expected header 'NORMAL_ID<TAB>TUMOR_ID"
+            f"[<TAB>NORMAL_PRIMARY_ID<TAB>TUMOR_PRIMARY_ID]', "
             f"got {content[0]!r}"
         )
 
     for lineno, line in enumerate(content[1:], start=2):
         cells = [cell.strip() for cell in line.split("\t")]
-        if len(cells) != 2 or not all(cells):
+        if len(cells) != width or not all(cells):
             raise ValueError(
-                f"{path}: line {lineno}: expected two tab-separated "
+                f"{path}: line {lineno}: expected {width} tab-separated "
                 f"non-empty fields, got {line!r}"
             )
-        rows.append((cells[0], cells[1]))
+        rows.append(tuple(cells) + (None,) * (4 - width))
     return rows
 
 
@@ -100,7 +114,7 @@ def resolve_sample(
     base: str,
     cmo_sample_name: str,
     tumor_or_normal: str,
-    cache: dict[tuple[str, str], str],
+    cache: dict[tuple[str, str, str], str],
     id_field: str = "cmo_sample_name",
 ) -> str:
     """Resolve an external sample id to its sample UUID, enforcing exact match.
@@ -113,7 +127,7 @@ def resolve_sample(
     Raises ValueError when the id matches zero or more than one sample of
     that side.
     """
-    key = (cmo_sample_name, tumor_or_normal)
+    key = (id_field, cmo_sample_name, tumor_or_normal)
     if key in cache:
         return cache[key]
 
@@ -377,7 +391,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     seen_tumors: dict[str, str] = {}
-    for normal_name, tumor_name in rows:
+    for normal_name, tumor_name, _np, _tp in rows:
         if tumor_name in seen_tumors and seen_tumors[tumor_name] != normal_name:
             print(
                 f"warning: tumor {tumor_name} appears twice with different "
@@ -388,7 +402,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         seen_tumors[tumor_name] = normal_name
 
     headers = {"Authorization": f"Bearer {args.token}"} if args.token else {}
-    cache: dict[tuple[str, str], str] = {}
+    cache: dict[tuple[str, str, str], str] = {}
     pinned = 0
     mismatched = 0
     multi = 0
@@ -396,13 +410,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     log_rows: list[tuple[str, str, str, str]] = []
 
     with httpx.Client(headers=headers, timeout=30.0) as client:
-        for normal_name, tumor_name in rows:
+        for normal_name, tumor_name, normal_primary, tumor_primary in rows:
             label = f"{normal_name} -> {tumor_name}"
             try:
-                normal_id = resolve_sample(
-                    client, base, normal_name, "NORMAL", cache, args.id_field)
-                tumor_id = resolve_sample(
-                    client, base, tumor_name, "TUMOR", cache, args.id_field)
+                # primary_id columns from the extended file win: they are
+                # the stable registry ids; cmoSampleName is the fallback
+                if normal_primary is not None:
+                    normal_id = resolve_sample(
+                        client, base, normal_primary, "NORMAL", cache,
+                        "primary_id")
+                else:
+                    normal_id = resolve_sample(
+                        client, base, normal_name, "NORMAL", cache,
+                        args.id_field)
+                if tumor_primary is not None:
+                    tumor_id = resolve_sample(
+                        client, base, tumor_primary, "TUMOR", cache,
+                        "primary_id")
+                else:
+                    tumor_id = resolve_sample(
+                        client, base, tumor_name, "TUMOR", cache,
+                        args.id_field)
             except httpx.HTTPError as exc:
                 print(f"FAIL  {label}: API error: {exc}", file=sys.stderr)
                 log_rows.append(("FAIL", normal_name, tumor_name, f"API error: {exc}"))
