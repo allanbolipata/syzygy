@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 import sqlalchemy as sa
 from sqlalchemy import Uuid
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from syzygy.database import Base
@@ -250,3 +251,44 @@ class AllowedUser(Base):
     active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AuditLog(Base):
+    """Append-only audit log (AUDIT_LOG_TICKETS.md, ticket AL1).
+
+    One row per sensitive write point, written ONLY by
+    ``syzygy/audit.py::record`` inside the caller's transaction, so the
+    event commits atomically with the mutation it documents.  Revision
+    0006_audit_log REVOKEs UPDATE/DELETE and installs a guard trigger
+    that rejects them at the database level — never UPDATE or DELETE
+    from application code.
+
+    ``payload`` carries ids and names ONLY — never patient, clinical or
+    variant data (binding sanitization rule, DECIDED #5).  ``actor`` is
+    an e-mail address for user actions and ``"system"`` for
+    machine-driven paths; ``pairing_logic`` is the AL2 visibility-scope
+    key (NULL = admin-only, unless it is the actor's own action).
+    """
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    occurred_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, default=utcnow, server_default=sa.func.now()
+    )
+    actor: Mapped[str] = mapped_column(sa.String(320), nullable=False)
+    actor_kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    action: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+    entity_type: Mapped[str] = mapped_column(sa.String(40), nullable=False)
+    entity_id: Mapped[str] = mapped_column(sa.String(200), nullable=False)
+    pairing_logic: Mapped[Optional[str]] = mapped_column(sa.String(80), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    reverse_of: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(sa.String(200), nullable=True)
+
+    __table_args__ = (
+        sa.Index("ix_audit_log_occurred_at", "occurred_at"),
+        sa.Index("ix_audit_log_pairing_logic_occurred_at", "pairing_logic", "occurred_at"),
+        sa.Index("ix_audit_log_entity_type_entity_id", "entity_type", "entity_id"),
+        sa.Index("ix_audit_log_actor_occurred_at", "actor", "occurred_at"),
+    )

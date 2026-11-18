@@ -44,9 +44,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: The revision stamped on existing databases (the chain's base).
 BASELINE_REVISION = "0001_baseline"
 
-#: The chain's head (ticket A2: 0002-0004 convert the legacy migrate
-#: scripts into revisions). Keep in lockstep with alembic/versions/.
-HEAD_REVISION = "0004_dmp_generated_columns"
+#: The chain's head (A2: 0002-0004 convert the legacy migrate scripts
+#: into revisions; R1: 0005_redaction; AL1: 0006_audit_log). Keep in
+#: lockstep with alembic/versions/.
+HEAD_REVISION = "0006_audit_log"
 
 #: The four DMP key columns the baseline carries as GENERATED ... STORED
 #: (must stay in lockstep with alembic/versions/0001_baseline.py and

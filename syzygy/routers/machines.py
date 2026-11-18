@@ -5,6 +5,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from syzygy import audit
+from syzygy.auth import get_current_user
 from syzygy.database import get_db
 from syzygy.models import PooledMachine
 from syzygy.schemas import PooledMachineRead, PooledMachineUpsert
@@ -21,7 +23,11 @@ def list_machines(db: Session = Depends(get_db)):
 
 
 @router.post("/", response_model=PooledMachineRead)
-def upsert_machine(payload: PooledMachineUpsert, db: Session = Depends(get_db)):
+def upsert_machine(
+    payload: PooledMachineUpsert,
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
+):
     """Create or update a pooled machine row (upsert on machine_name)."""
     name = payload.machine_name.strip().lower()
     machine_class = payload.machine_class.strip().lower()
@@ -44,6 +50,16 @@ def upsert_machine(payload: PooledMachineUpsert, db: Session = Depends(get_db)):
         machine_type=payload.machine_type,
     )
     db.add(machine)
+    db.flush()
+    # AL1: machine.created — ids/names only.
+    audit.record(
+        db,
+        audit.actor_from_user(current_user),
+        "machine.created",
+        entity_type="machine",
+        entity_id=machine.id,
+        payload={"machine_name": name, "machine_class": machine_class},
+    )
     try:
         db.commit()
     except IntegrityError:

@@ -63,10 +63,12 @@ them on the pairing row and surfaces them in API errors.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Protocol, Sequence
 
 from fastapi import HTTPException
+
+from syzygy import audit
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -75,9 +77,27 @@ from syzygy.models import PairingLogic, PairingTable, PooledMachine, Sample
 from syzygy.schemas import TumorOrNormal
 
 # Sentinel used to sort rows without a sequencing_date to the end. It is
-# never compared against a real (timezone-aware) timestamp: tuple
-# comparison short-circuits on the first element when a date is missing.
+# never compared against a real timestamp: tuple comparison short-circuits
+# on the first element when a date is missing.
 _NULL_DATE = datetime.min
+
+
+def _comparable_dt(value: Optional[datetime]) -> datetime:
+    """Normalize a timestamp for total ordering.
+
+    ``DateTime(timezone=True)`` round-trips timezone-aware on PostgreSQL
+    but timezone-naive on SQLite (the dialect drops the offset).  A
+    session can therefore hold in-memory aware values side by side with
+    freshly loaded naive ones, and comparing them directly raises
+    ``TypeError``.  Aware values are converted to their UTC wall time;
+    naive values are already UTC wall time by the app's storage
+    convention (``utcnow``).
+    """
+    if value is None:
+        return _NULL_DATE
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 # Default mapping from raw run-mode / sequencer substrings to buckets,
 # checked in order (most specific first). Unknown non-empty values map to
@@ -133,12 +153,22 @@ def seed_pooled_machines(db: Session) -> None:
             )
         )
         if existing is None:
-            db.add(
-                PooledMachine(
-                    machine_name=name,
-                    machine_class=machine_class,
-                    machine_type=machine_type,
-                )
+            machine = PooledMachine(
+                machine_name=name,
+                machine_class=machine_class,
+                machine_type=machine_type,
+            )
+            db.add(machine)
+            db.flush()
+            # AL1: machine.created (bootstrap seed — create only, system
+            # actor; ids/names only).
+            audit.record(
+                db,
+                audit.SYSTEM_ACTOR,
+                "machine.created",
+                entity_type="machine",
+                entity_id=machine.id,
+                payload={"machine_name": name, "machine_class": machine_class},
             )
     db.commit()
 
@@ -466,8 +496,8 @@ class DefaultPairingStrategy:
             candidates,
             key=lambda s: (
                 s.sequencing_date is not None,
-                s.sequencing_date or _NULL_DATE,
-                s.created_date,
+                _comparable_dt(s.sequencing_date),
+                _comparable_dt(s.created_date),
                 s.id,
             ),
         )

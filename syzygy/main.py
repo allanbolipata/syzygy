@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
 from syzygy.database import Base, SessionLocal, THREADPOOL_TOKENS, engine
+from syzygy import audit
 from syzygy.models import PairingLogic
 from syzygy.pairing_strategies import seed_pooled_machines
 from syzygy.bait_sets import seed_bait_sets
@@ -56,10 +57,40 @@ async def lifespan(app: FastAPI):
             existing = db.scalar(select(PairingLogic).where(PairingLogic.name == name))
             if existing is None:
                 db.add(PairingLogic(name=name, strategy_name=strategy))
+                # AL1: logic.created (boot-time seed, system actor —
+                # active defaults to True; the payload is ids/names only).
+                audit.record(
+                    db,
+                    audit.SYSTEM_ACTOR,
+                    "logic.created",
+                    entity_type="pairing_logic",
+                    entity_id=name,
+                    pairing_logic=name,
+                    payload={
+                        "name": name,
+                        "strategy_name": strategy,
+                        "active": True,
+                    },
+                )
             elif existing.strategy_name != strategy:
                 # Self-heal rows created before the beagle-aligned
                 # strategies existed (e.g. TEMPO seeded as "default").
+                old_strategy = existing.strategy_name
                 existing.strategy_name = strategy
+                # AL1: logic.updated (strategy self-heal, system actor).
+                audit.record(
+                    db,
+                    audit.SYSTEM_ACTOR,
+                    "logic.updated",
+                    entity_type="pairing_logic",
+                    entity_id=name,
+                    pairing_logic=name,
+                    payload={
+                        "name": name,
+                        "old_strategy_name": old_strategy,
+                        "strategy_name": strategy,
+                    },
+                )
         db.commit()
         seed_bait_sets(db)
         # Loud boot-time warning for columns added by scripts/migrate_*.py

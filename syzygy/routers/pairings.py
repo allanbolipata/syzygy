@@ -36,6 +36,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from syzygy.dmp_translator import remap_dmp_record
+from syzygy.auth import get_current_user
 from syzygy.database import SessionLocal, get_db, settings
 from syzygy.models import PairingLogic, PairingTable, Sample
 from syzygy.pairing_service import (
@@ -1575,6 +1576,7 @@ def export_pair_report(
 def trigger_pairing_endpoint(
     payload: PairingTriggerCreate,
     db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
 ) -> PairingTable:
     tumor = db.get(Sample, payload.tumor_id)
     if tumor is None or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
@@ -1608,6 +1610,7 @@ def trigger_pairing_endpoint(
         payload.trigger_type,
         payload.normal_id,
         strict=payload.strict,
+        actor=current_user,
     )
     if pairing is None:
         detail = "No valid pairing could be created"

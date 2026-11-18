@@ -5,10 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from syzygy import audit
 from syzygy.auth import get_current_user
 from syzygy.bait_sets import logic_membership_condition, resolve_bait_set_logic
 from syzygy.database import get_db, settings
-from syzygy.models import PairingLogic, Sample, utcnow
+from syzygy.models import AuditLog, PairingLogic, Sample, utcnow
 from syzygy.pairing_service import (
     MAX_OTHER_MATCHES_LIMIT,
     possible_matches,
@@ -30,7 +31,11 @@ router = APIRouter(prefix="/sample", tags=["samples"])
 
 
 @router.post("/", response_model=SampleRead, status_code=201)
-def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
+def create_sample(
+    payload: SampleCreate,
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
+):
     pairing_logic = resolve_pairing_logic(
         db,
         payload.pairing_logic_id,
@@ -42,6 +47,18 @@ def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
     sample_data["tumor_or_normal"] = payload.tumor_or_normal.value
     sample = Sample(**sample_data)
     db.add(sample)
+    db.flush()
+    # AL1: sample.created — ids/names only. The router is the manual
+    # create path, so the actor is the authenticated user (decision 4);
+    # system-recorded creates (NATS ingest) go through nats_ingest.py.
+    audit.record(
+        db,
+        audit.actor_from_user(current_user),
+        "sample.created",
+        entity_type="sample",
+        entity_id=sample.id,
+        payload={"sample_name": sample.cmo_sample_name, "primary_id": sample.primary_id},
+    )
     db.commit()
     db.refresh(sample)
 
@@ -308,6 +325,17 @@ def redact_sample(
         sample.redacted_at = utcnow()
         sample.redacted_by = (current_user or {}).get("email")
         sample.redaction_reason = payload.reason if payload is not None else None
+        # AL1: sample.redacted — the acting user's email is the actor;
+        # the payload carries ids/names only (the clinical reason stays
+        # on the sample row, never in the audit log).
+        audit.record(
+            db,
+            (current_user or {}).get("email") or audit.SYSTEM_ACTOR,
+            "sample.redacted",
+            entity_type="sample",
+            entity_id=sample_id,
+            payload={"sample_name": sample.cmo_sample_name},
+        )
         db.commit()
         db.refresh(sample)
     return sample
@@ -333,6 +361,26 @@ def unredact_sample(
         raise HTTPException(status_code=404, detail="Sample not found")
     if sample.redacted:
         sample.redacted = False
+        # AL1: sample.unredacted — linked to the redaction event it
+        # reverses (reverse_of).
+        redact_event_id = db.scalar(
+            select(AuditLog.id)
+            .where(
+                AuditLog.entity_type == "sample",
+                AuditLog.entity_id == str(sample_id),
+                AuditLog.action == "sample.redacted",
+            )
+            .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
+        )
+        audit.record(
+            db,
+            (current_user or {}).get("email") or audit.SYSTEM_ACTOR,
+            "sample.unredacted",
+            entity_type="sample",
+            entity_id=sample_id,
+            payload={"sample_name": sample.cmo_sample_name},
+            reverse_of=redact_event_id,
+        )
         db.commit()
         db.refresh(sample)
     return sample
