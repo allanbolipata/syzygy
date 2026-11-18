@@ -46,16 +46,40 @@ SYSTEM_ACTOR = "system"
 #: BULK_AUDIT_DETAIL_CAP").
 BULK_AUDIT_DETAIL_CAP = 500
 
-#: AL2: the read-only PUBLIC view over audit_log — one canonical DDL
-#: string shared by Alembic revision 0007_audit_view (adds the GRANT)
-#: and the ``after_create`` listener in models.py (so ``create_all`` and
-#: the alembic schema snapshots stay in lockstep).
-AUDIT_VIEW_DDL = (
-    "CREATE VIEW IF NOT EXISTS audit_view AS "
+#: AL2: the read-only PUBLIC view over audit_log.  The SELECT list is
+#: canonical and shared, but the CREATE clause is dialect-split because
+#: the two engines' CREATE VIEW grammars are mutually exclusive:
+#: PostgreSQL supports only ``CREATE [OR REPLACE] VIEW`` (there is no
+#: ``IF NOT EXISTS`` for views), while SQLite supports only
+#: ``CREATE VIEW IF NOT EXISTS`` (``OR REPLACE`` is a syntax error
+#: there).  ``AUDIT_VIEW_DDL`` (the PG variant) is what Alembic
+#: revision 0007_audit_view executes (alembic is PG-only — the
+#: bootstrap script refuses other dialects), and the ``after_create``
+#: listener in models.py uses :func:`audit_view_ddl` so ``create_all``
+#: and the alembic schema snapshots stay in lockstep on every dialect
+#: the app runs on.
+_AUDIT_VIEW_SELECT = (
     "SELECT id, occurred_at, actor, actor_kind, action, "
     "entity_type, entity_id, pairing_logic, payload, reverse_of, "
     "request_id FROM audit_log"
 )
+
+#: PostgreSQL DDL — executed by alembic revision 0007_audit_view and
+#: by the create_all listener on the PG dialect.
+AUDIT_VIEW_DDL = f"CREATE OR REPLACE VIEW audit_view AS {_AUDIT_VIEW_SELECT}"
+
+#: SQLite DDL — the create_all-only dev/test fallback dialect.
+AUDIT_VIEW_DDL_SQLITE = f"CREATE VIEW IF NOT EXISTS audit_view AS {_AUDIT_VIEW_SELECT}"
+
+
+def audit_view_ddl(dialect_name: str) -> str:
+    """The CREATE VIEW DDL for ``audit_view`` for a SQLAlchemy dialect
+    name (see the note above): SQLite gets ``IF NOT EXISTS``, every
+    other dialect (Postgres — the only one besides SQLite this app
+    targets) gets ``OR REPLACE``."""
+    if dialect_name == "sqlite":
+        return AUDIT_VIEW_DDL_SQLITE
+    return AUDIT_VIEW_DDL
 
 # _bulk_detail_records counts detail events for the CURRENT bulk pass.
 _bulk_detail_records = 0

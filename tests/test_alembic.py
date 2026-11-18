@@ -18,11 +18,12 @@ as tests/test_schema_check.py).
 
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 
 from syzygy.database import Base, settings
@@ -193,6 +194,37 @@ def scratch_db(pg_url):
 # tests
 # ---------------------------------------------------------------------------
 
+def test_head_revision_is_alembic_chain_head():
+    """F1: HEAD_REVISION must always equal the head of the alembic
+    chain in alembic/versions/. A new revision added without bumping
+    the constant would only surface on the PG job (the _version_rows
+    assertions below), so this pure file-parse guard fails on every CI
+    job the moment the two drift apart. The head is the revision no
+    other revision points at via down_revision (the chain is linear)."""
+    versions_dir = REPO_ROOT / "alembic" / "versions"
+    downs: dict[str, str | None] = {}
+    for path in sorted(versions_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        src = path.read_text(encoding="utf-8")
+        # Top-level (column-0) assignments only — docstring lines are
+        # indented and can't match.
+        rev = re.search(
+            r'^revision\s*(?::[^=]+)?=\s*["\']([^"\']+)["\']', src, re.M
+        )
+        assert rev, f"no top-level revision id in {path.name}"
+        down = re.search(r"^down_revision\s*(?::[^=]+)?=\s*(\S+)", src, re.M)
+        value = down.group(1).strip("'\"") if down else "None"
+        downs[rev.group(1)] = None if value == "None" else value
+    parents = {d for d in downs.values() if d is not None}
+    heads = {r for r in downs if r not in parents}
+    assert heads == {HEAD_REVISION}, (
+        f"HEAD_REVISION is {HEAD_REVISION!r} but the alembic chain "
+        f"head(s) in alembic/versions/ are {sorted(heads)} — bump "
+        "HEAD_REVISION in scripts/alembic_bootstrap.py"
+    )
+
+
 def test_pg_upgrade_head_matches_create_all(pg_url, scratch_db):
     """Accept: ``alembic upgrade head`` on a fresh PG db produces a schema
     whose information_schema.columns snapshot equals create_all's."""
@@ -302,3 +334,59 @@ def test_pg_bootstrap_refuses_plain_column_db(pg_url, scratch_db):
     with pytest.raises(SystemExit, match="not GENERATED"):
         bootstrap(scratch_db)
     assert not _has_alembic_version(scratch_db)
+
+
+def test_pg_audit_view_ddl_is_valid_postgres(pg_url, scratch_db):
+    """F1 (defect 1): the PG-side view DDL must be valid PostgreSQL.
+    ``create_all`` fires the models.py ``after_create`` listener on the
+    PG dialect, and the DDL must then be re-runnable (the OR REPLACE
+    path) — the old single 'CREATE VIEW IF NOT EXISTS' string was a
+    syntax error on every real-PG path (0007_audit_view.upgrade and
+    the listener). The SQLite suite can never catch that, so execute
+    it on real PG here."""
+    from syzygy.audit import AUDIT_VIEW_DDL
+
+    eng = create_engine(scratch_db)
+    Base.metadata.create_all(eng)  # listener runs AUDIT_VIEW_DDL
+    try:
+        with eng.connect() as conn:
+            conn.execute(text(AUDIT_VIEW_DDL))  # OR REPLACE re-run
+            conn.commit()
+    finally:
+        eng.dispose()
+    eng = create_engine(scratch_db)
+    try:
+        with eng.connect() as conn:
+            cols = {
+                r[0]
+                for r in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'audit_view'"
+                    )
+                )
+            }
+    finally:
+        eng.dispose()
+    assert {"id", "actor", "action", "payload", "reverse_of"} <= cols
+
+
+def test_pg_upgrade_then_downgrade_base(pg_url, scratch_db):
+    """F1 (defect 4): the 0006 downgrade's DROP INDEX statements are
+    PG-only syntax (``DROP INDEX [IF EXISTS] <name>`` — no ON clause)
+    that the SQLite suite can never execute. Run the full
+    upgrade→downgrade cycle on real PG and require a clean, empty
+    database at the end. The 0001-0005 downgrades are already
+    PG-valid; this pins the 0006/0007 ones."""
+    _alembic(scratch_db, "upgrade", "head")
+    assert _version_rows(scratch_db) == [HEAD_REVISION]
+
+    _alembic(scratch_db, "downgrade", "base")
+
+    eng = create_engine(scratch_db)
+    try:
+        tables = set(inspect(eng).get_table_names())
+    finally:
+        eng.dispose()
+    assert tables == set()

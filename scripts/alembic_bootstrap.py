@@ -45,9 +45,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_REVISION = "0001_baseline"
 
 #: The chain's head (A2: 0002-0004 convert the legacy migrate scripts
-#: into revisions; R1: 0005_redaction; AL1: 0006_audit_log). Keep in
-#: lockstep with alembic/versions/.
-HEAD_REVISION = "0006_audit_log"
+#: into revisions; R1: 0005_redaction; AL1: 0006_audit_log; AL2:
+#: 0007_audit_view). Keep in lockstep with alembic/versions/ —
+#: tests/test_alembic.py::test_head_revision_is_alembic_chain_head
+#: fails if a new revision is added without bumping this.
+HEAD_REVISION = "0007_audit_view"
 
 #: The four DMP key columns the baseline carries as GENERATED ... STORED
 #: (must stay in lockstep with alembic/versions/0001_baseline.py and

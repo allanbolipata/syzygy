@@ -74,6 +74,34 @@ def test_audit_log_table_created(db):
     assert inspect(db.get_bind()).has_table("audit_log")
 
 
+def test_audit_view_created_by_create_all_on_sqlite(db):
+    """AL2/F1: the after_create listener must build a queryable
+    audit_view on the SQLite dialect (the create_all-only dev/test
+    fallback path — the same path 0007_audit_view must stay in
+    lockstep with on Postgres)."""
+    assert "audit_view" in inspect(db.get_bind()).get_view_names()
+    assert db.execute(text("SELECT count(*) FROM audit_view")).scalar() == 0
+
+
+def test_audit_view_ddl_is_dialect_specific():
+    """F1 (defect 1): PostgreSQL supports only CREATE [OR REPLACE]
+    VIEW and SQLite only CREATE VIEW IF NOT EXISTS — the SELECT list
+    must be shared, the CREATE clause dialect-split. (A single
+    'CREATE VIEW IF NOT EXISTS' string is a syntax error on real
+    PostgreSQL; 'OR REPLACE' is a syntax error on SQLite — proven by
+    probe on sqlite 3.53.1.)"""
+    pg = audit.AUDIT_VIEW_DDL
+    sq = audit.AUDIT_VIEW_DDL_SQLITE
+    assert pg.startswith("CREATE OR REPLACE VIEW audit_view AS ")
+    assert "IF NOT EXISTS" not in pg
+    assert sq.startswith("CREATE VIEW IF NOT EXISTS audit_view AS ")
+    assert "OR REPLACE" not in sq
+    # The canonical SELECT list is identical on both sides.
+    assert pg.split("AS ", 1)[1] == sq.split("AS ", 1)[1]
+    assert audit.audit_view_ddl("sqlite") == sq
+    assert audit.audit_view_ddl("postgresql") == pg
+
+
 def test_append_only_guard_rejects_update_and_delete(db):
     row = audit.record(
         db,

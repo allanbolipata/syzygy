@@ -70,12 +70,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("DROP TRIGGER IF EXISTS audit_log_append_only ON audit_log")
     op.execute("DROP FUNCTION IF EXISTS audit_log_append_only_guard()")
-    op.execute("DROP INDEX IF EXISTS ix_audit_log_actor_occurred_at ON audit_log")
-    op.execute(
-        "DROP INDEX IF EXISTS ix_audit_log_entity_type_entity_id ON audit_log"
-    )
-    op.execute(
-        "DROP INDEX IF EXISTS ix_audit_log_pairing_logic_occurred_at ON audit_log"
-    )
-    op.execute("DROP INDEX IF EXISTS ix_audit_log_occurred_at ON audit_log")
+    # PG DROP INDEX takes the index name only — no ON clause (unlike
+    # DROP TRIGGER).
+    op.execute("DROP INDEX IF EXISTS ix_audit_log_actor_occurred_at")
+    op.execute("DROP INDEX IF EXISTS ix_audit_log_entity_type_entity_id")
+    op.execute("DROP INDEX IF EXISTS ix_audit_log_pairing_logic_occurred_at")
+    op.execute("DROP INDEX IF EXISTS ix_audit_log_occurred_at")
     op.execute("DROP TABLE IF EXISTS audit_log")

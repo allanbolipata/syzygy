@@ -306,18 +306,22 @@ class AuditLog(Base):
 
 
 # AUDIT_LOG_TICKETS.md (ticket AL2): the read-only audit_view over
-# audit_log, created here on EVERY dialect (CREATE VIEW IF NOT EXISTS)
-# so the app's create_all fallback (SQLite dev, fresh-DB bootstrap) and
-# the Alembic-managed schema (revision 0007_audit_view, which also runs
-# GRANT SELECT ... TO PUBLIC) expose the same object — the schema
-# snapshot tests compare the two, and views show up in
-# information_schema.columns, so both sides must create it.  The PG
-# trigger/function/REVOKE statements stay alembic-only (0006), exactly
-# like the 0005 redaction GRANT.
+# audit_log, created here on every dialect create_all runs on (SQLite
+# dev/test fallback and Postgres) — but the DDL is dialect-split,
+# because the two engines' CREATE VIEW grammars are mutually
+# exclusive: PostgreSQL supports only CREATE [OR REPLACE] VIEW (no IF
+# NOT EXISTS), SQLite only CREATE VIEW IF NOT EXISTS (no OR REPLACE).
+# syzygy.audit.audit_view_ddl() picks the right one for the connection's
+# dialect.  The app's create_all fallback and the Alembic-managed
+# schema (revision 0007_audit_view, which also runs GRANT SELECT ...
+# TO PUBLIC) expose the same object — the schema snapshot tests compare
+# the two, and views show up in information_schema.columns, so both
+# sides must create it.  The PG trigger/function/REVOKE statements stay
+# alembic-only (0006), exactly like the 0005 redaction GRANT.
 @event.listens_for(AuditLog.__table__, "after_create")
 def _create_audit_view(target, connection, **kw):
     # Lazy import: syzygy.audit imports syzygy.models at module level,
     # so a top-level import here would be a cycle.
-    from syzygy.audit import AUDIT_VIEW_DDL
+    from syzygy.audit import audit_view_ddl
 
-    connection.execute(DDL(AUDIT_VIEW_DDL))
+    connection.execute(DDL(audit_view_ddl(connection.dialect.name)))
