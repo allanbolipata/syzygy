@@ -557,3 +557,51 @@ class AuditMeRead(BaseModel):
     email: Optional[str] = None
     role: str = "user"
     logic_groups: list[str] = []
+
+
+class PairingImportCreate(BaseModel):
+    """POST /v1/pairing/import body (ticket AL3, decision 8a).
+
+    ``text`` is the same TSV the CLI script reads
+    (``NORMAL_ID<TAB>TUMOR_ID``, optional extended primary_id columns);
+    the flags mirror the CLI's ``--logic`` / ``--trigger-type`` /
+    ``--strict`` / ``--dry-run`` / ``--id-field``.
+    """
+
+    text: str
+    logic: Optional[str] = None
+    trigger_type: Literal["override", "manual"] = "override"
+    strict: bool = False
+    dry_run: bool = False
+    id_field: Literal["cmo_sample_name", "primary_id"] = "cmo_sample_name"
+
+
+class PairingImportRowRead(BaseModel):
+    """One import row: the CLI's per-row status (OK / MISMATCH / MULTI /
+    FAIL). ``normal_name`` / ``tumor_name`` are the TSV column values;
+    ``detail`` is the CLI log's detail column (empty for clean OK)."""
+
+    status: str
+    normal_name: str
+    tumor_name: str
+    detail: str = ""
+    pairing_id: Optional[str] = None
+
+
+class PairingImportRead(BaseModel):
+    """POST /v1/pairing/import result: the script's per-row statuses,
+    its summary counts, and the downloadable pairing log
+    (``log_tsv`` is the exact ``--log`` file content)."""
+
+    id: str
+    logic: str
+    trigger_type: str
+    strict: bool
+    dry_run: bool
+    total: int
+    pinned: int
+    mismatched: int
+    multi: int
+    failed: int
+    rows: list[PairingImportRowRead]
+    log_tsv: str
