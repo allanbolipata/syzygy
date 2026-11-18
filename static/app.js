@@ -3369,14 +3369,21 @@ $("#ops-audit-rows").addEventListener("click", (e) => {
 });
 
 async function reverseOpsAuditEvent(row) {
+  const note = row.action === "pair_assignment.imported"
+    ? "This reverses each pairing the import created — for every pair that is still in place, the strategy's own selection replaces the imported pairing. "
+    : "";
   const ok = window.confirm(
     `Reverse ${row.action} (${row.entity_type}/${row.entity_id})?\n\n` +
+    note +
     "This runs the compensating action through the normal code path — it is itself audited and linked to this event. The original row is never modified."
   );
   if (!ok) return;
   try {
     const done = await api(`/audit/${row.id}/reverse`, { method: "POST" });
-    banner("ok", `Reversed — compensating event ${esc(done.action)} written and linked.`);
+    banner(
+      "ok",
+      `Reversed — ${done.length} compensating event${done.length === 1 ? "" : "s"} written and linked.`
+    );
     loadOpsAudit(opsAudit.offset);
   } catch (e) {
     banner("error", `Reverse failed: ${esc(e.message)}`, true);

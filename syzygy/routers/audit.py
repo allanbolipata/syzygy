@@ -49,7 +49,8 @@ from sqlalchemy.orm import Session
 from syzygy.auth import get_current_user
 from syzygy.database import get_db
 from syzygy.models import AllowedUser, AuditLog, PairingLogic, PairingTable, Sample
-from syzygy.pairing_service import trigger_pairing
+from syzygy.pairing_service import is_pairable, trigger_pairing
+from syzygy.pairing_strategies import get_pairing_strategy
 from syzygy.routers.samples import unredact_sample
 from syzygy.schemas import AuditLogRead, AuditMeRead, AuditQueryRead
 
@@ -63,7 +64,7 @@ ROLES = ("user", "admin")
 REVERSIBLE_ACTIONS = (
     "pairing.created",      # override only — restore the replaced pairing
     "sample.redacted",      # unredact
-    "pair_assignment.imported",  # per-pair reversal — AL3 (see below)
+    "pair_assignment.imported",  # per-pair reversal (decision 6)
 )
 
 
@@ -141,9 +142,9 @@ def _is_reversible(row: AuditLog) -> bool:
     ``pairing.created`` counts only for overrides that actually
     replaced a previous pairing — restoring is only possible when the
     payload still carries the replaced row's id. ``pair_assignment.
-    imported`` is listed in decision 6 but its events (and the import
-    endpoint they come from) are ticket AL3, so the flag is False
-    until then.
+    imported`` counts when the event's payload carries at least one
+    created pairing — a dry-run import created nothing and is not
+    reversible.
     """
     payload = row.payload or {}
     if row.action == "sample.redacted":
@@ -152,6 +153,11 @@ def _is_reversible(row: AuditLog) -> bool:
         return (
             payload.get("trigger_type") == "override"
             and bool(payload.get("replaced_pairing_id"))
+        )
+    if row.action == "pair_assignment.imported":
+        rows = payload.get("rows")
+        return isinstance(rows, list) and any(
+            isinstance(r, dict) and r.get("pairing_id") for r in rows
         )
     return False
 
@@ -406,19 +412,131 @@ def _reverse_sample_redacted(
     return _row_read(new_event)
 
 
-@router.post("/{event_id}/reverse", response_model=AuditLogRead)
+def _reverse_import(
+    db: Session, event: AuditLog, payload: dict, current_user: dict
+) -> list[AuditLogRead]:
+    """Per-pair reversal of an import (decision 6).
+
+    The import event's ``payload.rows`` (pairings.py, decision 3)
+    carries one entry per TSV row. For each row whose import created a
+    pairing that is still the latest for its tumor, the normal pairing
+    path re-runs (manual trigger) so the strategy's own selection
+    replaces the imported row — the new ``pairing.created`` event
+    carries ``reverse_of`` itself, and the original import row is
+    never modified (append-only).
+
+    Rows that cannot be reversed are skipped with a reason: nothing
+    was created (dry run / FAIL), the pairing has since been replaced,
+    the tumor is missing or redacted, the strategy re-selects the very
+    normal the import pinned, or the logic is a fan-out (multi-pair)
+    strategy whose cascade cannot be expressed as one linked
+    compensating event per pair. If no row reverses, 409.
+    """
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This import event carries no rows to reverse (a dry-run "
+                "import created no pairings, and events written before "
+                "the per-row payload schema carry no row data)"
+            ),
+        )
+    new_events: list[AuditLogRead] = []
+    skipped: list[str] = []
+    for i, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            skipped.append(f"row {i}: malformed row entry")
+            continue
+        pairing_id = row.get("pairing_id")
+        if not pairing_id:
+            skipped.append(
+                f"row {i} ({row.get('status') or 'no status'}): no pairing "
+                "was created"
+            )
+            continue
+        try:
+            pairing = db.get(PairingTable, UUID(pairing_id))
+        except ValueError:
+            skipped.append(f"row {i}: pairing id is not a valid UUID")
+            continue
+        if pairing is None:
+            skipped.append(f"row {i}: the pairing row no longer exists")
+            continue
+        if not pairing.latest:
+            skipped.append(
+                f"row {i}: the imported pairing has since been replaced"
+            )
+            continue
+        logic = db.get(PairingLogic, pairing.pairing_logic_id)
+        if logic is None:
+            skipped.append(f"row {i}: the pairing logic no longer exists")
+            continue
+        if getattr(get_pairing_strategy(logic), "MULTI_PAIR", False):
+            skipped.append(
+                f"row {i}: fan-out (multi-pair) logics cannot be reversed "
+                "per pair"
+            )
+            continue
+        tumor = db.get(Sample, pairing.tumor_id)
+        if not is_pairable(tumor):
+            skipped.append(f"row {i}: the tumor sample is missing or redacted")
+            continue
+        new_row = trigger_pairing(
+            db, tumor, logic, "manual", actor=current_user, reverse_of=event.id
+        )
+        if new_row is None:
+            skipped.append(
+                f"row {i}: the strategy found no normal — the imported "
+                "pairing stays in place"
+            )
+            continue
+        if new_row.id == pairing.id:
+            skipped.append(
+                f"row {i}: the strategy's own selection matches the "
+                "imported pairing — nothing to undo"
+            )
+            continue
+        new_event = db.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "pairing.created",
+                AuditLog.entity_id == str(new_row.id),
+                AuditLog.reverse_of == event.id,
+            )
+        )
+        if new_event is None:
+            # Only a concurrent commit (which rolled back our row) can
+            # leave the new pairing without a linked event.
+            skipped.append(
+                f"row {i}: the pairing changed concurrently and no linked "
+                "event was written"
+            )
+            continue
+        new_events.append(_row_read(new_event))
+    if not new_events:
+        raise HTTPException(
+            status_code=409,
+            detail="Nothing to reverse: " + "; ".join(skipped[:10]),
+        )
+    return new_events
+
+
+@router.post("/{event_id}/reverse", response_model=list[AuditLogRead])
 def reverse_event(
     event_id: UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-) -> AuditLogRead:
+) -> list[AuditLogRead]:
     """Reverse one audit event (decision 6/8).
 
     The original row is never modified or deleted — the audit log is
     append-only (AL1 trigger). The compensating action runs the normal
     code path, so it is audited like any other action, and the new
     event's ``reverse_of`` links back to the one being reversed.
-    Permission: the actor of the event, or an admin.
+    The response is the list of compensating events written — one for
+    ``pairing.created`` / ``sample.redacted``, one per pair for
+    ``pair_assignment.imported``. Permission: the actor of the event,
+    or an admin.
     """
     event = db.get(AuditLog, event_id)
     if event is None:
@@ -436,20 +554,16 @@ def reverse_event(
         )
     payload = event.payload or {}
     if event.action == "pairing.created":
-        return _reverse_pairing_created(db, event, payload, current_user)
+        return [_reverse_pairing_created(db, event, payload, current_user)]
     if event.action == "sample.redacted":
-        return _reverse_sample_redacted(db, event, current_user)
+        return [_reverse_sample_redacted(db, event, current_user)]
     if event.action == "pair_assignment.imported":
-        # Listed as reversible in decision 6, but its events and the
-        # import endpoint they come from are ticket AL3 — until then
-        # there is no payload contract to reverse against.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Per-pair reversal of imported pair assignments ships "
-                "with the import endpoint (ticket AL3)"
-            ),
-        )
+        if not _is_reversible(event):
+            raise HTTPException(
+                status_code=400,
+                detail="This event is not reversible.",
+            )
+        return _reverse_import(db, event, payload, current_user)
     raise HTTPException(
         status_code=400,
         detail=(

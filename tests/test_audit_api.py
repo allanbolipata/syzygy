@@ -424,8 +424,7 @@ def test_reversal_override_restores_previous_pairing_and_links_event(client, db)
     _as(c, state, db, CAROL, groups=["TEMPO"])
     res = c.post(f"/v1/audit/{event.id}/reverse")
     assert res.status_code == 200, res.text
-    body = res.json()
-    # The response IS the new (compensating) event, linked to the old.
+    body = res.json()[0]  # one compensating event for a single-pair reversal
     assert body["action"] == "pairing.created"
     assert UUID(body["reverse_of"]) == event.id
     assert body["actor"] == CAROL
@@ -505,8 +504,8 @@ def test_reversal_of_another_users_event_requires_admin(client, db):
     _as(c, state, db, ADMIN, role="admin")
     res = c.post(f"/v1/audit/{event.id}/reverse")
     assert res.status_code == 200, res.text
-    assert res.json()["actor"] == ADMIN
-    assert UUID(res.json()["reverse_of"]) == event.id
+    assert res.json()[0]["actor"] == ADMIN
+    assert UUID(res.json()[0]["reverse_of"]) == event.id
     assert _latest(db, tumor, logic).normal_id == normal.id
 
 
@@ -552,11 +551,310 @@ def test_reversal_sample_redacted(client, db):
     )
     res = c.post(f"/v1/audit/{event.id}/reverse")
     assert res.status_code == 200, res.text
-    assert res.json()["action"] == "sample.unredacted"
-    assert UUID(res.json()["reverse_of"]) == event.id
+    assert res.json()[0]["action"] == "sample.unredacted"
+    assert UUID(res.json()[0]["reverse_of"]) == event.id
     db.refresh(sample)
     assert sample.redacted is False
 
     # Reversing again: the sample is no longer redacted — 409.
     res = c.post(f"/v1/audit/{event.id}/reverse")
     assert res.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Reversal of pair_assignment.imported (decision 6, per-pair)
+# ---------------------------------------------------------------------------
+
+
+def _import_event(c, db, text, logic="TEMPO", **flags):
+    """Run the REAL import endpoint as the current user; return
+    ``(response body, the pair_assignment.imported event)``."""
+    body = {"text": text, "logic": logic, "id_field": "primary_id"}
+    body.update(flags)
+    res = c.post("/v1/pairing/import", json=body)
+    assert res.status_code == 200, res.text
+    event = db.scalar(
+        select(AuditLog).where(
+            AuditLog.action == "pair_assignment.imported",
+            AuditLog.pairing_logic == logic,
+        )
+    )
+    assert event is not None
+    return res.json(), event
+
+
+def test_reversal_import_per_pair_undoes_the_imported_pairing(client, db):
+    """Decision 6: reversing an import re-runs the normal pairing path
+    per created pair — the strategy's own selection replaces the
+    imported row, the new event carries reverse_of, and the original
+    import row is untouched (append-only)."""
+    c, state = client
+    logic, tumor, normal, normal2 = _seed_pairing_inputs(db)
+    # The default strategy's own selection is the LATEST normal
+    # (normal2, 2024-01-03); the import pins the earlier one, so the
+    # reversal has something to undo.
+    _as(c, state, db, CAROL, groups=["TEMPO"])
+    body, event = _import_event(
+        c, db, "NORMAL_ID\tTUMOR_ID\nNORMAL-R-1\tTUMOR-R-1\n"
+    )
+    # Two matching candidate normals -> the CLI's MULTI status; the
+    # curated pin is still created (pairing_id is set).
+    assert body["rows"][0]["status"] == "MULTI"
+    imported_id = body["rows"][0]["pairing_id"]
+    assert imported_id
+    assert _latest(db, tumor, logic).id == UUID(imported_id)
+
+    # The viewer row carries reversible: true (a pairing was created).
+    rows = c.get(
+        "/v1/audit/", params={"action": "pair_assignment.imported"}
+    ).json()["rows"]
+    assert len(rows) == 1 and rows[0]["reversible"] is True
+
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert isinstance(body, list) and len(body) == 1
+    assert body[0]["action"] == "pairing.created"
+    assert UUID(body[0]["reverse_of"]) == event.id
+    assert body[0]["actor"] == CAROL
+
+    # Real behavior: the strategy's own selection (normal2) is latest
+    # again and the imported row is retired.
+    latest = _latest(db, tumor, logic)
+    assert latest.normal_id == normal2.id
+    assert db.get(PairingTable, UUID(imported_id)).latest is False
+
+    # The compensating event names the replaced row in its payload.
+    new_event = db.get(AuditLog, UUID(body[0]["id"]))
+    assert new_event.reverse_of == event.id
+    assert new_event.payload["replaced_pairing_id"] == imported_id
+    # The original import event is untouched (append-only).
+    orig = db.get(AuditLog, event.id)
+    assert orig.reverse_of is None
+    assert orig.payload["rows"][0]["pairing_id"] == imported_id
+
+
+def test_reversal_import_multi_pair_reverses_every_created_pairing(client, db):
+    """A two-row import yields two compensating events, each linked to
+    the same import event — one per pair (decision 6 'per-pair')."""
+    c, state = client
+    logic = PairingLogic(name="TEMPO")
+    db.add(logic)
+    db.commit()
+    db.refresh(logic)
+
+    def _samples(tag, patient, day):
+        tumor = Sample(
+            primary_id=f"TUMOR-IMP-{tag}",
+            cmo_sample_name=f"Tumor Imp {tag}",
+            patient__cmo=patient,
+            sample_type="tissue",
+            gene_panel="PANEL-A",
+            bait_set="BAIT-1",
+            tumor_or_normal=TumorOrNormal.TUMOR.value,
+            sequencing_date=datetime(2024, 2, 1),
+        )
+        pinned = Sample(
+            primary_id=f"NORMAL-IMP-{tag}-1",
+            cmo_sample_name=f"Normal Imp {tag} 1",
+            patient__cmo=patient,
+            sample_type="tissue",
+            gene_panel="PANEL-A",
+            bait_set="BAIT-1",
+            tumor_or_normal=TumorOrNormal.NORMAL.value,
+            sequencing_date=datetime(2024, 2, 2 + day),
+        )
+        own = Sample(
+            primary_id=f"NORMAL-IMP-{tag}-2",
+            cmo_sample_name=f"Normal Imp {tag} 2",
+            patient__cmo=patient,
+            sample_type="tissue",
+            gene_panel="PANEL-A",
+            bait_set="BAIT-1",
+            tumor_or_normal=TumorOrNormal.NORMAL.value,
+            sequencing_date=datetime(2024, 2, 5 + day),
+        )
+        db.add_all([tumor, pinned, own])
+        return tumor, pinned, own
+
+    t1, _, own1 = _samples("1", "PAT-IMP-1", 0)
+    t2, _, own2 = _samples("2", "PAT-IMP-2", 1)
+    db.commit()
+
+    _as(c, state, db, CAROL, groups=["TEMPO"])
+    body, event = _import_event(
+        c, db,
+        "NORMAL_ID\tTUMOR_ID\n"
+        "NORMAL-IMP-1-1\tTUMOR-IMP-1\n"
+        "NORMAL-IMP-2-1\tTUMOR-IMP-2\n",
+    )
+    assert [r["status"] for r in body["rows"]] == ["MULTI", "MULTI"]
+    imported_ids = [r["pairing_id"] for r in body["rows"]]
+    assert all(imported_ids)
+
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 200, res.text
+    done = res.json()
+    assert len(done) == 2
+    # Every compensating event links to the SAME import event.
+    assert {UUID(d["reverse_of"]) for d in done} == {event.id}
+    assert all(d["action"] == "pairing.created" for d in done)
+    # Both imported rows are retired; the strategy's own normal is
+    # latest again — per pair.
+    for pairing_id, tumor, own in zip(imported_ids, (t1, t2), (own1, own2)):
+        assert db.get(PairingTable, UUID(pairing_id)).latest is False
+        assert _latest(db, tumor, logic).normal_id == own.id
+
+
+def test_reversal_import_mixed_statuses_reverses_only_created_pairs(client, db):
+    """A FAIL row (unresolvable normal) created nothing — it is skipped
+    and the pinned (MULTI) row is still reversed."""
+    c, state = client
+    logic, tumor, normal, normal2 = _seed_pairing_inputs(db)
+    _as(c, state, db, CAROL, groups=["TEMPO"])
+    body, event = _import_event(
+        c, db,
+        "NORMAL_ID\tTUMOR_ID\n"
+        "NORMAL-R-1\tTUMOR-R-1\n"
+        "GHOST-NORMAL\tTUMOR-R-1\n",
+    )
+    assert [r["status"] for r in body["rows"]] == ["MULTI", "FAIL"]
+    assert body["rows"][1]["pairing_id"] is None
+
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 200, res.text
+    done = res.json()
+    assert len(done) == 1
+    assert UUID(done[0]["reverse_of"]) == event.id
+    # The imported pairing is gone; the strategy's own normal is latest.
+    assert _latest(db, tumor, logic).normal_id == normal2.id
+
+
+def test_reversal_dry_run_import_is_not_reversible(client, db):
+    """A dry-run import creates no pairings — the viewer row's flag is
+    False and the reversal 400s (nothing to undo)."""
+    c, state = client
+    logic, tumor, normal, normal2 = _seed_pairing_inputs(db)
+    _as(c, state, db, CAROL, groups=["TEMPO"])
+    body, event = _import_event(
+        c, db, "NORMAL_ID\tTUMOR_ID\nNORMAL-R-1\tTUMOR-R-1\n", dry_run=True
+    )
+    assert body["dry_run"] is True
+    assert body["rows"][0]["pairing_id"] is None
+    assert list(db.scalars(select(PairingTable))) == []
+
+    rows = c.get(
+        "/v1/audit/", params={"action": "pair_assignment.imported"}
+    ).json()["rows"]
+    assert len(rows) == 1 and rows[0]["reversible"] is False
+
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 400
+    assert "not reversible" in res.json()["detail"]
+
+
+def test_reversal_import_superseded_is_409(client, db):
+    """If the imported pairing has since been replaced, reversing the
+    import would clobber the newer pairing — 409 with the per-row
+    reason."""
+    c, state = client
+    logic, tumor, normal, normal2 = _seed_pairing_inputs(db)
+    _as(c, state, db, CAROL, groups=["TEMPO"])
+    body, event = _import_event(
+        c, db, "NORMAL_ID\tTUMOR_ID\nNORMAL-R-1\tTUMOR-R-1\n"
+    )
+    imported_id = body["rows"][0]["pairing_id"]
+    # A newer pairing replaces the import.
+    override = trigger_pairing(
+        db, tumor, logic, "override", normal_id=normal2.id, actor=CAROL
+    )
+    assert override.id != UUID(imported_id)
+
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 409
+    assert "Nothing to reverse" in res.json()["detail"]
+    assert "since been replaced" in res.json()["detail"]
+    # The newer pairing is untouched.
+    assert _latest(db, tumor, logic).id == override.id
+
+
+def test_reversal_import_of_another_users_event_requires_admin(client, db):
+    c, state = client
+    logic, tumor, normal, normal2 = _seed_pairing_inputs(db)
+    _as(c, state, db, CAROL, groups=["TEMPO"])
+    body, event = _import_event(
+        c, db, "NORMAL_ID\tTUMOR_ID\nNORMAL-R-1\tTUMOR-R-1\n"
+    )
+    _allowed_user(db, ADMIN, role="admin")
+    _allowed_user(db, DAVE)
+    _allowed_user(db, "erin@x.com", groups=["TEMPO"])
+
+    # A user with no groups cannot even see the event: 403.
+    _as(c, state, db, DAVE)
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 403
+
+    # A group user who is NOT the actor: visible, but not the actor and
+    # not admin — 403.
+    _as(c, state, db, "erin@x.com", groups=["TEMPO"])
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 403
+    assert "admin" in res.json()["detail"]
+
+    # The admin may reverse another user's import.
+    _as(c, state, db, ADMIN, role="admin")
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 200, res.text
+    done = res.json()
+    assert len(done) == 1
+    assert done[0]["actor"] == ADMIN
+    assert UUID(done[0]["reverse_of"]) == event.id
+    assert _latest(db, tumor, logic).normal_id == normal2.id
+
+
+def test_reversal_import_fan_out_logic_is_409(client, db):
+    """Under a multi-pair (DMP) logic the strategy's own cascade fans
+    out to the full match set — not expressible as one linked
+    compensating event per pair — so the row is skipped and, with no
+    other rows, the reversal 409s without touching the pairing."""
+    c, state = client
+    logic = PairingLogic(name="DMP", strategy_name="dmp")
+    db.add(logic)
+    tumor = Sample(
+        primary_id="TUMOR-DMP-R",
+        cmo_sample_name="Tumor DMP R",
+        patient__cmo="PAT-DMP-R",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.TUMOR.value,
+        sequencing_date=datetime(2024, 3, 1),
+    )
+    normal = Sample(
+        primary_id="NORMAL-DMP-R",
+        cmo_sample_name="Normal DMP R",
+        patient__cmo="PAT-DMP-R",
+        sample_type="tissue",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sequencing_date=datetime(2024, 3, 2),
+    )
+    db.add_all([tumor, normal])
+    db.commit()
+    db.refresh(logic)
+
+    _as(c, state, db, ADMIN, role="admin")
+    body, event = _import_event(
+        c, db,
+        "NORMAL_ID\tTUMOR_ID\nNORMAL-DMP-R\tTUMOR-DMP-R\n",
+        logic="DMP",
+    )
+    imported_id = body["rows"][0]["pairing_id"]
+    assert imported_id
+
+    res = c.post(f"/v1/audit/{event.id}/reverse")
+    assert res.status_code == 409
+    assert "fan-out" in res.json()["detail"]
+    # The imported row is untouched.
+    assert db.get(PairingTable, UUID(imported_id)).latest is True
