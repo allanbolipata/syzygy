@@ -123,7 +123,7 @@ function countLabel(total, rows, offset) {
  * Every navigation (tab switch, opening/closing a detail panel, opening
  * matches for a sample) pushes a history entry. */
 
-const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", "try"];
+const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", "try", "ops"];
 let restoringNav = false;
 let PAIRING_LOGICS = [];
 
@@ -287,6 +287,13 @@ function pushNav() {
 }
 
 function showView(name) {
+  // Ops (decision 8) is visible only to admin / logic-group users — the
+  // tab stays hidden for everyone else (loadOpsAccess). A hand-typed
+  // #/ops from a non-entitled session bounces to Samples.
+  if (name === "ops" && !opsAccess) {
+    banner("error", "The Ops tab is restricted to admin and pairing-logic group members.", true);
+    name = "samples";
+  }
   const prev = currentViewName();
   const isPairs = name === "pairs";
   if (prev && prev !== "pairs" && isPairs) {
@@ -633,6 +640,8 @@ async function loadLogics() {
     const logics = await api("/pairing-logic/?limit=100");
     PAIRING_LOGICS = logics;
     renderViewSelect();
+    renderOpsImportLogic();
+    renderOpsAuditLogicOptions();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -3141,11 +3150,372 @@ function signOut() {
 
 $("#logout-btn").addEventListener("click", signOut);
 
+/* ---------- Ops tab (AUDIT_LOG_TICKETS.md decision 8) ----------
+ * Visible only to identities with the admin role or >=1 pairing-logic
+ * group: /v1/audit/me returns role + logic_groups (server-side, decision
+ * 5). The three sections are the decision-8 panels:
+ *   a. pair assignment — POST /v1/pairing/import (shared core with the
+ *      CLI, so statuses cannot drift from scripts/import_tempo_pairs.py)
+ *   b. audit log viewer — GET /v1/audit (filters + payload expanders +
+ *      Reverse + CSV export; visibility applied server-side)
+ *   c. redaction controls — the R-feature redact/unredact endpoints */
+
+let opsAccess = null; // {email, role, logic_groups} or null when not entitled
+
+function opsTab() {
+  return document.querySelector('.tab[data-tab="ops"]');
+}
+
+async function loadOpsAccess() {
+  let me;
+  try {
+    me = await api("/audit/me");
+  } catch (_) {
+    return; // 401/403 already handled by api(): the user is sent to /login.
+  }
+  const entitled = me.role === "admin" || (me.logic_groups || []).length > 0;
+  opsAccess = entitled ? me : null;
+  opsTab().classList.toggle("hidden", !entitled);
+  if (!entitled) return;
+  const who = me.role === "admin" ? "admin" : `logic groups: ${me.logic_groups.join(", ")}`;
+  $("#ops-access-note").textContent = `Ops access — ${who}. The audit log below is already scoped to what you may see.`;
+  loadOpsAudit(0);
+}
+
+/* ---------- 8a: pair assignment (TEMPO import) ---------- */
+
+const opsImport = { busy: false, result: null };
+
+function renderOpsImportLogic() {
+  const sel = $("#ops-import-logic");
+  if (!sel) return;
+  sel.innerHTML = PAIRING_LOGICS.map((l) => {
+    const label = l.active ? l.name : `${l.name} (inactive)`;
+    return `<option value="${esc(l.name)}">${esc(label)}</option>`;
+  }).join("");
+}
+
+/* The file input only feeds the paste box — the user still reviews the
+ * TSV and presses Import (same as the CLI: the file never bypasses review). */
+$("#ops-import-file").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    $("#ops-import-text").value = String(reader.result);
+    banner("info", `Loaded ${esc(f.name)} into the paste box — review it, then Import.`);
+  };
+  reader.readAsText(f);
+});
+
+function opsStatusClass(status) {
+  if (status === "OK") return "ops-status-ok";
+  if (status === "MISMATCH") return "ops-status-mismatch";
+  if (status === "MULTI") return "ops-status-multi";
+  return "ops-status-fail";
+}
+
+async function runOpsImport() {
+  if (opsImport.busy) return;
+  const text = $("#ops-import-text").value;
+  if (!text.trim()) {
+    banner("error", "Paste (or upload) the pair TSV first — one NORMAL_ID<TAB>TUMOR_ID per line.", true);
+    return;
+  }
+  opsImport.busy = true;
+  $("#ops-import-run").disabled = true;
+  try {
+    opsImport.result = await api("/pairing/import", {
+      method: "POST",
+      body: JSON.stringify({
+        text,
+        logic: $("#ops-import-logic").value || null,
+        trigger_type: $("#ops-import-trigger").value,
+        id_field: $("#ops-import-idfield").value,
+        strict: $("#ops-import-strict").checked,
+        dry_run: $("#ops-import-dryrun").checked,
+      }),
+    });
+    const r = opsImport.result;
+    $("#ops-import-summary").innerHTML =
+      `<strong>${esc(r.logic)}</strong> &middot; ${esc(r.trigger_type)} &middot; ` +
+      (r.dry_run ? "<em>dry run — nothing pinned</em> " : "") +
+      `${r.total} rows: ` +
+      `<span class="ops-status-ok">${r.pinned} OK</span> &middot; ` +
+      `<span class="ops-status-mismatch">${r.mismatched} MISMATCH</span> &middot; ` +
+      `<span class="ops-status-multi">${r.multi} MULTI</span> &middot; ` +
+      `<span class="ops-status-fail">${r.failed} FAIL</span>`;
+    $("#ops-import-rows").innerHTML = r.rows.map((row) =>
+      `<tr><td class="${opsStatusClass(row.status)}">${esc(row.status)}</td>` +
+      `<td>${esc(row.normal_name)}</td><td>${esc(row.tumor_name)}</td>` +
+      `<td>${esc(row.detail || "")}</td><td>${esc(row.pairing_id || "")}</td></tr>`
+    ).join("");
+    $("#ops-import-result").classList.remove("hidden");
+  } catch (e) {
+    banner("error", `Import failed: ${esc(e.message)}`, true);
+  } finally {
+    opsImport.busy = false;
+    $("#ops-import-run").disabled = false;
+  }
+}
+
+function downloadText(name, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$("#ops-import-run").addEventListener("click", runOpsImport);
+
+$("#ops-import-log").addEventListener("click", () => {
+  const r = opsImport.result;
+  if (!r) return;
+  // log_tsv is the exact --log file content the CLI would have written.
+  downloadText(`pairing-import-${r.id}.tsv`, r.log_tsv);
+});
+
+/* ---------- 8b: audit log viewer ---------- */
+
+const opsAudit = { offset: 0, rows: [], total: 0 };
+
+function renderOpsAuditLogicOptions() {
+  const sel = $("#ops-audit-logic");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML =
+    `<option value="">any</option>` +
+    PAIRING_LOGICS.map((l) => `<option value="${esc(l.name)}">${esc(l.name)}</option>`).join("");
+  if (cur) sel.value = cur;
+}
+
+/* The filter bar's values, as the API's exact query names (decision 7):
+ * the time bounds are aliased `from`/`to`, newest first, limit <= 500.
+ * ``export`` mode ignores the page offset and pulls the 500-row cap. */
+function opsAuditParams(exportMode) {
+  const p = new URLSearchParams();
+  const from = $("#ops-audit-from").value;
+  const to = $("#ops-audit-to").value;
+  if (from) p.set("from", from + ":00");
+  if (to) p.set("to", to + ":59"); // datetime-local has no seconds: keep the whole "to" minute
+  const actor = $("#ops-audit-actor").value.trim();
+  if (actor) p.set("actor", actor);
+  const action = $("#ops-audit-action").value.trim();
+  if (action) p.set("action", action);
+  const logic = $("#ops-audit-logic").value;
+  if (logic) p.set("pairing_logic", logic);
+  p.set("limit", String(exportMode ? 500 : Number($("#ops-audit-limit").value)));
+  p.set("offset", String(exportMode ? 0 : opsAudit.offset));
+  return p;
+}
+
+function opsAuditRowHtml(row) {
+  const actor =
+    row.actor_kind === "system"
+      ? `<span title="system event">${esc(row.actor)}</span>`
+      : esc(row.actor);
+  return (
+    `<tr><td class="nowrap">${esc(fmtDate(row.occurred_at))}</td>` +
+    `<td>${actor}</td>` +
+    `<td><code>${esc(row.action)}</code></td>` +
+    `<td>${esc(row.entity_type)}/${esc(row.entity_id)}</td>` +
+    `<td>${esc(row.pairing_logic || "")}</td>` +
+    `<td class="ops-audit-actions">` +
+    `<button class="ops-payload-toggle" data-ops-audit-id="${esc(row.id)}">payload</button>` +
+    (row.reversible
+      ? `<button class="ops-reverse" data-ops-audit-id="${esc(row.id)}" title="Compensating action — runs the normal code path, is itself audited, and is linked to this event. The original row is never modified.">Reverse</button>`
+      : "") +
+    `</td></tr>` +
+    `<tr><td colspan="6"><pre class="ops-payload hidden">${esc(JSON.stringify(row.payload, null, 2))}</pre></td></tr>`
+  );
+}
+
+async function loadOpsAudit(offset) {
+  opsAudit.offset = offset || 0;
+  let body;
+  try {
+    body = await api(`/audit/?${opsAuditParams()}`);
+  } catch (e) {
+    banner("error", `Audit log failed: ${esc(e.message)}`, true);
+    return;
+  }
+  opsAudit.total = body.total;
+  opsAudit.rows = body.rows;
+  const per = Number($("#ops-audit-limit").value);
+  $("#ops-audit-count").textContent =
+    body.total === 0
+      ? ""
+      : `Showing ${opsAudit.offset + 1}–${Math.min(opsAudit.offset + per, body.total)} of ${body.total.toLocaleString("en-US")}`;
+  $("#ops-audit-prev").disabled = opsAudit.offset === 0;
+  $("#ops-audit-next").disabled = opsAudit.offset + per >= body.total;
+  $("#ops-audit-empty").classList.toggle("hidden", body.rows.length > 0);
+  $("#ops-audit-rows").innerHTML = body.rows.map(opsAuditRowHtml).join("");
+}
+
+/* One delegated handler: rows are replaced on every load, so the payload
+ * expanders and Reverse buttons are found by data attribute, not bound. */
+$("#ops-audit-rows").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-ops-audit-id]");
+  if (!btn) return;
+  const row = opsAudit.rows.find((r) => r.id === btn.dataset.opsAuditId);
+  if (!row) return;
+  if (btn.classList.contains("ops-payload-toggle")) {
+    const pre = btn.closest("td").parentElement.nextElementSibling.querySelector(".ops-payload");
+    if (pre) pre.classList.toggle("hidden");
+  } else {
+    reverseOpsAuditEvent(row);
+  }
+});
+
+async function reverseOpsAuditEvent(row) {
+  const ok = window.confirm(
+    `Reverse ${row.action} (${row.entity_type}/${row.entity_id})?\n\n` +
+    "This runs the compensating action through the normal code path — it is itself audited and linked to this event. The original row is never modified."
+  );
+  if (!ok) return;
+  try {
+    const done = await api(`/audit/${row.id}/reverse`, { method: "POST" });
+    banner("ok", `Reversed — compensating event ${esc(done.action)} written and linked.`);
+    loadOpsAudit(opsAudit.offset);
+  } catch (e) {
+    banner("error", `Reverse failed: ${esc(e.message)}`, true);
+  }
+}
+
+function csvCell(v) {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/* CSV export of the CURRENT filter set (decision 8b: "respecting
+ * visibility" — the server already scopes the query; the export just
+ * serializes what the viewer sees, capped at the API's 500-row limit). */
+async function exportOpsAuditCsv() {
+  let body;
+  try {
+    body = await api(`/audit/?${opsAuditParams(true)}`);
+  } catch (e) {
+    banner("error", `CSV export failed: ${esc(e.message)}`, true);
+    return;
+  }
+  if (!body.rows.length) {
+    banner("info", "Nothing to export — no events match the current filters.");
+    return;
+  }
+  const header = ["id", "occurred_at", "actor", "actor_kind", "action", "entity_type", "entity_id", "pairing_logic", "reverse_of", "request_id", "reversible", "payload"];
+  const lines = [header.join(",")];
+  for (const r of body.rows) {
+    lines.push(
+      [r.id, r.occurred_at, r.actor, r.actor_kind, r.action, r.entity_type, r.entity_id,
+       r.pairing_logic || "", r.reverse_of || "", r.request_id || "", r.reversible,
+       JSON.stringify(r.payload)].map(csvCell).join(",")
+    );
+  }
+  if (body.total > body.rows.length) {
+    banner("info", `Exported the first ${body.rows.length.toLocaleString("en-US")} of ${body.total.toLocaleString("en-US")} matching events — one query is capped at 500. Narrow the filters to get the rest.`, true);
+  } else {
+    banner("ok", `Exported ${body.rows.length.toLocaleString("en-US")} events.`);
+  }
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  downloadText(`audit-log-${stamp}.csv`, lines.join("\n"));
+}
+
+$("#ops-audit-apply").addEventListener("click", () => loadOpsAudit(0));
+$("#ops-audit-prev").addEventListener("click", () => loadOpsAudit(Math.max(0, opsAudit.offset - Number($("#ops-audit-limit").value))));
+$("#ops-audit-next").addEventListener("click", () => loadOpsAudit(opsAudit.offset + Number($("#ops-audit-limit").value)));
+$("#ops-audit-export").addEventListener("click", exportOpsAuditCsv);
+$("#ops-audit-clear").addEventListener("click", () => {
+  for (const id of ["ops-audit-from", "ops-audit-to", "ops-audit-actor", "ops-audit-action"]) $(`#${id}`).value = "";
+  $("#ops-audit-logic").value = "";
+  loadOpsAudit(0);
+});
+
+/* ---------- 8c: redaction controls ---------- */
+
+const opsRedact = { busy: false, rows: [] };
+
+async function searchOpsSamples() {
+  const q = $("#ops-redact-q").value.trim();
+  if (!q) {
+    opsRedact.rows = [];
+    $("#ops-redact-rows").innerHTML = "";
+    $("#ops-redact-empty").classList.remove("hidden");
+    return;
+  }
+  let rows;
+  try {
+    rows = await api(`/sample/?q=${encodeURIComponent(q)}&limit=50`);
+  } catch (e) {
+    banner("error", `Search failed: ${esc(e.message)}`, true);
+    return;
+  }
+  opsRedact.rows = rows;
+  $("#ops-redact-empty").classList.toggle("hidden", rows.length > 0);
+  $("#ops-redact-rows").innerHTML = rows.map((s) =>
+    `<tr><td>${redactedId(s, s.primary_id)} ${redactionBadge(s)}</td>` +
+    `<td>${redactedId(s, s.cmo_sample_name)}</td>` +
+    `<td>${esc(s.tumor_or_normal)}</td>` +
+    `<td>${
+      s.redacted
+        ? `<button data-ops-redact-id="${esc(s.id)}" data-ops-redact-act="unredact">Un-redact</button>`
+        : `<button data-ops-redact-id="${esc(s.id)}" data-ops-redact-act="redact">Redact</button>`
+    }</td></tr>`
+  ).join("");
+}
+
+$("#ops-redact-search").addEventListener("click", searchOpsSamples);
+$("#ops-redact-q").addEventListener("keydown", (e) => { if (e.key === "Enter") searchOpsSamples(); });
+
+$("#ops-redact-rows").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-ops-redact-id]");
+  if (!btn || opsRedact.busy) return;
+  const s = opsRedact.rows.find((x) => x.id === btn.dataset.opsRedactId);
+  if (!s) return;
+  if (btn.dataset.opsRedactAct === "redact") redactOpsSample(s);
+  else unredactOpsSample(s);
+});
+
+async function redactOpsSample(s) {
+  const reason = $("#ops-redact-reason").value.trim();
+  const ok = window.confirm(
+    `Redact ${s.primary_id}?\n\nA redacted sample is excluded from all pairing (automatic and manual). It keeps its id but appears flagged across candidate lists and pair reports. This can be undone.`
+  );
+  if (!ok) return;
+  opsRedact.busy = true;
+  try {
+    await api(`/sample/${s.id}/redact`, { method: "POST", body: JSON.stringify({ reason: reason || null }) });
+    banner("ok", `Redacted ${esc(s.primary_id)}.`);
+    $("#ops-redact-reason").value = "";
+    searchOpsSamples();
+  } catch (e) {
+    banner("error", `Redact failed: ${esc(e.message)}`, true);
+  } finally {
+    opsRedact.busy = false;
+  }
+}
+
+async function unredactOpsSample(s) {
+  const ok = window.confirm(`Un-redact ${s.primary_id}? It becomes pairable again.`);
+  if (!ok) return;
+  opsRedact.busy = true;
+  try {
+    await api(`/sample/${s.id}/unredact`, { method: "POST" });
+    banner("ok", `Un-redacted ${esc(s.primary_id)}.`);
+    searchOpsSamples();
+  } catch (e) {
+    banner("error", `Un-redact failed: ${esc(e.message)}`, true);
+  } finally {
+    opsRedact.busy = false;
+  }
+}
+
 /* ---------- init ---------- */
 
 (async function init() {
   loadCurrentUser();
   await loadLogics();
+  await loadOpsAccess();
   // Resolve the session View: saved localStorage choice → server default
   // (if active) → unselected (pairing tabs gated). Don't persist an
   // auto-resolved default — only an explicit user pick is saved, so a

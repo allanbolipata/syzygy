@@ -108,6 +108,28 @@ main.view { padding: 1rem 1.2rem 2rem; max-width: 120rem; }
 .panel h2 { font-size: 1rem; margin: 0 0 0.5rem; }
 .hint { color: var(--muted); font-size: 0.82rem; margin: 0.4rem 0; }
 
+/* Ops tab (AUDIT_LOG_TICKETS.md decision 8): import statuses, payload
+ * expanders and the paste box. */
+.nowrap { white-space: nowrap; }
+#ops-import-text { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+.ops-status-ok { color: var(--ok); font-weight: 600; }
+.ops-status-mismatch { color: var(--warn); font-weight: 600; }
+.ops-status-multi { color: var(--accent); font-weight: 600; }
+.ops-status-fail { color: var(--bad); font-weight: 600; }
+.ops-payload {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  margin: 0.2rem 0;
+  font-size: 0.78rem;
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ops-audit-actions button { margin-right: 0.35rem; }
+
 .filters { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; margin: 0.6rem 0; }
 .filters label, .actions label {
   display: flex; flex-direction: column; gap: 0.2rem;
