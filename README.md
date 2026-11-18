@@ -847,6 +847,26 @@ dict customizes the strategy at use time.
   `sample_type` are not keys. `TEMPO` and `CHRONOS` register as
   aliases of this strategy.
 
+## Sample redaction
+
+A sample can be **redacted**: flagged as excluded from pairing with an
+audit trail (`redacted` boolean plus `redacted_at` / `redacted_by` /
+`redaction_reason` columns on `samples`). Redaction is the single
+pairing choke point (`is_pairable` in `pairing_service.py`): a
+redacted **tumor** is never auto-paired (the bulk sweeps, `trigger-all`
+and the DMP/HARMONY passes skip it in SQL) and an explicit
+`POST /v1/pairing/trigger` on it returns 400; a redacted **normal** is
+never offered as a candidate by any strategy's automatic selection, and
+an explicit pin (`normal_id`) of it returns 400. Redacted samples still
+appear in candidate listings (`possible_matches` / `evaluate`), each
+carrying `redacted: true` and its reason, so they are visible but
+unselectable. Redaction **never retires an existing pairing** — pairing
+history is immutable and the UI badges it instead; un-redacting
+restores pairing eligibility while preserving the audit fields.
+Endpoints: `POST /v1/sample/{id}/redact` (optional `reason`) and
+`POST /v1/sample/{id}/unredact` (both idempotent);
+`GET /v1/sample/` gains a `redacted=true|false` filter.
+
 ## Tests
 
     pip install -r requirements-dev.txt

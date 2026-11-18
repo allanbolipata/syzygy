@@ -72,6 +72,22 @@ class Sample(Base):
     # "DMP BAMs", "Pooled Normals"); None for rows created outside a beagle
     # import (dashboard fixtures, manual API creates).
     file_group: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    # Redaction (spec R1, REDACTION_TICKETS.md): a redacted sample is
+    # excluded from every strategy's candidate query and the bulk
+    # pairing sweeps, and explicit pairing triggers on it return 400;
+    # candidate listings still show it, flagged. Redaction never retires
+    # existing pairings (pairing history is immutable). Together with
+    # redacted_at / redacted_by / redaction_reason these four columns
+    # ARE the redaction audit trail (this branch predates the
+    # audit-log feature).
+    redacted: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, default=False, server_default=sa.false()
+    )
+    redacted_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    redacted_by: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
+    redaction_reason: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
     # DMP sargable pairing keys (DMP bulk-pairing performance, item 1).
     # On Postgres these are GENERATED ALWAYS ... STORED columns (scripts/
     # migrate_dmp_generated_columns.py) materializing the exact key

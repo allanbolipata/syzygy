@@ -74,8 +74,23 @@ class SampleRead(BaseModel):
     errors: Optional[list[str]] = None
     sequencing_date: Optional[datetime] = None
     file_group: Optional[str] = None
+    # Redaction (spec R1, REDACTION_TICKETS.md): the flag plus the audit
+    # trail (when / by whom (email) / why). Redaction never retires
+    # existing pairings; un-redaction restores pairing eligibility.
+    redacted: bool
+    redacted_at: Optional[datetime] = None
+    redacted_by: Optional[str] = None
+    redaction_reason: Optional[str] = None
     created_date: datetime
     modified_date: datetime
+
+
+class RedactionRequest(BaseModel):
+    """Payload for POST /sample/{id}/redact (spec R1): the
+    operator-provided reason. Stored on the sample together with the
+    acting user's email and the timestamp — the redaction audit trail."""
+
+    reason: Optional[str] = None
 
 
 class PatientRead(BaseModel):

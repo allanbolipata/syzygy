@@ -394,9 +394,24 @@ class DefaultPairingStrategy:
 
     # -- matching -------------------------------------------------------
 
+    def _redaction_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
+        # Spec R1 (REDACTION_TICKETS.md): a redacted counterpart can never
+        # be paired. ``candidate_scope`` intentionally still returns redacted
+        # samples (the candidate listing must show them, flagged); this is
+        # the reason that marks them as non-matching so they are never
+        # auto-selected and the UI can badge them. Redaction never retires
+        # existing pairings — this only governs new candidate matching.
+        reasons: List[str] = []
+        if normal.redacted:
+            reasons.append("normal redacted")
+        if tumor.redacted:
+            reasons.append("tumor redacted")
+        return reasons
+
     def _base_mismatch_reasons(self, tumor: Sample, normal: Sample) -> List[str]:
         # Hard keys compare case-insensitively; None matches only NULL.
         reasons: List[str] = []
+        reasons.extend(self._redaction_reasons(tumor, normal))
         for label in self.HARD_KEYS:
             t_val = getattr(tumor, label)
             n_val = getattr(normal, label)
@@ -424,7 +439,12 @@ class DefaultPairingStrategy:
         request_id: Optional[str] = None,
         exclude_request_id: Optional[str] = None,
     ):
-        conds = [Sample.tumor_or_normal == TumorOrNormal.NORMAL.value]
+        # Spec R1 (REDACTION_TICKETS.md): redacted normals are never
+        # auto-selected — the cascade's candidate scope excludes them.
+        conds = [
+            Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
+            Sample.redacted.is_(False),
+        ]
         conds.extend(
             _key_condition(getattr(Sample, key), getattr(tumor, key))
             for key in self.HARD_KEYS
@@ -532,7 +552,12 @@ class DefaultPairingStrategy:
         normal: Sample,
         logic: Optional[PairingLogic] = None,
     ) -> List[Sample]:
-        conds = [Sample.tumor_or_normal == TumorOrNormal.TUMOR.value]
+        # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+        # auto-paired — the normal-side scope excludes them.
+        conds = [
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            Sample.redacted.is_(False),
+        ]
         conds.extend(
             _key_condition(getattr(Sample, key), getattr(normal, key))
             for key in self.HARD_KEYS
@@ -708,6 +733,9 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         # resolves to a novaseq/hiseq family. Both must resolve and
         # agree. The preservation gate still applies too.
         reasons: List[str] = []
+        # Spec R1: a redacted counterpart is never a valid pooled pair, so
+        # the candidate listing flags it (see ``_redaction_reasons``).
+        reasons.extend(self._redaction_reasons(tumor, pooled))
         if _norm_key(tumor.gene_panel) != _norm_key(pooled.gene_panel):
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
         if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
@@ -748,13 +776,22 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
     ) -> bool:
         return not self.mismatch_reasons(tumor, normal, db)
 
-    def _pooled_candidate_stmt(self, tumor: Sample):
-        return select(Sample).where(
+    def _pooled_candidate_stmt(self, tumor: Sample, include_redacted: bool = False):
+        # ``include_redacted`` keeps redacted pooled normals in the result.
+        # The automatic-selection path (``select_latest_normal``) leaves it
+        # False — a redacted pooled normal is never auto-selected (spec R1);
+        # the candidate-listing path (``candidate_scope``) passes True so a
+        # redacted pooled normal still shows up, flagged (spec R1: redacted
+        # candidates are listed, not hidden).
+        conds = [
             Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
             func.lower(Sample.sample_type).in_(self._pooled_types()),
             _key_condition(Sample.gene_panel, tumor.gene_panel),
             _key_condition(Sample.bait_set, tumor.bait_set),
-        )
+        ]
+        if not include_redacted:
+            conds.append(Sample.redacted.is_(False))
+        return select(Sample).where(*conds)
 
     def select_matching_tumors(
         self,
@@ -867,7 +904,13 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
                 candidates = []
             if role == TumorOrNormal.NORMAL.value:
                 # The pooled tier still applies for a DMP tumor.
-                pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+                # Listing path: include redacted pooled normals so they show
+                # up flagged (spec R1); auto-selection filters them instead.
+                pooled = list(
+                    db.scalars(
+                        self._pooled_candidate_stmt(sample, include_redacted=True)
+                    ).all()
+                )
                 known = {c.id for c in candidates}
                 candidates.extend(p for p in pooled if p.id not in known)
             return candidates
@@ -877,7 +920,11 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
                 # Patient-null hard-key scope already includes every
                 # matching pooled normal; nothing extra to add.
                 return candidates
-            pooled = list(db.scalars(self._pooled_candidate_stmt(sample)).all())
+            pooled = list(
+                db.scalars(
+                    self._pooled_candidate_stmt(sample, include_redacted=True)
+                ).all()
+            )
             dmp = self._dmp_candidates(db, sample)
             known = {c.id for c in candidates}
             candidates.extend(c for c in pooled + dmp if c.id not in known)
@@ -1001,6 +1048,9 @@ class TempoPairingStrategy(DefaultPairingStrategy):
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.NORMAL.value,
                 _key_condition(Sample.patient__cmo, tumor.patient__cmo),
+                # Spec R1 (REDACTION_TICKETS.md): redacted normals are
+                # never auto-selected.
+                Sample.redacted.is_(False),
             )
         ).all()
         picked, tier_notes = self._select_in_candidates(
@@ -1020,6 +1070,9 @@ class TempoPairingStrategy(DefaultPairingStrategy):
             select(Sample).where(
                 Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
                 _key_condition(Sample.patient__cmo, normal.patient__cmo),
+                # Spec R1 (REDACTION_TICKETS.md): redacted tumors are
+                # never auto-paired.
+                Sample.redacted.is_(False),
             )
         ).all()
         return [t for t in tumors if not self._soft_reasons(t, normal)]
@@ -1268,23 +1321,34 @@ class DmpPairingStrategy(DefaultPairingStrategy):
         (IM_ver rescue) normals, else nothing."""
         if not self._is_dmp(tumor) or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
             return []
+        # Spec R1 (REDACTION_TICKETS.md): a redacted tumor is never
+        # auto-paired — its row set is empty.
+        if tumor.redacted:
+            return []
         keys = self.pairing_keys(tumor)
         if not keys["patient"]:
             return []
-        tier1 = self._tier1_normals(db, tumor)
+        # Redacted normals are never auto-paired (spec R1) — a tumor
+        # whose only tier-1 normals are redacted falls through to the
+        # tier-2 rescue.
+        tier1 = [n for n in self._tier1_normals(db, tumor) if not n.redacted]
         if tier1:
             return tier1
         if not keys["ver"]:
             return []
         if _has_dmp_generated_columns(db):
-            return self._gen_key_select(
+            normals = self._gen_key_select(
                 db, TumorOrNormal.NORMAL.value, keys["patient"],
                 ver=keys["ver"],
             )
+            return [n for n in normals if not n.redacted]
         candidates = self._same_patient_dmp(
             db, TumorOrNormal.NORMAL.value, keys["patient"]
         )
-        return [n for n in candidates if self.pairing_keys(n)["ver"] == keys["ver"]]
+        return [
+            n for n in candidates
+            if self.pairing_keys(n)["ver"] == keys["ver"] and not n.redacted
+        ]
 
     def select_latest_normal(
         self,
@@ -1351,6 +1415,17 @@ class DmpPairingStrategy(DefaultPairingStrategy):
     def mismatch_reasons(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
     ) -> List[str]:
+        # Spec R1 (REDACTION_TICKETS.md): a redacted counterpart is never a
+        # valid DMP pairing row — even when the two-tier keys match, so the
+        # candidate listing flags it (``candidate_scope`` still lists it).
+        # The two-tier verdict below decides the rest.
+        return list(self._redaction_reasons(tumor, normal)) + self._dmp_pair_reasons(
+            tumor, normal, db
+        )
+
+    def _dmp_pair_reasons(
+        self, tumor: Sample, normal: Sample, db: Optional[Session] = None
+    ) -> List[str]:
         """Empty when the pair is a row of the tumor's two-tier row set.
 
         Tier 1 (same pool) always matches. Otherwise the pair matches
@@ -1415,10 +1490,19 @@ class DmpPairingStrategy(DefaultPairingStrategy):
         """
         if not self._is_dmp(normal) or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             return []
+        # Spec R1 (REDACTION_TICKETS.md): a redacted normal is never
+        # auto-paired — its tumor scope is empty.
+        if normal.redacted:
+            return []
         keys = self.pairing_keys(normal)
         if not keys["patient"]:
             return []
-        return self._same_patient_dmp(db, TumorOrNormal.TUMOR.value, keys["patient"])
+        # Redacted tumors are never auto-paired (spec R1).
+        return [
+            t
+            for t in self._same_patient_dmp(db, TumorOrNormal.TUMOR.value, keys["patient"])
+            if not t.redacted
+        ]
 
     # -- candidate view (Sample Pairing UI) ------------------------------------
 

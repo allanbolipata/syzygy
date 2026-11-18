@@ -111,6 +111,20 @@ def resolve_filter_logic(db: Session, pairing_logic: Optional[str]) -> Optional[
     return logic
 
 
+def is_pairable(sample: Optional[Sample]) -> bool:
+    """The single redaction chokepoint (spec R1, REDACTION_TICKETS.md).
+
+    A sample is pairable iff it is not redacted. Redacted samples are
+    excluded from all automatic pairing — every strategy's candidate
+    query and the bulk pairing sweeps filter them out in SQL — and
+    explicit pairing triggers on them raise 400 (``trigger_pairing``).
+    Redaction never retires existing pairings (pairing history is
+    immutable); ``_create_pairing`` and the strategy ``select_*``
+    methods never see a redacted sample through any of these paths.
+    """
+    return sample is not None and not sample.redacted
+
+
 def _get_latest_pairings(
     db: Session, tumor_id: UUID, pairing_logic_id: UUID
 ) -> list[PairingTable]:
@@ -237,6 +251,13 @@ def _trigger_multi_pair(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=404, detail="Normal sample not found")
+        # Spec R1 (REDACTION_TICKETS.md): an explicit pin of a redacted
+        # normal is a 400 — redacted samples are never (re-)paired.
+        if not is_pairable(normal):
+            raise HTTPException(
+                status_code=400,
+                detail="Normal sample is redacted: un-redact it to pair",
+            )
         reasons = strategy.mismatch_reasons(tumor, normal, db)
         if strict and reasons:
             raise HTTPException(
@@ -337,6 +358,18 @@ def trigger_pairing(
         return None
     if pairing_logic is None:
         return None
+    # Spec R1 (REDACTION_TICKETS.md): a redacted tumor can never be
+    # (re-)paired. Explicit triggers (manual / pinned) are a 400;
+    # automatic triggers skip it (None) — the bulk pairing sweeps
+    # already exclude redacted tumors in SQL, so this only guards a
+    # redaction that lands mid-pass (never kills the pass).
+    if not is_pairable(tumor):
+        if trigger_type == "automatic":
+            return None
+        raise HTTPException(
+            status_code=400,
+            detail="Tumor sample is redacted: un-redact it to pair",
+        )
 
     strategy = get_pairing_strategy(pairing_logic)
     if getattr(strategy, "MULTI_PAIR", False):
@@ -351,6 +384,13 @@ def trigger_pairing(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=404, detail="Normal sample not found")
+        # Spec R1 (REDACTION_TICKETS.md): an explicit pin of a redacted
+        # normal is a 400 — redacted samples are never (re-)paired.
+        if not is_pairable(normal):
+            raise HTTPException(
+                status_code=400,
+                detail="Normal sample is redacted: un-redact it to pair",
+            )
         reasons = strategy.mismatch_reasons(tumor, normal, db)
         if strict and reasons:
             raise HTTPException(
@@ -420,6 +460,11 @@ def trigger_pairing_for_normal(
     if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
         return
     if pairing_logic is None:
+        return
+    # Spec R1 (REDACTION_TICKETS.md): a redacted normal is never
+    # auto-paired against its tumors (the strategy queries exclude it
+    # too; this guard keeps the chokepoint explicit at the entry point).
+    if not is_pairable(normal):
         return
 
     strategy = get_pairing_strategy(pairing_logic)
@@ -514,7 +559,13 @@ def trigger_pairing_for_unpaired_tumors(
         _ensure_active(scoped_logic)
 
     tumors = db.scalars(
-        select(Sample).where(Sample.tumor_or_normal == TumorOrNormal.TUMOR.value)
+        select(Sample).where(
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the backfill sweep skips them entirely (not
+            # counted in the summary).
+            Sample.redacted.is_(False),
+        )
     ).all()
 
     scanned = 0
@@ -643,6 +694,10 @@ def _run_bulk_pair_pass(
         select(Sample).where(
             Sample.sample_type == "DMP",
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the bulk pass skips them entirely (not
+            # counted in the summary).
+            Sample.redacted.is_(False),
         )
     ).all()
 
@@ -736,6 +791,9 @@ def _run_bulk_pair_pass(
                     Sample.sample_type == "DMP",
                     Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
                     Sample.created_date >= started_at,
+                    # Spec R1 (REDACTION_TICKETS.md): redacted tumors are
+                    # never auto-paired.
+                    Sample.redacted.is_(False),
                 )
             ).all()
             if t.id not in main_ids
@@ -758,6 +816,10 @@ def _run_bulk_pair_pass(
                 Sample.sample_type == "DMP",
                 Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
                 Sample.created_date >= started_at,
+                # Spec R1 (REDACTION_TICKETS.md): redacted tumors are
+                # never auto-paired — they are not follow-up stragglers
+                # (a follow-up pass would skip them too).
+                Sample.redacted.is_(False),
                 ~exists(
                     select(PairingTable.id).where(
                         PairingTable.tumor_id == Sample.id,
@@ -939,6 +1001,9 @@ def _logic_tumor_scope(db: Session, logic: PairingLogic) -> list[Sample]:
         stmt = select(Sample).where(
             Sample.sample_type == "DMP",
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the dry-run scope matches the backfill.
+            Sample.redacted.is_(False),
         )
     else:
         names = _logic_bait_set_names(db, logic)
@@ -948,6 +1013,9 @@ def _logic_tumor_scope(db: Session, logic: PairingLogic) -> list[Sample]:
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
             func.upper(func.coalesce(Sample.sample_type, "")) != "DMP",
             func.lower(Sample.bait_set).in_(names),
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the dry-run scope matches the backfill.
+            Sample.redacted.is_(False),
         )
     return list(db.scalars(stmt).all())
 
