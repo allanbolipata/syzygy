@@ -41,6 +41,28 @@ function noteList(v) {
   return "<ul class='notes'>" + v.map((n) => `<li>${esc(n)}</li>`).join("") + "</ul>";
 }
 
+/* Redaction (spec R2, REDACTION_TICKETS.md): a distinct chip for a redacted
+ * sample, carrying the audit trail (reason / by / when) in its tooltip.
+ * ``sample`` is any SampleRead-shaped record; returns "" when not redacted. */
+function redactionBadge(sample) {
+  if (!sample || !sample.redacted) return "";
+  const bits = [];
+  if (sample.redaction_reason) bits.push("reason: " + sample.redaction_reason);
+  if (sample.redacted_by) bits.push("by " + sample.redacted_by);
+  if (sample.redacted_at) bits.push(fmtDate(sample.redacted_at));
+  const title = bits.length ? "REDACTED \u2014 " + bits.join(" \u00b7 ") : "REDACTED";
+  return `<span class="badge redacted" title="${esc(title)}">REDACTED</span>`;
+}
+
+/* Strike through a redacted sample's id text (spec R2). ``sample`` is the
+ * record ``text`` belongs to; returns the escaped text, wrapped in a
+ * strikethrough span when that sample is redacted. */
+function redactedId(sample, text) {
+  const safe = esc(text);
+  if (sample && sample.redacted) return `<span class="redacted-id">${safe}</span>`;
+  return safe;
+}
+
 let bannerTimer = null;
 function banner(kind, html, sticky) {
   const el = $("#banner");
@@ -495,8 +517,8 @@ function renderSamples() {
   const rows = samplesState.results;
   const tbody = $("#samples-table tbody");
   tbody.innerHTML = rows.map((s) => `
-    <tr class="click" data-id="${s.id}">
-      <td>${esc(s.primary_id)}</td>
+    <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
+      <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
       <td>${esc(s.cmo_sample_name)}</td>
       <td>${esc(s.patient__cmo || "—")}</td>
       <td>${esc(s.patient__dmp || "—")}</td>
@@ -640,8 +662,8 @@ function renderSampleResults(prefix, rows, selectedId, total, onSelect) {
   $(`#${prefix}-results`).classList.remove("hidden");
   const tbody = $(`#${prefix}-results-table tbody`);
   tbody.innerHTML = rows.map((s) => `
-    <tr class="click${selectedId != null && String(s.id) === String(selectedId) ? " selected" : ""}" data-id="${esc(s.id)}">
-      <td>${esc(s.primary_id)}</td>
+    <tr class="click${selectedId != null && String(s.id) === String(selectedId) ? " selected" : ""}${s.redacted ? " redacted-row" : ""}" data-id="${esc(s.id)}">
+      <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
       <td>${esc(s.cmo_sample_name)}</td>
       <td>${esc(s.patient__cmo || "—")}</td>
       <td>${esc(s.request_id || "—")}</td>
@@ -779,6 +801,37 @@ function hideMatchesPanels() {
   for (const id of ["m-summary", "m-current-panel", "m-others-panel"]) $(`#${id}`).classList.add("hidden");
 }
 
+/* Redaction controls for the sample detail panel (spec R2): the current
+ * redaction state + audit trail, a reason input, and the Redact / Un-redact
+ * buttons. The buttons are picked up by the #m-summary click handler via
+ * data-redact-action → handleRedactionAction. */
+function renderRedactionControl(s) {
+  if (s.redacted) {
+    const bits = [];
+    if (s.redacted_by) bits.push(`by ${esc(s.redacted_by)}`);
+    if (s.redacted_at) bits.push(fmtDate(s.redacted_at));
+    return `
+      <div class="redaction-block">
+        <h4>Redaction</h4>
+        <p class="redaction-state"><span class="badge redacted">REDACTED</span>${bits.length ? ` <span class="reason">${bits.join(" \u00b7 ")}</span>` : ""}</p>
+        ${s.redaction_reason ? `<p class="redaction-state reason">Reason: ${esc(s.redaction_reason)}</p>` : ""}
+        <div class="redaction-actions">
+          <button class="small" data-redact-action="unredact">Un-redact</button>
+          <span class="hint">This sample is excluded from all pairing (automatic and manual) until un-redacted.</span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="redaction-block">
+      <h4>Redaction</h4>
+      <div class="redaction-actions">
+        <input id="redact-reason" type="text" placeholder="reason (optional)" title="Reason recorded in the redaction audit trail">
+        <button class="small danger" data-redact-action="redact">Redact</button>
+      </div>
+      <p class="hint">A redacted sample is excluded from all pairing (automatic and manual). It keeps its id but appears flagged across candidate lists and pair reports. This can be undone.</p>
+    </div>`;
+}
+
 function renderMatches(data, logic) {
   const s = data.sample;
   $("#m-summary").classList.remove("hidden");
@@ -786,7 +839,7 @@ function renderMatches(data, logic) {
     <h2>Sample</h2>
     <dl class="kv">
       <dt>id</dt><dd>${esc(s.id)}</dd>
-      <dt>primary_id</dt><dd>${esc(s.primary_id)}</dd>
+      <dt>primary_id</dt><dd>${redactedId(s, s.primary_id)}${redactionBadge(s)}</dd>
       <dt>cmo_sample_name</dt><dd>${esc(s.cmo_sample_name)}</dd>
       <dt>patient__cmo</dt><dd>${s.patient__cmo ? `<span class="nav-link" data-nav-patient="${esc(s.patient__cmo)}" title="Go to the patient page">${esc(s.patient__cmo)}</span>` : "—"}</dd>
       <dt>patient__dmp</dt><dd>${esc(s.patient__dmp || "—")}</dd>
@@ -803,6 +856,7 @@ function renderMatches(data, logic) {
       <dt>sequencing_date</dt><dd>${fmtDate(s.sequencing_date)}</dd>
       <dt>errors</dt><dd>${s.errors && s.errors.length ? esc(s.errors.join("; ")) : "—"}</dd>
     </dl>
+    ${renderRedactionControl(s)}
     <p class="hint">Click patient__cmo / request_id to go to that patient's or request's page.</p>`;
 
   // Current matches: a tumor has at most one; a normal matches 1-to-many
@@ -820,7 +874,7 @@ function renderMatches(data, logic) {
         <div class="current-match">
           <dl class="kv">
             <dt>matched ${counterpartWord}</dt>
-            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${esc(c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient__cmo || "no patient")})</span></dd>
+            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${redactedId(c, c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient__cmo || "no patient")})</span>${redactionBadge(c)}</dd>
             <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
             <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
           </dl>
@@ -838,13 +892,16 @@ function renderMatches(data, logic) {
     const status = c.matched
       ? '<span class="badge ok">matches all keys</span>'
       : '<span class="badge bad">mismatch</span>';
+    const redacted = !!cs.redacted;
     const overrideBtn = isTumor
-      ? `<button class="small danger" data-override="${cs.id}">Override</button>`
+      ? (redacted
+          ? `<button class="small danger" disabled title="Redacted: un-redact this sample to pair it">Override</button>`
+          : `<button class="small danger" data-override="${cs.id}">Override</button>`)
       : "";
     const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
     return `
-      <tr class="${c.would_be_selected ? "current click" : "click"}" data-sample-id="${esc(cs.id)}" title="Open this sample's matches &amp; overrides">
-        <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
+      <tr class="${c.would_be_selected ? "current click" : "click"}${redacted ? " redacted-row" : ""}" data-sample-id="${esc(cs.id)}" title="Open this sample's matches &amp; overrides">
+        <td>${redactedId(cs, cs.primary_id)} — ${esc(cs.cmo_sample_name)}${redactionBadge(cs)}${star}</td>
         <td>${esc(cs.patient__cmo || "—")}</td>
         <td>${esc(cs.patient__dmp || "—")}</td>
         <td><span class="badge tier">${esc(c.tier)}</span></td>
@@ -902,6 +959,11 @@ $("#m-others-next").addEventListener("click", () => {
 
 /* Sample panel: click a patient__cmo / request_id value to go to its page. */
 $("#m-summary").addEventListener("click", (e) => {
+  const redactBtn = e.target.closest("[data-redact-action]");
+  if (redactBtn) {
+    handleRedactionAction(redactBtn.dataset.redactAction);
+    return;
+  }
   const el = e.target.closest("[data-nav-patient],[data-nav-request]");
   if (!el) return;
   if (el.dataset.navPatient) navigateToPatient(el.dataset.navPatient);
@@ -958,6 +1020,52 @@ function submitOverride(normalId) {
       showMatches();
     })
     .catch((e) => banner("error", `Override failed: ${esc(e.message)}`, true));
+}
+
+/* Redact / un-redact the sample open in the detail panel (spec R2). Reads the
+ * reason from #redact-reason, confirms with the user, POSTs to the redaction
+ * endpoints, then re-fetches possible-matches (from the first candidate page)
+ * so the badge, audit trail and candidate scope are all fresh. Server-side
+ * redaction is the source of truth; this only drives the UI. */
+let redactionBusy = false;
+async function handleRedactionAction(action) {
+  const data = matchesState.data;
+  const s = data && data.sample;
+  if (!s || redactionBusy) return;
+  if (action === "redact") {
+    const reasonEl = $("#redact-reason");
+    const reason = reasonEl ? reasonEl.value.trim() : "";
+    const ok = window.confirm(
+      `Redact ${s.primary_id}?\n\nA redacted sample is excluded from all pairing (automatic and manual). ` +
+      `It keeps its id but appears flagged across candidate lists and pair reports. This can be undone.`
+    );
+    if (!ok) return;
+    redactionBusy = true;
+    try {
+      await api(`/sample/${s.id}/redact`, { method: "POST", body: JSON.stringify({ reason: reason || null }) });
+      banner("ok", `Redacted ${esc(s.primary_id)}.`);
+      matchesState.othersOffset = 0;
+      await showMatches();
+    } catch (e) {
+      banner("error", `Redact failed: ${esc(e.message)}`, true);
+    } finally {
+      redactionBusy = false;
+    }
+  } else if (action === "unredact") {
+    const ok = window.confirm(`Un-redact ${s.primary_id}? It becomes pairable again.`);
+    if (!ok) return;
+    redactionBusy = true;
+    try {
+      await api(`/sample/${s.id}/unredact`, { method: "POST" });
+      banner("ok", `Un-redacted ${esc(s.primary_id)}.`);
+      matchesState.othersOffset = 0;
+      await showMatches();
+    } catch (e) {
+      banner("error", `Un-redact failed: ${esc(e.message)}`, true);
+    } finally {
+      redactionBusy = false;
+    }
+  }
 }
 
 /* ---------- patients view ---------- */
@@ -1113,8 +1221,8 @@ async function openPatient(row) {
     ]);
     patientsState.patientSamples = samples;
     tbody.innerHTML = samples.map((s) => `
-      <tr class="click" data-id="${s.id}">
-        <td>${esc(s.primary_id)}</td>
+      <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
+        <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
         <td>${esc(s.cmo_sample_name)}</td>
         <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
         <td>${esc(s.sample_type)}</td>
@@ -1282,8 +1390,8 @@ async function openRequest(row) {
     requestsState.requestPatients = Object.keys(byPatient).sort().map((pid) => byPatient[pid]);
 
     sbody.innerHTML = samples.map((s) => `
-      <tr class="click" data-id="${s.id}">
-        <td>${esc(s.primary_id)}</td>
+      <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
+        <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
         <td>${esc(s.cmo_sample_name)}</td>
         <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
         <td>${esc(s.sample_type)}</td>
@@ -1402,9 +1510,9 @@ function renderPooled() {
   const rows = pooledState.results;
   const tbody = $("#pooled-table tbody");
   tbody.innerHTML = rows.map((s) => `
-    <tr class="click" data-id="${s.id}">
+    <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
       <td>${esc(s.cmo_sample_name)}</td>
-      <td>${esc(s.primary_id)}</td>
+      <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
       <td>${esc(s.request_id || "")}</td>
       <td>${esc(s.sample_type)}</td>
       <td>${esc(s.gene_panel)}</td>
@@ -1967,7 +2075,20 @@ function pairCellHtml(r, c) {
     : link.kind === "request" ? "data-nav-request" : "data-nav-dmp-patient";
   const cmo = link.kind === "dmp-patient" && link.cmo
     ? ` data-nav-cmo="${esc(String(link.cmo))}"` : "";
-  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}"${cmo} title="${esc(PAIR_LINK_TITLES[link.kind])}">${esc(raw)}</span></td>`;
+  // Redaction (spec R2): if this cell references a redacted sample, strike
+  // through its identity text and put a single REDACTED chip on the side's
+  // primary column (PAIR *_primary_id, DMP tumor_sample/normal_sample). PAIR/DMP
+  // rows carry full sample objects; HARMONY rows are flat primary_id strings
+  // (no redaction flag to read) and render via harmonyCellHtml.
+  let side = null;
+  if (link.kind === "sample") {
+    if (r.tumor && String(link.id) === String(r.tumor.id)) side = r.tumor;
+    else if (r.normal && String(link.id) === String(r.normal.id)) side = r.normal;
+  }
+  const isPrimary = c.key.endsWith("_primary_id") || c.key === "tumor_sample" || c.key === "normal_sample";
+  const text = (side && side.redacted) ? redactedId(side, raw) : esc(raw);
+  const badge = (side && side.redacted && isPrimary) ? redactionBadge(side) : "";
+  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}"${cmo} title="${esc(PAIR_LINK_TITLES[link.kind])}">${text}</span>${badge}</td>`;
 }
 
 /* HARMONY: normal-oriented table over the CHECKED HARMONY columns (via
@@ -2796,7 +2917,7 @@ async function selectTrySample(sample) {
   renderSelectedBar("tq", sample);
   tryRenderResults();
   const kv = [
-    ["primary_id", esc(sample.primary_id)],
+    ["primary_id", redactedId(sample, sample.primary_id) + redactionBadge(sample)],
     ["cmo_sample_name", esc(sample.cmo_sample_name)],
     ["patient__cmo", sample.patient__cmo ? esc(sample.patient__cmo) : "—"],
     ["patient__dmp", sample.patient__dmp ? esc(sample.patient__dmp) : "—"],
@@ -2858,7 +2979,7 @@ function renderTryResult(data, logic) {
       <div class="current-match">
         <dl class="kv">
           <dt>matched ${isTumor ? "normal" : "tumor"}</dt>
-          <dd>${esc(cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient__cmo || "no patient")})</dd>
+          <dd>${redactedId(cm.sample, cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient__cmo || "no patient")})${redactionBadge(cm.sample)}</dd>
           <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
           <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
         </dl>
@@ -2872,7 +2993,7 @@ function renderTryResult(data, logic) {
   if (isTumor) {
     if (winner) {
       parts.push(`<h3>Cascade outcome</h3>
-        <p>The cascade would pick <strong>${esc(winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong> (${esc(winner.sample.patient__cmo || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
+        <p>The cascade would pick <strong>${redactedId(winner.sample, winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong>${redactionBadge(winner.sample)} (${esc(winner.sample.patient__cmo || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
     } else {
       parts.push(`<h3>Cascade outcome</h3>
         <p>No candidate would be selected — the sample would stay unpaired under this logic.</p>`);
@@ -2905,8 +3026,8 @@ function renderTryResult(data, logic) {
           ? '<span class="badge ok">matches all keys</span>'
           : '<span class="badge bad">mismatch</span>';
         const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
-        return `<tr>
-          <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
+        return `<tr${cs.redacted ? ' class="redacted-row"' : ""}>
+          <td>${redactedId(cs, cs.primary_id)} — ${esc(cs.cmo_sample_name)}${redactionBadge(cs)}${star}</td>
           <td>${esc(cs.patient__cmo || "—")}</td>
           <td>${esc(cs.patient__dmp || "—")}</td>
           <td><span class="badge tier">${esc(c.tier)}</span></td>

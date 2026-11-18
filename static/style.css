@@ -372,6 +372,21 @@ tbody tr.selected { background: #e8f0fe; box-shadow: inset 3px 0 0 var(--accent)
 .badge.tier { background: #eef0f3; color: var(--muted); font-weight: 400; }
 .badge.ok { background: #edf8f1; color: var(--ok); }
 .badge.bad { background: #fbeeec; color: var(--bad); }
+/* Redaction (spec R2, REDACTION_TICKETS.md): a distinct plum chip, separate
+ * from the red .badge.bad, so a redaction flag never reads as an error. */
+.badge.redacted {
+  background: #f3e0e6; color: #8e2a44; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+.redacted-id { text-decoration: line-through; color: var(--muted); }
+tbody tr.redacted-row { background: #fbf3f5; }
+tbody tr.redacted-row:hover { background: #f6e7eb; }
+.redaction-block { margin-top: 0.8rem; padding-top: 0.8rem; border-top: 1px solid var(--line); }
+.redaction-block h4 { margin: 0 0 0.4rem; font-size: 0.85rem; }
+.redaction-state { margin: 0 0 0.5rem; font-size: 0.85rem; }
+.redaction-state .reason { color: var(--muted); }
+.redaction-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.redaction-actions input { flex: 1; min-width: 180px; }
 .star { color: var(--warn); font-weight: 700; }
 
 .empty { color: var(--muted); }
