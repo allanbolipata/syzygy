@@ -516,3 +516,44 @@ class BaitSetRead(BaseModel):
     pairing_logic: str
     created_date: datetime
     modified_date: datetime
+
+
+class AuditLogRead(BaseModel):
+    """One audit_log row (AL2 query/reversal API response).
+
+    ``reversible`` (decision 6) is computed server-side — not an ORM
+    column — so it defaults to False and the audit router sets it from
+    the row's action + payload before returning.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    occurred_at: datetime
+    actor: str
+    actor_kind: str
+    action: str
+    entity_type: str
+    entity_id: str
+    pairing_logic: Optional[str] = None
+    payload: dict
+    reverse_of: Optional[UUID] = None
+    request_id: Optional[str] = None
+    reversible: bool = False
+
+
+class AuditQueryRead(BaseModel):
+    """One page of GET /v1/audit: newest first; ``total`` is the full
+    filter-matched set, not the page."""
+
+    rows: list[AuditLogRead]
+    total: int
+
+
+class AuditMeRead(BaseModel):
+    """GET /v1/audit/me — the viewer's own visibility settings
+    (decision 5): role + logic_groups from allowed_users."""
+
+    email: Optional[str] = None
+    role: str = "user"
+    logic_groups: list[str] = []

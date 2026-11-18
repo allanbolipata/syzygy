@@ -16,6 +16,7 @@ from syzygy.pairing_strategies import seed_pooled_machines
 from syzygy.bait_sets import seed_bait_sets
 from syzygy.schema_check import find_missing_columns
 from syzygy.auth import get_current_user, router as auth_router
+from syzygy.routers.audit import router as audit_router
 from syzygy.routers.bait_sets import router as bait_sets_router
 from syzygy.routers.machines import router as machines_router
 from syzygy.routers.nats_ingest import router as nats_ingest_router
@@ -155,6 +156,9 @@ app.include_router(nats_ingest_router, prefix="/v1")
 app.include_router(publish_outbox_router, prefix="/v1")
 app.include_router(
     bait_sets_router, prefix="/v1", dependencies=[Depends(get_current_user)]
+)
+app.include_router(
+    audit_router, prefix="/v1/audit", dependencies=[Depends(get_current_user)]
 )
 
 

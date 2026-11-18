@@ -229,6 +229,7 @@ def _create_pairing(
     actor: Any = None,
     replaced: Optional[PairingTable] = None,
     in_bulk: bool = False,
+    reverse_of: Optional[UUID] = None,
 ) -> PairingTable:
     pairing = PairingTable(
         tumor_id=tumor.id,
@@ -264,6 +265,7 @@ def _create_pairing(
         logic_name=pairing_logic.name,
         payload=_pairing_created_payload(trigger_type, tumor, normal, mismatched_keys, replaced),
         in_bulk=in_bulk,
+        reverse_of=reverse_of,
     )
     if not commit:
         # Bulk-pass deferred commit: the caller (a bulk pairing pass) owns
@@ -430,6 +432,7 @@ def trigger_pairing(
     commit: bool = True,
     actor: Any = None,
     in_bulk: bool = False,
+    reverse_of: Optional[UUID] = None,
 ) -> Optional[PairingTable]:
     """Create (or return) the current pairing rows for a tumor.
 
@@ -515,6 +518,7 @@ def trigger_pairing(
             actor=actor,
             replaced=existing,
             in_bulk=in_bulk,
+            reverse_of=reverse_of,
         )
         # Race guard: a concurrent commit may have won the "latest" slot.
         if result.normal_id != normal.id:
@@ -545,6 +549,7 @@ def trigger_pairing(
         actor=actor,
         replaced=existing,
         in_bulk=in_bulk,
+        reverse_of=reverse_of,
     )
 
 

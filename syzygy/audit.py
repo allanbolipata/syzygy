@@ -46,6 +46,17 @@ SYSTEM_ACTOR = "system"
 #: BULK_AUDIT_DETAIL_CAP").
 BULK_AUDIT_DETAIL_CAP = 500
 
+#: AL2: the read-only PUBLIC view over audit_log — one canonical DDL
+#: string shared by Alembic revision 0007_audit_view (adds the GRANT)
+#: and the ``after_create`` listener in models.py (so ``create_all`` and
+#: the alembic schema snapshots stay in lockstep).
+AUDIT_VIEW_DDL = (
+    "CREATE VIEW IF NOT EXISTS audit_view AS "
+    "SELECT id, occurred_at, actor, actor_kind, action, "
+    "entity_type, entity_id, pairing_logic, payload, reverse_of, "
+    "request_id FROM audit_log"
+)
+
 # _bulk_detail_records counts detail events for the CURRENT bulk pass.
 _bulk_detail_records = 0
 
@@ -142,6 +153,11 @@ def record(
                 action,
             )
             return None
+        if isinstance(actor, dict):
+            # Routers pass the get_current_user() dict down the service
+            # layer (decision 4); resolve it here, at the single writer,
+            # so no path records a real user as "system".
+            actor = actor_from_user(actor)
         row = AuditLog(
             occurred_at=utcnow(),
             actor=actor if isinstance(actor, str) and actor else SYSTEM_ACTOR,
@@ -177,12 +193,15 @@ def record_pairing_created(
     logic_name: Optional[str],
     payload: Dict[str, Any],
     in_bulk: bool = False,
+    reverse_of: Optional[uuid.UUID] = None,
 ) -> Optional[AuditLog]:
     """``pairing.created`` detail event, honoring the bulk detail cap.
 
     Outside bulk passes every call records; inside a bulk pass only the
     first :data:`BULK_AUDIT_DETAIL_CAP` calls record (the pass's
-    summary event carries the full counts).
+    summary event carries the full counts).  ``reverse_of`` links the
+    event to the audit event it reverses (AL2 reversal runs the normal
+    pairing path, so the new event carries the link itself).
     """
     global _bulk_detail_records
     if in_bulk and _bulk_detail_records >= BULK_AUDIT_DETAIL_CAP:
@@ -195,6 +214,7 @@ def record_pairing_created(
         entity_id=pairing.id,
         pairing_logic=logic_name,
         payload=payload,
+        reverse_of=reverse_of,
     )
     if row is not None:
         _bulk_detail_records += 1

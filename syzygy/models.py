@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import sqlalchemy as sa
-from sqlalchemy import Uuid
+from sqlalchemy import DDL, Uuid, event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -249,6 +249,17 @@ class AllowedUser(Base):
     email: Mapped[str] = mapped_column(sa.String(255), unique=True, index=True)
     display_name: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    # AL2 (AUDIT_LOG_TICKETS.md, decision 5): audit-log visibility.
+    # ``role`` is 'user' or 'admin'; ``logic_groups`` is a list of
+    # pairing-logic names. An admin sees every audit event; a user sees
+    # events of the pairing logics in their groups plus their own
+    # actions; a user with no groups sees only their own actions.
+    role: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, default="user", server_default="user"
+    )
+    logic_groups: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -292,3 +303,21 @@ class AuditLog(Base):
         sa.Index("ix_audit_log_entity_type_entity_id", "entity_type", "entity_id"),
         sa.Index("ix_audit_log_actor_occurred_at", "actor", "occurred_at"),
     )
+
+
+# AUDIT_LOG_TICKETS.md (ticket AL2): the read-only audit_view over
+# audit_log, created here on EVERY dialect (CREATE VIEW IF NOT EXISTS)
+# so the app's create_all fallback (SQLite dev, fresh-DB bootstrap) and
+# the Alembic-managed schema (revision 0007_audit_view, which also runs
+# GRANT SELECT ... TO PUBLIC) expose the same object — the schema
+# snapshot tests compare the two, and views show up in
+# information_schema.columns, so both sides must create it.  The PG
+# trigger/function/REVOKE statements stay alembic-only (0006), exactly
+# like the 0005 redaction GRANT.
+@event.listens_for(AuditLog.__table__, "after_create")
+def _create_audit_view(target, connection, **kw):
+    # Lazy import: syzygy.audit imports syzygy.models at module level,
+    # so a top-level import here would be a cycle.
+    from syzygy.audit import AUDIT_VIEW_DDL
+
+    connection.execute(DDL(AUDIT_VIEW_DDL))
