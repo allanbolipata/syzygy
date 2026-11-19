@@ -24,10 +24,13 @@ for _p in (REPO, SCRIPTS):
 
 from syzygy.database import Base
 from manage_allowed_users import (
+    ROLES,
     cmd_add,
     cmd_enable,
     cmd_list,
     cmd_remove,
+    cmd_set_groups,
+    cmd_set_role,
     format_table,
 )
 from syzygy.models import AllowedUser
@@ -120,9 +123,61 @@ def test_list_orders_by_email(db):
         ("z@x.com", "Zed", True),
     ]
     table = format_table(users)
-    assert table.splitlines()[0].split() == ["email", "display_name", "active"]
+    assert table.splitlines()[0].split() == [
+        "email", "display_name", "active", "role", "logic_groups"
+    ]
     assert "z@x.com" in table
     assert "False" in table
+
+
+def test_list_shows_role_and_logic_groups(db):
+    cmd_add(db, "a@x.com")
+    cmd_set_role(db, "a@x.com", "admin")
+    cmd_set_groups(db, "a@x.com", ["TEMPO", "IMPACT"])
+    table = format_table(cmd_list(db))
+    assert "admin" in table
+    assert "TEMPO,IMPACT" in table
+
+
+def test_set_role_updates_role(db):
+    cmd_add(db, "bob@example.com")
+    assert _get(db, "bob@example.com").role == "user"  # default
+    msg = cmd_set_role(db, "bob@example.com", "admin")
+    assert "role=admin" in msg
+    assert _get(db, "bob@example.com").role == "admin"
+    assert "no change" in cmd_set_role(db, "bob@example.com", "admin")
+
+
+def test_set_role_unknown_email(db):
+    assert cmd_set_role(db, "nobody@example.com", "admin") is None
+
+
+def test_set_role_rejects_bad_role(db):
+    cmd_add(db, "bob@example.com")
+    with pytest.raises(ValueError):
+        cmd_set_role(db, "bob@example.com", "root")
+    assert set(ROLES) == {"user", "admin"}
+
+
+def test_set_groups_sets_and_normalizes(db):
+    cmd_add(db, "bob@example.com")
+    assert _get(db, "bob@example.com").logic_groups == []
+    msg = cmd_set_groups(db, "bob@example.com", [" TEMPO ", "IMPACT", "TEMPO"])
+    assert "logic_groups=TEMPO,IMPACT" in msg  # stripped + deduped, order kept
+    assert _get(db, "bob@example.com").logic_groups == ["TEMPO", "IMPACT"]
+    assert "no change" in cmd_set_groups(db, "bob@example.com", ["TEMPO", "IMPACT"])
+
+
+def test_set_groups_clears(db):
+    cmd_add(db, "bob@example.com")
+    cmd_set_groups(db, "bob@example.com", ["TEMPO"])
+    msg = cmd_set_groups(db, "bob@example.com", [])
+    assert "logic_groups=none" in msg
+    assert _get(db, "bob@example.com").logic_groups == []
+
+
+def test_set_groups_unknown_email(db):
+    assert cmd_set_groups(db, "nobody@example.com", ["TEMPO"]) is None
 
 
 def test_add_upsert_remove_enable_list_round_trip(db):
@@ -187,5 +242,35 @@ def test_cli_remove_unknown_email_nonzero(tmp_path):
 
 def test_cli_enable_unknown_email_nonzero(tmp_path):
     r = _run_cli(tmp_path, "enable", "--email", "ghost@example.com")
+    assert r.returncode != 0
+    assert "error" in r.stderr
+
+
+def test_cli_set_role_and_groups(tmp_path):
+    _run_cli(tmp_path, "add", "--email", "cli@example.com")
+    r = _run_cli(tmp_path, "set-role", "--email", "cli@example.com",
+                 "--role", "admin")
+    assert r.returncode == 0
+    assert "role=admin" in r.stdout
+    r = _run_cli(tmp_path, "set-groups", "--email", "cli@example.com",
+                 "--groups", " TEMPO ,IMPACT,TEMPO")
+    assert r.returncode == 0
+    assert "logic_groups=TEMPO,IMPACT" in r.stdout
+    r = _run_cli(tmp_path, "list")
+    assert r.returncode == 0
+    assert "admin" in r.stdout
+    assert "TEMPO,IMPACT" in r.stdout
+
+
+def test_cli_set_role_bad_role_nonzero(tmp_path):
+    _run_cli(tmp_path, "add", "--email", "cli@example.com")
+    r = _run_cli(tmp_path, "set-role", "--email", "cli@example.com",
+                 "--role", "root")
+    assert r.returncode != 0
+
+
+def test_cli_set_groups_unknown_email_nonzero(tmp_path):
+    r = _run_cli(tmp_path, "set-groups", "--email", "ghost@example.com",
+                 "--groups", "TEMPO")
     assert r.returncode != 0
     assert "error" in r.stderr

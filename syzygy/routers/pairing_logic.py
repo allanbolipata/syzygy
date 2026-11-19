@@ -6,7 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from syzygy.auth import require_logic_admin
+from syzygy import audit
+from syzygy.auth import get_current_user, require_logic_admin
 from syzygy.database import get_db, settings
 from syzygy.models import PairingLogic
 from syzygy.pairing_strategies import strategies
@@ -51,6 +52,7 @@ def list_pairing_logic(
 def create_pairing_logic(
     payload: PairingLogicCreate,
     db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
     logic_admin: None = Depends(require_logic_admin),
 ):
     existing = db.scalar(select(PairingLogic).where(PairingLogic.name == payload.name))
@@ -68,6 +70,21 @@ def create_pairing_logic(
         config=payload.config,
     )
     db.add(logic)
+    db.flush()
+    # AL1: logic.created — ids/names only.
+    audit.record(
+        db,
+        audit.actor_from_user(current_user),
+        "logic.created",
+        entity_type="pairing_logic",
+        entity_id=payload.name,
+        pairing_logic=payload.name,
+        payload={
+            "name": payload.name,
+            "strategy_name": payload.strategy_name,
+            "active": payload.active,
+        },
+    )
     try:
         db.commit()
     except IntegrityError:

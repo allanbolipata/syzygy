@@ -15,6 +15,17 @@ in syzygy/pairing_service.py):
 Idempotent: a second run is a no-op. Dev-database housekeeping only --
 do not run against production data without review.
 
+Alembic (ticket A2): this stays a standalone script and has NO
+corresponding alembic revision, deliberately. It is a pure DATA
+migration (row renames/consolidation in ``pairing_logic`` + re-pointing
+``pairing_table`` rows) with no DDL: the versioned revision chain tracks
+schema shape, and this one-shot dev housekeeping fix would add no
+schema state a fresh ``create_all`` database doesn't already have, so
+folding it into the chain would only make ``upgrade head`` do data
+surgery on databases that never had the pre-consolidation rows. The
+other three migrate scripts (patient_columns, consent, dmp_generated)
+do have Alembic twins (revisions 0002-0004) because they change schema.
+
 Usage:
     DATABASE_URL=... python scripts/migrate_logic_names.py
 """

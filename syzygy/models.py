@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import sqlalchemy as sa
-from sqlalchemy import Uuid
+from sqlalchemy import DDL, Uuid, event
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from syzygy.database import Base
@@ -72,6 +73,22 @@ class Sample(Base):
     # "DMP BAMs", "Pooled Normals"); None for rows created outside a beagle
     # import (dashboard fixtures, manual API creates).
     file_group: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
+    # Redaction (spec R1, REDACTION_TICKETS.md): a redacted sample is
+    # excluded from every strategy's candidate query and the bulk
+    # pairing sweeps, and explicit pairing triggers on it return 400;
+    # candidate listings still show it, flagged. Redaction never retires
+    # existing pairings (pairing history is immutable). Together with
+    # redacted_at / redacted_by / redaction_reason these four columns
+    # ARE the redaction audit trail (this branch predates the
+    # audit-log feature).
+    redacted: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, default=False, server_default=sa.false()
+    )
+    redacted_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+    redacted_by: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
+    redaction_reason: Mapped[Optional[str]] = mapped_column(sa.Text, nullable=True)
     # DMP sargable pairing keys (DMP bulk-pairing performance, item 1).
     # On Postgres these are GENERATED ALWAYS ... STORED columns (scripts/
     # migrate_dmp_generated_columns.py) materializing the exact key
@@ -232,5 +249,79 @@ class AllowedUser(Base):
     email: Mapped[str] = mapped_column(sa.String(255), unique=True, index=True)
     display_name: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True)
     active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    # AL2 (AUDIT_LOG_TICKETS.md, decision 5): audit-log visibility.
+    # ``role`` is 'user' or 'admin'; ``logic_groups`` is a list of
+    # pairing-logic names. An admin sees every audit event; a user sees
+    # events of the pairing logics in their groups plus their own
+    # actions; a user with no groups sees only their own actions.
+    role: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, default="user", server_default="user"
+    )
+    logic_groups: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     created_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow)
     modified_date: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AuditLog(Base):
+    """Append-only audit log (AUDIT_LOG_TICKETS.md, ticket AL1).
+
+    One row per sensitive write point, written ONLY by
+    ``syzygy/audit.py::record`` inside the caller's transaction, so the
+    event commits atomically with the mutation it documents.  Revision
+    0006_audit_log REVOKEs UPDATE/DELETE and installs a guard trigger
+    that rejects them at the database level — never UPDATE or DELETE
+    from application code.
+
+    ``payload`` carries ids and names ONLY — never patient, clinical or
+    variant data (binding sanitization rule, DECIDED #5).  ``actor`` is
+    an e-mail address for user actions and ``"system"`` for
+    machine-driven paths; ``pairing_logic`` is the AL2 visibility-scope
+    key (NULL = admin-only, unless it is the actor's own action).
+    """
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    occurred_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, default=utcnow, server_default=sa.func.now()
+    )
+    actor: Mapped[str] = mapped_column(sa.String(320), nullable=False)
+    actor_kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    action: Mapped[str] = mapped_column(sa.String(80), nullable=False)
+    entity_type: Mapped[str] = mapped_column(sa.String(40), nullable=False)
+    entity_id: Mapped[str] = mapped_column(sa.String(200), nullable=False)
+    pairing_logic: Mapped[Optional[str]] = mapped_column(sa.String(80), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    reverse_of: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(sa.String(200), nullable=True)
+
+    __table_args__ = (
+        sa.Index("ix_audit_log_occurred_at", "occurred_at"),
+        sa.Index("ix_audit_log_pairing_logic_occurred_at", "pairing_logic", "occurred_at"),
+        sa.Index("ix_audit_log_entity_type_entity_id", "entity_type", "entity_id"),
+        sa.Index("ix_audit_log_actor_occurred_at", "actor", "occurred_at"),
+    )
+
+
+# AUDIT_LOG_TICKETS.md (ticket AL2): the read-only audit_view over
+# audit_log, created here on every dialect create_all runs on (SQLite
+# dev/test fallback and Postgres) — but the DDL is dialect-split,
+# because the two engines' CREATE VIEW grammars are mutually
+# exclusive: PostgreSQL supports only CREATE [OR REPLACE] VIEW (no IF
+# NOT EXISTS), SQLite only CREATE VIEW IF NOT EXISTS (no OR REPLACE).
+# syzygy.audit.audit_view_ddl() picks the right one for the connection's
+# dialect.  The app's create_all fallback and the Alembic-managed
+# schema (revision 0007_audit_view, which also runs GRANT SELECT ...
+# TO PUBLIC) expose the same object — the schema snapshot tests compare
+# the two, and views show up in information_schema.columns, so both
+# sides must create it.  The PG trigger/function/REVOKE statements stay
+# alembic-only (0006), exactly like the 0005 redaction GRANT.
+@event.listens_for(AuditLog.__table__, "after_create")
+def _create_audit_view(target, connection, **kw):
+    # Lazy import: syzygy.audit imports syzygy.models at module level,
+    # so a top-level import here would be a cycle.
+    from syzygy.audit import audit_view_ddl
+
+    connection.execute(DDL(audit_view_ddl(connection.dialect.name)))

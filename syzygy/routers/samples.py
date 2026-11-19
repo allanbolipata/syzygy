@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from syzygy import audit
 from syzygy.auth import get_current_user, gating_allowed_logics, require_logic_access
 from syzygy.bait_sets import (
     allowed_logics_condition,
@@ -12,7 +13,7 @@ from syzygy.bait_sets import (
     resolve_bait_set_logic,
 )
 from syzygy.database import get_db, settings
-from syzygy.models import PairingLogic, Sample
+from syzygy.models import AuditLog, PairingLogic, Sample, utcnow
 from syzygy.pairing_service import (
     MAX_OTHER_MATCHES_LIMIT,
     possible_matches,
@@ -21,14 +22,24 @@ from syzygy.pairing_service import (
     trigger_pairing,
     trigger_pairing_for_normal,
 )
-from syzygy.schemas import PossibleMatchesRead, SampleCreate, SampleRead, TumorOrNormal
+from syzygy.schemas import (
+    PossibleMatchesRead,
+    RedactionRequest,
+    SampleCreate,
+    SampleRead,
+    TumorOrNormal,
+)
 
 
 router = APIRouter(prefix="/sample", tags=["samples"])
 
 
 @router.post("/", response_model=SampleRead, status_code=201)
-def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
+def create_sample(
+    payload: SampleCreate,
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
+):
     pairing_logic = resolve_pairing_logic(
         db,
         payload.pairing_logic_id,
@@ -40,6 +51,18 @@ def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
     sample_data["tumor_or_normal"] = payload.tumor_or_normal.value
     sample = Sample(**sample_data)
     db.add(sample)
+    db.flush()
+    # AL1: sample.created — ids/names only. The router is the manual
+    # create path, so the actor is the authenticated user (decision 4);
+    # system-recorded creates (NATS ingest) go through nats_ingest.py.
+    audit.record(
+        db,
+        audit.actor_from_user(current_user),
+        "sample.created",
+        entity_type="sample",
+        entity_id=sample.id,
+        payload={"sample_name": sample.cmo_sample_name, "primary_id": sample.primary_id},
+    )
     db.commit()
     db.refresh(sample)
 
@@ -65,6 +88,7 @@ def _samples_filtered_query(
     file_group: Optional[str],
     tumor_or_normal: Optional[TumorOrNormal],
     no_patient: Optional[bool],
+    redacted: Optional[bool],
     logic: Optional[PairingLogic] = None,
     gating=None,
 ):
@@ -104,6 +128,12 @@ def _samples_filtered_query(
             stmt = stmt.where(getattr(Sample, field).ilike(f"%{value}%"))
     if no_patient:
         stmt = stmt.where(Sample.patient__cmo.is_(None))
+    if redacted is not None:
+        # Spec R1 (REDACTION_TICKETS.md): listing-side filter — redacted
+        # samples stay VISIBLE (flagged); the filter just narrows the
+        # view. Pairing candidate scope is unaffected by listing
+        # filters.
+        stmt = stmt.where(Sample.redacted.is_(redacted))
     if tumor_or_normal is not None:
         stmt = stmt.where(Sample.tumor_or_normal == tumor_or_normal.value)
     if logic is not None:
@@ -134,6 +164,7 @@ def list_samples(
     file_group: Optional[str] = None,
     tumor_or_normal: Optional[TumorOrNormal] = None,
     no_patient: Optional[bool] = None,
+    redacted: Optional[bool] = None,
     pairing_logic: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -146,6 +177,11 @@ def list_samples(
     case-insensitive substring matches; ``tumor_or_normal`` is exact;
     ``no_patient`` restricts to samples with a null patient__cmo (e.g.
     pooled normals). All filters combine with AND.
+
+    ``redacted`` (spec R1, REDACTION_TICKETS.md) restricts to redacted
+    samples (``true``) or non-redacted ones (``false``); omitted means
+    no restriction — redacted samples stay visible in the default view
+    (the ``redacted`` field on each row is the flag).
 
     ``pairing_logic`` restricts to samples belonging to one pairing-logic
     family (e.g. ``ARGOS``): the sample's ``bait_set`` must match a
@@ -187,6 +223,7 @@ def list_samples(
         file_group=file_group,
         tumor_or_normal=tumor_or_normal,
         no_patient=no_patient,
+        redacted=redacted,
         logic=logic,
         gating=gating,
     )
@@ -281,3 +318,95 @@ def possible_matches_endpoint(
     if offset is not None and offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >= 0")
     return possible_matches(db, sample, logic, limit=limit, offset=offset)
+
+
+@router.post("/{sample_id}/redact", response_model=SampleRead)
+def redact_sample(
+    sample_id: UUID,
+    payload: Optional[RedactionRequest] = None,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Redact a sample (spec R1, REDACTION_TICKETS.md).
+
+    A redacted sample is excluded from all automatic pairing — every
+    strategy's candidate query and the bulk pairing sweeps skip it —
+    and explicit pairing triggers on it return 400. Candidate listings
+    still show it, flagged (``possible-matches`` reports a
+    ``mismatched_keys`` reason). Redaction never retires existing
+    pairings (pairing history is immutable).
+
+    The optional ``reason`` body plus the acting user's email and the
+    timestamp are stored on the sample (``redacted`` / ``redacted_at``
+    / ``redacted_by`` / ``redaction_reason``) — together these columns
+    ARE the redaction audit trail. Re-redacting an already-redacted
+    sample is a no-op that returns 200 (the original audit fields are
+    preserved).
+    """
+    sample = db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    if not sample.redacted:
+        sample.redacted = True
+        sample.redacted_at = utcnow()
+        sample.redacted_by = (current_user or {}).get("email")
+        sample.redaction_reason = payload.reason if payload is not None else None
+        # AL1: sample.redacted — the acting user's email is the actor;
+        # the payload carries ids/names only (the clinical reason stays
+        # on the sample row, never in the audit log).
+        audit.record(
+            db,
+            (current_user or {}).get("email") or audit.SYSTEM_ACTOR,
+            "sample.redacted",
+            entity_type="sample",
+            entity_id=sample_id,
+            payload={"sample_name": sample.cmo_sample_name},
+        )
+        db.commit()
+        db.refresh(sample)
+    return sample
+
+
+@router.post("/{sample_id}/unredact", response_model=SampleRead)
+def unredact_sample(
+    sample_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Un-redact a sample (spec R1, REDACTION_TICKETS.md).
+
+    Restores the sample to pairable immediately: it re-enters every
+    strategy's candidate scope and the bulk pairing sweeps. The audit
+    fields (``redacted_at`` / ``redacted_by`` / ``redaction_reason``)
+    are PRESERVED — they are the immutable history of the redaction
+    event; only the ``redacted`` flag flips back to false. Un-redacting
+    a non-redacted sample is a no-op that returns 200.
+    """
+    sample = db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    if sample.redacted:
+        sample.redacted = False
+        # AL1: sample.unredacted — linked to the redaction event it
+        # reverses (reverse_of).
+        redact_event_id = db.scalar(
+            select(AuditLog.id)
+            .where(
+                AuditLog.entity_type == "sample",
+                AuditLog.entity_id == str(sample_id),
+                AuditLog.action == "sample.redacted",
+            )
+            .order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc())
+        )
+        audit.record(
+            db,
+            (current_user or {}).get("email") or audit.SYSTEM_ACTOR,
+            "sample.unredacted",
+            entity_type="sample",
+            entity_id=sample_id,
+            payload={"sample_name": sample.cmo_sample_name},
+            reverse_of=redact_event_id,
+        )
+        db.commit()
+        db.refresh(sample)
+    return sample

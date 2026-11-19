@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from syzygy import audit
 from syzygy.database import get_db, settings
 from syzygy.models import PendingNatsPublish, utcnow
 
@@ -87,5 +88,16 @@ def mark_published(
     if row is None:
         raise HTTPException(status_code=404, detail="unknown outbox row")
     row.published_at = utcnow()
+    # AL1: cohort.published — the outbox row leaves the queue. Actor is
+    # system: the flusher runs as the listener (token-authenticated), not
+    # a named user.
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "cohort.published",
+        entity_type="cohort",
+        entity_id=row.cohort_id,
+        payload={"cohort_id": row.cohort_id, "subject": row.subject},
+    )
     db.commit()
     return {"id": str(row.id), "published_at": row.published_at.isoformat()}
