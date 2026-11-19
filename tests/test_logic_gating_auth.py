@@ -67,6 +67,16 @@ def client(db):
     app.dependency_overrides.pop(get_db, None)
 
 
+@pytest.fixture(autouse=True)
+def _uniform_open_logics(monkeypatch):
+    """These claim-parsing tests predate P1 (GATING_OPEN_LOGICS) and assert
+    the *claim-derived* set in isolation. Pin the default-open set to empty
+    for the whole module so the open set does not leak into them; the
+    P1-specific tests at the bottom of the file override this with an
+    explicit value."""
+    monkeypatch.setattr(settings, "gating_open_logics", "", raising=False)
+
+
 def _claims(logics=None, admin=None):
     """A synthetic verified-claims dict (Keycloak-shaped identity keys)."""
     claims = {
@@ -291,3 +301,84 @@ def test_auth_me_dev_token_full_admin(client, monkeypatch):
     assert body["sub"] == "dev-admin"
     assert set(body["allowed_logics"]) == ALL_LOGICS
     assert body["is_logic_admin"] is True
+
+
+# ---------------------------------------------------------------------------
+# P1 — GATING_OPEN_LOGICS: the default-open logic set (union semantics)
+# ---------------------------------------------------------------------------
+
+OPEN_DEFAULT = "ARGOS,TEMPO,ACCESS"
+OPEN_SET = {"ARGOS", "TEMPO", "ACCESS"}
+
+
+def test_open_set_visible_with_no_claims(db, monkeypatch):
+    """P1: an authenticated principal with NO logic claim still sees the
+    default-open set — the asymmetric policy (the open set applies to every
+    authenticated principal, no enrollment needed)."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    monkeypatch.setattr(settings, "gating_open_logics", OPEN_DEFAULT)
+    _, user, _ = auth._user_from_claims(_claims(), db)
+    assert user["allowed_logics"] == OPEN_SET
+    assert user["is_logic_admin"] is False
+
+
+def test_claim_adds_gated_logic_to_open_set(db, monkeypatch):
+    """P1: a claim for a GATED logic (DMP, not in the open set) adds to the
+    open set — allowed = open ∪ claim; enrollment adds, never subtracts. A
+    claim for an already-open logic (ARGOS) adds nothing (union)."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    monkeypatch.setattr(settings, "gating_open_logics", OPEN_DEFAULT)
+    _, dmp_user, _ = auth._user_from_claims(_claims(logics=["DMP"]), db)
+    assert dmp_user["allowed_logics"] == OPEN_SET | {"DMP"}
+    _, argos_user, _ = auth._user_from_claims(_claims(logics=["ARGOS"]), db)
+    assert argos_user["allowed_logics"] == OPEN_SET
+
+
+def test_flag_off_ignores_open_set(db, monkeypatch):
+    """P1 dark-launch: with the flag off the open set is irrelevant — the
+    principal still gets the FULL set + admin (byte-identical to today),
+    even when GATING_OPEN_LOGICS is non-empty."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", False)
+    monkeypatch.setattr(settings, "gating_open_logics", OPEN_DEFAULT)
+    _, user, _ = auth._user_from_claims(_claims(logics=["DMP"]), db)
+    assert user["allowed_logics"] == ALL_LOGICS
+    assert user["is_logic_admin"] is True
+
+
+def test_open_set_empty_restores_uniform(db, monkeypatch):
+    """P1: an empty GATING_OPEN_LOGICS restores today's uniform fail-closed
+    model — claim-derived only (no claim -> empty set)."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    monkeypatch.setattr(settings, "gating_open_logics", "")
+    _, nobody, _ = auth._user_from_claims(_claims(), db)
+    assert nobody["allowed_logics"] == set()
+    _, dmp_user, _ = auth._user_from_claims(_claims(logics=["DMP"]), db)
+    assert dmp_user["allowed_logics"] == {"DMP"}
+
+
+def test_open_set_unknown_names_ignored_with_warning(db, monkeypatch, caplog):
+    """P1: unknown names in GATING_OPEN_LOGICS are ignored with a server
+    warning (the same rule applied to the token claim)."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    monkeypatch.setattr(settings, "gating_open_logics", "ARGOS,BOGUS,TEMPO")
+    with caplog.at_level("WARNING", logger="syzygy.auth"):
+        _, user, _ = auth._user_from_claims(_claims(), db)
+    assert user["allowed_logics"] == {"ARGOS", "TEMPO"}
+    assert any("BOGUS" in record.getMessage() for record in caplog.records)
+
+
+def test_auth_me_reflects_open_union(client, db, monkeypatch):
+    """P1: /auth/me exposes the open-set ∪ claim union so the UI View
+    selector matches server-side truth."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    monkeypatch.setattr(settings, "gating_open_logics", OPEN_DEFAULT)
+    _, user, _ = auth._user_from_claims(_claims(logics=["DMP"]), db)
+    app.dependency_overrides[auth.get_current_user] = lambda: user
+    try:
+        response = client.get("/v1/auth/me")
+    finally:
+        app.dependency_overrides.pop(auth.get_current_user, None)
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body["allowed_logics"]) == OPEN_SET | {"DMP"}
+    assert body["is_logic_admin"] is False

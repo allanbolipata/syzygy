@@ -6,9 +6,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from syzygy import audit
-from syzygy.auth import get_current_user, gating_allowed_logics, require_logic_access
+from syzygy.auth import (
+    consent_gate_active,
+    get_current_user,
+    gating_allowed_logics,
+    require_logic_access,
+)
 from syzygy.bait_sets import (
     allowed_logics_condition,
+    consent_gate_condition,
     logic_membership_condition,
     resolve_bait_set_logic,
 )
@@ -91,6 +97,7 @@ def _samples_filtered_query(
     redacted: Optional[bool],
     logic: Optional[PairingLogic] = None,
     gating=None,
+    consent_gate=None,
 ):
     """Filtered ``SELECT`` on ``Sample`` — no ordering or pagination.
 
@@ -100,6 +107,11 @@ def _samples_filtered_query(
     ``gating`` is the Layer B condition (ticket C3): a SQL boolean
     restricting rows to the principal's allowed logics (None = gating
     disabled, no restriction).
+
+    ``consent_gate`` is the P3 consent-gate condition: a SQL boolean
+    that hides non-consent DMP samples (``consent IS FALSE``) from a
+    principal lacking the non-consent entitlement (None = gate not
+    active for this principal, no restriction).
     """
     stmt = select(Sample)
     if q is not None:
@@ -145,6 +157,11 @@ def _samples_filtered_query(
         # principal's allowed logics (OR across logics; the DMP
         # null-bait rule comes free from the helper).
         stmt = stmt.where(gating)
+    if consent_gate is not None:
+        # P3 consent gate: hide non-consent DMP samples (consent IS
+        # FALSE) from a principal without the non-consent entitlement.
+        # consent IS NOT FALSE keeps TRUE / NULL / non-DMP samples.
+        stmt = stmt.where(consent_gate)
     return stmt
 
 
@@ -210,6 +227,7 @@ def list_samples(
     logic = resolve_filter_logic(db, pairing_logic)
     allowed = gating_allowed_logics(current_user)
     gating = allowed_logics_condition(db, allowed) if allowed is not None else None
+    consent_gate = consent_gate_condition() if consent_gate_active(current_user) else None
     base = _samples_filtered_query(
         q=q,
         primary_id=primary_id,
@@ -226,6 +244,7 @@ def list_samples(
         redacted=redacted,
         logic=logic,
         gating=gating,
+        consent_gate=consent_gate,
     )
     total = db.scalar(select(func.count()).select_from(base.subquery()))
     if response is not None:

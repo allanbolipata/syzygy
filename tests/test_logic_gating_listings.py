@@ -592,3 +592,64 @@ def test_http_listings_use_principal_from_auth_dependency(world, db, monkeypatch
     finally:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_user, None)
+
+
+# ---------------------------------------------------------------------------
+# P2: HARMONY null-bait ownership — HARMONY samples visible iff enrolled
+# ---------------------------------------------------------------------------
+
+
+def test_harmony_sample_visible_iff_enrolled_harmony(db, monkeypatch):
+    """Accept (P2): a HARMONY null-bait sample is visible iff the principal
+    is enrolled in HARMONY — the null-bait ``sample_type == 'HARMONY'``
+    family is HARMONY-owned, disjoint from DMP's ``sample_type == 'DMP'``
+    family (DMP's rule untouched)."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    dmp = PairingLogic(name="DMP", strategy_name="dmp", active=True)
+    harmony = PairingLogic(name="HARMONY", strategy_name="dmp", active=True)
+    argos = PairingLogic(name="ARGOS", strategy_name="default", active=True)
+    db.add_all([dmp, harmony, argos])
+    db.commit()
+    db.add(BaitSet(bait_set="ARGOS-BAIT", pairing_logic_id=argos.id))
+    db.commit()
+    db.add_all([
+        Sample(primary_id="S-HAR1", cmo_sample_name="s-har1",
+               gene_panel="IMPACT468", bait_set=None, sample_type="HARMONY",
+               tumor_or_normal="TUMOR", patient__cmo="P-H", request_id="R-H",
+               created_date=BASE_TIME),
+        Sample(primary_id="S-DMP1", cmo_sample_name="s-dmp1",
+               gene_panel="IMPACT468", bait_set=None, sample_type="DMP",
+               tumor_or_normal="TUMOR", patient__cmo="P-D", request_id="R-D",
+               created_date=BASE_TIME + timedelta(minutes=1)),
+        Sample(primary_id="S-ARG1", cmo_sample_name="s-arg1",
+               gene_panel="IMPACT468", bait_set="ARGOS-BAIT",
+               sample_type="tissue", tumor_or_normal="TUMOR",
+               patient__cmo="P-A", request_id="R-A",
+               created_date=BASE_TIME + timedelta(minutes=2)),
+    ])
+    db.commit()
+
+    # Enrolled in HARMONY: sees the HARMONY null-bait sample — and only it.
+    ids = _ids(list_samples(limit=None, offset=None, db=db,
+                            current_user=_principal(["HARMONY"])))
+    assert ids == {"S-HAR1"}
+    # Enrolled in DMP: sees the DMP null-bait sample, NOT HARMONY's.
+    ids = _ids(list_samples(limit=None, offset=None, db=db,
+                            current_user=_principal(["DMP"])))
+    assert ids == {"S-DMP1"}
+    # Enrolled in ARGOS only: sees the ARGOS-registered sample, neither
+    # null-bait sample.
+    ids = _ids(list_samples(limit=None, offset=None, db=db,
+                            current_user=_principal(["ARGOS"])))
+    assert ids == {"S-ARG1"}
+
+
+def test_default_open_set_excludes_harmony(monkeypatch):
+    """Accept (P2, default-config path): HARMONY is gated by default — the
+    shipped GATING_OPEN_LOGICS default (ARGOS,TEMPO,ACCESS) never opens it,
+    so a principal with no HARMONY claim sees no HARMONY samples."""
+    monkeypatch.setattr(settings, "gating_open_logics", "ARGOS,TEMPO,ACCESS")
+    from syzygy.auth import _open_logic_set
+    known = {"ARGOS", "TEMPO", "ACCESS", "DMP", "HARMONY"}
+    assert _open_logic_set(known) == {"ARGOS", "TEMPO", "ACCESS"}
+    assert "HARMONY" not in _open_logic_set(known)

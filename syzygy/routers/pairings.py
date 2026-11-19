@@ -37,12 +37,13 @@ from sqlalchemy.orm import Session, aliased, joinedload
 
 from syzygy import audit, pairing_import
 from syzygy.auth import (
+    consent_gate_active,
     get_current_user,
     gating_allowed_logics,
     require_logic_access,
     require_logic_admin,
 )
-from syzygy.bait_sets import allowed_logics_condition
+from syzygy.bait_sets import allowed_logics_condition, consent_gate_condition
 from syzygy.dmp_translator import remap_dmp_record
 from syzygy.database import SessionLocal, get_db, settings
 from syzygy.models import PairingLogic, PairingTable, Sample
@@ -177,18 +178,30 @@ def list_pairings(
     # BOTH join sides (see docstring). Reuses the aliases the attribute
     # filters created when present; otherwise joins its own pair.
     allowed = gating_allowed_logics(current_user)
-    if allowed is not None:
+    consent_gated = consent_gate_active(current_user)
+    if (allowed is not None) or consent_gated:
         if tumor_alias is None:
             tumor_alias = aliased(Sample)
             normal_alias = aliased(Sample)
             stmt = stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id)
             stmt = stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id)
-        stmt = stmt.where(
-            or_(
-                allowed_logics_condition(db, allowed, sample=tumor_alias),
-                allowed_logics_condition(db, allowed, sample=normal_alias),
+        if allowed is not None:
+            stmt = stmt.where(
+                or_(
+                    allowed_logics_condition(db, allowed, sample=tumor_alias),
+                    allowed_logics_condition(db, allowed, sample=normal_alias),
+                )
             )
-        )
+        if consent_gated:
+            # P3 consent gate: hide a pairing when EITHER side is a
+            # non-consent DMP sample (consent IS FALSE) — the hidden
+            # sample's data must not leak through the pairing's columns.
+            stmt = stmt.where(
+                and_(
+                    consent_gate_condition(sample=tumor_alias),
+                    consent_gate_condition(sample=normal_alias),
+                )
+            )
     if pairing_logic_id is not None:
         if db.get(PairingLogic, pairing_logic_id) is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
@@ -217,6 +230,7 @@ def list_unmatched_dmp_samples(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
 ):
     """DMP samples that have no latest pairing under the given logic.
@@ -227,6 +241,11 @@ def list_unmatched_dmp_samples(
     pairings (hundreds of sequential requests against a ~280k-row table
     per load); the set difference is computed here in one query instead.
     Same per-logic, latest-only semantics as the pairing list itself.
+
+    Consent gate (P3): when the consent gate is active (logic gating ON and
+    the caller lacks the NONCONSENT entitlement), DMP samples with
+    ``consent IS FALSE`` are withheld — the same rule the Layer B listings
+    apply. ``consent IS TRUE`` / NULL are unaffected.
     """
     logic = find_logic_by_name(db, pairing_logic_name)
     if logic is None:
@@ -246,6 +265,8 @@ def list_unmatched_dmp_samples(
         .where(Sample.sample_type == "DMP", ~paired)
         .order_by(Sample.created_date.desc(), Sample.id.desc())
     )
+    if consent_gate_active(current_user):
+        stmt = stmt.where(consent_gate_condition())
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset is not None:
@@ -305,7 +326,8 @@ def _either_side_conds(tumor_alias, normal_alias, q: str):
 
 
 def _report_paired_page(
-    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None
+    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None,
+    consent_gated: bool = False,
 ) -> list[PairingTable]:
     """One slice of the logic's latest paired rows, in report order.
 
@@ -313,6 +335,11 @@ def _report_paired_page(
     ``created_date desc, id desc``) so page boundaries are stable.
     With ``q``, the slice is restricted to rows the query matches on
     either side (NULL sides never match — the client-side semantics).
+
+    ``consent_gated`` (P3): when set, hide a pairing when EITHER side is a
+    non-consent DMP sample (``consent IS FALSE``) — the same rule the
+    Layer B listings and the unmatched DMP read apply (Layer A
+    logic-scoped reads honor the same rule).
     """
     stmt = (
         select(PairingTable)
@@ -329,7 +356,7 @@ def _report_paired_page(
         .offset(offset)
         .limit(limit)
     )
-    if q is not None:
+    if q is not None or consent_gated:
         tumor_alias = aliased(Sample)
         normal_alias = aliased(Sample)
         stmt = stmt.join(
@@ -338,20 +365,41 @@ def _report_paired_page(
         stmt = stmt.join(
             normal_alias, PairingTable.normal_id == normal_alias.id, isouter=True
         )
-        stmt = stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+        if q is not None:
+            stmt = stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+        if consent_gated:
+            stmt = stmt.where(
+                and_(
+                    consent_gate_condition(sample=tumor_alias),
+                    consent_gate_condition(sample=normal_alias),
+                )
+            )
     return list(db.scalars(stmt).all())
 
 
 def _report_paired_total(
-    db: Session, logic: PairingLogic, q: str
+    db: Session, logic: PairingLogic, q: str, consent_gated: bool = False
 ) -> int:
     """SQL COUNT of the logic's latest paired rows matching the query.
 
-    Same predicate as ``_report_paired_page`` with ``q``, so the count
-    and the served pages always cover the same filtered set.
+    Same predicate as ``_report_paired_page`` with ``q`` (incl. the
+    ``consent_gated`` P3 consent rule), so the count and the served pages
+    always cover the same filtered set.
     """
     tumor_alias = aliased(Sample)
     normal_alias = aliased(Sample)
+    where = [
+        PairingTable.pairing_logic_id == logic.id,
+        PairingTable.latest.is_(True),
+        _either_side_conds(tumor_alias, normal_alias, q),
+    ]
+    if consent_gated:
+        where.append(
+            and_(
+                consent_gate_condition(sample=tumor_alias),
+                consent_gate_condition(sample=normal_alias),
+            )
+        )
     return int(
         db.scalar(
             select(func.count(PairingTable.id))
@@ -364,18 +412,15 @@ def _report_paired_total(
                 PairingTable.normal_id == normal_alias.id,
                 isouter=True,
             )
-            .where(
-                PairingTable.pairing_logic_id == logic.id,
-                PairingTable.latest.is_(True),
-                _either_side_conds(tumor_alias, normal_alias, q),
-            )
+            .where(*where)
         )
         or 0
     )
 
 
 def _report_unmatched_page(
-    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None
+    db: Session, logic: PairingLogic, offset: int, limit: int, q: Optional[str] = None,
+    consent_gated: bool = False,
 ) -> list[Sample]:
     """One slice of the unmatched DMP TUMOR rows, in report order.
 
@@ -388,6 +433,10 @@ def _report_unmatched_page(
     With ``q``, restricted to samples any report search field matches —
     an unmatched row carries the sample on the tumor side only (the
     normal side is null), so the search reduces to the tumor's own fields.
+
+    ``consent_gated`` (P3): when set, also restricts to samples that are
+    not non-consent DMP samples (``consent IS NOT FALSE``) — the same rule
+    the Layer B listings apply.
     """
     paired = exists(
         select(PairingTable.id).where(
@@ -412,11 +461,13 @@ def _report_unmatched_page(
     )
     if q is not None:
         stmt = stmt.where(or_(*_search_conds(Sample, q)))
+    if consent_gated:
+        stmt = stmt.where(consent_gate_condition())
     return list(db.scalars(stmt).all())
 
 
 def _report_unmatched_total(
-    db: Session, logic: PairingLogic, q: Optional[str] = None
+    db: Session, logic: PairingLogic, q: Optional[str] = None, consent_gated: bool = False
 ) -> int:
     """SQL COUNT of the unmatched DMP TUMOR rows for the logic.
 
@@ -428,6 +479,8 @@ def _report_unmatched_total(
     ``count_unpaired``'s ``unpaired``, this never falls back to a
     total-minus-paired estimate, so ``total`` stays exact. With ``q``,
     narrowed to the same search the page rows are filtered by.
+    ``consent_gated`` (P3) additionally narrows to samples that are not
+    non-consent DMP samples, matching the page rows.
     """
     paired = exists(
         select(PairingTable.id).where(
@@ -439,13 +492,16 @@ def _report_unmatched_total(
             PairingTable.pairing_logic_id == logic.id,
         )
     )
-    stmt = select(func.count(Sample.id)).where(
+    base = [
         Sample.sample_type == "DMP",
         Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
         ~paired,
-    )
+    ]
     if q is not None:
-        stmt = stmt.where(or_(*_search_conds(Sample, q)))
+        base.append(or_(*_search_conds(Sample, q)))
+    if consent_gated:
+        base.append(consent_gate_condition())
+    stmt = select(func.count(Sample.id)).where(*base)
     return db.scalar(stmt) or 0
 
 
@@ -502,6 +558,7 @@ def pairing_report(
             "/pairing/report-stats/. Default true keeps the 5/8 contract."
         ),
     ),
+    current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
 ):
     """One page of the merged Pair Report list for the logic.
@@ -547,21 +604,26 @@ def pairing_report(
     # falsy-q branch.
     if q is not None:
         q = q.strip().lower() or None
+    # P3 consent gate: a principal lacking the NONCONSENT entitlement gets
+    # the gate (Layer A logic-scoped reads honor the same rule as the
+    # Layer B listings) — non-consent DMP samples are withheld from the
+    # report's rows, total, and stats.
+    consent_gated = consent_gate_active(current_user)
 
     # paired section: the logic's latest rows with both sides present
     # (count_unpaired's "paired" counts exactly these); with a query,
-    # count the matching subset instead.
+    # count the matching subset instead. Both paths honor the consent gate.
     if q is None:
-        paired_total = count_unpaired(db, pairing_logic_name)["paired"]
+        paired_total = count_unpaired(db, pairing_logic_name, consent_gated)["paired"]
     else:
-        paired_total = _report_paired_total(db, logic, q)
+        paired_total = _report_paired_total(db, logic, q, consent_gated)
     # unmatched section (DMP logics only): count it with the SAME predicate
     # the rows are served with. We do NOT reuse count_unpaired's "unpaired"
     # here: for a bait-set-less DMP logic it falls back to
     # total-minus-paired, which can overcount and would make "total" drift
     # from the rows actually returned.
     if _is_dmp_strategy(logic):
-        unmatched_total = _report_unmatched_total(db, logic, q)
+        unmatched_total = _report_unmatched_total(db, logic, q, consent_gated)
     else:
         unmatched_total = 0
     total = paired_total + unmatched_total
@@ -576,14 +638,14 @@ def pairing_report(
     # the boundary; fetch the part of each section it covers.
     if offset < paired_total:
         take = min(limit, paired_total - offset)
-        for p in _report_paired_page(db, logic, offset, take, q=q):
+        for p in _report_paired_page(db, logic, offset, take, q=q, consent_gated=consent_gated):
             rows.append(_paired_row(p))
     remaining = limit - len(rows)
     if remaining > 0 and unmatched_total > 0:
         # The slice has reached the unmatched section; its local offset is
         # 0 when the slice started inside the paired section.
         unmatched_offset = max(0, offset - paired_total)
-        for s in _report_unmatched_page(db, logic, unmatched_offset, remaining, q=q):
+        for s in _report_unmatched_page(db, logic, unmatched_offset, remaining, q=q, consent_gated=consent_gated):
             rows.append(_unmatched_row(s, logic))
 
     # DMP logics only (5/8): the reference's summary counts + QC warnings
@@ -593,7 +655,7 @@ def pairing_report(
     summary = None
     warnings = None
     if _is_dmp_strategy(logic) and include_stats:
-        summary, warnings = _dmp_report_stats_cached(db, logic)
+        summary, warnings = _dmp_report_stats_cached(db, logic, consent_gated)
 
     return PairingReportRead(
         rows=rows, total=total, summary=summary, warnings=warnings
@@ -604,6 +666,7 @@ def pairing_report(
 def pairing_report_stats(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
 ):
     """The DMP summary counts + 5 QC warning buckets on their own (5/8).
@@ -613,13 +676,15 @@ def pairing_report_stats(
     Cached per logic until the frame's watermark moves or the entry ages out
     (see the stats cache below). ``summary``/``warnings`` are null for
     non-DMP logics, matching the report's contract.
+    The aggregate is scoped by the caller's P3 consent entitlement so a
+    non-consent DMP sample is counted only for principals who may see it.
     """
     logic = find_logic_by_name(db, pairing_logic_name)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
     if not _is_dmp_strategy(logic):
         return DmpReportStatsRead(summary=None, warnings=None)
-    summary, warnings = _dmp_report_stats_cached(db, logic)
+    summary, warnings = _dmp_report_stats_cached(db, logic, consent_gate_active(current_user))
     return DmpReportStatsRead(summary=summary, warnings=warnings)
 
 
@@ -967,11 +1032,14 @@ def _csv_line(cells: list, sep: str) -> str:
     return sep.join(_escape_cell(c, sep) for c in cells) + "\n"
 
 
-def _iter_paired_export_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+def _iter_paired_export_rows(
+    db: Session, logic: PairingLogic, q: Optional[str], consent_gated: bool = False
+):
     """Stream every latest paired row for the logic in report order
     (created_date desc, id desc) via keyset pagination, so the full set is
     never materialized. Same predicate as _report_paired_page (incl. the q
-    either-side search); the keyset cursor replaces OFFSET."""
+    either-side search and the P3 consent rule); the keyset cursor replaces
+    OFFSET."""
     base_stmt = (
         select(PairingTable)
         .options(
@@ -982,12 +1050,20 @@ def _iter_paired_export_rows(db: Session, logic: PairingLogic, q: Optional[str])
         .where(PairingTable.pairing_logic_id == logic.id, PairingTable.latest.is_(True))
         .order_by(PairingTable.created_date.desc(), PairingTable.id.desc())
     )
-    if q is not None:
+    if q is not None or consent_gated:
         tumor_alias = aliased(Sample)
         normal_alias = aliased(Sample)
         base_stmt = base_stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id, isouter=True)
         base_stmt = base_stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id, isouter=True)
-        base_stmt = base_stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+        if q is not None:
+            base_stmt = base_stmt.where(_either_side_conds(tumor_alias, normal_alias, q))
+        if consent_gated:
+            base_stmt = base_stmt.where(
+                and_(
+                    consent_gate_condition(sample=tumor_alias),
+                    consent_gate_condition(sample=normal_alias),
+                )
+            )
     last_created = None
     last_id = None
     while True:
@@ -1010,7 +1086,9 @@ def _iter_paired_export_rows(db: Session, logic: PairingLogic, q: Optional[str])
         last_id = batch[-1].id
 
 
-def _iter_unmatched_export_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+def _iter_unmatched_export_rows(
+    db: Session, logic: PairingLogic, q: Optional[str], consent_gated: bool = False
+):
     """Stream every unmatched DMP TUMOR row for the logic in report order via
     keyset pagination. Same predicate as _report_unmatched_page (DMP TUMORS
     with no latest pairing under the logic — the pair file is tumor-driven,
@@ -1032,6 +1110,8 @@ def _iter_unmatched_export_rows(db: Session, logic: PairingLogic, q: Optional[st
     ]
     if q is not None:
         base.append(or_(*_search_conds(Sample, q)))
+    if consent_gated:
+        base.append(consent_gate_condition())
     last_created = None
     last_id = None
     while True:
@@ -1137,15 +1217,17 @@ def _dedup(values) -> list:
     return out
 
 
-def _iter_dmp_pair_cells(db: Session, logic: PairingLogic):
+def _iter_dmp_pair_cells(db: Session, logic: PairingLogic, consent_gated: bool = False):
     """Yield the 15 reference pair-file cells (spec c) for every row of the
     logic's FULL pair frame — latest paired rows, then unmatched DMP tumor
     rows, no search filter — with bam_exists resolved per
     EXPORT_BATCH_SIZE chunk via the beagle file records, exactly as the DMP
-    export renders them."""
+    export renders them. ``consent_gated`` (P3) threads the caller's consent
+    entitlement into both row iterators so the frame (and any stats built on
+    it) is scoped to rows the principal may see."""
     for row_iter in (
-        _iter_paired_export_rows(db, logic, None),
-        _iter_unmatched_export_rows(db, logic, None),
+        _iter_paired_export_rows(db, logic, None, consent_gated),
+        _iter_unmatched_export_rows(db, logic, None, consent_gated),
     ):
         it = iter(row_iter)
         while True:
@@ -1404,13 +1486,16 @@ def _run_pairing_job(job_id: str, pass_key, run_fn) -> None:
         _release_pairing_pass_key(pass_key)
 
 
-def _dmp_report_stats_cached(db: Session, logic: PairingLogic):
+def _dmp_report_stats_cached(db: Session, logic: PairingLogic, consent_gated: bool = False):
     """_dmp_report_stats, reused across requests while the frame looks the
-    same (watermark + TTL; see the cache notes above)."""
+    same (watermark + TTL; see the cache notes above). The cache key is
+    scoped per P3 consent entitlement: a principal without the NONCONSENT
+    claim and one with it each get their own (differently gated) aggregate
+    rather than sharing a leaked one."""
     cache = _dmp_stats_cache(db)
     if cache is None:
-        return _dmp_report_stats(db, logic)
-    key = str(logic.id)
+        return _dmp_report_stats(db, logic, consent_gated)
+    key = (str(logic.id), consent_gated)
     watermark = _dmp_stats_watermark(db, logic)
     hit = cache.get(key)
     if (
@@ -1419,12 +1504,12 @@ def _dmp_report_stats_cached(db: Session, logic: PairingLogic):
         and (datetime.now(timezone.utc) - hit[1]).total_seconds() < DMP_STATS_TTL_SECONDS
     ):
         return hit[2], hit[3]
-    summary, warnings = _dmp_report_stats(db, logic)
+    summary, warnings = _dmp_report_stats(db, logic, consent_gated)
     cache[key] = (watermark, datetime.now(timezone.utc), summary, warnings)
     return summary, warnings
 
 
-def _dmp_report_stats(db: Session, logic: PairingLogic):
+def _dmp_report_stats(db: Session, logic: PairingLogic, consent_gated: bool = False):
     """The reference's 3 summary counts and 5 QC warnings (spec d/e) for
     the logic's full DMP pair frame, in the exact row sets and conditions
     pair_tumor_with_normal.R implements:
@@ -1468,7 +1553,7 @@ def _dmp_report_stats(db: Session, logic: PairingLogic):
     w_low_normals: list = []
     row_bams: list = []            # (tumor_bamname, tumor_sample) per row
     matched_bam_counts: dict = {}
-    for cells in _iter_dmp_pair_cells(db, logic):
+    for cells in _iter_dmp_pair_cells(db, logic, consent_gated):
         tumor_sample = cells[ci["tumor_sample"]]
         matched = cells[ci["tumor_matched"]] == "Matched"
         if matched:
@@ -1555,6 +1640,7 @@ def export_pair_report(
     ),
     fmt: str = Query("csv", description="csv or tsv"),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
 ):
     """Stream the FULL merged Pair Report list for a logic as CSV/TSV.
@@ -1576,6 +1662,10 @@ def export_pair_report(
         raise HTTPException(status_code=404, detail="Pairing logic not found")
     if q is not None:
         q = q.strip().lower() or None
+    # P3 consent gate: scope the export to the rows this principal may see —
+    # non-consent DMP samples are withheld otherwise (the same rule the
+    # report's rows, total, and stats apply).
+    consent_gated = consent_gate_active(current_user)
     fmt = (fmt or "").strip().lower()
     if fmt not in ("csv", "tsv"):
         raise HTTPException(status_code=400, detail="fmt must be 'csv' or 'tsv'")
@@ -1599,12 +1689,12 @@ def export_pair_report(
                 # cells (spec c) restricted to col_defs; the unmatched
                 # section is tumor rows only.
                 for it in (
-                    _iter_paired_export_rows(db, logic, q),
-                    _iter_unmatched_export_rows(db, logic, q),
+                    _iter_paired_export_rows(db, logic, q, consent_gated),
+                    _iter_unmatched_export_rows(db, logic, q, consent_gated),
                 ):
                     yield from _iter_dmp_pair_lines(it, col_defs, sep)
             else:
-                for row in _iter_paired_export_rows(db, logic, q):
+                for row in _iter_paired_export_rows(db, logic, q, consent_gated):
                     yield _csv_line([c["text"](row) for c in col_defs], sep)
         finally:
             db.close()
@@ -2363,6 +2453,7 @@ def trigger_harmony_pairing_endpoint(
 def unmatched_count_endpoint(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
 ) -> dict:
     """Per-logic unpaired count for the Pairing overview summary strip.
@@ -2370,8 +2461,14 @@ def unmatched_count_endpoint(
     DMP: mirrors ``GET /unmatched/`` (every unpaired DMP sample). Any
     other logic: the logic's unpaired tumor population — the same scope
     a backfill for that logic would consider. Read-only.
+
+    P3: the count honors the consent gate exactly like the mirrored
+    ``/unmatched/`` read — a hidden non-consent DMP sample must not
+    count toward the strip (a count leak is a leak).
     """
-    return count_unpaired(db, pairing_logic_name)
+    return count_unpaired(
+        db, pairing_logic_name, consent_gated=consent_gate_active(current_user)
+    )
 
 
 @router.get("/evaluate/", response_model=EvaluateRead)

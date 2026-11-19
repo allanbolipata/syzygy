@@ -4,8 +4,12 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
-from syzygy.auth import get_current_user, gating_allowed_logics
-from syzygy.bait_sets import allowed_logics_condition, logic_membership_condition
+from syzygy.auth import consent_gate_active, get_current_user, gating_allowed_logics
+from syzygy.bait_sets import (
+    allowed_logics_condition,
+    consent_gate_condition,
+    logic_membership_condition,
+)
 from syzygy.database import get_db
 from syzygy.models import PairingLogic, Sample
 from syzygy.pairing_service import resolve_filter_logic
@@ -73,6 +77,7 @@ def _apply_request_filters(
     patient__cmo: Optional[str] = None,
     logic: Optional[PairingLogic] = None,
     gating=None,
+    consent_gate=None,
 ):
     """Filter clauses shared by the page query and the total query, so
     the reported total always reflects the currently active filter set.
@@ -82,10 +87,23 @@ def _apply_request_filters(
     group's counts). The advanced filters are group-level HAVING clauses
     on the unfiltered group rows — the request is included when at least
     one of its samples matches, but its aggregate counts still cover ALL
-    of its samples."""
+    of its samples.
+
+    ``consent_gate`` (P3) is a ROW-level (WHERE) restriction, not a
+    group HAVING: a non-consent DMP sample (``consent IS FALSE``) is
+    hidden from a principal without the non-consent entitlement, so it
+    must not count toward the group's sample/tumor/normal counts (a
+    security boundary — unlike the logic gate's all-samples counting, the
+    hidden sample's data must not leak through the aggregates). A group
+    whose samples are all hidden simply has no rows and does not appear.
+    """
     stmt = stmt.where(Sample.request_id.is_not(None))
     if q is not None:
         stmt = stmt.where(Sample.request_id.ilike(f"%{q}%"))
+    if consent_gate is not None:
+        # P3 consent gate: hide non-consent DMP samples (consent IS
+        # FALSE) before the GROUP BY, so the aggregates exclude them.
+        stmt = stmt.where(consent_gate)
     having = _request_advanced_having(
         gene_panel=gene_panel,
         sample_type=sample_type,
@@ -186,6 +204,7 @@ def list_requests(
     """
     allowed = gating_allowed_logics(current_user)
     gating = allowed_logics_condition(db, allowed) if allowed is not None else None
+    consent_gate = consent_gate_condition() if consent_gate_active(current_user) else None
     advanced = {
         "gene_panel": gene_panel,
         "sample_type": sample_type,
@@ -193,15 +212,19 @@ def list_requests(
         "patient__cmo": patient__cmo,
         "logic": resolve_filter_logic(db, pairing_logic),
         "gating": gating,
+        "consent_gate": consent_gate,
     }
     rows = _request_page(db, limit, offset, q=q, **advanced)
 
     by_request: dict[str, list[Sample]] = {}
     if rows:
         request_ids = [row.request_id for row in rows]
-        samples = db.scalars(
-            select(Sample).where(Sample.request_id.in_(request_ids))
-        ).all()
+        post_cond = Sample.request_id.in_(request_ids)
+        if consent_gate is not None:
+            # The hidden samples must not leak into the distinct lists
+            # (patients / sample_types / gene_panels) either.
+            post_cond = and_(post_cond, consent_gate)
+        samples = db.scalars(select(Sample).where(post_cond)).all()
         for s in samples:
             by_request.setdefault(s.request_id, []).append(s)
 
