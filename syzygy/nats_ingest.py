@@ -119,6 +119,46 @@ def _first_run(sample_entry: Dict[str, Any]) -> Dict[str, Any]:
     return first_run if isinstance(first_run, dict) else {}
 
 
+def _collect_run_ids(sample_entry: Dict[str, Any]) -> List[str]:
+    """Distinct raw runIds from ``libraries[].runs[].runId``, order-preserving.
+
+    The ARGOS pooled tier's beagle-exact machine matching reads
+    ``additional_metadata["run_ids"]`` (raw runIds; machine = first
+    underscore token, normalized at pairing time). Accumulation semantics
+    mirror ``scripts/import_beagle_dump._accumulate_run_ids``.
+    """
+    seen: List[str] = []
+    libraries = sample_entry.get("libraries")
+    if not isinstance(libraries, list):
+        return seen
+    for library in libraries:
+        if not isinstance(library, dict):
+            continue
+        runs = library.get("runs")
+        if not isinstance(runs, list):
+            continue
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            run_id = str(run.get("runId") or "").strip()
+            if run_id and run_id not in seen:
+                seen.append(run_id)
+    return seen
+
+
+def _merge_run_ids(prior: Any, new: List[str]) -> List[str]:
+    """Accumulate new runIds onto a sample's stored list (prior first,
+    distinct). Tolerates a legacy single-string value."""
+    merged: List[str] = []
+    if isinstance(prior, str):
+        prior = [prior]
+    for run_id in [*(prior or []), *new]:
+        run_id = str(run_id).strip()
+        if run_id and run_id not in merged:
+            merged.append(run_id)
+    return merged
+
+
 def _parse_run_date(value: Any) -> Optional[datetime]:
     """SMILE runDate -> UTC datetime; date-only values become midnight."""
     if not value:
@@ -230,6 +270,15 @@ def _upsert_sample(
     # Application-level upsert (no schema change): the samples table has
     # no unique constraint on primary_id, so pick the first matching row.
     existing = db.scalar(select(Sample).where(Sample.primary_id == primary_id).limit(1))
+    # runIds accumulate across messages (beagle semantics): merge this
+    # entry's runIds onto the stored list before the wholesale
+    # additional_metadata overwrite below.
+    merged_run_ids = _merge_run_ids(
+        (existing.additional_metadata or {}).get("run_ids") if existing else None,
+        _collect_run_ids(sample_entry),
+    )
+    if merged_run_ids:
+        additional_metadata["run_ids"] = merged_run_ids
     if existing is not None:
         for key, value in fields.items():
             setattr(existing, key, value)
@@ -637,6 +686,12 @@ def handle_sample_update(
     if isinstance(payload.get("sampleMetadataList"), list):
         meta["sampleMetadataList"] = payload["sampleMetadataList"]
         meta_keys_touched.append("sampleMetadataList")
+    # runIds accumulate across updates (beagle semantics), same as the
+    # new-request path.
+    merged_run_ids = _merge_run_ids(meta.get("run_ids"), _collect_run_ids(latest))
+    if merged_run_ids:
+        meta["run_ids"] = merged_run_ids
+        meta_keys_touched.append("run_ids")
 
     changed = []
     for column, value in fields.items():
