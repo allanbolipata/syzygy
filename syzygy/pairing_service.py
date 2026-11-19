@@ -1,14 +1,16 @@
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
+from syzygy import audit
 from syzygy.models import (
     DMP_LOGIC_NAME,
+    HARMONY_LOGIC_NAME,
     BaitSet,
     PairingLogic,
     PairingTable,
@@ -16,7 +18,11 @@ from syzygy.models import (
     Sample,
     utcnow,
 )
-from syzygy.bait_sets import classify_bait_set, resolve_bait_set_logic
+from syzygy.bait_sets import (
+    classify_bait_set,
+    consent_gate_condition,
+    resolve_bait_set_logic,
+)
 from syzygy.pairing_strategies import get_pairing_strategy, strategies
 from syzygy.schemas import TumorOrNormal
 
@@ -151,6 +157,20 @@ def resolve_filter_logic(db: Session, pairing_logic: Optional[str]) -> Optional[
     return logic
 
 
+def is_pairable(sample: Optional[Sample]) -> bool:
+    """The single redaction chokepoint (spec R1, REDACTION_TICKETS.md).
+
+    A sample is pairable iff it is not redacted. Redacted samples are
+    excluded from all automatic pairing — every strategy's candidate
+    query and the bulk pairing sweeps filter them out in SQL — and
+    explicit pairing triggers on them raise 400 (``trigger_pairing``).
+    Redaction never retires existing pairings (pairing history is
+    immutable); ``_create_pairing`` and the strategy ``select_*``
+    methods never see a redacted sample through any of these paths.
+    """
+    return sample is not None and not sample.redacted
+
+
 def _get_latest_pairings(
     db: Session, tumor_id: UUID, pairing_logic_id: UUID
 ) -> list[PairingTable]:
@@ -180,6 +200,67 @@ def _get_latest_pairing(
     return rows[0] if rows else None
 
 
+def _mismatch_key_labels(mismatched_keys: Optional[list]) -> Optional[list]:
+    """Key labels only, from mismatch reason strings (AL1 sanitization).
+
+    Reasons are formatted ``"{key} mismatch (a vs b)"`` — the ``(a vs b)``
+    part carries key VALUES (patient ids, panels, run modes), which the
+    binding sanitization rule keeps out of audit payloads (ids and names
+    only). Fixed-text reasons (redaction, DMP manual-only, unresolvable
+    preservation) carry no values and are kept verbatim.
+    """
+    if not mismatched_keys:
+        return None
+    labels = [str(reason).split(" mismatch")[0].strip() for reason in mismatched_keys]
+    return [label for label in labels if label] or None
+
+
+def _pairing_created_payload(
+    trigger_type: Optional[str],
+    tumor: Sample,
+    normal: Sample,
+    mismatched_keys: Optional[list],
+    replaced: Optional[PairingTable],
+) -> dict:
+    """``pairing.created`` payload (ids/names only, spec decision 3)."""
+    payload = {
+        "trigger_type": trigger_type,
+        "tumor_name": tumor.cmo_sample_name,
+        "normal_name": normal.cmo_sample_name,
+    }
+    labels = _mismatch_key_labels(mismatched_keys)
+    if labels:
+        payload["mismatched_keys"] = labels
+    if replaced is not None:
+        payload["replaced_pairing_id"] = str(replaced.id)
+    return payload
+
+
+def _conflict_fallback(
+    db: Session,
+    tumor: Sample,
+    normal: Sample,
+    pairing_logic: PairingLogic,
+    multi_pair: bool,
+) -> Optional[PairingTable]:
+    """Resolve a pair-scoped unique-index collision: return the row the
+    conflicting transaction left behind, or ``None`` (caller re-raises)."""
+    if multi_pair:
+        # Fan-out rows: the pair-scoped unique index is what
+        # collided (a duplicate (tumor, normal, logic) latest row)
+        # — the tumor-scoped index exempts multi_pair rows, so the
+        # single-winner fallback does not apply.
+        return db.scalar(
+            select(PairingTable).where(
+                PairingTable.tumor_id == tumor.id,
+                PairingTable.normal_id == normal.id,
+                PairingTable.pairing_logic_id == pairing_logic.id,
+                PairingTable.latest == True,
+            )
+        )
+    return _get_latest_pairing(db, tumor.id, pairing_logic.id)
+
+
 def _create_pairing(
     db: Session,
     tumor: Sample,
@@ -190,6 +271,10 @@ def _create_pairing(
     notes: Optional[list] = None,
     multi_pair: bool = False,
     commit: bool = True,
+    actor: Any = None,
+    replaced: Optional[PairingTable] = None,
+    in_bulk: bool = False,
+    reverse_of: Optional[UUID] = None,
 ) -> PairingTable:
     pairing = PairingTable(
         tumor_id=tumor.id,
@@ -202,34 +287,44 @@ def _create_pairing(
         multi_pair=multi_pair,
     )
     db.add(pairing)
+    # AL1: flush before the audit event so `pairing.id` (the event's
+    # entity_id) is already assigned. This also moves a pair-scoped
+    # unique-index violation to flush time, handled by the same
+    # fallback as a commit-time collision.
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = _conflict_fallback(db, tumor, normal, pairing_logic, multi_pair)
+        if existing is not None:
+            return existing
+        raise
+    # AL1: pairing.created — one event per created row, in the caller's
+    # transaction (an IntegrityError rollback below discards it with the
+    # failed row — no event without a row). Bulk passes cap the detail
+    # events (the pass's pairing.bulk summary carries the full counts).
+    audit.record_pairing_created(
+        db,
+        actor,
+        pairing=pairing,
+        logic_name=pairing_logic.name,
+        payload=_pairing_created_payload(trigger_type, tumor, normal, mismatched_keys, replaced),
+        in_bulk=in_bulk,
+        reverse_of=reverse_of,
+    )
     if not commit:
         # Bulk-pass deferred commit: the caller (a bulk pairing pass) owns
         # the transaction and commits every N newly-paired tumors, rolling
         # back the open batch on failure — so the per-row commit/fsync is
-        # off the hot path. The row's Python-side defaults (id,
-        # created_date) are already set, so no refresh is needed.
+        # off the hot path.
         return pairing
     try:
         db.commit()
     except IntegrityError:
+        # A concurrent commit may have created this pair between our
+        # flush and commit.
         db.rollback()
-        if multi_pair:
-            # Fan-out rows: the pair-scoped unique index is what
-            # collided (a duplicate (tumor, normal, logic) latest row)
-            # — the tumor-scoped index exempts multi_pair rows, so the
-            # single-winner fallback does not apply.
-            existing = db.scalar(
-                select(PairingTable).where(
-                    PairingTable.tumor_id == tumor.id,
-                    PairingTable.normal_id == normal.id,
-                    PairingTable.pairing_logic_id == pairing_logic.id,
-                    PairingTable.latest == True,
-                )
-            )
-            if existing is not None:
-                return existing
-            raise
-        existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
+        existing = _conflict_fallback(db, tumor, normal, pairing_logic, multi_pair)
         if existing is not None:
             return existing
         raise
@@ -237,9 +332,30 @@ def _create_pairing(
     return pairing
 
 
-def _mark_stale(existing: PairingTable) -> None:
+def _mark_stale(
+    db: Session,
+    existing: PairingTable,
+    actor: Any = None,
+    logic_name: Optional[str] = None,
+) -> None:
     existing.latest = False
     existing.modified_date = utcnow()
+    # AL1: pairing.retired — one event per retired row (ids only; the
+    # replacing pairing.created event carries replaced_pairing_id, so
+    # the link runs forward from the new row).
+    audit.record(
+        db,
+        actor,
+        "pairing.retired",
+        entity_type="pairing",
+        entity_id=existing.id,
+        pairing_logic=logic_name,
+        payload={
+            "pairing_id": str(existing.id),
+            "tumor_id": str(existing.tumor_id),
+            "normal_id": str(existing.normal_id),
+        },
+    )
 
 
 def _multi_pair_representative(db: Session, existing: list[PairingTable]) -> PairingTable:
@@ -261,6 +377,8 @@ def _trigger_multi_pair(
     normal_id: Optional[UUID],
     strict: bool,
     commit: bool = True,
+    actor: Any = None,
+    in_bulk: bool = False,
 ) -> Optional[PairingTable]:
     """The multi_pair (DMP) branch of ``trigger_pairing``: one row per
     match, no winner (docs/dmp_reference_alignment.md, section b).
@@ -277,6 +395,13 @@ def _trigger_multi_pair(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=404, detail="Normal sample not found")
+        # Spec R1 (REDACTION_TICKETS.md): an explicit pin of a redacted
+        # normal is a 400 — redacted samples are never (re-)paired.
+        if not is_pairable(normal):
+            raise HTTPException(
+                status_code=400,
+                detail="Normal sample is redacted: un-redact it to pair",
+            )
         reasons = strategy.mismatch_reasons(tumor, normal, db)
         if strict and reasons:
             raise HTTPException(
@@ -287,7 +412,7 @@ def _trigger_multi_pair(
         if pinned:
             return pinned[0]
         for row in existing:
-            _mark_stale(row)
+            _mark_stale(db, row, actor, pairing_logic.name)
         result = _create_pairing(
             db,
             tumor,
@@ -297,6 +422,8 @@ def _trigger_multi_pair(
             mismatched_keys=reasons or None,
             multi_pair=True,
             commit=commit,
+            actor=actor,
+            in_bulk=in_bulk,
         )
         # Race guard: a concurrent commit may have created this pair.
         if result.normal_id != normal.id:
@@ -319,7 +446,7 @@ def _trigger_multi_pair(
         return next(r for r in existing if r.normal_id == rep.id)
 
     for row in existing:
-        _mark_stale(row)
+        _mark_stale(db, row, actor, pairing_logic.name)
     selection_notes = strategy.select_latest_normal(db, tumor, pairing_logic).notes
     created: list[PairingTable] = []
     for normal in sorted(normals, key=lambda s: str(s.primary_id)):
@@ -333,6 +460,8 @@ def _trigger_multi_pair(
                 notes=selection_notes or None,
                 multi_pair=True,
                 commit=commit,
+                actor=actor,
+                in_bulk=in_bulk,
             )
         )
     return created[0]
@@ -346,6 +475,9 @@ def trigger_pairing(
     normal_id: Optional[UUID] = None,
     strict: bool = False,
     commit: bool = True,
+    actor: Any = None,
+    in_bulk: bool = False,
+    reverse_of: Optional[UUID] = None,
 ) -> Optional[PairingTable]:
     """Create (or return) the current pairing rows for a tumor.
 
@@ -377,12 +509,24 @@ def trigger_pairing(
         return None
     if pairing_logic is None:
         return None
+    # Spec R1 (REDACTION_TICKETS.md): a redacted tumor can never be
+    # (re-)paired. Explicit triggers (manual / pinned) are a 400;
+    # automatic triggers skip it (None) — the bulk pairing sweeps
+    # already exclude redacted tumors in SQL, so this only guards a
+    # redaction that lands mid-pass (never kills the pass).
+    if not is_pairable(tumor):
+        if trigger_type == "automatic":
+            return None
+        raise HTTPException(
+            status_code=400,
+            detail="Tumor sample is redacted: un-redact it to pair",
+        )
 
     strategy = get_pairing_strategy(pairing_logic)
     if getattr(strategy, "MULTI_PAIR", False):
         return _trigger_multi_pair(
             db, strategy, tumor, pairing_logic, trigger_type, normal_id, strict,
-            commit=commit,
+            commit=commit, actor=actor, in_bulk=in_bulk,
         )
 
     existing = _get_latest_pairing(db, tumor.id, pairing_logic.id)
@@ -391,6 +535,13 @@ def trigger_pairing(
         normal = db.get(Sample, normal_id)
         if normal is None or normal.tumor_or_normal != TumorOrNormal.NORMAL.value:
             raise HTTPException(status_code=404, detail="Normal sample not found")
+        # Spec R1 (REDACTION_TICKETS.md): an explicit pin of a redacted
+        # normal is a 400 — redacted samples are never (re-)paired.
+        if not is_pairable(normal):
+            raise HTTPException(
+                status_code=400,
+                detail="Normal sample is redacted: un-redact it to pair",
+            )
         reasons = strategy.mismatch_reasons(tumor, normal, db)
         if strict and reasons:
             raise HTTPException(
@@ -400,7 +551,7 @@ def trigger_pairing(
         if existing is not None and existing.normal_id == normal.id:
             return existing
         if existing is not None:
-            _mark_stale(existing)
+            _mark_stale(db, existing, actor, pairing_logic.name)
         # A pinned pooled normal on an unverified machine (no row, or a
         # class outside novaseq/hiseq) pairs under the advisory registry
         # and carries the same visible warning note as the automatic
@@ -419,6 +570,10 @@ def trigger_pairing(
             mismatched_keys=reasons or None,
             notes=notes,
             commit=commit,
+            actor=actor,
+            replaced=existing,
+            in_bulk=in_bulk,
+            reverse_of=reverse_of,
         )
         # Race guard: a concurrent commit may have won the "latest" slot.
         if result.normal_id != normal.id:
@@ -437,7 +592,7 @@ def trigger_pairing(
     if existing is not None and existing.normal_id == selection.normal.id:
         return existing
     if existing is not None:
-        _mark_stale(existing)
+        _mark_stale(db, existing, actor, pairing_logic.name)
     return _create_pairing(
         db,
         tumor,
@@ -446,6 +601,10 @@ def trigger_pairing(
         trigger_type=trigger_type,
         notes=selection.notes or None,
         commit=commit,
+        actor=actor,
+        replaced=existing,
+        in_bulk=in_bulk,
+        reverse_of=reverse_of,
     )
 
 
@@ -453,6 +612,7 @@ def trigger_pairing_for_normal(
     db: Session,
     normal: Sample,
     pairing_logic: Optional[PairingLogic],
+    actor: Any = None,
 ) -> None:
     """Auto-pair a normal sample against its matching tumors.
 
@@ -471,6 +631,11 @@ def trigger_pairing_for_normal(
         return
     if pairing_logic is None:
         return
+    # Spec R1 (REDACTION_TICKETS.md): a redacted normal is never
+    # auto-paired against its tumors (the strategy queries exclude it
+    # too; this guard keeps the chokepoint explicit at the entry point).
+    if not is_pairable(normal):
+        return
 
     strategy = get_pairing_strategy(pairing_logic)
 
@@ -481,7 +646,7 @@ def trigger_pairing_for_normal(
             if {n.id for n in normals} == {row.normal_id for row in existing}:
                 continue
             for row in existing:
-                _mark_stale(row)
+                _mark_stale(db, row, actor, pairing_logic.name)
             selection_notes = strategy.select_latest_normal(db, tumor, pairing_logic).notes
             for candidate in sorted(normals, key=lambda s: str(s.primary_id)):
                 _create_pairing(
@@ -492,6 +657,7 @@ def trigger_pairing_for_normal(
                     trigger_type="automatic",
                     notes=selection_notes or None,
                     multi_pair=True,
+                    actor=actor,
                 )
         return
 
@@ -510,6 +676,7 @@ def trigger_pairing_for_normal(
             pairing_logic,
             trigger_type="automatic",
             notes=selection.notes or None,
+            actor=actor,
         )
 
 
@@ -563,8 +730,18 @@ def trigger_pairing_for_unpaired_tumors(
             )
         _ensure_active(scoped_logic)
 
+    # AL1: bulk pass — per-row pairing.created detail events are capped
+    # by the bulk detail cap; the summary below carries the full counts.
+    audit.begin_bulk_pass()
+
     tumors = db.scalars(
-        select(Sample).where(Sample.tumor_or_normal == TumorOrNormal.TUMOR.value)
+        select(Sample).where(
+            Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the backfill sweep skips them entirely (not
+            # counted in the summary).
+            Sample.redacted.is_(False),
+        )
     ).all()
 
     scanned = 0
@@ -602,12 +779,37 @@ def trigger_pairing_for_unpaired_tumors(
         if _get_latest_pairing(db, tumor.id, logic.id) is not None:
             already_paired += 1
             continue
-        pairing = trigger_pairing(db, tumor, logic, "automatic")
+        pairing = trigger_pairing(db, tumor, logic, "automatic", in_bulk=True)
         if pairing is None:
             unpaired += 1
         else:
             paired += 1
             new_pairings.append(pairing)
+
+    # AL1: one pairing.bulk summary per backfill pass (system actor).
+    # Per-row pairings committed inside trigger_pairing, so the summary
+    # flush needs its own commit to survive session close.
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "pairing.bulk",
+        entity_type="pairing_logic",
+        entity_id=scoped_logic.name if scoped_logic is not None else "ALL",
+        pairing_logic=scoped_logic.name if scoped_logic is not None else None,
+        payload={
+            "scope": scoped_logic.name if scoped_logic is not None else "ALL",
+            "scanned": scanned,
+            "already_paired": already_paired,
+            "paired": paired,
+            "unpaired": unpaired,
+            "skipped_dmp": skipped_dmp,
+            "skipped_no_logic": skipped_no_logic,
+            "skipped_inactive_logic": skipped_inactive_logic,
+            "detail_events_recorded": audit.bulk_detail_count(),
+            "detail_cap": audit.BULK_AUDIT_DETAIL_CAP,
+        },
+    )
+    db.commit()
 
     return {
         "scanned": scanned,
@@ -674,6 +876,10 @@ def _run_bulk_pair_pass(
             ),
         )
 
+    # AL1: bulk pass — per-row pairing.created detail events are capped
+    # by the bulk detail cap; the summary below carries the full counts.
+    audit.begin_bulk_pass()
+
     # Pass start: timestamp the pass so the end-of-pass re-check can find
     # DMP tumors ingested mid-pass (created on/after this moment).
     started_at = utcnow()
@@ -693,6 +899,10 @@ def _run_bulk_pair_pass(
         select(Sample).where(
             Sample.sample_type == "DMP",
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the bulk pass skips them entirely (not
+            # counted in the summary).
+            Sample.redacted.is_(False),
         )
     ).all()
 
@@ -751,7 +961,7 @@ def _run_bulk_pair_pass(
             # commit=False defers the per-row commit: the pass owns the
             # transaction and commits every ``batch_size`` newly-paired
             # tumors, so the per-row fsync is off the hot path.
-            pairing = trigger_pairing(db, tumor, logic, "automatic", commit=False)
+            pairing = trigger_pairing(db, tumor, logic, "automatic", commit=False, in_bulk=True)
             if pairing is None:
                 unpaired += 1
             else:
@@ -786,6 +996,9 @@ def _run_bulk_pair_pass(
                     Sample.sample_type == "DMP",
                     Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
                     Sample.created_date >= started_at,
+                    # Spec R1 (REDACTION_TICKETS.md): redacted tumors are
+                    # never auto-paired.
+                    Sample.redacted.is_(False),
                 )
             ).all()
             if t.id not in main_ids
@@ -808,6 +1021,10 @@ def _run_bulk_pair_pass(
                 Sample.sample_type == "DMP",
                 Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
                 Sample.created_date >= started_at,
+                # Spec R1 (REDACTION_TICKETS.md): redacted tumors are
+                # never auto-paired — they are not follow-up stragglers
+                # (a follow-up pass would skip them too).
+                Sample.redacted.is_(False),
                 ~exists(
                     select(PairingTable.id).where(
                         PairingTable.tumor_id == Sample.id,
@@ -824,6 +1041,30 @@ def _run_bulk_pair_pass(
         raise
 
     _report()
+    # AL1: one pairing.bulk summary per pass (system actor). Batch
+    # commits above already persisted the pairings; this commit persists
+    # the summary row (record only flushed).
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "pairing.bulk",
+        entity_type="pairing_logic",
+        entity_id=logic.name,
+        pairing_logic=logic.name,
+        payload={
+            "scope": logic.name,
+            "scanned": scanned,
+            "total": total,
+            "already_paired": already_paired,
+            "missing_patient__dmp": missing_patient,
+            "paired": paired,
+            "unpaired": unpaired,
+            "needs_follow_up": stragglers > 0,
+            "detail_events_recorded": audit.bulk_detail_count(),
+            "detail_cap": audit.BULK_AUDIT_DETAIL_CAP,
+        },
+    )
+    db.commit()
     return {
         "pairing_logic": logic.name,
         "scanned": scanned,
@@ -886,14 +1127,15 @@ def trigger_dmp_pairing(
 # Automatic HARMONY pairing (POST /pairing/trigger-harmony)
 # ---------------------------------------------------------------------------
 
-#: Name of the pairing logic under which HARMONY samples pair
-#: automatically. HARMONY is its OWN pairing logic row and pairing space,
+#: ``HARMONY_LOGIC_NAME`` ("HARMONY") is defined on the models layer
+#: (next to ``DMP_LOGIC_NAME``) so the SQL-side listing filter (bait_sets
+#: ``logic_membership_condition``) and this trigger share one source of
+#: truth. HARMONY is its OWN pairing logic row and pairing space,
 #: separate from the DMP logic: the two may drift over time (a future
 #: HARMONY strategy class the HARMONY row points at), so this trigger
 #: resolves "HARMONY" by name and never touches the DMP logic row or its
 #: pairings. For now the HARMONY row reuses the ``dmp`` strategy (same
 #: matching: DMP-group only, ``patient__dmp`` + gene panel).
-HARMONY_LOGIC_NAME = "HARMONY"
 
 
 def trigger_harmony_pairing(
@@ -989,6 +1231,9 @@ def _logic_tumor_scope(db: Session, logic: PairingLogic) -> list[Sample]:
         stmt = select(Sample).where(
             Sample.sample_type == "DMP",
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the dry-run scope matches the backfill.
+            Sample.redacted.is_(False),
         )
     else:
         names = _logic_bait_set_names(db, logic)
@@ -998,6 +1243,9 @@ def _logic_tumor_scope(db: Session, logic: PairingLogic) -> list[Sample]:
             Sample.tumor_or_normal == TumorOrNormal.TUMOR.value,
             func.upper(func.coalesce(Sample.sample_type, "")) != "DMP",
             func.lower(Sample.bait_set).in_(names),
+            # Spec R1 (REDACTION_TICKETS.md): redacted tumors are never
+            # auto-paired — the dry-run scope matches the backfill.
+            Sample.redacted.is_(False),
         )
     return list(db.scalars(stmt).all())
 
@@ -1070,7 +1318,7 @@ def evaluate_logic(db: Session, logic_name: str) -> dict:
     }
 
 
-def count_unpaired(db: Session, logic_name: str) -> dict:
+def count_unpaired(db: Session, logic_name: str, consent_gated: bool = False) -> dict:
     """Per-logic paired/unpaired counts for the Pairing overview strip.
 
     ``paired``: the logic's latest report rows where both the tumor
@@ -1081,25 +1329,47 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
     latest DMP-logic pairing. Any other logic: the logic's unpaired
     tumor population (the backfill scope, see ``_logic_tumor_scope``).
     Read-only.
+
+    ``consent_gated`` (P3): when set (gating ON and the caller lacks
+    the NONCONSENT entitlement), non-consent DMP samples (``consent IS
+    FALSE``) are withheld from both counts — the same rule the Layer B
+    listings and the Pair Report apply. Hidden samples must not count
+    toward the strip's aggregates (a security boundary: a count leak is
+    a leak). Non-DMP samples are provably unaffected (their consent is
+    NULL), so only the DMP branches gain the predicate.
     """
     logic = find_logic_by_name(db, logic_name)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
     # "Paired" strip value: this logic's latest rows with both sides
     # present (the explicit null guards state the report row rule).
-    paired_count = int(
-        db.scalar(
-            select(func.count())
-            .select_from(PairingTable)
+    paired_stmt = (
+        select(func.count())
+        .select_from(PairingTable)
+        .where(
+            PairingTable.pairing_logic_id == logic.id,
+            PairingTable.latest.is_(True),
+            PairingTable.tumor_id.isnot(None),
+            PairingTable.normal_id.isnot(None),
+        )
+    )
+    if consent_gated:
+        # P3 consent gate: hide a paired row when EITHER side is a
+        # non-consent DMP sample (consent IS NOT FALSE on both sides).
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        paired_stmt = (
+            paired_stmt
+            .join(tumor_alias, PairingTable.tumor_id == tumor_alias.id)
+            .join(normal_alias, PairingTable.normal_id == normal_alias.id)
             .where(
-                PairingTable.pairing_logic_id == logic.id,
-                PairingTable.latest.is_(True),
-                PairingTable.tumor_id.isnot(None),
-                PairingTable.normal_id.isnot(None),
+                and_(
+                    consent_gate_condition(sample=tumor_alias),
+                    consent_gate_condition(sample=normal_alias),
+                )
             )
         )
-        or 0
-    )
+    paired_count = int(db.scalar(paired_stmt) or 0)
     paired = exists(
         select(PairingTable.id).where(
             or_(
@@ -1114,6 +1384,9 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
         stmt = select(func.count()).select_from(Sample).where(
             Sample.sample_type == "DMP", ~paired
         )
+        if consent_gated:
+            # P3 consent gate: same rule as the /pairing/unmatched/ read.
+            stmt = stmt.where(consent_gate_condition())
     else:
         names = _logic_bait_set_names(db, logic)
         if not names:

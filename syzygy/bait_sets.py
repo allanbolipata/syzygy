@@ -8,7 +8,14 @@ from typing import Iterable, Optional
 from sqlalchemy import and_, false, func, or_, select
 from sqlalchemy.orm import Session
 
-from syzygy.models import DMP_LOGIC_NAME, BaitSet, PairingLogic, Sample
+from syzygy import audit
+from syzygy.models import (
+    DMP_LOGIC_NAME,
+    HARMONY_LOGIC_NAME,
+    BaitSet,
+    PairingLogic,
+    Sample,
+)
 
 TEMPO_BAIT_SETS = (
     "Agilent_v4_51MB_Human_hg19_BAITS",
@@ -60,6 +67,17 @@ def seed_bait_sets(db: Session) -> None:
         logic = db.scalar(select(PairingLogic).where(PairingLogic.name == logic_name))
         if logic is not None:
             db.add(BaitSet(bait_set=name, pairing_logic_id=logic.id))
+            # AL1: bait_set.assigned (bootstrap seed — system actor;
+            # ids/names only).
+            audit.record(
+                db,
+                audit.SYSTEM_ACTOR,
+                "bait_set.assigned",
+                entity_type="bait_set",
+                entity_id=name,
+                pairing_logic=logic.name,
+                payload={"bait_set": name, "pairing_logic": logic.name},
+            )
     db.commit()
 
 
@@ -78,6 +96,17 @@ def resolve_bait_set_logic(db: Session, name: Optional[str]) -> Optional[Pairing
     if logic is None:
         return None
     db.add(BaitSet(bait_set=name.strip(), pairing_logic_id=logic.id))
+    # AL1: bait_set.assigned (lazy registration on first sight — system
+    # actor; ids/names only).
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "bait_set.assigned",
+        entity_type="bait_set",
+        entity_id=name.strip(),
+        pairing_logic=logic.name,
+        payload={"bait_set": name.strip(), "pairing_logic": logic.name},
+    )
     db.commit()
     return logic
 
@@ -92,8 +121,12 @@ def logic_membership_condition(logic: PairingLogic, sample=None):
 
     - the sample's ``bait_set`` matches, case-insensitively, a
       ``bait_sets`` row whose ``pairing_logic_id`` is ``logic.id``;
-    - the DMP logic additionally owns samples with ``bait_set`` NULL and
-      ``sample_type`` ``'DMP'`` — DMP samples carry no bait-set key.
+    - the DMP and HARMONY logics additionally own samples with
+      ``bait_set`` NULL and ``sample_type`` of their own logic name
+      (``'DMP'`` / ``'HARMONY'``, exact case) — those ingested samples
+      carry no bait-set key. HARMONY is its own logic row (it reuses the
+      ``dmp`` strategy) but owns a separate NULL-bait_set family, so the
+      two stay separate gates.
 
     ``sample`` is the mapped class (or alias) whose row the condition is
     evaluated against; it defaults to ``Sample``. Pass an ``aliased``
@@ -127,6 +160,14 @@ def logic_membership_condition(logic: PairingLogic, sample=None):
                 sample.sample_type == DMP_LOGIC_NAME,
             ),
         )
+    if logic.name.strip().upper() == HARMONY_LOGIC_NAME:
+        return or_(
+            registered,
+            and_(
+                sample.bait_set.is_(None),
+                sample.sample_type == HARMONY_LOGIC_NAME,
+            ),
+        )
     return registered
 
 
@@ -150,3 +191,25 @@ def allowed_logics_condition(db: Session, allowed_logics: Iterable[str], sample=
         return false()
     conds = [logic_membership_condition(logic, sample=sample) for logic in logics]
     return conds[0] if len(conds) == 1 else or_(*conds)
+
+
+def consent_gate_condition(sample=None):
+    """SQL boolean condition on a sample row: the row is NOT a
+    non-consent DMP sample — the P3 consent gate (Layer B entitlement,
+    and the Layer A logic-scoped reads that honor the same rule).
+
+    Expresses ``consent IS NOT FALSE``: a row passes when its ``consent``
+    is TRUE, NULL, or the column is absent. Because the ``consent``
+    column is DMP-only (NULL for LIMS/IGO samples), this naturally keeps
+    every non-DMP sample (consent NULL), every DMP sample with consent
+    TRUE, and every DMP sample with consent NULL — hiding ONLY the
+    consent=FALSE DMP samples. The spec's "DMP family" scope is thus
+    satisfied without an extra ``sample_type`` predicate: a non-DMP
+    sample's consent can never be FALSE.
+
+    ``sample`` is the mapped class or column alias (the pairing listing
+    passes its tumor/normal aliases); defaults to ``Sample``.
+    """
+    if sample is None:
+        sample = Sample
+    return sample.consent.isnot(False)

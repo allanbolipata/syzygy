@@ -66,6 +66,7 @@ def _dev_user(db: Session) -> dict:
         "display_name": "Dev Admin (local)",
         "allowed_logics": _known_logic_names(db),
         "is_logic_admin": True,
+        "can_see_nonconsent": True,
     }
 
 
@@ -178,9 +179,15 @@ def verify_token(token: str) -> dict:
         "preferred_username": claims.get("preferred_username"),
     }
     # Pass the entitlement claims through, BY THE CONFIGURED NAMES, so
-    # _user_from_claims can derive allowed_logics / is_logic_admin.
-    # Tokens without them are left untouched (the three-key shape).
-    for claim_name in (settings.logic_claim_name, settings.logic_admin_claim):
+    # _user_from_claims can derive allowed_logics / is_logic_admin /
+    # can_see_nonconsent. Tokens without them are left untouched (the
+    # three-key shape). The P3 consent-gate claim (``nonconsent_claim``)
+    # rides along here too — _nonconsent_entitlement reads it.
+    for claim_name in (
+        settings.logic_claim_name,
+        settings.logic_admin_claim,
+        settings.nonconsent_claim,
+    ):
         if claim_name in claims:
             user[claim_name] = claims[claim_name]
     return user
@@ -264,6 +271,34 @@ def _known_logic_names(db: Session) -> Set[str]:
     return set(db.scalars(select(PairingLogic.name)).all())
 
 
+def _open_logic_set(known: Set[str]) -> Set[str]:
+    """The default-open pairing logics (``GATING_OPEN_LOGICS``), restricted
+    to names the app actually knows.
+
+    A comma-separated setting; blank entries are skipped, so an empty
+    setting (or one of all-unknown names) yields the empty set — restoring
+    the uniform fail-closed model. Names that are not known pairing logics
+    are ignored with a server warning, the same rule applied to the token
+    claim. Only consulted while ``logic_gating_enabled`` is True: with the
+    flag off the caller returns the full set + admin before this is ever
+    called, so the dark launch stays byte-identical to today.
+    """
+    open_set: Set[str] = set()
+    for raw_name in settings.gating_open_logics.split(","):
+        name = raw_name.strip()
+        if not name:
+            continue
+        if name in known:
+            open_set.add(name)
+        else:
+            logger.warning(
+                "auth: ignoring unknown pairing logic %r from "
+                "GATING_OPEN_LOGICS",
+                name,
+            )
+    return open_set
+
+
 def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
     """(allowed_logics, is_logic_admin) for a verified Keycloak token.
 
@@ -271,12 +306,18 @@ def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
     ``logic_admin_claim``) so adapting to the org's Keycloak scheme is a
     .env change, not a code change:
     - gating disabled: the FULL set + admin — behavior is exactly
-      today's and /auth/me needs no flag knowledge;
-    - gating enabled (fail-closed): allowed logics are the configured
-      list claim intersected with the known logic names — an absent
-      claim yields an EMPTY set, and names the app does not know are
-      ignored with a warning. The admin flag is the configured boolean
-      claim.
+      today's and /auth/me needs no flag knowledge. The default-open set
+      is NOT applied here, so the dark launch stays byte-identical to
+      today regardless of ``GATING_OPEN_LOGICS``;
+    - gating enabled (asymmetric, P1): allowed logics are the
+      default-open set (``GATING_OPEN_LOGICS``) UNION the configured list
+      claim intersected with the known logic names. The open set applies
+      to every authenticated principal (no enrollment needed); the claim
+      adds gated logics on top — enrollment adds, never subtracts. An
+      absent claim yields just the open set (empty when the setting is
+      empty, restoring uniform fail-closed). Names the app does not know,
+      in the setting OR the claim, are ignored with a warning. The admin
+      flag is the configured boolean claim, unchanged.
     """
     known = _known_logic_names(db)
     if not settings.logic_gating_enabled:
@@ -288,7 +329,7 @@ def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
         # A non-list (e.g. a bare string) degrades to a single-element
         # list rather than failing open.
         raw = [raw]
-    allowed: Set[str] = set()
+    allowed: Set[str] = _open_logic_set(known)
     for name in raw:
         if name in known:
             allowed.add(name)
@@ -300,6 +341,36 @@ def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
             )
     is_admin = bool(claims.get(settings.logic_admin_claim))
     return allowed, is_admin
+
+
+def _nonconsent_entitlement(claims: dict) -> bool:
+    """Whether the principal holds the P3 non-consent entitlement.
+
+    The configured claim (``nonconsent_claim``, default
+    ``syzygy_nonconsent``) must carry the ``nonconsent_group`` name.
+    Reference shape (KC 26.8.1 built-in Group Membership mapper): the
+    claim value is a JSON list of the user's group names — the mapper
+    emits ALL of the user's group names for any user who has a group
+    and does NOT filter on its configured group (verified live: the
+    class never references claim.value). So the entitlement is list
+    MEMBERSHIP (the group name in the list), not claim presence: a
+    non-member's token still carries the claim (their other group
+    names), and a truthy check would grant the gate to everyone.
+    A scalar truthy claim (integration option b, org-configured) is
+    honored as well. Gating off (dark launch): the consent gate never
+    applies, so every principal is treated as able to see non-consent
+    DMP samples (the flag is True and the filter is never reached).
+    Fail-closed: gating on with an absent claim -> False (non-consent
+    DMP samples hidden).
+    """
+    if not settings.logic_gating_enabled:
+        return True
+    value = claims.get(settings.nonconsent_claim)
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return settings.nonconsent_group in {str(v) for v in value}
+    return bool(value)
 
 
 def _user_from_claims(
@@ -325,6 +396,7 @@ def _user_from_claims(
     principal["allowed_logics"], principal["is_logic_admin"] = _logic_entitlements(
         claims, db
     )
+    principal["can_see_nonconsent"] = _nonconsent_entitlement(claims)
     return ("ok", principal, claims)
 
 
@@ -604,6 +676,25 @@ def gating_allowed_logics(current_user) -> Optional[Set[str]]:
         if isinstance(allowed, (set, frozenset, list, tuple)):
             return set(allowed)
     return set()
+
+
+def consent_gate_active(current_user) -> bool:
+    """Whether the P3 consent gate applies to this principal's listings
+    (and Layer A logic-scoped reads that honor the same rule): gating is
+    ON and the principal lacks the non-consent entitlement.
+
+    Dark launch (``logic_gating_enabled`` False): the gate never applies
+    (returns False) — listings behave exactly as today. Fail-closed: a
+    missing / non-dict principal, or one without a ``can_see_nonconsent``
+    flag, gets the gate (non-consent DMP samples hidden). A principal
+    whose flag is True (holds the entitlement, or the dev admin) sees
+    non-consent samples.
+    """
+    if not settings.logic_gating_enabled:
+        return False
+    if isinstance(current_user, dict) and current_user.get("can_see_nonconsent"):
+        return False
+    return True
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])

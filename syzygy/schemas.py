@@ -79,8 +79,23 @@ class SampleRead(BaseModel):
     errors: Optional[list[str]] = None
     sequencing_date: Optional[datetime] = None
     file_group: Optional[str] = None
+    # Redaction (spec R1, REDACTION_TICKETS.md): the flag plus the audit
+    # trail (when / by whom (email) / why). Redaction never retires
+    # existing pairings; un-redaction restores pairing eligibility.
+    redacted: bool
+    redacted_at: Optional[datetime] = None
+    redacted_by: Optional[str] = None
+    redaction_reason: Optional[str] = None
     created_date: datetime
     modified_date: datetime
+
+
+class RedactionRequest(BaseModel):
+    """Payload for POST /sample/{id}/redact (spec R1): the
+    operator-provided reason. Stored on the sample together with the
+    acting user's email and the timestamp — the redaction audit trail."""
+
+    reason: Optional[str] = None
 
 
 class PatientRead(BaseModel):
@@ -510,3 +525,92 @@ class BaitSetRead(BaseModel):
     pairing_logic: str
     created_date: datetime
     modified_date: datetime
+
+
+class AuditLogRead(BaseModel):
+    """One audit_log row (AL2 query/reversal API response).
+
+    ``reversible`` (decision 6) is computed server-side — not an ORM
+    column — so it defaults to False and the audit router sets it from
+    the row's action + payload before returning.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    occurred_at: datetime
+    actor: str
+    actor_kind: str
+    action: str
+    entity_type: str
+    entity_id: str
+    pairing_logic: Optional[str] = None
+    payload: dict
+    reverse_of: Optional[UUID] = None
+    request_id: Optional[str] = None
+    reversible: bool = False
+
+
+class AuditQueryRead(BaseModel):
+    """One page of GET /v1/audit: newest first; ``total`` is the full
+    filter-matched set, not the page."""
+
+    rows: list[AuditLogRead]
+    total: int
+
+
+class AuditMeRead(BaseModel):
+    """GET /v1/audit/me — the viewer's own visibility settings
+    (decision 5): role + logic_groups from allowed_users."""
+
+    email: Optional[str] = None
+    role: str = "user"
+    logic_groups: list[str] = []
+
+
+class PairingImportCreate(BaseModel):
+    """POST /v1/pairing/import body (ticket AL3, decision 8a).
+
+    ``text`` is the same TSV the CLI script reads
+    (``NORMAL_ID<TAB>TUMOR_ID``, optional extended primary_id columns);
+    the flags mirror the CLI's ``--logic`` / ``--trigger-type`` /
+    ``--strict`` / ``--dry-run`` / ``--id-field``.
+    """
+
+    text: str
+    logic: Optional[str] = None
+    trigger_type: Literal["override", "manual"] = "override"
+    strict: bool = False
+    dry_run: bool = False
+    id_field: Literal["cmo_sample_name", "primary_id"] = "cmo_sample_name"
+
+
+class PairingImportRowRead(BaseModel):
+    """One import row: the CLI's per-row status (OK / MISMATCH / MULTI /
+    FAIL). ``normal_name`` / ``tumor_name`` are the TSV column values;
+    ``detail`` is the CLI log's detail column (empty for clean OK)."""
+
+    status: str
+    normal_name: str
+    tumor_name: str
+    detail: str = ""
+    pairing_id: Optional[str] = None
+
+
+class PairingImportRead(BaseModel):
+    """POST /v1/pairing/import result: the script's per-row statuses,
+    its summary counts, and the downloadable pairing log
+    (``log_tsv`` is the exact ``--log`` file content)."""
+
+    id: str
+    logic: str
+    trigger_type: str
+    strict: bool
+    dry_run: bool
+    total: int
+    pinned: int
+    mismatched: int
+    multi: int
+    failed: int
+    rows: list[PairingImportRowRead]
+    log_tsv: str

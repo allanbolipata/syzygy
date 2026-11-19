@@ -124,6 +124,13 @@ step, Python 3.11+ for the app and the seed/mock scripts.
 
        python scripts/seed_dev_data.py
 
+   If you are reusing an existing `syzygy_db_data` volume after pulling
+   newer code, bring the schema up to date first — `create_all` only
+   builds *new* tables and never ALTERs existing ones, so a stale volume
+   fails the seed with `column ... does not exist`:
+
+       python scripts/alembic_bootstrap.py   # idempotent; stamps + upgrades to head
+
 5. (Optional) Replay the dev NATS fixtures through the real ingest chain
    (NATS → `smile-listener` → `POST /v1/ingest/nats`). Publishes all eight
    payloads in `tests/fixtures/nats/dev/` in a deterministic ingest order
@@ -239,9 +246,9 @@ re-initializes on the next start), and re-seed.
 ### Against an existing Postgres (no local database)
 
 Per the Running section, the app builds the schema on startup
-(`create_all`) and seeds idempotently — **an empty database is fine,
-no migration step is needed on this branch** (alembic lives on a
-separate branch). The connecting role just needs `CREATE` privilege
+(`create_all`) and seeds idempotently — **an empty database is fine**.
+An *existing* database needs the schema brought up to head once:
+`python scripts/alembic_bootstrap.py` (see *Schema migrations*). The connecting role just needs `CREATE` privilege
 on the database. Point `DATABASE_URL` at it:
 
     DATABASE_URL=postgresql+psycopg2://user:pass@db-host:5432/dbname \
@@ -347,19 +354,66 @@ always uses its own named volume `keycloak_db_data`):
 
 ## Schema migrations
 
-Schema changes ship as standalone idempotent scripts in
-`scripts/migrate_*.py`. Each script self-checks `information_schema`
-before touching anything, so running any of them — in any order, any
-number of times — against any database is safe. `Base.metadata.create_all`
-only builds *new* tables; it never ALTERs existing ones, so **after
-pulling a new version against an existing database, run the migration
-scripts** (each uses the app's configured `DATABASE_URL`, or pass one as
-an argument):
+Schema changes are managed with [Alembic](https://alembic.sqlalchemy.org/):
+an ordered chain of revisions under `alembic/` plus an `alembic_version`
+table recording which ones a given database has. The URL is not
+hard-coded — `alembic/env.py` reads the same `DATABASE_URL` the app
+uses (`.env` / `syzygy.database.settings`); set `ALEMBIC_DATABASE_URL`
+for a one-off run against a different database. The chain starts at
+`0001_baseline`, a hand-written snapshot of the full current schema
+(`create_all` output plus the four DMP `GENERATED ... STORED` key
+columns, which autogenerate cannot express), and continues at
+`0002_patient_columns`, `0003_consent` and
+`0004_dmp_generated_columns` — the hand-written Alembic twins of the
+legacy migrate scripts (ticket A2), each guarded so it is a no-op when
+the change is already present. `migrate_logic_names.py` deliberately
+has no revision: it is a pure data migration (row renames in
+`pairing_logic`), not a schema change (see its docstring).
 
-    python scripts/migrate_patient_columns.py
-    python scripts/migrate_consent_column.py
-    python scripts/migrate_dmp_generated_columns.py
-    python scripts/migrate_logic_names.py
+**A new schema change:**
+
+    alembic revision -m "add the widget column"
+    # hand-review the generated revision before running it — autogenerate
+    # does NOT understand the DMP generated columns, so every revision is
+    # reviewed by hand (and those four columns are always hand-written).
+    alembic upgrade head
+
+**Bringing a database under Alembic** (existing or fresh):
+
+    python scripts/alembic_bootstrap.py
+
+On an existing database it spot-checks the schema via `information_schema`
+and **stamps** `0001_baseline` (the baseline is never *run* against a
+live database), then runs `alembic upgrade head` so the later
+revisions apply only what is missing (on a fully migrated legacy
+database each of them is a guarded no-op, so the database simply lands
+at head); on a fresh database it runs `alembic upgrade head`
+straightaway. Idempotent — a second run changes nothing. If the
+baseline spot-check refuses with *missing samples.dmp_*_key*, the
+database predates even the legacy migrate scripts — run
+`python scripts/migrate_dmp_generated_columns.py` once, then re-run
+the bootstrap. The app still
+runs `Base.metadata.create_all` at startup (it only builds *new*
+tables; it never ALTERs existing ones) and the startup drift check
+(`syzygy/schema_check.py`) still warns about missing columns.
+
+**Legacy databases (pre-Alembic):** the original migration scripts in
+`scripts/migrate_*.py` are now **legacy shims** — each has an
+equivalent Alembic revision, and the scripts remain functional for one
+release cycle so existing pre-Alembic databases keep their established
+update path:
+
+    python scripts/migrate_patient_columns.py        # equivalent Alembic revision: 0002_patient_columns
+    python scripts/migrate_consent_column.py         # equivalent Alembic revision: 0003_consent
+    python scripts/migrate_dmp_generated_columns.py  # equivalent Alembic revision: 0004_dmp_generated_columns
+    python scripts/migrate_logic_names.py            # no revision — pure data migration (row renames), see its docstring
+
+Each script self-checks `information_schema` before touching anything,
+so running any of them — in any order, any number of times — against
+any database is safe. `Base.metadata.create_all` only builds *new*
+tables; it never ALTERs existing ones, so **after pulling a new
+version against an existing database, run the migration scripts** (each
+uses the app's configured `DATABASE_URL`, or pass one as an argument):
 
 Against a containerized deployment the container already has the scripts
 and the right `DATABASE_URL`:
@@ -816,6 +870,26 @@ dict customizes the strategy at use time.
   wins. No request cascade, no pooled tier; `gene_panel` and
   `sample_type` are not keys. `TEMPO` and `CHRONOS` register as
   aliases of this strategy.
+
+## Sample redaction
+
+A sample can be **redacted**: flagged as excluded from pairing with an
+audit trail (`redacted` boolean plus `redacted_at` / `redacted_by` /
+`redaction_reason` columns on `samples`). Redaction is the single
+pairing choke point (`is_pairable` in `pairing_service.py`): a
+redacted **tumor** is never auto-paired (the bulk sweeps, `trigger-all`
+and the DMP/HARMONY passes skip it in SQL) and an explicit
+`POST /v1/pairing/trigger` on it returns 400; a redacted **normal** is
+never offered as a candidate by any strategy's automatic selection, and
+an explicit pin (`normal_id`) of it returns 400. Redacted samples still
+appear in candidate listings (`possible_matches` / `evaluate`), each
+carrying `redacted: true` and its reason, so they are visible but
+unselectable. Redaction **never retires an existing pairing** — pairing
+history is immutable and the UI badges it instead; un-redacting
+restores pairing eligibility while preserving the audit fields.
+Endpoints: `POST /v1/sample/{id}/redact` (optional `reason`) and
+`POST /v1/sample/{id}/unredact` (both idempotent);
+`GET /v1/sample/` gains a `redacted=true|false` filter.
 
 ## Tests
 

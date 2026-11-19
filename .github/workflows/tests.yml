@@ -86,7 +86,8 @@ jobs:
           set -o pipefail
           pytest tests/test_dmp_generated_columns.py \
                  tests/test_dmp_perf_guard_e2e.py \
-                 tests/test_schema_check.py -v | tee pg.log
+                 tests/test_schema_check.py \
+                 tests/test_alembic.py -v | tee pg.log
           if grep -qE "[0-9]+ skipped" pg.log; then
             echo "::error::Postgres-backed tests were SKIPPED — the CI" \
                  "database is not usable (need CREATEDB) or DATABASE_URL" \

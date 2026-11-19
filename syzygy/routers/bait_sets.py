@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from syzygy import audit
 from syzygy.bait_sets import find_bait_set, resolve_bait_set_logic
 from syzygy.database import get_db
 from syzygy.models import BaitSet
@@ -43,6 +44,16 @@ def upsert_bait_set(payload: BaitSetUpsert, db: Session = Depends(get_db)):
         db.add(row)
     else:
         row.pairing_logic_id = logic.id
+    # AL1: bait_set.assigned (create or reassignment) — ids/names only.
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "bait_set.assigned",
+        entity_type="bait_set",
+        entity_id=name,
+        pairing_logic=logic.name,
+        payload={"bait_set": name, "pairing_logic": logic.name},
+    )
     db.commit()
     db.refresh(row)
     return row

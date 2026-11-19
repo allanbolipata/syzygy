@@ -635,7 +635,7 @@ def test_trigger_pairing_endpoint_strict_override_rejects(
         strict=True,
     )
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 400
     assert "patient__cmo mismatch" in exc.value.detail
 
@@ -657,7 +657,7 @@ def test_trigger_pairing_endpoint_404_includes_selection_notes(db):
         tumor_id=tumor.id, trigger_type="manual", pairing_logic_name="ARGOS"
     )
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 404
     assert "run_mode mismatch" in exc.value.detail
 
@@ -1844,7 +1844,7 @@ def test_trigger_pairing_endpoint_inactive_logic(db, tumor_sample):
         pairing_logic_name="IMPACT",
     )
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 400
 
 
@@ -1863,7 +1863,7 @@ def test_create_sample_default_logic_active_pairs(db, normal_sample, monkeypatch
         bait_set="BAIT-1",
         tumor_or_normal=TumorOrNormal.TUMOR,
     )
-    sample = create_sample(payload, db=db)
+    sample = create_sample(payload, db=db, current_user=None)
     assert sample.id is not None
     pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
     assert pairing is not None
@@ -1885,7 +1885,7 @@ def test_create_sample_inactive_default_logic_skips_pairing(db, monkeypatch):
         bait_set="BAIT-1",
         tumor_or_normal=TumorOrNormal.TUMOR,
     )
-    sample = create_sample(payload, db=db)
+    sample = create_sample(payload, db=db, current_user=None)
     assert sample.id is not None
     pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
     assert pairing is None
@@ -2723,7 +2723,7 @@ def _sample_payload(primary_id, patient__cmo, tumor_or_normal, **kwargs):
 
 def test_create_sample_explicit_logic_by_name_pairs(db, tumor_sample, normal_sample, pairing_logic):
     payload = _sample_payload("TUMOR-EXP-1", "PATIENT-001", TumorOrNormal.TUMOR, pairing_logic_name="TEMPO")
-    sample = create_sample(payload, db=db)
+    sample = create_sample(payload, db=db, current_user=None)
     pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
     assert pairing is not None
     assert pairing.normal_id == normal_sample.id
@@ -2732,7 +2732,7 @@ def test_create_sample_explicit_logic_by_name_pairs(db, tumor_sample, normal_sam
 
 def test_create_sample_explicit_logic_by_id_pairs(db, tumor_sample, normal_sample, pairing_logic):
     payload = _sample_payload("TUMOR-EXP-2", "PATIENT-001", TumorOrNormal.TUMOR, pairing_logic_id=pairing_logic.id)
-    sample = create_sample(payload, db=db)
+    sample = create_sample(payload, db=db, current_user=None)
     pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
     assert pairing is not None
     assert pairing.normal_id == normal_sample.id
@@ -2745,7 +2745,7 @@ def test_create_sample_explicit_inactive_logic_rejected(db, tumor_sample):
     db.commit()
     payload = _sample_payload("TUMOR-EXP-3", "PATIENT-001", TumorOrNormal.TUMOR, pairing_logic_name="IMPACT")
     with pytest.raises(HTTPException) as exc:
-        create_sample(payload, db=db)
+        create_sample(payload, db=db, current_user=None)
     assert exc.value.status_code == 400
     assert "not active" in exc.value.detail
 
@@ -2756,7 +2756,7 @@ def test_create_sample_normal_with_default_logic_pairs_unpaired_tumor(db, tumor_
     db.commit()
     monkeypatch.setattr(database.settings, "default_pairing_logic_name", "TEMPO")
     payload = _sample_payload("NORMAL-DEF-1", "PATIENT-001", TumorOrNormal.NORMAL)
-    sample = create_sample(payload, db=db)
+    sample = create_sample(payload, db=db, current_user=None)
     pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == tumor_sample.id))
     assert pairing is not None
     assert pairing.normal_id == sample.id
@@ -2764,7 +2764,7 @@ def test_create_sample_normal_with_default_logic_pairs_unpaired_tumor(db, tumor_
 
 def test_create_sample_normal_without_logic_creates_no_pairing(db, tumor_sample):
     payload = _sample_payload("NORMAL-NONE-1", "PATIENT-001", TumorOrNormal.NORMAL)
-    sample = create_sample(payload, db=db)
+    sample = create_sample(payload, db=db, current_user=None)
     pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == tumor_sample.id))
     assert pairing is None
 
@@ -2776,7 +2776,7 @@ def test_create_sample_normal_without_logic_creates_no_pairing(db, tumor_sample)
 
 def test_create_pairing_logic_happy_path(db):
     payload = PairingLogicCreate(name="IMPACT", description="IMPACT panel logic", strategy_name="default")
-    logic = create_pairing_logic(payload, db=db)
+    logic = create_pairing_logic(payload, db=db, current_user=None)
     assert logic.id is not None
     assert logic.name == "IMPACT"
     assert logic.active is True
@@ -2789,14 +2789,14 @@ def test_create_pairing_logic_happy_path(db):
 def test_create_pairing_logic_duplicate_rejected(db, pairing_logic):
     payload = PairingLogicCreate(name="TEMPO")
     with pytest.raises(HTTPException) as exc:
-        create_pairing_logic(payload, db=db)
+        create_pairing_logic(payload, db=db, current_user=None)
     assert exc.value.status_code == 409
 
 
 def test_create_pairing_logic_unknown_strategy_rejected(db):
     payload = PairingLogicCreate(name="WEIRD", strategy_name="nope")
     with pytest.raises(HTTPException) as exc:
-        create_pairing_logic(payload, db=db)
+        create_pairing_logic(payload, db=db, current_user=None)
     assert exc.value.status_code == 400
 
 
@@ -2807,7 +2807,7 @@ def test_create_pairing_logic_unknown_strategy_rejected(db):
 
 def test_trigger_pairing_endpoint_manual_creates_pairing(db, tumor_sample, normal_sample, pairing_logic):
     payload = PairingTriggerCreate(tumor_id=tumor_sample.id, trigger_type="manual", pairing_logic_name="TEMPO")
-    pairing = trigger_pairing_endpoint(payload, db=db)
+    pairing = trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert pairing is not None
     assert pairing.tumor_id == tumor_sample.id
     assert pairing.normal_id == normal_sample.id
@@ -2837,7 +2837,7 @@ def test_trigger_pairing_endpoint_override_replaces_latest(db, tumor_sample, nor
         pairing_logic_name="TEMPO",
         normal_id=other_normal.id,
     )
-    pairing = trigger_pairing_endpoint(payload, db=db)
+    pairing = trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert pairing.normal_id == other_normal.id
     assert pairing.latest is True
     latest = _get_latest_pairing(db, tumor_sample.id, pairing_logic.id)
@@ -2847,28 +2847,28 @@ def test_trigger_pairing_endpoint_override_replaces_latest(db, tumor_sample, nor
 def test_trigger_pairing_endpoint_tumor_not_found(db, pairing_logic):
     payload = PairingTriggerCreate(tumor_id=uuid.uuid4(), trigger_type="manual", pairing_logic_name="TEMPO")
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 404
 
 
 def test_trigger_pairing_endpoint_tumor_is_normal(db, normal_sample, pairing_logic):
     payload = PairingTriggerCreate(tumor_id=normal_sample.id, trigger_type="manual", pairing_logic_name="TEMPO")
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 404
 
 
 def test_trigger_pairing_endpoint_missing_logic(db, tumor_sample):
     payload = PairingTriggerCreate(tumor_id=tumor_sample.id, trigger_type="manual")
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 400
 
 
 def test_trigger_pairing_endpoint_no_matching_normal(db, tumor_sample, pairing_logic):
     payload = PairingTriggerCreate(tumor_id=tumor_sample.id, trigger_type="manual", pairing_logic_name="TEMPO")
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 404
 
 
@@ -2900,7 +2900,7 @@ def test_trigger_pairing_override_normal_not_found_endpoint(db, tumor_sample, pa
         normal_id=uuid.uuid4(),
     )
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 404
 
 
@@ -3549,7 +3549,7 @@ def test_manual_trigger_endpoint_refuses_dmp_logic(db):
         tumor_id=tumor.id, trigger_type="manual", pairing_logic_name="DMP"
     )
     with pytest.raises(HTTPException) as exc:
-        trigger_pairing_endpoint(payload, db=db)
+        trigger_pairing_endpoint(payload, db=db, current_user=None)
     assert exc.value.status_code == 400
     assert "automatic" in exc.value.detail
     assert db.scalar(
@@ -4003,7 +4003,9 @@ def test_unmatched_count_endpoint(db):
     _bait_logic(db, name="UC-EP", bait="BAIT-UCEP")
     _sample(db, "UCEP-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-UCEP")
 
-    result = unmatched_count_endpoint(pairing_logic_name="UC-EP", db=db)
+    result = unmatched_count_endpoint(
+        pairing_logic_name="UC-EP", db=db, current_user={}
+    )
 
     assert result["pairing_logic"] == "UC-EP"
     assert result["unpaired"] == 1

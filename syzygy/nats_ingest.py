@@ -46,6 +46,8 @@ from syzygy.request_metadata import request_exists, update_request_metadata
 
 logger = logging.getLogger(__name__)
 
+from syzygy import audit  # noqa: E402  (AL1 write hooks)
+
 # Provenance bucket for samples registered via NATS ingestion.
 SMILE_FILE_GROUP = "SMILE"
 
@@ -242,6 +244,16 @@ def _upsert_sample(
     # Advisory pooled_machines registry: a Pooled Normal whose machine
     # has no row gets one (class "unknown").
     ensure_pooled_machine(db, sample)
+    # AL1: one sample.created per registered sample (ids/names only —
+    # the message-level nats.ingest event carries the request context).
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "sample.created",
+        entity_type="sample",
+        entity_id=sample.id,
+        payload={"sample_name": sample.cmo_sample_name, "primary_id": sample.primary_id},
+    )
     return sample, True, []
 
 
@@ -685,6 +697,20 @@ def handle_sample_update(
     # Advisory pooled_machines registry: the update may have made this
     # sample a Pooled Normal on a machine without a registry row.
     ensure_pooled_machine(db_session, sample)
+    # AL1: sample.updated — ids/names only (the pairing sub-events are
+    # emitted by pairing_service itself, in this same transaction).
+    audit.record(
+        db_session,
+        audit.SYSTEM_ACTOR,
+        "sample.updated",
+        entity_type="sample",
+        entity_id=sample.id if sample is not None else sample_key,
+        payload={
+            "sample_name": sample.cmo_sample_name if sample is not None else None,
+            "primary_id": sample_key,
+            "request_id": request_id,
+        },
+    )
     db_session.commit()
 
     detail = (
@@ -985,4 +1011,19 @@ def dispatch(
     if handler is None:
         logger.warning("nats ingest: unknown subject %s", subject)
         return {"status": "error", "detail": f"unknown subject: {subject}"}
-    return handler(db_session, payload)
+    result = handler(db_session, payload)
+    if result.get("status") == "ok":
+        # AL1: one nats.ingest event per ingested message — subject +
+        # ids only, never the payload (no patient data in the log).
+        request_id = payload.get("igoRequestId") if isinstance(payload, dict) else None
+        cohort_id = payload.get("cohortId") if isinstance(payload, dict) else None
+        audit.record(
+            db_session,
+            audit.SYSTEM_ACTOR,
+            "nats.ingest",
+            entity_type="ingest",
+            entity_id=str(request_id or cohort_id or subject),
+            payload={"subject": subject, "request_id": request_id, "cohort_id": cohort_id},
+        )
+        db_session.commit()
+    return result
