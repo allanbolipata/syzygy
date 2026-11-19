@@ -152,6 +152,17 @@ def to_sample_kwargs(metadata: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
         value = metadata.get(key)
         if value is not None:
             additional[key] = str(value).strip() if isinstance(value, str) else value
+    # Raw beagle runIds (aggregated by merge_samples): carried verbatim into
+    # additional_metadata["run_ids"]; normalized at pairing time.
+    run_ids = metadata.get("run_ids")
+    if run_ids:
+        seen: list[str] = []
+        for rid in run_ids:
+            rid = str(rid).strip()
+            if rid and rid not in seen:
+                seen.append(rid)
+        if seen:
+            additional["run_ids"] = seen
 
     kwargs: dict[str, Any] = {
         "primary_id": primary_id or igo_id,
@@ -225,6 +236,16 @@ def merge_dmp_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[
     return samples
 
 
+def _accumulate_run_ids(kwargs: dict[str, Any], value: Any) -> None:
+    """Append a distinct runId to a sample's aggregated run_ids list
+    (order-preserving de-dup)."""
+    if not value:
+        return
+    run_ids = kwargs.setdefault("run_ids", [])
+    if value not in run_ids:
+        run_ids.append(value)
+
+
 def merge_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
     """Merge ``(filegroup, metadata)`` rows into one sample per primaryId.
 
@@ -259,6 +280,9 @@ def merge_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str,
                     value = value.strip()
                 if not value:
                     continue
+                if key == "runId":
+                    _accumulate_run_ids(kwargs, value)
+                    continue
                 if kwargs.get(key) in (None, ""):
                     kwargs[key] = value
         else:
@@ -282,6 +306,9 @@ def merge_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str,
             if isinstance(value, str):
                 value = value.strip()
             if not value:
+                continue
+            if key == "runId":
+                _accumulate_run_ids(kwargs, value)
                 continue
             if kwargs.get(key) in (None, ""):
                 kwargs[key] = value

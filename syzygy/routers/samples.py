@@ -37,8 +37,20 @@ def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
         settings.default_pairing_logic_name,
     )
 
-    sample_data = payload.model_dump(exclude={"pairing_logic_id", "pairing_logic_name"})
+    sample_data = payload.model_dump(
+        exclude={"pairing_logic_id", "pairing_logic_name", "run_ids"}
+    )
     sample_data["tumor_or_normal"] = payload.tumor_or_normal.value
+    # run_ids has no dedicated column: merge it verbatim into
+    # additional_metadata (de-duplicated, order preserved).
+    if payload.run_ids:
+        additional = dict(sample_data.get("additional_metadata") or {})
+        merged = list(additional.get("run_ids") or [])
+        for rid in payload.run_ids:
+            if rid not in merged:
+                merged.append(rid)
+        additional["run_ids"] = merged
+        sample_data["additional_metadata"] = additional
     sample = Sample(**sample_data)
     db.add(sample)
     # Advisory pooled_machines registry: a Pooled Normal whose machine

@@ -21,6 +21,7 @@ from syzygy.pairing_service import (
     count_unpaired,
     ensure_pooled_machine,
     evaluate_logic,
+    possible_matches,
     resolve_pairing_logic,
     trigger_dmp_pairing,
     trigger_harmony_pairing,
@@ -527,6 +528,7 @@ def _sample(
     gene_panel="PANEL-A",
     bait_set="BAIT-1",
     sequencing_date=None,
+    additional_metadata=None,
 ):
     sample = Sample(
         primary_id=primary_id,
@@ -541,6 +543,7 @@ def _sample(
         preservation=preservation,
         sample_origin=sample_origin,
         sequencing_date=sequencing_date,
+        additional_metadata=additional_metadata,
     )
     db.add(sample)
     db.commit()
@@ -1256,6 +1259,175 @@ def test_argos_pooled_sample_types_configurable(db):
     )
     selection = strategy.select_latest_normal(db, tumor)
     assert selection.normal.id == pooled.id
+
+
+# ---------------------------------------------------------------------------
+# ARGOS pooled tier: beagle-exact machine matching via tumor runIds
+# ---------------------------------------------------------------------------
+
+
+def test_argos_pooled_runid_exact_machine_wins(db):
+    """A tumor carrying beagle runIds pairs only with a pool whose machine
+    (raw run_mode) is in the runId machine set — exact prefix match, the
+    same-family pool on another machine is excluded even though it is
+    newer (legacy ``_latest`` behavior would have picked it)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zzmachine", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-RID-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+        additional_metadata={"run_ids": ["zzmachine_A_L001_R1"]},
+    )
+    other_machine_pool = _sample(
+        db, "NORM-RID-1-OTHER", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2025, 4, 28, tzinfo=timezone.utc),
+    )
+    exact_pool = _sample(
+        db, "NORM-RID-1-EXACT", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zzmachine", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    argos = strategies["argos"]
+    assert argos.mismatch_reasons(tumor, exact_pool, db) == []
+    assert argos.mismatch_reasons(tumor, other_machine_pool, db) == [
+        "pooled machine mismatch (tumor machines zzmachine vs pool zztank)"
+    ]
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id == exact_pool.id
+    assert result.trigger_type == "automatic"
+
+
+def test_argos_pooled_runid_no_pool_on_machine_no_fallback(db):
+    """A tumor with runIds whose machine has no pool stays UNPAIRED even
+    when a same-family pool exists (beagle has no cross-machine
+    fallback); the reason is visible via the possible-matches view."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-RID-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+        additional_metadata={"run_ids": ["zzmachine_B_L002_R1"]},
+    )
+    same_family_pool = _sample(
+        db, "NORM-RID-2", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    # Sanity: the SAME family pool would pair for a runId-less (legacy)
+    # tumor — the block below is due to the exact-machine gate, not the
+    # family gate.
+    legacy = _sample(
+        db, "TUMOR-RID-2-LEGACY", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+    )
+    assert strategies["argos"].mismatch_reasons(legacy, same_family_pool, db) == []
+    # But the runId-bearing tumor never falls back across machines.
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is None
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any(
+        "pooled machine mismatch (tumor machines zzmachine vs pool zztank)" in n
+        for n in selection.notes
+    )
+    # The reason is visible via the possible-matches view.
+    pm = possible_matches(db, tumor, logic)
+    entry = next(c for c in pm["other_matches"] if c["sample"].id == same_family_pool.id)
+    assert entry["tier"] == "pooled"
+    assert entry["matched"] is False
+    assert entry["would_be_selected"] is False
+    assert "pooled machine mismatch (tumor machines zzmachine vs pool zztank)" in entry["mismatched_keys"]
+
+
+def test_argos_pooled_runid_multi_machine_earliest_pool_wins(db):
+    """runIds from two machines, both with pools: the EARLIEST pool
+    sequencing_date wins (beagle's cross-machine tie-break — the opposite
+    of ``_latest``)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zzmachine", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-RID-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+        additional_metadata={"run_ids": ["zzmachine_C_L001_R1", "zztank_D_L002_R2"]},
+    )
+    newer_pool = _sample(
+        db, "NORM-RID-3-NEW", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2025, 4, 28, tzinfo=timezone.utc),
+    )
+    earlier_pool = _sample(
+        db, "NORM-RID-3-OLD", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zzmachine", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id == earlier_pool.id
+
+
+def test_create_sample_carries_run_ids_verbatim(db):
+    """SampleCreate.run_ids is persisted verbatim (deduped, order
+    preserved) into additional_metadata['run_ids'] and the automatic
+    pairing at ingest time uses it (exact-machine pool wins)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zzmachine", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    other_pool = _sample(
+        db, "NORM-RID-4-OTHER", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2025, 4, 28, tzinfo=timezone.utc),
+    )
+    exact_pool = _sample(
+        db, "NORM-RID-4-EXACT", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zzmachine", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    payload = SampleCreate(
+        primary_id="TUMOR-RID-4",
+        cmo_sample_name="TUMOR-RID-4 name",
+        patient__cmo="PATIENT-001",
+        sample_type="tissue",
+        gene_panel="HC_IMPACT",
+        bait_set="IMPACT505_BAITS",
+        tumor_or_normal=TumorOrNormal.TUMOR,
+        run_mode="NovaSeq X",
+        preservation=["Frozen"],
+        sample_origin=["Frozen"],
+        pairing_logic_name=logic.name,
+        run_ids=["zzmachine_E_L001_R1", "zzmachine_E_L002_R2", "zzmachine_E_L001_R1"],
+    )
+    sample = create_sample(payload, db=db)
+    assert sample.additional_metadata["run_ids"] == [
+        "zzmachine_E_L001_R1",
+        "zzmachine_E_L002_R2",
+    ]
+    pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
+    assert pairing is not None
+    assert pairing.normal_id == exact_pool.id
+    assert other_pool is not None  # created but must NOT be the match
 
 
 def test_get_pairing_strategy_applies_run_mode_map_config(db):
