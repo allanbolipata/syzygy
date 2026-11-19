@@ -33,6 +33,11 @@ class SampleCreate(BaseModel):
     # Raw run-mode / sequencer string (e.g. "NovaSeq X 1000"); normalized
     # into a bucket at pairing time (argos strategy).
     run_mode: Optional[str] = None
+    # Raw beagle runId values (e.g. "fauci2_S1_L005_R1"), one per file/run.
+    # Carried verbatim into additional_metadata["run_ids"]; the ARGOS pooled
+    # tier normalizes them at pairing time (machine = first underscore-
+    # delimited token, lower-cased). No dedicated column.
+    run_ids: Optional[list[str]] = None
     # Raw preservation data, e.g. ["FFPE"] or "FFPE"; and sample origin,
     # e.g. ["Fresh or Frozen"]. Resolved to ffpe/frozen at pairing time
     # (argos strategy).

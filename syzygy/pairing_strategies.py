@@ -80,6 +80,7 @@ from syzygy.schemas import TumorOrNormal
 # never compared against a real timestamp: tuple comparison short-circuits
 # on the first element when a date is missing.
 _NULL_DATE = datetime.min
+_MAX_DATE = datetime.max
 
 
 def _comparable_dt(value: Optional[datetime]) -> datetime:
@@ -128,8 +129,13 @@ DEFAULT_POOLED_SAMPLE_TYPES: tuple = ("Pooled Normal",)
 # Default machine reference rows for the pooled_machines table (used by
 # seed_pooled_machines at startup and by tests). machine_class is the
 # family used for pooled run-mode matching; machine_type is display-only.
+# The NovaSeq X pool machines (fauci2/bono) are registered as the
+# novaseq family: beagle v2.3.0 collapses NovaSeq X into novaseq for
+# pooled matching, mirroring _tumor_machine_family on the tumor side.
 DEFAULT_POOLED_MACHINES: tuple = (
+    ("bono", "novaseq", "NovaSeq X"),
     ("diana", "novaseq", "NovaSeq 6000"),
+    ("fauci2", "novaseq", "NovaSeq X"),
     ("jax", "hiseq", "HiSeq 4000"),
     ("kim", "hiseq", "HiSeq 2500"),
     ("liz", "hiseq", "HiSeq 2500"),
@@ -416,6 +422,15 @@ class DefaultPairingStrategy:
     def _is_pooled(self, sample: Sample) -> bool:
         return False
 
+    def _pooled_machine_warning(
+        self, db: Optional[Session], sample: Sample
+    ) -> Optional[str]:
+        """Warning note for pairing against an unverified pool machine.
+
+        The default strategy has no pooled tier, so there is nothing to
+        warn about."""
+        return None
+
     @staticmethod
     def _is_dmp(sample: Sample) -> bool:
         # DMP is an argos-strategy concept; other strategies treat
@@ -640,12 +655,16 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         tier (mirrors beagle's compare_dates "most recent" selection);
       * a pooled-normal tier — shared pooled normals (``sample_type`` in
         ``pooled_sample_types``, patient__cmo null), matched across patients
-        on gene_panel + bait_set. Run mode is resolved through the
-        pooled_machines table: the pool's machine name (its raw run_mode)
-        maps to a machine class, the tumor's run_mode maps to a
-        novaseq/hiseq family, and the pair matches only when both resolve
-        to the same family (unresolvable on either side blocks it). The
-        preservation gate still applies;
+        on gene_panel + bait_set. A tumor carrying beagle runIds pairs
+        beagle-exact: the pool's machine name (its raw run_mode) must be in
+        the runId machine set (``runId.split("_")[0].lower()``), the
+        earliest pool wins, and there is no cross-machine fallback. A
+        runId-less (legacy) tumor resolves run mode through the
+        pooled_machines table instead: the pool's machine name maps to a
+        machine class, the tumor's run_mode maps to a novaseq/hiseq family,
+        and the pair matches only when both resolve to the same family
+        (unresolvable on either side blocks it). The preservation gate
+        still applies;
       * DMP samples (``sample_type`` == "DMP") are manual-pairing only:
         the automatic cascade never selects them (``select_latest_normal``
         returns no selection for a DMP tumor, and ``select_matching_tumors``
@@ -755,13 +774,45 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         )
         return row.machine_class if row is not None else ""
 
+    def _pooled_machine_status(
+        self, db: Optional[Session], tumor: Sample, pooled: Sample
+    ) -> tuple:
+        """Machine-family status for a (tumor, pooled normal) pair.
+
+        Returns (status, machine_class), where machine_class is the
+        pooled normal's raw class from the pooled_machines table (""
+        when the machine has no row). status is one of:
+          "match"              known class (novaseq/hiseq) == tumor family
+          "mismatch"           known class different from the tumor family
+          "tumor_unresolvable" known class, but the tumor's run_mode
+                               resolves to no family
+          "unknown"            no pooled_machines row, or a class outside
+                               the known novaseq/hiseq families
+        The registry is ADVISORY: an unverified machine (no row, or a
+        class outside the known families) must not silently drop a pair
+        — the 2026-11-18 NovaSeq X cohort sat unpairable exactly that
+        way. The selection layer records a warning note instead (see
+        _pooled_machine_warning). A known class keeps the full
+        beagle-faithful check.
+        """
+        p_class = self._pooled_machine_class(db, pooled)
+        if p_class in ("novaseq", "hiseq"):
+            t_family = self._tumor_machine_family(tumor.run_mode)
+            if not t_family:
+                return "tumor_unresolvable", p_class
+            return ("match" if t_family == p_class else "mismatch"), p_class
+        return "unknown", p_class
+
     def _pooled_reasons(
         self, db: Optional[Session], tumor: Sample, pooled: Sample
     ) -> List[str]:
         # Pooled run-mode check: the pool's machine name resolves to a
         # class via the pooled_machines table; the tumor's run_mode
-        # resolves to a novaseq/hiseq family. Both must resolve and
-        # agree. The preservation gate still applies too.
+        # resolves to a novaseq/hiseq family. A KNOWN class must agree
+        # (mismatch rejects, as before); an unverified machine — no row,
+        # or a class outside novaseq/hiseq — is advisory and does NOT
+        # reject, so the pair is not silently dropped. The preservation
+        # gate still applies too.
         reasons: List[str] = []
         # Spec R1: a redacted counterpart is never a valid pooled pair, so
         # the candidate listing flags it (see ``_redaction_reasons``).
@@ -770,19 +821,177 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
         if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
             reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
-        t_family = self._tumor_machine_family(tumor.run_mode)
-        p_class = self._pooled_machine_class(db, pooled)
-        if not t_family:
-            reasons.append("tumor run_mode unresolvable")
-        elif not p_class:
-            reasons.append(
-                "pooled machine not in table "
-                f"({(pooled.run_mode or '').strip() or 'missing'})"
-            )
-        elif t_family != p_class:
-            reasons.append(f"run_mode mismatch ({t_family} vs {p_class})")
+        # Beagle-exact machine gate: a tumor carrying beagle runIds pairs
+        # only with a pool on the same machine (runId prefix). This
+        # supersedes the family-based run_mode check below — the runId is
+        # the exact machine identity — and beagle has no cross-machine
+        # fallback.
+        run_machines = self._tumor_run_machines(tumor)
+        if run_machines is not None:
+            reasons.extend(self._pooled_machine_set_reasons(pooled, run_machines))
+        else:
+            status, p_class = self._pooled_machine_status(db, tumor, pooled)
+            if status == "tumor_unresolvable":
+                reasons.append("tumor run_mode unresolvable")
+            elif status == "mismatch":
+                t_family = self._tumor_machine_family(tumor.run_mode)
+                reasons.append(f"run_mode mismatch ({t_family} vs {p_class})")
         reasons.extend(self._preservation_reasons(tumor, pooled))
         return reasons
+
+    def _pooled_machine_warning(
+        self, db: Optional[Session], pooled: Sample
+    ) -> Optional[str]:
+        """Visible warning for pairing against an unverified pool
+        machine: None when the machine is registered with a known
+        novaseq/hiseq class, otherwise a note naming the machine so an
+        unverified pool never pairs silently."""
+        name = (pooled.run_mode or "").strip()
+        label = name or "missing"
+        row = None
+        if name and db is not None:
+            row = db.scalar(
+                select(PooledMachine).where(
+                    func.lower(PooledMachine.machine_name) == name.lower()
+                )
+            )
+        if row is None:
+            return f"pooled machine '{label}' not in pooled_machines - family unverified"
+        if row.machine_class not in ("novaseq", "hiseq"):
+            return f"pooled machine '{label}' has unknown class in pooled_machines - family unverified"
+        return None
+
+    def _select_pooled(
+        self, db: Optional[Session], tumor: Sample, candidates: Sequence[Sample]
+    ):
+        """Pooled-tier selection with the advisory machine registry.
+
+        A tumor carrying beagle runIds pairs beagle-exact: candidates must
+        sit on a machine in the runId machine set (exact runId-prefix
+        match, no cross-machine fallback) and the earliest sequencing_date
+        wins (beagle's cross-machine tie-break — the opposite of _latest).
+        A runId-less tumor keeps the advisory behavior: a KNOWN same-family
+        machine is preferred (latest wins within the group), and an
+        unverified machine (no row, or a class outside novaseq/hiseq) is
+        only picked when no known-family candidate passes. A known
+        different-family machine never passes (see _pooled_reasons) —
+        it is a real mismatch, not an unverified one. Returns
+        (picked, notes)."""
+        if not candidates:
+            return None, ["tier=pooled: no candidate normals"]
+        run_machines = self._tumor_run_machines(tumor)
+        if run_machines is not None:
+            return self._select_pooled_by_run_machines(
+                db, tumor, candidates, run_machines
+            )
+        verified: List[Sample] = []
+        unverified: List[Sample] = []
+        failures: Dict[str, int] = {}
+        for candidate in candidates:
+            reasons = self._pooled_reasons(db, tumor, candidate)
+            if reasons:
+                for reason in reasons:
+                    failures[reason] = failures.get(reason, 0) + 1
+            elif self._pooled_machine_status(db, tumor, candidate)[0] == "match":
+                verified.append(candidate)
+            else:
+                unverified.append(candidate)
+        if verified:
+            picked = self._latest(verified)
+        elif unverified:
+            picked = self._latest(unverified)
+        else:
+            picked = None
+        matched = len(verified) + len(unverified)
+        note = f"tier=pooled: {len(candidates)} candidate(s), {matched} matched"
+        if failures:
+            note += "; " + ", ".join(f"{n} skipped ({r})" for r, n in sorted(failures.items()))
+        return picked, [note]
+
+    @staticmethod
+    def _tumor_run_machines(tumor: Sample) -> Optional[set]:
+        """Beagle-exact machine set for a tumor, or None when it carries
+        no runIds (legacy row -> family-based pooled behavior).
+
+        Normalizes ``additional_metadata["run_ids"]`` at pairing time:
+        machine = first underscore-delimited token, lower-cased (beagle:
+        ``runId.split("_")[0].lower()``).
+        """
+        metadata = tumor.additional_metadata or {}
+        raw = metadata.get("run_ids")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not raw:
+            return None
+        machines = set()
+        for rid in raw:
+            token = str(rid).split("_")[0].strip().lower()
+            if token:
+                machines.add(token)
+        return machines or None
+
+    def _pooled_machine_set_reasons(
+        self, pooled: Sample, run_machines: set
+    ) -> List[str]:
+        """Beagle-exact machine reason for one pooled candidate: empty
+        when the pool's machine (its raw run_mode) is in the tumor's runId
+        machine set, otherwise the mismatch reason (beagle has no
+        cross-machine fallback)."""
+        name = (pooled.run_mode or "").strip()
+        if name and name.lower() in run_machines:
+            return []
+        label = name or "missing"
+        machines = ", ".join(sorted(run_machines))
+        return [f"pooled machine mismatch (tumor machines {machines} vs pool {label})"]
+
+    def _select_pooled_by_run_machines(
+        self,
+        db: Optional[Session],
+        tumor: Sample,
+        candidates: Sequence[Sample],
+        run_machines: set,
+    ):
+        """Beagle-exact pooled selection for a runId-bearing tumor:
+        candidates must pass the panel/bait/preservation gates AND sit on
+        a machine in ``run_machines`` (exact runId-prefix match, no
+        cross-machine fallback). Within the matched set the earliest
+        sequencing_date wins — beagle's cross-machine tie-break, the
+        opposite of ``_latest``. Returns (picked, notes)."""
+        passing: List[Sample] = []
+        failures: Dict[str, int] = {}
+        for candidate in candidates:
+            reasons = self._pooled_reasons(db, tumor, candidate)
+            if reasons:
+                for reason in reasons:
+                    failures[reason] = failures.get(reason, 0) + 1
+            else:
+                passing.append(candidate)
+        picked = self._earliest(passing) if passing else None
+        note = (
+            f"tier=pooled: {len(candidates)} candidate(s), {len(passing)} matched "
+            f"(beagle-exact machines: {', '.join(sorted(run_machines))})"
+        )
+        if failures:
+            note += "; " + ", ".join(
+                f"{n} skipped ({r})" for r, n in sorted(failures.items())
+            )
+        return picked, [note]
+
+    @staticmethod
+    def _earliest(candidates: List[Sample]) -> Sample:
+        """The candidate with the earliest sequencing_date (missing dates
+        lose to dated candidates; ties break on created_date then id, as
+        in ``_latest``). The inverse of ``_latest`` — beagle's
+        cross-machine pooled tie-break."""
+        return min(
+            candidates,
+            key=lambda s: (
+                s.sequencing_date is None,
+                s.sequencing_date or _MAX_DATE,
+                s.created_date,
+                s.id,
+            ),
+        )
 
     def mismatch_reasons(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
@@ -895,13 +1104,15 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             return selection
         notes = list(selection.notes)
         candidates = db.scalars(self._pooled_candidate_stmt(tumor)).all()
-        picked, tier_notes = self._select_in_candidates(
-            tumor,
-            candidates,
-            "pooled",
-            lambda t, c: self._pooled_reasons(db, t, c),
-        )
+        picked, tier_notes = self._select_pooled(db, tumor, candidates)
         notes.extend(tier_notes)
+        # The advisory machine warning applies only to the legacy (no
+        # runIds) path: a beagle-exact pool already sits on the tumor's
+        # own machine, so there is no unverified family to flag.
+        if picked is not None and self._tumor_run_machines(tumor) is None:
+            warning = self._pooled_machine_warning(db, picked)
+            if warning:
+                notes.append(warning)
         return NormalSelection(picked, notes)
 
     def candidate_scope(
