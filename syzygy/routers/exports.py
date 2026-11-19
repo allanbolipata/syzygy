@@ -2,12 +2,12 @@
 
 Spec: Projects/Syzygy/Factory/TEMPO_EXPORT_TICKETS.md.
 
-``GET /v1/export/tempo/{pairing,unpaired}`` stream the two pairing-side
-beagle files as ``text/plain`` downloads with beagle's filenames
-(``sample_pairing.txt`` / ``sample_unpaired.txt``). Auth required (router
-mounted under the global auth dependency in ``main.py``); the
-``?pairing_logic_name`` query param defaults to ``TEMPO`` and an unknown
-logic name is a 404.
+``GET /v1/export/tempo/{pairing,unpaired,tracker}`` stream the beagle
+files as ``text/plain`` downloads with beagle's filenames
+(``sample_pairing.txt`` / ``sample_unpaired.txt`` /
+``sample_tracker.txt``). Auth required (router mounted under the global
+auth dependency in ``main.py``); the ``?pairing_logic_name`` query param
+defaults to ``TEMPO`` and an unknown logic name is a 404.
 
 The response bodies are produced by ``syzygy.export.tempo_files``:
 
@@ -20,8 +20,15 @@ The response bodies are produced by ``syzygy.export.tempo_files``:
   (``sample_unpaired.txt`` shape), logic-family tumors with no latest
   pairing row for the logic, reasons from the strategy diagnostics and
   never empty.
+- tracker -- beagle's byte-equal PM header + the raw metadata columns
+  (``sample_tracker.txt`` shape), one row per sample in the logic's
+  family (tumors and normals, paired or unpaired); column resolution
+  order sample column -> ``additional_metadata`` ->
+  ``additional_metadata["requestMetadata"]`` -> empty cell, missing keys
+  never raise, DMP samples put ``primary_id`` in the Collaborator_ID
+  column.
 
-E2 (tracker) and E3 (conflict) add their routes here.
+E3 (conflict) adds its route here.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
@@ -30,8 +37,10 @@ from sqlalchemy.orm import Session
 from syzygy.database import get_db
 from syzygy.export.tempo_files import (
     PAIRING_FILENAME,
+    TRACKER_FILENAME,
     UNPAIRED_FILENAME,
     build_pairing_tsv,
+    build_tracker_tsv,
     build_unpaired_tsv,
 )
 
@@ -75,3 +84,19 @@ def export_tempo_unpaired(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return _download(UNPAIRED_FILENAME, body)
+
+
+@router.get(
+    "/tracker",
+    response_class=PlainTextResponse,
+    summary="beagle sample_tracker.txt (PM header + raw metadata columns) for a pairing logic",
+)
+def export_tempo_tracker(
+    pairing_logic_name: str = Query(default="TEMPO"),
+    db: Session = Depends(get_db),
+):
+    try:
+        body = build_tracker_tsv(db, pairing_logic_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _download(TRACKER_FILENAME, body)

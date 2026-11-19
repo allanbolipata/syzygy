@@ -21,8 +21,17 @@ E1 covers the two pairing-side files:
   the same mechanism as the possible-matches / MULTI checks) and is never
   empty.
 
-E2 (tracker CSV) and E3 (conflict TSV) extend this module with their own
-builders.
+E2 (ticket E2) adds ``build_tracker_tsv``: beagle's
+``sample_tracker.txt`` — the byte-equal PM header
+(``TRACKER_HEADER``, 6 PM-formatted columns + the 17 raw metadata keys),
+one row per sample in the logic's family (tumors and normals, paired or
+unpaired — beagle's tracker covers whole patients). Raw-metadata columns
+follow the spec's resolution order (sample column ->
+``additional_metadata`` -> ``additional_metadata["requestMetadata"]`` ->
+empty cell), never raising on a missing key; DMP samples put
+``primary_id`` in the ``Collaborator_ID_(or_DMP_Sample_ID)`` column.
+
+E3 (conflict TSV) extends this module with its own builder.
 """
 from __future__ import annotations
 
@@ -37,9 +46,11 @@ from syzygy.pairing_import import EXTENDED_HEADER
 from syzygy.pairing_strategies import PairingStrategy, get_pairing_strategy
 from syzygy.schemas import TumorOrNormal
 
-#: beagle's operator filenames (create_pairing_file / create_unpaired_txt_file).
+#: beagle's operator filenames (create_pairing_file /
+#: create_unpaired_txt_file / create_tracker_file).
 PAIRING_FILENAME = "sample_pairing.txt"
 UNPAIRED_FILENAME = "sample_unpaired.txt"
+TRACKER_FILENAME = "sample_tracker.txt"
 
 #: beagle's unpaired file: the 8 conflict-file fields + the reason column.
 UNPAIRED_HEADER: tuple[str, ...] = (
@@ -52,6 +63,42 @@ UNPAIRED_HEADER: tuple[str, ...] = (
     "baitSet",
     "runDate",
     "Possible Reason?",
+)
+
+#: beagle's tracker header — byte-equal to what
+#: ``TempoMpgenOperator.create_tracker_file`` writes (beagle
+#: ``runner/operator/tempo_mpgen_operator/tempo_mpgen_operator.py``):
+#: the 6 PM-formatted columns followed by the 17 raw metadata keys used
+#: verbatim as column names, tab-joined, no trailing tab. Verified
+#: against the beagle source 2026-11-19; the raw metadata column names
+#: are beagle's ``settings.py`` metadata-key values (``RECIPE_METADATA_KEY``
+#: -> genePanel, ``SAMPLE_CLASS_METADATA_KEY`` -> sampleClass,
+#: ``SAMPLE_ID_METADATA_KEY`` -> primaryId, ``PATIENT_ID_METADATA_KEY`` ->
+#: the CMO patient-id key).
+TRACKER_HEADER: tuple[str, ...] = (
+    "CMO_Sample_ID",
+    "Collaborator_ID_(or_DMP_Sample_ID)",
+    "Historical_Investigator_ID_(for_CCS_use)",
+    "Sample_Class_(T/N)",
+    "Bait_set_(Agilent/_IDT/WGS)",
+    "IGO_Request_ID_(Project_ID)",
+    "tumorOrNormal",
+    "species",
+    "genePanel",
+    "sampleClass",
+    "primaryId",
+    "cmoPatientId",
+    "investigatorName",
+    "investigatorEmail",
+    "piEmail",
+    "labHeadName",
+    "labHeadEmail",
+    "preservation",
+    "dataAnalystName",
+    "dataAnalystEmail",
+    "projectManagerName",
+    "investigatorSampleId",
+    "cmoSampleName",
 )
 
 
@@ -216,3 +263,129 @@ def build_unpaired_tsv(db: Session, logic_name: str) -> str:
             )
         )
     return _tsv(rows)
+
+
+# ---------------------------------------------------------------------------
+# build_tracker_tsv — beagle's sample_tracker.txt (ticket E2)
+# ---------------------------------------------------------------------------
+
+
+def _cell_str(value) -> str:
+    """One TSV cell: ``None`` -> empty, lists joined with ``,``; tabs and
+    line breaks sanitized to spaces so a value can never break the column
+    grid."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (list, tuple)):
+        text = ",".join(str(item) for item in value if item is not None)
+    else:
+        text = str(value)
+    return text.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _metadata_cell(sample: Sample, key: str) -> str:
+    """A raw-metadata column by the spec's resolution order:
+    ``additional_metadata`` -> ``additional_metadata["requestMetadata"]``
+    -> empty cell. Never raises: a missing key, a ``None`` value, a
+    non-dict blob, or an absent ``requestMetadata`` all resolve to an
+    empty cell."""
+    am = sample.additional_metadata
+    if isinstance(am, dict):
+        value = am.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            return _cell_str(value)
+        nested = am.get("requestMetadata")
+        if isinstance(nested, dict):
+            value = nested.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                return _cell_str(value)
+    return ""
+
+
+def _resolved(sample: Sample, key: str, sample_value) -> str:
+    """The spec's full column resolution order: the sample column (when
+    one exists for the key) -> ``additional_metadata`` ->
+    ``additional_metadata["requestMetadata"]`` -> empty cell."""
+    if sample_value is None or sample_value == "":
+        return _metadata_cell(sample, key)
+    return _cell_str(sample_value)
+
+
+def _is_dmp(sample: Sample) -> bool:
+    """DMP-ingested sample (provenance marker ``sample_type == "DMP"``,
+    per the model's column docs) — same convention as
+    ``pairing_service._is_dmp_sample``."""
+    return str(sample.sample_type or "").strip().upper() == "DMP"
+
+
+def _class_cell(sample: Sample) -> str:
+    """beagle's T/N class cell from the ``tumor_or_normal`` column."""
+    return "T" if sample.tumor_or_normal == TumorOrNormal.TUMOR.value else "N"
+
+
+def _tracker_row(sample: Sample) -> tuple[str, ...]:
+    """One tracker row in ``TRACKER_HEADER`` order."""
+    tnn = _class_cell(sample)
+    if _is_dmp(sample):
+        # Spec DECIDED: DMP samples put their DMP sample id (primary_id)
+        # in the Collaborator slot.
+        collaborator = _cell_str(sample.primary_id)
+    else:
+        # beagle fills the Collaborator slot from the
+        # investigatorSampleId metadata for non-DMP samples.
+        collaborator = _metadata_cell(sample, "investigatorSampleId")
+    return (
+        _cell_str(sample.cmo_sample_name),  # CMO_Sample_ID
+        collaborator,  # Collaborator_ID_(or_DMP_Sample_ID)
+        # Spec DECIDED: Historical_Investigator_ID <- investigatorSampleId
+        # when present.
+        _metadata_cell(sample, "investigatorSampleId"),
+        tnn,  # Sample_Class_(T/N)
+        _resolved(sample, "baitSet", sample.bait_set),
+        _resolved(sample, "igoRequestId", sample.request_id),
+        tnn,  # tumorOrNormal
+        _metadata_cell(sample, "species"),
+        _resolved(sample, "genePanel", sample.gene_panel),
+        tnn,  # sampleClass
+        _resolved(sample, "primaryId", sample.primary_id),
+        _resolved(sample, "cmoPatientId", sample.patient__cmo),
+        _metadata_cell(sample, "investigatorName"),
+        _metadata_cell(sample, "investigatorEmail"),
+        _metadata_cell(sample, "piEmail"),
+        _metadata_cell(sample, "labHeadName"),
+        _metadata_cell(sample, "labHeadEmail"),
+        _resolved(sample, "preservation", sample.preservation),
+        _metadata_cell(sample, "dataAnalystName"),
+        _metadata_cell(sample, "dataAnalystEmail"),
+        _metadata_cell(sample, "projectManagerName"),
+        _metadata_cell(sample, "investigatorSampleId"),
+        _cell_str(sample.cmo_sample_name),  # cmoSampleName
+    )
+
+
+def build_tracker_tsv(db: Session, logic_name: str) -> str:
+    """beagle's ``sample_tracker.txt`` for ``logic_name``.
+
+    Header is byte-equal to beagle's tracker header (``TRACKER_HEADER``).
+    Rows are every sample in the logic's family
+    (``logic_membership_condition`` — the same "samples of a given pairing
+    logic" scope as the listing filters and the unpaired builder), both
+    tumors and normals, paired or unpaired (beagle's tracker covers whole
+    patients, including unpaired normals), ordered by
+    ``cmo_sample_name`` (ties broken by id).
+
+    Column resolution follows the spec's order: the sample column (where
+    one exists for the key) -> ``additional_metadata`` ->
+    ``additional_metadata["requestMetadata"]`` -> empty cell; a missing
+    key never raises. DMP samples (``sample_type == "DMP"``) put
+    ``primary_id`` in the ``Collaborator_ID_(or_DMP_Sample_ID)`` column;
+    other samples take ``investigatorSampleId`` from the metadata there.
+    """
+    logic = _resolve_logic(db, logic_name)
+    samples = db.scalars(
+        select(Sample).where(logic_membership_condition(logic, sample=Sample))
+    ).all()
+    ordered = sorted(samples, key=lambda s: (s.cmo_sample_name, s.id))
+    return _tsv([TRACKER_HEADER] + [_tracker_row(s) for s in ordered])
