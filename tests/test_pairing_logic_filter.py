@@ -253,6 +253,42 @@ def test_samples_unknown_logic_400(db):
     assert exc_info.value.status_code == 400
 
 
+# ---------- HARMONY null-bait rule (mirror of the DMP rule) ----------
+
+def test_samples_harmony_null_bait_rule_mirrors_dmp(db):
+    """P2: HARMONY owns its own NULL-bait_set family the way DMP owns
+    ``sample_type == 'DMP'`` — a null-bait sample of ``sample_type``
+    'HARMONY' (exact case) belongs to HARMONY, and a registered HARMONY
+    bait set does too; the two families stay disjoint from each other."""
+    dmp = _logic(db, "DMP", strategy_name="dmp")
+    harmony = _logic(db, "HARMONY", strategy_name="dmp")
+    _assign(db, "DMP", dmp)
+    _assign(db, "HARMONY-BAIT", harmony)
+    # HARMONY family: null-bait 'HARMONY' sample + registered HARMONY bait.
+    _sample(db, "H-NULL", patient__cmo="P-H", request_id="R-H",
+            bait_set=None, sample_type="HARMONY", n=1)
+    _sample(db, "H-LOW", patient__cmo="P-H", request_id="R-H",
+            bait_set=None, sample_type="harmony", n=2)  # lowercase -> no match
+    _sample(db, "H-REG", patient__cmo="P-H", request_id="R-H",
+            bait_set="HARMONY-BAIT", sample_type="tissue", n=3)
+    # DMP family: null-bait 'DMP' sample + registered DMP bait.
+    _sample(db, "D-NULL", patient__cmo="P-D", request_id="R-D",
+            bait_set=None, sample_type="DMP", n=4)
+    _sample(db, "D-REG", patient__cmo="P-D", request_id="R-D",
+            bait_set="DMP", sample_type="cfDNA", n=5)
+
+    # HARMONY family = the null-bait 'HARMONY' sample + the registered
+    # HARMONY bait set. The lowercase 'harmony' variant does NOT match
+    # (exact case), and no DMP sample leaks into HARMONY.
+    rows = list_samples(limit=None, offset=None, pairing_logic="HARMONY", db=db)
+    assert {x.primary_id for x in rows} == {"H-NULL", "H-REG"}
+
+    # DMP family = its own null-bait 'DMP' sample + the registered DMP bait
+    # set; the HARMONY null-bait sample does NOT leak into DMP.
+    rows = list_samples(limit=None, offset=None, pairing_logic="DMP", db=db)
+    assert {x.primary_id for x in rows} == {"D-NULL", "D-REG"}
+
+
 # ---------- patients: group membership, all-samples counts ----------
 
 def test_patients_logic_filter_membership_counts_stay_all_samples(db):

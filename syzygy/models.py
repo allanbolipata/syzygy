@@ -20,6 +20,17 @@ def utcnow() -> datetime:
 #: pairing_service (which itself imports bait_sets).
 DMP_LOGIC_NAME = "DMP"
 
+#: Name of the pairing logic under which HARMONY samples pair
+#: automatically (see pairing_service.trigger_harmony_pairing). HARMONY is
+#: its OWN pairing logic row and pairing space, separate from DMP, but it
+#: reuses the ``dmp`` strategy and owns its own NULL-bait_set sample
+#: family (``sample_type`` "HARMONY") the way DMP owns ``sample_type``
+#: "DMP". Lives on the models layer for the same reason DMP_LOGIC_NAME
+#: does: so the SQL-side listing filter (bait_sets
+#: logic_membership_condition) and the HARMONY pairing trigger share one
+#: source of truth.
+HARMONY_LOGIC_NAME = "HARMONY"
+
 
 class PairingLogic(Base):
     __tablename__ = "pairing_logic"

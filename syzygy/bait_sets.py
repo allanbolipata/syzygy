@@ -8,7 +8,13 @@ from typing import Iterable, Optional
 from sqlalchemy import and_, false, func, or_, select
 from sqlalchemy.orm import Session
 
-from syzygy.models import DMP_LOGIC_NAME, BaitSet, PairingLogic, Sample
+from syzygy.models import (
+    DMP_LOGIC_NAME,
+    HARMONY_LOGIC_NAME,
+    BaitSet,
+    PairingLogic,
+    Sample,
+)
 
 TEMPO_BAIT_SETS = (
     "Agilent_v4_51MB_Human_hg19_BAITS",
@@ -92,8 +98,12 @@ def logic_membership_condition(logic: PairingLogic, sample=None):
 
     - the sample's ``bait_set`` matches, case-insensitively, a
       ``bait_sets`` row whose ``pairing_logic_id`` is ``logic.id``;
-    - the DMP logic additionally owns samples with ``bait_set`` NULL and
-      ``sample_type`` ``'DMP'`` — DMP samples carry no bait-set key.
+    - the DMP and HARMONY logics additionally own samples with
+      ``bait_set`` NULL and ``sample_type`` of their own logic name
+      (``'DMP'`` / ``'HARMONY'``, exact case) — those ingested samples
+      carry no bait-set key. HARMONY is its own logic row (it reuses the
+      ``dmp`` strategy) but owns a separate NULL-bait_set family, so the
+      two stay separate gates.
 
     ``sample`` is the mapped class (or alias) whose row the condition is
     evaluated against; it defaults to ``Sample``. Pass an ``aliased``
@@ -125,6 +135,14 @@ def logic_membership_condition(logic: PairingLogic, sample=None):
             and_(
                 sample.bait_set.is_(None),
                 sample.sample_type == DMP_LOGIC_NAME,
+            ),
+        )
+    if logic.name.strip().upper() == HARMONY_LOGIC_NAME:
+        return or_(
+            registered,
+            and_(
+                sample.bait_set.is_(None),
+                sample.sample_type == HARMONY_LOGIC_NAME,
             ),
         )
     return registered

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from syzygy.models import (
     DMP_LOGIC_NAME,
+    HARMONY_LOGIC_NAME,
     BaitSet,
     PairingLogic,
     PairingTable,
@@ -836,14 +837,15 @@ def trigger_dmp_pairing(
 # Automatic HARMONY pairing (POST /pairing/trigger-harmony)
 # ---------------------------------------------------------------------------
 
-#: Name of the pairing logic under which HARMONY samples pair
-#: automatically. HARMONY is its OWN pairing logic row and pairing space,
+#: ``HARMONY_LOGIC_NAME`` ("HARMONY") is defined on the models layer
+#: (next to ``DMP_LOGIC_NAME``) so the SQL-side listing filter (bait_sets
+#: ``logic_membership_condition``) and this trigger share one source of
+#: truth. HARMONY is its OWN pairing logic row and pairing space,
 #: separate from the DMP logic: the two may drift over time (a future
 #: HARMONY strategy class the HARMONY row points at), so this trigger
 #: resolves "HARMONY" by name and never touches the DMP logic row or its
 #: pairings. For now the HARMONY row reuses the ``dmp`` strategy (same
 #: matching: DMP-group only, ``patient__dmp`` + gene panel).
-HARMONY_LOGIC_NAME = "HARMONY"
 
 
 def trigger_harmony_pairing(

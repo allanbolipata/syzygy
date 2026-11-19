@@ -56,6 +56,23 @@ admin. The UI reflects the same entitlements from `GET /auth/me`
 (`allowed_logics`, `is_logic_admin`) — **UX only**; the server-side 403s
 are the real gate (ticket C5).
 
+**Sample-family ownership (what Layer B filters on).** Layer B restricts
+each listing to the union of the sample *families* of the principal's
+`allowed_logics`. A sample belongs to a logic's family when **either** of
+these holds (`logic_membership_condition`, `syzygy/bait_sets.py`):
+
+| Family member | Rule (SQL-side) |
+|---|---|
+| Registered bait set | the sample's `bait_set` matches a **registered** `bait_sets` assignment for the logic (case-insensitive). |
+| DMP null-bait family | `bait_set` is **NULL** and `sample_type == 'DMP'` (exact case). |
+| HARMONY null-bait family (P2) | `bait_set` is **NULL** and `sample_type == 'HARMONY'` (exact case) — mirrors the DMP rule; HARMONY reuses the `dmp` pairing strategy but owns its own null-bait family. |
+
+Unregistered bait sets (no `bait_sets` assignment) belong to **no** family
+and stay invisible under any gate (fail-closed; decision 3). The two
+null-bait families are disjoint from each other and from the registered-bait
+families, so a HARMONY-enrolled principal sees only HARMONY-family samples
+and a DMP-enrolled principal sees only DMP-family samples.
+
 ## Env flags (app)
 
 | Env var | Default | Meaning |
