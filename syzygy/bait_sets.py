@@ -3,9 +3,9 @@
 Explicit lists take precedence, then name rules: "ACCESS" in the name ->
 ACCESS; "HEMEPACT" or "IMPACT" in the name -> ARGOS (case-insensitive).
 """
-from typing import Optional
+from typing import Iterable, Optional
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, false, func, or_, select
 from sqlalchemy.orm import Session
 
 from syzygy import audit
@@ -105,8 +105,8 @@ def resolve_bait_set_logic(db: Session, name: Optional[str]) -> Optional[Pairing
     return logic
 
 
-def logic_membership_condition(logic: PairingLogic):
-    """SQL boolean condition on a ``samples`` row: the sample belongs to
+def logic_membership_condition(logic: PairingLogic, sample=None):
+    """SQL boolean condition on a sample row: the sample belongs to
     ``logic``'s family (listing-filter semantics, pure SQL — no
     per-row Python resolution).
 
@@ -118,6 +118,11 @@ def logic_membership_condition(logic: PairingLogic):
     - the DMP logic additionally owns samples with ``bait_set`` NULL and
       ``sample_type`` ``'DMP'`` — DMP samples carry no bait-set key.
 
+    ``sample`` is the mapped class (or alias) whose row the condition is
+    evaluated against; it defaults to ``Sample``. Pass an ``aliased``
+    class when the condition must bind to a specific join side (e.g. the
+    tumor/normal aliases of a pairing listing).
+
     Known wrinkle (flagged per card): samples whose ``bait_set`` is NOT
     registered in ``bait_sets`` belong to no logic filter — they are only
     visible when the filter is omitted/ALL — even when ``classify_bait_set``
@@ -125,22 +130,46 @@ def logic_membership_condition(logic: PairingLogic):
     such names lazily (on ingest/pairing), so imported data is normally
     registered; a never-resolved bait set stays invisible to logic filters.
     """
+    if sample is None:
+        sample = Sample
     registered = (
         select(BaitSet.id)
         .where(
             BaitSet.pairing_logic_id == logic.id,
-            Sample.bait_set.is_not(None),
-            func.lower(BaitSet.bait_set) == func.lower(Sample.bait_set),
+            sample.bait_set.is_not(None),
+            func.lower(BaitSet.bait_set) == func.lower(sample.bait_set),
         )
-        .correlate(Sample)
+        .correlate(sample)
         .exists()
     )
     if logic.name.strip().upper() == DMP_LOGIC_NAME:
         return or_(
             registered,
             and_(
-                Sample.bait_set.is_(None),
-                Sample.sample_type == DMP_LOGIC_NAME,
+                sample.bait_set.is_(None),
+                sample.sample_type == DMP_LOGIC_NAME,
             ),
         )
     return registered
+
+
+def allowed_logics_condition(db: Session, allowed_logics: Iterable[str], sample=None):
+    """SQL boolean condition on a sample row: the row belongs to ANY of
+    ``allowed_logics`` — the Layer B listing filter (ticket C3).
+
+    An OR across ``logic_membership_condition`` for each allowed logic
+    (the DMP null-bait rule comes free from the helper). ``sample`` is
+    passed through (see ``logic_membership_condition``).
+
+    Fail-closed (design point 3): an empty set — or a set with no
+    resolvable logic rows — yields a FALSY condition, so a principal
+    with no logic entitlements sees no logic-scoped data at all.
+    """
+    names = {n for n in (allowed_logics or ()) if isinstance(n, str) and n}
+    if not names:
+        return false()
+    logics = db.scalars(select(PairingLogic).where(PairingLogic.name.in_(names))).all()
+    if not logics:
+        return false()
+    conds = [logic_membership_condition(logic, sample=sample) for logic in logics]
+    return conds[0] if len(conds) == 1 else or_(*conds)

@@ -712,6 +712,19 @@ gets `403`. Provision users with:
 
     python scripts/manage_allowed_users.py add --email name@example.com
 
+**Per-logic data gating** (dark launch, `LOGIC_GATING_ENABLED=false` by
+default): with the flag on, each user's accessible pairing logics come
+from a token claim (`LOGIC_CLAIM_NAME`, default `syzygy_logics` — a JSON
+list of exact logic names) and their logic-admin flag from
+`LOGIC_ADMIN_CLAIM` (default `syzygy_admin` — any truthy value). Listings
+filter to the user's logics, logic-scoped reads 403, and trigger /
+pairing-logic writes require the admin claim; a user with no claim gets
+no logics (fail-closed). The org's Keycloak approach is not yet decided —
+the Keycloak group + mapper walkthrough, claim shapes, env flags and the
+rollout order (populate groups → flip the flag) are documented as a
+**reference implementation** in
+[docs/logic_gating_setup.md](docs/logic_gating_setup.md).
+
 **Local development:**
 
 1. Start the dev stack (app on **8000**, Keycloak on the default port

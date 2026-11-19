@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from syzygy.database import get_db, settings
-from syzygy.models import AllowedUser
+from syzygy.models import AllowedUser, PairingLogic
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +54,18 @@ def dev_auth_enabled() -> bool:
     return bool(settings.dev_auth_token)
 
 
-def _dev_user() -> dict:
+def _dev_user(db: Session) -> dict:
     """Identity for the dev-only local admin. No Keycloak token and no
     allowed_users row are involved; this path only exists when
-    ``dev_auth_token`` is set."""
+    ``dev_auth_token`` is set. The synthetic local identity is an admin:
+    full logic set + admin, gating enabled or not."""
     return {
         "sub": "dev-admin",
         "email": settings.dev_auth_email,
         "preferred_username": "dev-admin",
         "display_name": "Dev Admin (local)",
+        "allowed_logics": _known_logic_names(db),
+        "is_logic_admin": True,
     }
 
 
@@ -125,7 +128,10 @@ def _refetch_jwks(realm: str) -> bool:
 def verify_token(token: str) -> dict:
     """Decode a Keycloak JWT and return its identity claims.
 
-    Returns {"sub", "email", "preferred_username"} or raises TokenError.
+    Returns {"sub", "email", "preferred_username"}, plus the configured
+    logic-entitlement claims (``settings.logic_claim_name`` /
+    ``settings.logic_admin_claim``) when the token carries them — tokens
+    without those claims keep the three-key shape. Raises TokenError.
     """
     try:
         kid = jwt.get_unverified_header(token).get("kid")
@@ -166,11 +172,18 @@ def verify_token(token: str) -> dict:
     except jwt.PyJWTError as exc:
         raise TokenError(f"token verification failed: {exc}") from exc
 
-    return {
+    user = {
         "sub": claims.get("sub"),
         "email": claims.get("email"),
         "preferred_username": claims.get("preferred_username"),
     }
+    # Pass the entitlement claims through, BY THE CONFIGURED NAMES, so
+    # _user_from_claims can derive allowed_logics / is_logic_admin.
+    # Tokens without them are left untouched (the three-key shape).
+    for claim_name in (settings.logic_claim_name, settings.logic_admin_claim):
+        if claim_name in claims:
+            user[claim_name] = claims[claim_name]
+    return user
 
 
 def _extract_token(request: Request) -> Optional[str]:
@@ -245,6 +258,50 @@ def _set_session_cookies(
         )
 
 
+def _known_logic_names(db: Session) -> Set[str]:
+    """All pairing-logic names in the database — the full entitlement
+    set (every logic a principal can be granted)."""
+    return set(db.scalars(select(PairingLogic.name)).all())
+
+
+def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
+    """(allowed_logics, is_logic_admin) for a verified Keycloak token.
+
+    Claim names come from settings (``logic_claim_name`` /
+    ``logic_admin_claim``) so adapting to the org's Keycloak scheme is a
+    .env change, not a code change:
+    - gating disabled: the FULL set + admin — behavior is exactly
+      today's and /auth/me needs no flag knowledge;
+    - gating enabled (fail-closed): allowed logics are the configured
+      list claim intersected with the known logic names — an absent
+      claim yields an EMPTY set, and names the app does not know are
+      ignored with a warning. The admin flag is the configured boolean
+      claim.
+    """
+    known = _known_logic_names(db)
+    if not settings.logic_gating_enabled:
+        return known, True
+    raw = claims.get(settings.logic_claim_name)
+    if raw is None:
+        raw = []
+    elif not isinstance(raw, list):
+        # A non-list (e.g. a bare string) degrades to a single-element
+        # list rather than failing open.
+        raw = [raw]
+    allowed: Set[str] = set()
+    for name in raw:
+        if name in known:
+            allowed.add(name)
+        else:
+            logger.warning(
+                "auth: ignoring unknown pairing logic %r from %r claim",
+                name,
+                settings.logic_claim_name,
+            )
+    is_admin = bool(claims.get(settings.logic_admin_claim))
+    return allowed, is_admin
+
+
 def _user_from_claims(
     claims: dict, db: Session
 ) -> Tuple[str, Optional[dict], Optional[dict]]:
@@ -259,16 +316,16 @@ def _user_from_claims(
     )
     if user is None or not user.active:
         return ("forbidden", None, claims)
-    return (
-        "ok",
-        {
-            "sub": claims.get("sub"),
-            "email": claims.get("email"),
-            "preferred_username": claims.get("preferred_username"),
-            "display_name": user.display_name,
-        },
-        claims,
+    principal = {
+        "sub": claims.get("sub"),
+        "email": claims.get("email"),
+        "preferred_username": claims.get("preferred_username"),
+        "display_name": user.display_name,
+    }
+    principal["allowed_logics"], principal["is_logic_admin"] = _logic_entitlements(
+        claims, db
     )
+    return ("ok", principal, claims)
 
 
 def _attempt_silent_refresh(
@@ -362,7 +419,9 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], O
                         caller can explain why)
     - "ok"              valid token for an active allowed user; user is
                         {"sub", "email", "preferred_username",
-                         "display_name" (from the AllowedUser row)}
+                         "display_name" (from the AllowedUser row),
+                         "allowed_logics" (set[str]),
+                         "is_logic_admin" (bool)}
     """
     token = _extract_token(request)
     if token is None:
@@ -377,7 +436,7 @@ def _resolve_user(request: Request, db: Session) -> Tuple[str, Optional[dict], O
             token.encode("utf-8"), settings.dev_auth_token.encode("utf-8")
         )
     ):
-        return ("ok", _dev_user(), None)
+        return ("ok", _dev_user(db), None)
     try:
         claims = verify_token(token)
     except TokenError as exc:
@@ -435,6 +494,116 @@ def get_current_user(
             )
         raise HTTPException(status_code=403, detail=detail)
     raise HTTPException(status_code=401, detail="Authentication required")
+
+
+# ---------------------------------------------------------------------------
+# Logic-entitlement endpoint gates (ticket C2: Layers A + C)
+# ---------------------------------------------------------------------------
+#
+# Two endpoint dependencies on top of get_current_user, BOTH no-ops while
+# settings.logic_gating_enabled is False (the dark-launch flag): behavior
+# is exactly today's until the org flips the flag in .env.
+#
+# Layer A — read gate: require_logic_access() checks the REQUESTED pairing
+#   logic against the principal's allowed_logics. The requested logic is
+#   the endpoint's own existing pairing_logic_name query/path param (the
+#   factory takes its name); endpoints scoped to one fixed logic without
+#   a param (the HARMONY frame) pass that name via ``logic`` instead.
+#
+# Layer C — write/admin gate: require_logic_admin() checks is_logic_admin
+#   on the trigger and pairing-logic mutation endpoints. Read != write:
+#   being able to see a logic's data does not grant the right to trigger
+#   pairing under it or to change the logic configuration.
+
+#: Stable 403 detail for a logic read the principal may not see (Layer A).
+LOGIC_ACCESS_DENIED_DETAIL = "Logic not accessible"
+#: Stable 403 detail for a trigger/config write the principal may not
+#: perform (Layer C).
+LOGIC_ADMIN_DENIED_DETAIL = "Logic admin required"
+
+
+def require_logic_access(
+    param: Optional[str] = "pairing_logic_name",
+    logic: Optional[str] = None,
+):
+    """Layer A dependency factory: gate a logic-scoped read endpoint.
+
+    The requested logic comes from the endpoint's existing query/path
+    param named ``param`` (default ``"pairing_logic_name"``). An endpoint
+    that is scoped to ONE fixed logic without a param (e.g. the HARMONY
+    frame, whose logic name is hard-coded) passes that name via ``logic``
+    and ``param=None``. When the param is absent there is no requested
+    logic to check and the request passes (the endpoint's own fallback
+    resolution applies).
+
+    While ``logic_gating_enabled`` is False this is a no-op. When enabled
+    and the requested logic is not in the principal's ``allowed_logics``,
+    403 with the stable ``LOGIC_ACCESS_DENIED_DETAIL``.
+    """
+
+    def dependency(
+        request: Request,
+        current_user: dict = Depends(get_current_user),
+    ) -> None:
+        if not settings.logic_gating_enabled:
+            return
+        requested = logic
+        if requested is None and param is not None:
+            requested = request.query_params.get(param)
+            if requested is None:
+                requested = request.path_params.get(param)
+        if requested is None:
+            return
+        if requested not in current_user.get("allowed_logics", set()):
+            raise HTTPException(
+                status_code=403, detail=LOGIC_ACCESS_DENIED_DETAIL
+            )
+
+    return dependency
+
+
+def require_logic_admin(
+    current_user: dict = Depends(get_current_user),
+) -> None:
+    """Layer C dependency: gate the trigger and pairing-logic mutation
+    endpoints on the admin entitlement — not mere visibility of a logic.
+
+    No-op while ``logic_gating_enabled`` is False; otherwise 403 with the
+    stable ``LOGIC_ADMIN_DENIED_DETAIL`` when the principal is not
+    ``is_logic_admin``.
+    """
+    if not settings.logic_gating_enabled:
+        return
+    if not current_user.get("is_logic_admin"):
+        raise HTTPException(status_code=403, detail=LOGIC_ADMIN_DENIED_DETAIL)
+
+
+# Layer B — data-level listing filter (ticket C3): the LISTING endpoints
+# (samples / patients / requests / pairings) are not scoped to one
+# requested logic, so no endpoint gate applies; instead the query itself
+# is intersected with the principal's allowed logics via
+# ``bait_sets.allowed_logics_condition``. gating_allowed_logics is the
+# shared switch: None while gating is disabled (dark-launch no-op —
+# listings behave exactly as today), otherwise the principal's allowed
+# logic names. Fail-closed (design point 3): a missing / non-dict
+# principal or one without an allowed_logics set yields an EMPTY set,
+# which the SQL helper turns into a falsy condition (no rows).
+
+
+def gating_allowed_logics(current_user) -> Optional[Set[str]]:
+    """The principal's allowed logic names for Layer B listing filters.
+
+    Returns None while ``logic_gating_enabled`` is False (no filter at
+    all); otherwise the ``allowed_logics`` set from the principal (an
+    empty set when the principal is missing or malformed — fail-closed).
+    """
+    if not settings.logic_gating_enabled:
+        return None
+    if isinstance(current_user, dict):
+        allowed = current_user.get("allowed_logics")
+        if isinstance(allowed, (set, frozenset, list, tuple)):
+            return set(allowed)
+    return set()
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])

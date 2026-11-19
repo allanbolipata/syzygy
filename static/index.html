@@ -122,7 +122,12 @@
   <section class="panel">
     <h2>Patients</h2>
     <div class="filters">
-      <label>patient__cmo
+      <div id="p-mode-wrap" class="p-mode hidden">
+        <span class="p-mode-label">group by</span>
+        <button id="p-mode-cmo" type="button" class="p-mode-btn primary">CMO groups</button>
+        <button id="p-mode-dmp" type="button" class="p-mode-btn">DMP-only groups</button>
+      </div>
+      <label><span id="p-q-label">patient__cmo</span>
         <input id="p-q" placeholder="partial match, e.g. C-EXAMPLE1">
       </label>
       <label>limit
@@ -164,7 +169,7 @@
       <table id="patients-table">
         <thead>
           <tr>
-            <th>patient__cmo</th><th>samples</th><th>tumors</th><th>normals</th>
+            <th id="p-id-head">patient__cmo</th><th>samples</th><th>tumors</th><th>normals</th>
             <th>requests</th><th>metadata</th>
           </tr>
         </thead>
@@ -554,7 +559,7 @@
       switch the topbar <strong>View</strong> — it applies to every pairing
       tab.
     </p>
-    <label class="check">
+    <label class="check" id="m-overrides-wrap">
       <input type="checkbox" id="m-allow-overrides">
       Allow overrides
     </label>

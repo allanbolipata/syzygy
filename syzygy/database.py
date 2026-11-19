@@ -22,6 +22,18 @@ class Settings(BaseSettings):
     dev_auth_token: str = ""
     dev_auth_email: str = "dev-admin@syzygy.local"
 
+    # Per-user pairing-logic visibility gating (dark-launched): when
+    # False, behavior is exactly today's (everyone sees everything) and
+    # every principal gets the full logic set + admin on /auth/me, so the
+    # UI needs no flag knowledge. When True, allowed_logics come from the
+    # token's list claim (fail-closed: no claim -> empty set) and
+    # is_logic_admin from the boolean admin claim. Claim names are
+    # CONFIGURATION, not code: the org's Keycloak group->mapper scheme is
+    # not yet decided, so adapting is a .env change, not a code change.
+    logic_gating_enabled: bool = False
+    logic_claim_name: str = "syzygy_logics"
+    logic_admin_claim: str = "syzygy_admin"
+
     # Optional read-only beagle DB (the restored beagle dump — local data,
     # never in production) used ONLY to resolve the DMP pair file's
     # bam_exists column (docs/dmp_reference_alignment.md section f, the

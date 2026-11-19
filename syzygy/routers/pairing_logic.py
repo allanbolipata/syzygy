@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from syzygy import audit
-from syzygy.auth import get_current_user
+from syzygy.auth import get_current_user, require_logic_admin
 from syzygy.database import get_db, settings
 from syzygy.models import PairingLogic
 from syzygy.pairing_strategies import strategies
@@ -53,6 +53,7 @@ def create_pairing_logic(
     payload: PairingLogicCreate,
     db: Session = Depends(get_db),
     current_user: Optional[dict] = Depends(get_current_user),
+    logic_admin: None = Depends(require_logic_admin),
 ):
     existing = db.scalar(select(PairingLogic).where(PairingLogic.name == payload.name))
     if existing is not None:

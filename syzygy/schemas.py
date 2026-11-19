@@ -94,9 +94,13 @@ class RedactionRequest(BaseModel):
 
 
 class PatientRead(BaseModel):
-    # Patients are derived from samples (``patient__cmo`` non-null); there is
-    # no separate patient table yet.
-    patient__cmo: str
+    # Patients are derived from samples; there is no separate patient table
+    # yet. The CMO group view keys on ``patient__cmo`` (non-null rows); the
+    # DMP-only group view (ticket C4, ``dmp_only=true``) keys on
+    # ``patient__dmp`` for pure-DMP patients (``patient__cmo IS NULL``).
+    # Same row shape in both views: exactly one of the two ids is set.
+    patient__cmo: Optional[str] = None
+    patient__dmp: Optional[str] = None
     sample_count: int
     tumor_count: int
     normal_count: int

@@ -36,8 +36,14 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from syzygy import audit, pairing_import
+from syzygy.auth import (
+    get_current_user,
+    gating_allowed_logics,
+    require_logic_access,
+    require_logic_admin,
+)
+from syzygy.bait_sets import allowed_logics_condition
 from syzygy.dmp_translator import remap_dmp_record
-from syzygy.auth import get_current_user
 from syzygy.database import SessionLocal, get_db, settings
 from syzygy.models import PairingLogic, PairingTable, Sample
 from syzygy.pairing_service import (
@@ -113,7 +119,20 @@ def list_pairings(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
+    """List pairings.
+
+    Layer B entitlement filter (ticket C3): while ``logic_gating_enabled``
+    is set, only pairings whose TUMOR or NORMAL sample belongs to one of
+    the principal's ``allowed_logics`` are listed (OR across the two
+    sides and across the logics; the DMP null-bait rule comes free from
+    the membership helper). A pairing created under logic X is visible
+    to principals of ANY of their logics when either side's sample
+    belongs to one of them — including a pairing created under an
+    unauthorized logic whose samples belong to an authorized family.
+    With the flag off the listing is exactly today's.
+    """
     stmt = select(PairingTable).options(
         joinedload(PairingTable.tumor),
         joinedload(PairingTable.normal),
@@ -145,6 +164,7 @@ def list_pairings(
         )
         if value is not None
     ]
+    tumor_alias = normal_alias = None
     if sample_filters:
         tumor_alias = aliased(Sample)
         normal_alias = aliased(Sample)
@@ -153,6 +173,22 @@ def list_pairings(
         tumor_conds = [getattr(tumor_alias, field) == value for field, value in sample_filters]
         normal_conds = [getattr(normal_alias, field) == value for field, value in sample_filters]
         stmt = stmt.where(or_(and_(*tumor_conds), and_(*normal_conds)))
+    # Layer B entitlement filter (ticket C3) — sample-side membership on
+    # BOTH join sides (see docstring). Reuses the aliases the attribute
+    # filters created when present; otherwise joins its own pair.
+    allowed = gating_allowed_logics(current_user)
+    if allowed is not None:
+        if tumor_alias is None:
+            tumor_alias = aliased(Sample)
+            normal_alias = aliased(Sample)
+            stmt = stmt.join(tumor_alias, PairingTable.tumor_id == tumor_alias.id)
+            stmt = stmt.join(normal_alias, PairingTable.normal_id == normal_alias.id)
+        stmt = stmt.where(
+            or_(
+                allowed_logics_condition(db, allowed, sample=tumor_alias),
+                allowed_logics_condition(db, allowed, sample=normal_alias),
+            )
+        )
     if pairing_logic_id is not None:
         if db.get(PairingLogic, pairing_logic_id) is None:
             raise HTTPException(status_code=404, detail="Pairing logic not found")
@@ -181,6 +217,7 @@ def list_unmatched_dmp_samples(
     limit: Optional[int] = Query(None, ge=1),
     offset: Optional[int] = Query(None, ge=0),
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """DMP samples that have no latest pairing under the given logic.
 
@@ -465,6 +502,7 @@ def pairing_report(
             "/pairing/report-stats/. Default true keeps the 5/8 contract."
         ),
     ),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """One page of the merged Pair Report list for the logic.
 
@@ -566,6 +604,7 @@ def pairing_report(
 def pairing_report_stats(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """The DMP summary counts + 5 QC warning buckets on their own (5/8).
 
@@ -1516,6 +1555,7 @@ def export_pair_report(
     ),
     fmt: str = Query("csv", description="csv or tsv"),
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ):
     """Stream the FULL merged Pair Report list for a logic as CSV/TSV.
 
@@ -1581,6 +1621,7 @@ def trigger_pairing_endpoint(
     payload: PairingTriggerCreate,
     db: Session = Depends(get_db),
     current_user: Optional[dict] = Depends(get_current_user),
+    logic_admin: None = Depends(require_logic_admin),
 ) -> PairingTable:
     tumor = db.get(Sample, payload.tumor_id)
     if tumor is None or tumor.tumor_or_normal != TumorOrNormal.TUMOR.value:
@@ -1755,6 +1796,7 @@ def pairing_import_endpoint(
 def trigger_all_pairings_endpoint(
     pairing_logic_name: Optional[str] = None,
     db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
 ) -> dict:
     """Backfill pairings for every tumor that has no latest pairing yet.
 
@@ -1778,7 +1820,10 @@ def trigger_all_pairings_endpoint(
 
 
 @router.post("/trigger-dmp", response_model=PairingJobTriggerRead)
-def trigger_dmp_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+def trigger_dmp_pairing_endpoint(
+    db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
+) -> dict:
     """Trigger a bulk DMP pairing pass in the background.
 
     The pass runs on a worker thread — it takes hours on staging-scale
@@ -2175,6 +2220,9 @@ def get_harmony_pairings(
         "unknown key is a 400 (rejected even when the frame is empty).",
     ),
     db: Session = Depends(get_db),
+    logic_access: None = Depends(
+        require_logic_access(param=None, logic=HARMONY_LOGIC_NAME)
+    ),
 ):
     """One page of the HARMONY pairing output, normal-oriented.
 
@@ -2269,7 +2317,10 @@ def get_harmony_pairings(
 
 
 @router.post("/trigger-harmony", response_model=PairingJobTriggerRead)
-def trigger_harmony_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
+def trigger_harmony_pairing_endpoint(
+    db: Session = Depends(get_db),
+    logic_admin: None = Depends(require_logic_admin),
+) -> dict:
     """Trigger a bulk HARMONY pairing pass in the background.
 
     Same contract as ``POST /pairing/trigger-dmp`` — job id immediately,
@@ -2312,6 +2363,7 @@ def trigger_harmony_pairing_endpoint(db: Session = Depends(get_db)) -> dict:
 def unmatched_count_endpoint(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ) -> dict:
     """Per-logic unpaired count for the Pairing overview summary strip.
 
@@ -2326,6 +2378,7 @@ def unmatched_count_endpoint(
 def evaluate_pairing_endpoint(
     pairing_logic_name: str,
     db: Session = Depends(get_db),
+    logic_access: None = Depends(require_logic_access()),
 ) -> dict:
     """Dry-run: how many of this logic's unpaired tumors would pair.
 
