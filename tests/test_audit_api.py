@@ -190,6 +190,23 @@ def test_visibility_matrix_no_groups_own_actions_only(client, db):
     assert got == {ev["dave_impact"], ev["dave_nologic"]}
 
 
+def test_dev_admin_without_allowed_row_is_admin(client, db):
+    """The dev-token local admin (auth._dev_user) has no allowed_users
+    row by design — its admin-ness lives in the token claims, so a
+    claim with is_logic_admin must resolve to role=admin and full
+    visibility."""
+    ev = _seed_matrix(db)
+    c, state = client
+    state["user"] = {
+        "sub": "dev-admin",
+        "email": "dev-admin@syzygy.local",
+        "is_logic_admin": True,
+    }
+    me = c.get("/v1/audit/me")
+    assert me.status_code == 200 and me.json()["role"] == "admin"
+    assert _visible_ids(c.get("/v1/audit/")) == set(ev.values())
+
+
 def test_payload_pairing_logic_fallback_counts_for_groups(client, db):
     """A row with NULL column but payload.pairing_logic is visible to
     the group, like a column value (decision 5)."""

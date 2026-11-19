@@ -88,6 +88,10 @@ def _viewer_for(db: Session, current_user) -> _Viewer:
     email = current_user["email"]
     row = db.scalar(select(AllowedUser).where(AllowedUser.email == email))
     if row is None or not row.active:
+        # The dev-token local admin has no allowed_users row by design
+        # (see auth._dev_user) — its admin-ness lives in the token claims.
+        if current_user.get("is_logic_admin"):
+            return _Viewer(email, "admin", ())
         # Unknown/inactive viewer: least privilege — own actions only.
         return _Viewer(email, "user", ())
     role = row.role or "user"
