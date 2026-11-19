@@ -14,12 +14,14 @@ import syzygy.database as database
 import syzygy.pairing_service as pairing_service
 import syzygy.routers.pairings as pairings
 from syzygy.database import Base
-from syzygy.models import BaitSet, PairingLogic, PairingTable, Sample
+from syzygy.models import BaitSet, PairingLogic, PairingTable, PooledMachine, Sample
 from syzygy.pairing_service import (
     _create_pairing,
     _get_latest_pairing,
     count_unpaired,
+    ensure_pooled_machine,
     evaluate_logic,
+    possible_matches,
     resolve_pairing_logic,
     trigger_dmp_pairing,
     trigger_harmony_pairing,
@@ -27,7 +29,8 @@ from syzygy.pairing_service import (
     trigger_pairing_for_normal,
     trigger_pairing_for_unpaired_tumors,
 )
-from syzygy.pairing_strategies import NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
+from syzygy.pairing_strategies import DEFAULT_POOLED_MACHINES, NormalSelection, get_pairing_strategy, register_pairing_strategy, seed_pooled_machines, strategies
+from syzygy.routers.machines import upsert_machine
 from syzygy.routers.pairing_logic import create_pairing_logic, list_pairing_logic
 from syzygy.routers.pairings import (
     evaluate_pairing_endpoint,
@@ -44,6 +47,7 @@ from syzygy.schemas import (
     PairingLogicCreate,
     PairingTriggerCreate,
     PatientRead,
+    PooledMachineUpsert,
     RequestRead,
     SampleCreate,
     TumorOrNormal,
@@ -524,6 +528,7 @@ def _sample(
     gene_panel="PANEL-A",
     bait_set="BAIT-1",
     sequencing_date=None,
+    additional_metadata=None,
 ):
     sample = Sample(
         primary_id=primary_id,
@@ -538,6 +543,7 @@ def _sample(
         preservation=preservation,
         sample_origin=sample_origin,
         sequencing_date=sequencing_date,
+        additional_metadata=additional_metadata,
     )
     db.add(sample)
     db.commit()
@@ -866,8 +872,13 @@ def test_argos_pooled_run_mode_resolved_via_machines(db):
     assert selection2.normal.id == pool_hiseq.id
 
 
-def test_argos_pooled_unknown_machine_blocks(db):
-    """A pool whose machine isn't in pooled_machines can't pair."""
+def test_argos_pooled_unknown_machine_pairs_with_warning(db):
+    """Advisory registry: a pool whose machine isn't in pooled_machines
+    must NOT silently drop the pair. The pair is created when the
+    panel/bait/preservation gates pass, and the selection carries a
+    visible unverified-family warning note (2026-11-18 NovaSeq X
+    cohort incident: the whole cohort sat unpairable while the drop
+    was silent)."""
     seed_pooled_machines(db)
     tumor = _sample(
         db, "TUMOR-POOL-U", tumor_or_normal=TumorOrNormal.TUMOR.value,
@@ -875,11 +886,282 @@ def test_argos_pooled_unknown_machine_blocks(db):
     )
     pooled = _sample(
         db, "NORM-POOL-U", patient__cmo=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="bono",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="zephyr",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
-    assert selection.normal is None
-    assert any("pooled machine not in table" in note for note in selection.notes)
+    assert selection.normal is not None
+    assert selection.normal.id == pooled.id
+    notes = " | ".join(selection.notes)
+    assert "pooled machine 'zephyr' not in pooled_machines - family unverified" in notes
+
+
+def test_argos_pooled_unknown_class_row_pairs_with_warning(db):
+    """A pooled_machines row whose class is not a known novaseq/hiseq
+    family is treated as unverified (advisory): the pair is created and
+    carries the warning note naming the machine."""
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zephyr", machine_class="unknown", machine_type=""))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-POOL-U2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    pooled = _sample(
+        db, "NORM-POOL-U2", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="zephyr",
+    )
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is not None
+    assert selection.normal.id == pooled.id
+    notes = " | ".join(selection.notes)
+    assert "pooled machine 'zephyr' has unknown class in pooled_machines - family unverified" in notes
+
+
+def test_argos_pooled_known_family_preferred_over_unknown(db):
+    """Selection preference inside the pooled tier: a KNOWN same-family
+    machine wins even when an unverified pool is newer; the unverified
+    pool is only picked when no known-family candidate matches."""
+    seed_pooled_machines(db)
+    argos = strategies["argos"]
+    tumor = _sample(
+        db, "TUMOR-POOL-P", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    known = _sample(
+        db, "NORM-POOL-P-KNOWN", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+        sequencing_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    # The unverified pool is the LATEST one, so a naive latest-wins rule
+    # would pick it; the preference rule must still prefer the known
+    # same-family machine.
+    unknown = _sample(
+        db, "NORM-POOL-P-UNK", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="zephyr",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    selection = argos.select_latest_normal(db, tumor)
+    assert selection.normal is not None
+    assert selection.normal.id == known.id
+    assert not any("family unverified" in n for n in selection.notes)
+    # With the known pool gone, the unverified pool pairs (with warning).
+    db.delete(known)
+    db.commit()
+    selection = argos.select_latest_normal(db, tumor)
+    assert selection.normal is not None
+    assert selection.normal.id == unknown.id
+    assert any("family unverified" in n for n in selection.notes)
+
+
+def test_argos_pooled_known_different_family_never_falls_through(db):
+    """A known but DIFFERENT family still rejects with the run_mode
+    mismatch reason and is never reclassified as unverified — but the
+    advisory unverified pool still pairs (with a warning) when no
+    known-family candidate matches."""
+    seed_pooled_machines(db)
+    argos = strategies["argos"]
+    tumor = _sample(
+        db, "TUMOR-POOL-F", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        patient__cmo="PATIENT-POOL-F",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="HiSeq 3000",
+    )
+    different = _sample(
+        db, "NORM-POOL-F-DIFF", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="diana",
+    )
+    unknown = _sample(
+        db, "NORM-POOL-F-UNK", patient__cmo=None, sample_type="Pooled Normal",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="zephyr",
+        sequencing_date=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    # The known-different pool keeps its hard rejection reason.
+    reasons = argos.mismatch_reasons(tumor, different, db)
+    assert any("run_mode mismatch" in r for r in reasons)
+    assert not any("unverified" in r for r in reasons)
+    # Selection: the known-different pool is skipped (not reclassified),
+    # and the advisory unverified pool pairs with its warning note.
+    selection = argos.select_latest_normal(db, tumor)
+    assert selection.normal is not None
+    assert selection.normal.id == unknown.id
+    notes = " | ".join(selection.notes)
+    assert "run_mode mismatch" in notes
+    assert "family unverified" in notes
+
+
+def test_ensure_pooled_machine_creates_unknown_row(db):
+    """Ingesting a Pooled Normal sample on a machine without a registry
+    row auto-inserts one with class 'unknown' and empty machine_type."""
+    sample = _sample(
+        db, "NORM-INGEST-1", patient__cmo=None,
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sample_type="Pooled Normal", run_mode="zephyr",
+    )
+    row = ensure_pooled_machine(db, sample)
+    db.commit()
+    assert row is not None
+    assert row.machine_name == "zephyr"
+    assert row.machine_class == "unknown"
+    assert row.machine_type == ""
+    assert len(db.scalars(select(PooledMachine)).all()) == 1
+
+
+def test_ensure_pooled_machine_idempotent_never_overwrites(db):
+    """Auto-registration is idempotent and never touches an existing
+    row — whether the operator set the real class first or a previous
+    ingest auto-registered it (case-insensitive match)."""
+    seed_pooled_machines(db)  # diana -> novaseq (known class)
+    sample = _sample(
+        db, "NORM-OVERWRITE-1", patient__cmo=None,
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sample_type="Pooled Normal", run_mode="diana",
+    )
+    ensure_pooled_machine(db, sample)
+    db.commit()
+    row = db.scalar(
+        select(PooledMachine).where(func.lower(PooledMachine.machine_name) == "diana")
+    )
+    assert row.machine_class == "novaseq"
+    assert len(db.scalars(select(PooledMachine)).all()) == len(DEFAULT_POOLED_MACHINES)
+    # A different-case ingest of the same machine finds the same row.
+    sample2 = _sample(
+        db, "NORM-OVERWRITE-2", patient__cmo=None,
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sample_type="Pooled Normal", run_mode="DIANA",
+    )
+    ensure_pooled_machine(db, sample2)
+    db.commit()
+    assert len(db.scalars(select(PooledMachine)).all()) == len(DEFAULT_POOLED_MACHINES)
+
+
+def test_ensure_pooled_machine_noop_cases(db):
+    """Only Pooled Normal samples with a machine name auto-register:
+    tumors, patient normals, and run_mode-less pools are no-ops."""
+    tumor = _sample(db, "TUMOR-NOOP", tumor_or_normal=TumorOrNormal.TUMOR.value)
+    assert ensure_pooled_machine(db, tumor) is None
+    plain = _sample(db, "NORM-NOOP", tumor_or_normal=TumorOrNormal.NORMAL.value)
+    assert ensure_pooled_machine(db, plain) is None
+    no_machine = _sample(
+        db, "NORM-NOOP-2", patient__cmo=None,
+        tumor_or_normal=TumorOrNormal.NORMAL.value,
+        sample_type="Pooled Normal", run_mode=None,
+    )
+    assert ensure_pooled_machine(db, no_machine) is None
+    assert len(db.scalars(select(PooledMachine)).all()) == 0
+
+
+def test_create_sample_auto_registers_pooled_machine(db):
+    """Ingesting a Pooled Normal sample via the API auto-creates the
+    'unknown' pooled_machines row for its machine (raw run_mode);
+    re-ingest is idempotent."""
+    payload = SampleCreate(
+        primary_id="NORM-INGEST-A",
+        cmo_sample_name="NORM-INGEST-A name",
+        patient__cmo=None,
+        sample_type="Pooled Normal",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.NORMAL,
+        run_mode="zephyr",
+    )
+    create_sample(payload, db=db)
+    row = db.scalar(
+        select(PooledMachine).where(func.lower(PooledMachine.machine_name) == "zephyr")
+    )
+    assert row is not None
+    assert row.machine_class == "unknown"
+    assert row.machine_type == ""
+    # Re-ingest (another sample on the same machine, different case):
+    # the row is left untouched.
+    payload2 = SampleCreate(
+        primary_id="NORM-INGEST-B",
+        cmo_sample_name="NORM-INGEST-B name",
+        patient__cmo=None,
+        sample_type="Pooled Normal",
+        gene_panel="PANEL-A",
+        bait_set="BAIT-1",
+        tumor_or_normal=TumorOrNormal.NORMAL,
+        run_mode="ZEPHYR",
+    )
+    create_sample(payload2, db=db)
+    assert len(db.scalars(select(PooledMachine)).all()) == 1
+    row = db.scalar(
+        select(PooledMachine).where(func.lower(PooledMachine.machine_name) == "zephyr")
+    )
+    assert row.machine_class == "unknown"
+
+
+def test_pooled_warning_disappears_after_class_update(db):
+    """Full advisory lifecycle: ingest auto-registers the pool machine
+    as unknown (the pair is created with the warning note), and a
+    later class update via the machines router is respected — the
+    pairing no longer carries the warning."""
+    logic = _argos_logic(db)
+    # 1. Ingest the pooled normal via the API: auto-registration.
+    create_sample(
+        SampleCreate(
+            primary_id="NORM-CLS-UPD",
+            cmo_sample_name="NORM-CLS-UPD name",
+            patient__cmo=None,
+            sample_type="Pooled Normal",
+            gene_panel="PANEL-A",
+            bait_set="BAIT-1",
+            tumor_or_normal=TumorOrNormal.NORMAL,
+            run_mode="zephyr",
+        ),
+        db=db,
+    )
+    tumor = _sample(
+        db, "TUMOR-CLS-UPD", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="NovaSeq X",
+    )
+    # 2. The automatic pair is created WITH the warning note.
+    pairing = trigger_pairing(db, tumor, logic, "automatic")
+    assert pairing is not None
+    assert any("family unverified" in n for n in (pairing.notes or []))
+    # 3. A later class update via the machines router.
+    upsert_machine(
+        PooledMachineUpsert(machine_name="zephyr", machine_class="novaseq"),
+        db=db,
+    )
+    # 4. Pairing now respects the known class: no warning note.
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is not None
+    assert not any("family unverified" in n for n in selection.notes)
+
+
+def test_argos_pooled_novaseqx_pool_machines_auto_pair(db):
+    """beagle v2.3.0 "novaseq X change": the NovaSeq X pool machines
+    (fauci2/bono) are registered as the novaseq family, so a frozen
+    HC_IMPACT / IMPACT505_BAITS NovaSeq X tumor auto-pairs through the
+    pooled tier (NovaSeq X collapses into the novaseq family)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-NSX-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X 25B", preservation=["Frozen"],
+    )
+    fauci2_pool = _sample(
+        db, "NORM-POOL-NSX-1", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="fauci2", preservation=["frozen"],
+    )
+    bono_pool = _sample(
+        db, "NORM-POOL-NSX-2", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="bono", preservation=["frozen"],
+    )
+    # Both NovaSeq X pool machines pass the pooled gate: the tumor's
+    # "NovaSeq X 25B" collapses to the novaseq family, and each machine
+    # resolves to novaseq via the pooled_machines table.
+    argos = strategies["argos"]
+    assert argos.mismatch_reasons(tumor, fauci2_pool, db) == []
+    assert argos.mismatch_reasons(tumor, bono_pool, db) == []
+
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id in {fauci2_pool.id, bono_pool.id}
+    assert result.trigger_type == "automatic"
 
 
 def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
@@ -977,6 +1259,175 @@ def test_argos_pooled_sample_types_configurable(db):
     )
     selection = strategy.select_latest_normal(db, tumor)
     assert selection.normal.id == pooled.id
+
+
+# ---------------------------------------------------------------------------
+# ARGOS pooled tier: beagle-exact machine matching via tumor runIds
+# ---------------------------------------------------------------------------
+
+
+def test_argos_pooled_runid_exact_machine_wins(db):
+    """A tumor carrying beagle runIds pairs only with a pool whose machine
+    (raw run_mode) is in the runId machine set — exact prefix match, the
+    same-family pool on another machine is excluded even though it is
+    newer (legacy ``_latest`` behavior would have picked it)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zzmachine", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-RID-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+        additional_metadata={"run_ids": ["zzmachine_A_L001_R1"]},
+    )
+    other_machine_pool = _sample(
+        db, "NORM-RID-1-OTHER", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2025, 4, 28, tzinfo=timezone.utc),
+    )
+    exact_pool = _sample(
+        db, "NORM-RID-1-EXACT", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zzmachine", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    argos = strategies["argos"]
+    assert argos.mismatch_reasons(tumor, exact_pool, db) == []
+    assert argos.mismatch_reasons(tumor, other_machine_pool, db) == [
+        "pooled machine mismatch (tumor machines zzmachine vs pool zztank)"
+    ]
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id == exact_pool.id
+    assert result.trigger_type == "automatic"
+
+
+def test_argos_pooled_runid_no_pool_on_machine_no_fallback(db):
+    """A tumor with runIds whose machine has no pool stays UNPAIRED even
+    when a same-family pool exists (beagle has no cross-machine
+    fallback); the reason is visible via the possible-matches view."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-RID-2", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+        additional_metadata={"run_ids": ["zzmachine_B_L002_R1"]},
+    )
+    same_family_pool = _sample(
+        db, "NORM-RID-2", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    # Sanity: the SAME family pool would pair for a runId-less (legacy)
+    # tumor — the block below is due to the exact-machine gate, not the
+    # family gate.
+    legacy = _sample(
+        db, "TUMOR-RID-2-LEGACY", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+    )
+    assert strategies["argos"].mismatch_reasons(legacy, same_family_pool, db) == []
+    # But the runId-bearing tumor never falls back across machines.
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is None
+    selection = strategies["argos"].select_latest_normal(db, tumor)
+    assert selection.normal is None
+    assert any(
+        "pooled machine mismatch (tumor machines zzmachine vs pool zztank)" in n
+        for n in selection.notes
+    )
+    # The reason is visible via the possible-matches view.
+    pm = possible_matches(db, tumor, logic)
+    entry = next(c for c in pm["other_matches"] if c["sample"].id == same_family_pool.id)
+    assert entry["tier"] == "pooled"
+    assert entry["matched"] is False
+    assert entry["would_be_selected"] is False
+    assert "pooled machine mismatch (tumor machines zzmachine vs pool zztank)" in entry["mismatched_keys"]
+
+
+def test_argos_pooled_runid_multi_machine_earliest_pool_wins(db):
+    """runIds from two machines, both with pools: the EARLIEST pool
+    sequencing_date wins (beagle's cross-machine tie-break — the opposite
+    of ``_latest``)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zzmachine", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    tumor = _sample(
+        db, "TUMOR-RID-3", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X", preservation=["Frozen"], sample_origin=["Frozen"],
+        additional_metadata={"run_ids": ["zzmachine_C_L001_R1", "zztank_D_L002_R2"]},
+    )
+    newer_pool = _sample(
+        db, "NORM-RID-3-NEW", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2025, 4, 28, tzinfo=timezone.utc),
+    )
+    earlier_pool = _sample(
+        db, "NORM-RID-3-OLD", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zzmachine", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id == earlier_pool.id
+
+
+def test_create_sample_carries_run_ids_verbatim(db):
+    """SampleCreate.run_ids is persisted verbatim (deduped, order
+    preserved) into additional_metadata['run_ids'] and the automatic
+    pairing at ingest time uses it (exact-machine pool wins)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    db.add(PooledMachine(machine_name="zzmachine", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.add(PooledMachine(machine_name="zztank", machine_class="novaseq", machine_type="NovaSeq X"))
+    db.commit()
+    other_pool = _sample(
+        db, "NORM-RID-4-OTHER", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zztank", preservation=["frozen"],
+        sequencing_date=datetime(2025, 4, 28, tzinfo=timezone.utc),
+    )
+    exact_pool = _sample(
+        db, "NORM-RID-4-EXACT", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="zzmachine", preservation=["frozen"],
+        sequencing_date=datetime(2023, 9, 14, tzinfo=timezone.utc),
+    )
+    payload = SampleCreate(
+        primary_id="TUMOR-RID-4",
+        cmo_sample_name="TUMOR-RID-4 name",
+        patient__cmo="PATIENT-001",
+        sample_type="tissue",
+        gene_panel="HC_IMPACT",
+        bait_set="IMPACT505_BAITS",
+        tumor_or_normal=TumorOrNormal.TUMOR,
+        run_mode="NovaSeq X",
+        preservation=["Frozen"],
+        sample_origin=["Frozen"],
+        pairing_logic_name=logic.name,
+        run_ids=["zzmachine_E_L001_R1", "zzmachine_E_L002_R2", "zzmachine_E_L001_R1"],
+    )
+    sample = create_sample(payload, db=db)
+    assert sample.additional_metadata["run_ids"] == [
+        "zzmachine_E_L001_R1",
+        "zzmachine_E_L002_R2",
+    ]
+    pairing = db.scalar(select(PairingTable).where(PairingTable.tumor_id == sample.id))
+    assert pairing is not None
+    assert pairing.normal_id == exact_pool.id
+    assert other_pool is not None  # created but must NOT be the match
 
 
 def test_get_pairing_strategy_applies_run_mode_map_config(db):

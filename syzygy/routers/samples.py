@@ -22,6 +22,7 @@ from syzygy.database import get_db, settings
 from syzygy.models import AuditLog, PairingLogic, Sample, utcnow
 from syzygy.pairing_service import (
     MAX_OTHER_MATCHES_LIMIT,
+    ensure_pooled_machine,
     possible_matches,
     resolve_filter_logic,
     resolve_pairing_logic,
@@ -53,11 +54,27 @@ def create_sample(
         settings.default_pairing_logic_name,
     )
 
-    sample_data = payload.model_dump(exclude={"pairing_logic_id", "pairing_logic_name"})
+    sample_data = payload.model_dump(
+        exclude={"pairing_logic_id", "pairing_logic_name", "run_ids"}
+    )
     sample_data["tumor_or_normal"] = payload.tumor_or_normal.value
+    # run_ids has no dedicated column: merge it verbatim into
+    # additional_metadata (de-duplicated, order preserved).
+    if payload.run_ids:
+        additional = dict(sample_data.get("additional_metadata") or {})
+        merged = list(additional.get("run_ids") or [])
+        for rid in payload.run_ids:
+            if rid not in merged:
+                merged.append(rid)
+        additional["run_ids"] = merged
+        sample_data["additional_metadata"] = additional
     sample = Sample(**sample_data)
     db.add(sample)
     db.flush()
+    # Advisory pooled_machines registry: a Pooled Normal whose machine
+    # has no row gets one (class "unknown"), so the pooled tier pairs it
+    # with a warning instead of silently dropping the pair.
+    ensure_pooled_machine(db, sample)
     # AL1: sample.created — ids/names only. The router is the manual
     # create path, so the actor is the authenticated user (decision 4);
     # system-recorded creates (NATS ingest) go through nats_ingest.py.

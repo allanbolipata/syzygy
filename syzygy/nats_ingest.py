@@ -37,7 +37,11 @@ from syzygy.cohort.cohort_crf import write_crf
 from syzygy.cohort.cohort_schema import validate_cohort_request, validate_report
 from syzygy.cohort.cohort_validation import classify_cohort
 from syzygy.dmp_translator import to_dmp_sample_kwargs
-from syzygy.pairing_service import trigger_pairing, trigger_pairing_for_normal
+from syzygy.pairing_service import (
+    ensure_pooled_machine,
+    trigger_pairing,
+    trigger_pairing_for_normal,
+)
 from syzygy.request_metadata import request_exists, update_request_metadata
 
 logger = logging.getLogger(__name__)
@@ -230,10 +234,16 @@ def _upsert_sample(
         for key, value in fields.items():
             setattr(existing, key, value)
         db.flush()
+        # Advisory pooled_machines registry (covers updates that make a
+        # sample a Pooled Normal on a new machine too).
+        ensure_pooled_machine(db, existing)
         return existing, False, []
     sample = Sample(**fields)
     db.add(sample)
     db.flush()
+    # Advisory pooled_machines registry: a Pooled Normal whose machine
+    # has no row gets one (class "unknown").
+    ensure_pooled_machine(db, sample)
     # AL1: one sample.created per registered sample (ids/names only —
     # the message-level nats.ingest event carries the request context).
     audit.record(
@@ -684,6 +694,9 @@ def handle_sample_update(
             }
         logger.info("nats sample-update %s: re-paired (%s)", sample_key, pairing)
 
+    # Advisory pooled_machines registry: the update may have made this
+    # sample a Pooled Normal on a machine without a registry row.
+    ensure_pooled_machine(db_session, sample)
     # AL1: sample.updated — ids/names only (the pairing sub-events are
     # emitted by pairing_service itself, in this same transaction).
     audit.record(
