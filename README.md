@@ -124,6 +124,13 @@ step, Python 3.11+ for the app and the seed/mock scripts.
 
        python scripts/seed_dev_data.py
 
+   If you are reusing an existing `syzygy_db_data` volume after pulling
+   newer code, bring the schema up to date first — `create_all` only
+   builds *new* tables and never ALTERs existing ones, so a stale volume
+   fails the seed with `column ... does not exist`:
+
+       python scripts/alembic_bootstrap.py   # idempotent; stamps + upgrades to head
+
 5. (Optional) Replay the dev NATS fixtures through the real ingest chain
    (NATS → `smile-listener` → `POST /v1/ingest/nats`). Publishes all eight
    payloads in `tests/fixtures/nats/dev/` in a deterministic ingest order
@@ -239,9 +246,9 @@ re-initializes on the next start), and re-seed.
 ### Against an existing Postgres (no local database)
 
 Per the Running section, the app builds the schema on startup
-(`create_all`) and seeds idempotently — **an empty database is fine,
-no migration step is needed on this branch** (alembic lives on a
-separate branch). The connecting role just needs `CREATE` privilege
+(`create_all`) and seeds idempotently — **an empty database is fine**.
+An *existing* database needs the schema brought up to head once:
+`python scripts/alembic_bootstrap.py` (see *Schema migrations*). The connecting role just needs `CREATE` privilege
 on the database. Point `DATABASE_URL` at it:
 
     DATABASE_URL=postgresql+psycopg2://user:pass@db-host:5432/dbname \
@@ -381,7 +388,11 @@ live database), then runs `alembic upgrade head` so the later
 revisions apply only what is missing (on a fully migrated legacy
 database each of them is a guarded no-op, so the database simply lands
 at head); on a fresh database it runs `alembic upgrade head`
-straightaway. Idempotent — a second run changes nothing. The app still
+straightaway. Idempotent — a second run changes nothing. If the
+baseline spot-check refuses with *missing samples.dmp_*_key*, the
+database predates even the legacy migrate scripts — run
+`python scripts/migrate_dmp_generated_columns.py` once, then re-run
+the bootstrap. The app still
 runs `Base.metadata.create_all` at startup (it only builds *new*
 tables; it never ALTERs existing ones) and the startup drift check
 (`syzygy/schema_check.py`) still warns about missing columns.
