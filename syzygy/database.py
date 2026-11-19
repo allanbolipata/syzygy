@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     logic_gating_enabled: bool = False
     logic_claim_name: str = "syzygy_logics"
     logic_admin_claim: str = "syzygy_admin"
+    # Default-open pairing logics (P1, asymmetric policy): a comma list of
+    # EXACT pairing-logic names that every authenticated principal sees
+    # WITHOUT enrollment, on top of the claim-derived set (allowed = open
+    # union claim). The asymmetric policy makes ARGOS/TEMPO/ACCESS open to
+    # everyone; DMP/HARMONY stay gated (claim-only). Empty value = the
+    # uniform fail-closed model (claim-derived only). Only applies while
+    # logic_gating_enabled is True — the flag-off dark launch still returns
+    # the full set + admin and never consults this. Unknown names are
+    # ignored with a warning (same rule as the token claim).
+    gating_open_logics: str = "ARGOS,TEMPO,ACCESS"
 
     # Optional read-only beagle DB (the restored beagle dump — local data,
     # never in production) used ONLY to resolve the DMP pair file's

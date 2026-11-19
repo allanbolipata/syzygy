@@ -264,6 +264,34 @@ def _known_logic_names(db: Session) -> Set[str]:
     return set(db.scalars(select(PairingLogic.name)).all())
 
 
+def _open_logic_set(known: Set[str]) -> Set[str]:
+    """The default-open pairing logics (``GATING_OPEN_LOGICS``), restricted
+    to names the app actually knows.
+
+    A comma-separated setting; blank entries are skipped, so an empty
+    setting (or one of all-unknown names) yields the empty set — restoring
+    the uniform fail-closed model. Names that are not known pairing logics
+    are ignored with a server warning, the same rule applied to the token
+    claim. Only consulted while ``logic_gating_enabled`` is True: with the
+    flag off the caller returns the full set + admin before this is ever
+    called, so the dark launch stays byte-identical to today.
+    """
+    open_set: Set[str] = set()
+    for raw_name in settings.gating_open_logics.split(","):
+        name = raw_name.strip()
+        if not name:
+            continue
+        if name in known:
+            open_set.add(name)
+        else:
+            logger.warning(
+                "auth: ignoring unknown pairing logic %r from "
+                "GATING_OPEN_LOGICS",
+                name,
+            )
+    return open_set
+
+
 def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
     """(allowed_logics, is_logic_admin) for a verified Keycloak token.
 
@@ -271,12 +299,18 @@ def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
     ``logic_admin_claim``) so adapting to the org's Keycloak scheme is a
     .env change, not a code change:
     - gating disabled: the FULL set + admin — behavior is exactly
-      today's and /auth/me needs no flag knowledge;
-    - gating enabled (fail-closed): allowed logics are the configured
-      list claim intersected with the known logic names — an absent
-      claim yields an EMPTY set, and names the app does not know are
-      ignored with a warning. The admin flag is the configured boolean
-      claim.
+      today's and /auth/me needs no flag knowledge. The default-open set
+      is NOT applied here, so the dark launch stays byte-identical to
+      today regardless of ``GATING_OPEN_LOGICS``;
+    - gating enabled (asymmetric, P1): allowed logics are the
+      default-open set (``GATING_OPEN_LOGICS``) UNION the configured list
+      claim intersected with the known logic names. The open set applies
+      to every authenticated principal (no enrollment needed); the claim
+      adds gated logics on top — enrollment adds, never subtracts. An
+      absent claim yields just the open set (empty when the setting is
+      empty, restoring uniform fail-closed). Names the app does not know,
+      in the setting OR the claim, are ignored with a warning. The admin
+      flag is the configured boolean claim, unchanged.
     """
     known = _known_logic_names(db)
     if not settings.logic_gating_enabled:
@@ -288,7 +322,7 @@ def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
         # A non-list (e.g. a bare string) degrades to a single-element
         # list rather than failing open.
         raw = [raw]
-    allowed: Set[str] = set()
+    allowed: Set[str] = _open_logic_set(known)
     for name in raw:
         if name in known:
             allowed.add(name)

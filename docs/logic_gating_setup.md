@@ -17,24 +17,39 @@ pairing-logic access, the app's env flags, and the rollout order.
 ## How the app reads entitlements
 
 While `LOGIC_GATING_ENABLED=true`, the app derives each principal's
-pairing-logic entitlements from their **access token** (ticket C1,
-`syzygy/auth.py`):
+pairing-logic entitlements from **two sources** (tickets C1 + P1;
+`syzygy/auth.py`): a **default-open set** and the **access token**:
 
+- `GATING_OPEN_LOGICS` (default `ARGOS,TEMPO,ACCESS`) — a **comma list of
+  exact pairing-logic names** that are **default-open**: every
+  authenticated principal sees them **without enrollment**, on top of
+  whatever their claim grants. This is the asymmetric policy (decision 1):
+  ARGOS, TEMPO, ACCESS are open to everyone; DMP and HARMONY are the real
+  gate (visible only via enrollment). The open set applies to every
+  authenticated principal; enrollment **adds, never subtracts**. Names the
+  app does not know are ignored with a server warning (the same rule as the
+  claim); an **empty** value disables the open set and restores the uniform
+  fail-closed model (claim-derived only).
 - `LOGIC_CLAIM_NAME` (default `syzygy_logics`) — a **JSON list of logic
   names**, matched **exactly** (case-sensitive) against the names in the
   `pairing_logics` table, e.g. `["ARGOS", "DMP"]`. Names that are not known
   logics are ignored with a server warning. A non-list value is treated as
-  a single name; a missing claim means **no logics**.
+  a single name; a missing claim means **no claimed logics** (the
+  default-open set still applies).
 - `LOGIC_ADMIN_CLAIM` (default `syzygy_admin`) — any **truthy** value makes
   the principal a logic admin (the reference shape is boolean `true`).
+
+The principal's `allowed_logics` is the **union** of the default-open set
+and the valid names in the claim, and `GET /auth/me` returns that union so
+the UI View selector matches server-side truth.
 
 What the flag does:
 
 | State | Behavior |
 |---|---|
-| `LOGIC_GATING_ENABLED=false` (default) | Exactly today's behavior: every allow-listed user gets the full logic set and admin. Claims, if present, are ignored (dark launch). |
-| `true` + claims present | The principal's `allowed_logics` = the valid names in their claim. Listings filter to those logics (Layer B), logic-scoped reads 403 `"Logic not accessible"` (Layer A), and trigger / pairing-logic writes require the admin claim, 403 `"Logic admin required"` (Layer C). |
-| `true` + no / unknown claim | **Fail-closed**: `allowed_logics` is empty — the user sees no logic-scoped data (empty listings, 403s on logic-scoped reads). |
+| `LOGIC_GATING_ENABLED=false` (default) | Exactly today's behavior: every allow-listed user gets the full logic set and admin. Claims and the default-open set are both ignored (dark launch — byte-identical to today). |
+| `true`, principal has a claim | `allowed_logics` = `GATING_OPEN_LOGICS` ∪ the valid names in the claim. Listings filter to that set (Layer B), logic-scoped reads 403 `"Logic not accessible"` (Layer A), and trigger / pairing-logic writes require the admin claim, 403 `"Logic admin required"` (Layer C). |
+| `true`, principal has no claim | `allowed_logics` = the default-open set only (default: ARGOS, TEMPO, ACCESS). With `GATING_OPEN_LOGICS` **empty** this is the uniform **fail-closed** empty set — the user sees no logic-scoped data. |
 
 The dev-token principal (`DEV_AUTH_TOKEN`) always gets the full set +
 admin. The UI reflects the same entitlements from `GET /auth/me`
@@ -48,8 +63,9 @@ are the real gate (ticket C5).
 | `LOGIC_GATING_ENABLED` | `false` | Master switch (dark launch). `false` = today's behavior; no Keycloak changes needed. |
 | `LOGIC_CLAIM_NAME` | `syzygy_logics` | Access-token claim holding the list of logic names. |
 | `LOGIC_ADMIN_CLAIM` | `syzygy_admin` | Access-token claim holding the logic-admin flag. |
+| `GATING_OPEN_LOGICS` | `ARGOS,TEMPO,ACCESS` | Comma list of default-open logics (visible to every authenticated user without enrollment). Empty = uniform fail-closed (claim-only). |
 
-All three are documented in `.env.example` (the `Logic gating` section) and
+All four are documented in `.env.example` (the `Logic gating` section) and
 map 1:1 to `Settings` fields in `syzygy/database.py`.
 
 ## Reference Keycloak layout (dev compose)
@@ -193,14 +209,21 @@ everyone (dark launch), so verify the **raw access token**:
 2. **Verify the claims** in the raw access token (procedure above).
 3. **Flip the flag**: set `LOGIC_GATING_ENABLED=true` in the app's `.env`,
    restart the app.
-4. **UAT three personas** — an ARGOS-only user, a DMP-only user, and a
-   logic admin: listings show only each user's logics; the topbar View
-   selector lists only their logics (pairing tabs hidden when they have
-   none); the DMP-only-groups toggle appears only for DMP-allowed users;
-   the admin can trigger pairing and edit pairing logics while a
-   non-admin gets 403 on both.
+4. **UAT the personas under the asymmetric policy** (P1). With the default
+   `GATING_OPEN_LOGICS=ARGOS,TEMPO,ACCESS`:
+   - a user in **no group** still sees ARGOS, TEMPO, ACCESS (default-open,
+     no enrollment) and nothing else;
+   - a **DMP** group member sees the open set **plus** DMP (enrollment
+     adds, never subtracts); a **HARMONY** group member sees the open set
+     **plus** HARMONY;
+   - the topbar View selector lists exactly `allowed_logics` (open ∪
+     claimed); the DMP-only-groups toggle appears only for DMP-allowed
+     users; the admin can trigger pairing and edit pairing logics while a
+     non-admin gets 403 on both.
+   To run the uniform fail-closed model instead (no default-open set), set
+   `GATING_OPEN_LOGICS=` (empty) in `.env` before flipping the flag.
 5. **Rollback**: set the flag back to `false` and restart — no Keycloak
-   changes needed.
+   changes needed; behavior is byte-identical to today (open set or not).
 
 ## JS-mapper appendix: nested group layouts (Keycloak 26)
 
