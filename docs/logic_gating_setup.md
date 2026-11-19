@@ -105,6 +105,66 @@ non-DMP sample's consent can never be `FALSE`, so the single SQL predicate
   mapper feeding `syzygy_nonconsent`; `scripts/keycloak_gating_setup.py`
   does both (see the handoff one-pager, `docs/keycloak_gating_handoff.md`).
 
+## Bait-set registration (P4): backfill + runbook
+
+**Why.** While `LOGIC_GATING_ENABLED=true`, a sample whose `bait_set` value
+has no row in the `bait_sets` table belongs to no pairing logic and is
+**invisible to everyone** (fail-closed, policy design point 3). The app
+registers names lazily — on ingest/pairing, and via the
+`GET /v1/bait-sets/lookup` route — but data imported or backfilled before a
+name was first seen is never re-scanned, so its bait sets can stay
+unregistered indefinitely. Dev-box example: `IMPACT468` /
+`IMPACT505_BAITS` samples were invisible-to-all although
+`classify_bait_set` already maps them to ARGOS.
+
+**Backfill script.** `scripts/register_bait_sets.py` reads every distinct
+non-NULL `bait_set` value in `samples`, classifies each unregistered value
+with the same `classify_bait_set` rules the app uses, and inserts
+`bait_sets` rows:
+
+```bash
+.venv/bin/python scripts/register_bait_sets.py          # dry run: report only
+.venv/bin/python scripts/register_bait_sets.py --apply  # insert the rows
+```
+
+Dry-run is the default; `--apply` is **idempotent** (already-registered
+names are matched case-insensitively, exactly like the app's lookup, so a
+second `--apply` inserts nothing). Values no rule classifies are
+**reported, NOT inserted** — unknown bait sets stay fail-closed until
+someone registers them deliberately with the manual form below. A
+classifiable name whose `pairing_logics` row is missing is likewise
+skipped and reported.
+
+**Classification rules** (case-insensitive, first match wins — see
+`bait_sets.classify_bait_set`):
+
+| Rule | Logic |
+|---|---|
+| exact match on the explicit seed lists (`TEMPO_BAIT_SETS` / `ACCESS_BAIT_SETS`) | TEMPO / ACCESS |
+| name contains `access` | ACCESS |
+| name contains `hemepact` or `impact` | ARGOS |
+| none of the above | unclassifiable → reported, not inserted |
+
+**Manual registration** (unclassifiable names, or when a name should go to
+a logic the rules don't suggest):
+
+```sql
+INSERT INTO bait_sets (id, bait_set, pairing_logic_id, created_date, modified_date)
+VALUES (gen_random_uuid(), 'MSK-IMPACT468_baits',
+        (SELECT id FROM pairing_logic WHERE name = 'ARGOS'),
+        now(), now());
+```
+
+`bait_set` is unique in the table, but the app matches case-insensitively —
+insert the canonical spelling the LIMS uses so lookups and the backfill
+don't double-register the same name. API alternative:
+`POST /v1/bait-sets` with `{"bait_set": "...", "pairing_logic_name": "ARGOS"}`
+(upsert); `GET /v1/bait-sets` lists the current rows.
+
+**Dev-box acceptance.** After `--apply`, `IMPACT468` / `IMPACT505_BAITS`
+samples are visible to ARGOS (default-open) users; unknown names remain
+invisible until manually registered.
+
 ## Env flags (app)
 
 | Env var | Default | Meaning |
