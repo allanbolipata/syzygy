@@ -71,6 +71,28 @@ def test_upsert_normalizes_case_and_whitespace(db):
     assert row.machine_class == "novaseq"
 
 
+def test_seed_does_not_overwrite_existing_rows(db):
+    """The startup seed must not overwrite existing rows — including
+    auto-registered 'unknown' rows created at ingest — so the two
+    paths (seed + advisory auto-registration) cannot fight."""
+    # Simulate an auto-registered row for a DEFAULT machine with a
+    # class the seed would not set (ingest happened before the
+    # operator set the real class).
+    upsert_machine(
+        PooledMachineUpsert(machine_name="bono", machine_class="unknown"), db=db
+    )
+    seed_pooled_machines(db)
+    rows = list_machines(db=db)
+    assert len(rows) == len(DEFAULT_POOLED_MACHINES)
+    by_name = {r.machine_name: r for r in rows}
+    assert by_name["bono"].machine_class == "unknown"
+    # Seeding again stays idempotent.
+    seed_pooled_machines(db)
+    assert len(list_machines(db=db)) == len(DEFAULT_POOLED_MACHINES)
+    by_name = {r.machine_name: r for r in list_machines(db=db)}
+    assert by_name["bono"].machine_class == "unknown"
+
+
 def test_upsert_requires_fields(db):
     with pytest.raises(HTTPException) as e:
         upsert_machine(PooledMachineUpsert(machine_name="", machine_class="novaseq"), db=db)

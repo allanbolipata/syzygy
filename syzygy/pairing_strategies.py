@@ -391,6 +391,15 @@ class DefaultPairingStrategy:
     def _is_pooled(self, sample: Sample) -> bool:
         return False
 
+    def _pooled_machine_warning(
+        self, db: Optional[Session], sample: Sample
+    ) -> Optional[str]:
+        """Warning note for pairing against an unverified pool machine.
+
+        The default strategy has no pooled tier, so there is nothing to
+        warn about."""
+        return None
+
     @staticmethod
     def _is_dmp(sample: Sample) -> bool:
         # DMP is an argos-strategy concept; other strategies treat
@@ -705,31 +714,118 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
         )
         return row.machine_class if row is not None else ""
 
+    def _pooled_machine_status(
+        self, db: Optional[Session], tumor: Sample, pooled: Sample
+    ) -> tuple:
+        """Machine-family status for a (tumor, pooled normal) pair.
+
+        Returns (status, machine_class), where machine_class is the
+        pooled normal's raw class from the pooled_machines table (""
+        when the machine has no row). status is one of:
+          "match"              known class (novaseq/hiseq) == tumor family
+          "mismatch"           known class different from the tumor family
+          "tumor_unresolvable" known class, but the tumor's run_mode
+                               resolves to no family
+          "unknown"            no pooled_machines row, or a class outside
+                               the known novaseq/hiseq families
+        The registry is ADVISORY: an unverified machine (no row, or a
+        class outside the known families) must not silently drop a pair
+        — the 2026-11-18 NovaSeq X cohort sat unpairable exactly that
+        way. The selection layer records a warning note instead (see
+        _pooled_machine_warning). A known class keeps the full
+        beagle-faithful check.
+        """
+        p_class = self._pooled_machine_class(db, pooled)
+        if p_class in ("novaseq", "hiseq"):
+            t_family = self._tumor_machine_family(tumor.run_mode)
+            if not t_family:
+                return "tumor_unresolvable", p_class
+            return ("match" if t_family == p_class else "mismatch"), p_class
+        return "unknown", p_class
+
     def _pooled_reasons(
         self, db: Optional[Session], tumor: Sample, pooled: Sample
     ) -> List[str]:
         # Pooled run-mode check: the pool's machine name resolves to a
         # class via the pooled_machines table; the tumor's run_mode
-        # resolves to a novaseq/hiseq family. Both must resolve and
-        # agree. The preservation gate still applies too.
+        # resolves to a novaseq/hiseq family. A KNOWN class must agree
+        # (mismatch rejects, as before); an unverified machine — no row,
+        # or a class outside novaseq/hiseq — is advisory and does NOT
+        # reject, so the pair is not silently dropped. The preservation
+        # gate still applies too.
         reasons: List[str] = []
         if _norm_key(tumor.gene_panel) != _norm_key(pooled.gene_panel):
             reasons.append(f"gene_panel mismatch ({tumor.gene_panel} vs {pooled.gene_panel})")
         if _norm_key(tumor.bait_set) != _norm_key(pooled.bait_set):
             reasons.append(f"bait_set mismatch ({tumor.bait_set} vs {pooled.bait_set})")
-        t_family = self._tumor_machine_family(tumor.run_mode)
-        p_class = self._pooled_machine_class(db, pooled)
-        if not t_family:
+        status, p_class = self._pooled_machine_status(db, tumor, pooled)
+        if status == "tumor_unresolvable":
             reasons.append("tumor run_mode unresolvable")
-        elif not p_class:
-            reasons.append(
-                "pooled machine not in table "
-                f"({(pooled.run_mode or '').strip() or 'missing'})"
-            )
-        elif t_family != p_class:
+        elif status == "mismatch":
+            t_family = self._tumor_machine_family(tumor.run_mode)
             reasons.append(f"run_mode mismatch ({t_family} vs {p_class})")
         reasons.extend(self._preservation_reasons(tumor, pooled))
         return reasons
+
+    def _pooled_machine_warning(
+        self, db: Optional[Session], pooled: Sample
+    ) -> Optional[str]:
+        """Visible warning for pairing against an unverified pool
+        machine: None when the machine is registered with a known
+        novaseq/hiseq class, otherwise a note naming the machine so an
+        unverified pool never pairs silently."""
+        name = (pooled.run_mode or "").strip()
+        label = name or "missing"
+        row = None
+        if name and db is not None:
+            row = db.scalar(
+                select(PooledMachine).where(
+                    func.lower(PooledMachine.machine_name) == name.lower()
+                )
+            )
+        if row is None:
+            return f"pooled machine '{label}' not in pooled_machines - family unverified"
+        if row.machine_class not in ("novaseq", "hiseq"):
+            return f"pooled machine '{label}' has unknown class in pooled_machines - family unverified"
+        return None
+
+    def _select_pooled(
+        self, db: Optional[Session], tumor: Sample, candidates: Sequence[Sample]
+    ):
+        """Pooled-tier selection with the advisory machine registry.
+
+        Passing candidates are split: a KNOWN same-family machine is
+        preferred (latest wins within the group), and an unverified
+        machine (no row, or a class outside novaseq/hiseq) is only
+        picked when no known-family candidate passes. A known
+        different-family machine never passes (see _pooled_reasons) —
+        it is a real mismatch, not an unverified one. Returns
+        (picked, notes)."""
+        if not candidates:
+            return None, ["tier=pooled: no candidate normals"]
+        verified: List[Sample] = []
+        unverified: List[Sample] = []
+        failures: Dict[str, int] = {}
+        for candidate in candidates:
+            reasons = self._pooled_reasons(db, tumor, candidate)
+            if reasons:
+                for reason in reasons:
+                    failures[reason] = failures.get(reason, 0) + 1
+            elif self._pooled_machine_status(db, tumor, candidate)[0] == "match":
+                verified.append(candidate)
+            else:
+                unverified.append(candidate)
+        if verified:
+            picked = self._latest(verified)
+        elif unverified:
+            picked = self._latest(unverified)
+        else:
+            picked = None
+        matched = len(verified) + len(unverified)
+        note = f"tier=pooled: {len(candidates)} candidate(s), {matched} matched"
+        if failures:
+            note += "; " + ", ".join(f"{n} skipped ({r})" for r, n in sorted(failures.items()))
+        return picked, [note]
 
     def mismatch_reasons(
         self, tumor: Sample, normal: Sample, db: Optional[Session] = None
@@ -833,13 +929,12 @@ class ArgosPairingStrategy(DefaultPairingStrategy):
             return selection
         notes = list(selection.notes)
         candidates = db.scalars(self._pooled_candidate_stmt(tumor)).all()
-        picked, tier_notes = self._select_in_candidates(
-            tumor,
-            candidates,
-            "pooled",
-            lambda t, c: self._pooled_reasons(db, t, c),
-        )
+        picked, tier_notes = self._select_pooled(db, tumor, candidates)
         notes.extend(tier_notes)
+        if picked is not None:
+            warning = self._pooled_machine_warning(db, picked)
+            if warning:
+                notes.append(warning)
         return NormalSelection(picked, notes)
 
     def candidate_scope(

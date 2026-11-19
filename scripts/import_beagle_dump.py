@@ -74,7 +74,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from syzygy.database import engine
 from syzygy.dmp_translator import to_dmp_sample_kwargs
 from syzygy.models import PairingLogic, Sample
-from syzygy.pairing_service import trigger_pairing, trigger_pairing_for_normal
+from syzygy.pairing_service import (
+    ensure_pooled_machine,
+    trigger_pairing,
+    trigger_pairing_for_normal,
+)
 
 # File group holding the DMP data structure.
 DMP_FILEGROUP = "DMP BAMs"
@@ -333,12 +337,16 @@ def upsert_samples(db: Session, samples: list[dict[str, Any]]) -> tuple[int, int
     for idx, kwargs in enumerate(samples, 1):
         row = db.get(Sample, existing.get(kwargs["primary_id"]))
         if row is None:
-            db.add(Sample(**kwargs))
+            row = Sample(**kwargs)
+            db.add(row)
             created += 1
         else:
             for key, value in kwargs.items():
                 setattr(row, key, value)
             updated += 1
+        # Advisory pooled_machines registry: a Pooled Normal whose
+        # machine has no row gets one (class "unknown").
+        ensure_pooled_machine(db, row)
         if idx % 2000 == 0:
             db.flush()
             print(f"  ...{idx}/{len(samples)} upserted", flush=True)

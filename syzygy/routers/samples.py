@@ -15,6 +15,7 @@ from syzygy.database import get_db, settings
 from syzygy.models import PairingLogic, Sample
 from syzygy.pairing_service import (
     MAX_OTHER_MATCHES_LIMIT,
+    ensure_pooled_machine,
     possible_matches,
     resolve_filter_logic,
     resolve_pairing_logic,
@@ -40,6 +41,10 @@ def create_sample(payload: SampleCreate, db: Session = Depends(get_db)):
     sample_data["tumor_or_normal"] = payload.tumor_or_normal.value
     sample = Sample(**sample_data)
     db.add(sample)
+    # Advisory pooled_machines registry: a Pooled Normal whose machine
+    # has no row gets one (class "unknown"), so the pooled tier pairs it
+    # with a warning instead of silently dropping the pair.
+    ensure_pooled_machine(db, sample)
     db.commit()
     db.refresh(sample)
 

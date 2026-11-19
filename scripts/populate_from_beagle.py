@@ -463,7 +463,10 @@ def main() -> int:
     from syzygy.database import Base, SessionLocal, engine
     from syzygy.dmp_translator import to_dmp_sample_kwargs
     from syzygy.models import PairingLogic, PairingTable, Sample
-    from syzygy.pairing_service import trigger_pairing  # noqa: F811  (rebind global)
+    from syzygy.pairing_service import (  # noqa: F811  (rebind global)
+        ensure_pooled_machine,
+        trigger_pairing,
+    )
 
     want_argos = args.scenario in ("argos", "both", "all")
     want_tempo = args.scenario in ("tempo", "both", "all")
@@ -527,6 +530,9 @@ def main() -> int:
                     print(f"NOTE: {pid} has null required fields: {missing}")
                 s = Sample(**kwargs)
                 db.add(s)
+                # Advisory pooled_machines registry: a Pooled Normal whose
+                # machine has no row gets one (class "unknown").
+                ensure_pooled_machine(db, s)
                 db.commit()
                 db.refresh(s)
                 argos_samples.append(s)

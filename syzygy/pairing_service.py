@@ -12,6 +12,7 @@ from syzygy.models import (
     BaitSet,
     PairingLogic,
     PairingTable,
+    PooledMachine,
     Sample,
     utcnow,
 )
@@ -27,6 +28,45 @@ from syzygy.schemas import TumorOrNormal
 # ``Query``) so the service stays directly callable from tests without a
 # request context.
 BULK_PASS_COMMIT_BATCH_SIZE = 500
+
+
+def ensure_pooled_machine(db: Session, sample: Sample) -> Optional[PooledMachine]:
+    """Advisory pooled_machines registry: auto-register the pool machine
+    of an ingested Pooled Normal sample.
+
+    When a sample with ``sample_type == "Pooled Normal"`` is ingested and
+    its machine name (the raw ``run_mode``) has no pooled_machines row
+    yet, insert one with ``machine_class="unknown"`` and
+    ``machine_type=""`` so the pooled tier can pair it — with a visible
+    warning note — instead of silently dropping the pair (the 2026-11-18
+    NovaSeq X cohort incident). Idempotent: an existing row — an
+    auto-registered "unknown" row, or a real class later set via the
+    machines router — is never touched, and
+    ``pairing_strategies.seed_pooled_machines`` skips existing rows the
+    same way, so the two paths cannot fight. No-op for non-pooled
+    samples and for pooled samples without a run_mode. Does NOT commit:
+    the caller's transaction owns the commit. Returns the row (existing
+    or newly added), or None when the sample is not a Pooled Normal with
+    a machine name.
+    """
+    if sample is None:
+        return None
+    sample_type = str(getattr(sample, "sample_type", None) or "").strip()
+    if sample_type.lower() != "pooled normal":
+        return None
+    name = str(getattr(sample, "run_mode", None) or "").strip()
+    if not name:
+        return None
+    row = db.scalar(
+        select(PooledMachine).where(
+            func.lower(PooledMachine.machine_name) == name.lower()
+        )
+    )
+    if row is None:
+        row = PooledMachine(machine_name=name, machine_class="unknown", machine_type="")
+        db.add(row)
+        db.flush()
+    return row
 
 
 def _ensure_active(logic: PairingLogic) -> None:
@@ -361,6 +401,15 @@ def trigger_pairing(
             return existing
         if existing is not None:
             _mark_stale(existing)
+        # A pinned pooled normal on an unverified machine (no row, or a
+        # class outside novaseq/hiseq) pairs under the advisory registry
+        # and carries the same visible warning note as the automatic
+        # cascade.
+        notes = None
+        if getattr(strategy, "HAS_POOLED_TIER", False) and strategy._is_pooled(normal):
+            warning = strategy._pooled_machine_warning(db, normal)
+            if warning:
+                notes = [warning]
         result = _create_pairing(
             db,
             tumor,
@@ -368,6 +417,7 @@ def trigger_pairing(
             pairing_logic,
             trigger_type=trigger_type,
             mismatched_keys=reasons or None,
+            notes=notes,
             commit=commit,
         )
         # Race guard: a concurrent commit may have won the "latest" slot.
