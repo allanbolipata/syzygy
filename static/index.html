@@ -17,6 +17,9 @@
     <button class="tab" data-tab="pairs">Pair Report</button>
     <button class="tab" data-tab="matches">Matches &amp; Overrides</button>
     <button class="tab" data-tab="try">Try Pairing</button>
+    <!-- Ops (AUDIT_LOG_TICKETS.md decision 8): hidden by default; loadOpsAccess()
+         shows it only when /v1/audit/me reports the admin role or >=1 logic group. -->
+    <button class="tab hidden" data-tab="ops">Ops</button>
   </nav>
   <div class="view-select" title="Session-wide pairing logic — drives Pair Report, Matches &amp; Overrides and Try Pairing; persists across tabs and reloads">
     <label for="view-logic">View</label>
@@ -622,6 +625,144 @@
     <h3>How the selected logic pairs</h3>
     <div id="tq-explain-body"></div>
     <p class="hint">Sourced from <code>pairing_strategies.py</code> &mdash; see that module for the authoritative rules.</p>
+  </section>
+</main>
+
+<!-- Operations (AUDIT_LOG_TICKETS.md decision 8): pair assignment + audit
+     log viewer + redaction controls. The tab and this whole view stay
+     hidden unless the identity has the admin role or >=1 pairing-logic
+     group (loadOpsAccess() reads /v1/audit/me). -->
+<main id="view-ops" class="view hidden">
+  <p id="ops-access-note" class="hint"></p>
+
+  <!-- 8a: pair assignment — the UI transport of scripts/import_tempo_pairs.py -->
+  <section class="panel">
+    <h2>Pair assignment &mdash; TEMPO import</h2>
+    <p class="hint">Paste or upload the TEMPO pair file: one <code>NORMAL_ID&lt;TAB&gt;TUMOR_ID</code> per line &mdash; the same TSV <code>scripts/import_tempo_pairs.py</code> reads. Both paths run the shared import core, so the statuses match the CLI exactly. A dry run resolves and reports without pinning any pairing.</p>
+    <div class="filters">
+      <label>logic
+        <select id="ops-import-logic"></select>
+      </label>
+      <label>trigger type
+        <select id="ops-import-trigger">
+          <option value="override" selected>override</option>
+          <option value="manual">manual</option>
+        </select>
+      </label>
+      <label>id field
+        <select id="ops-import-idfield">
+          <option value="cmo_sample_name" selected>cmo_sample_name</option>
+          <option value="primary_id">primary_id</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="ops-import-dryrun" checked> dry run</label>
+      <label><input type="checkbox" id="ops-import-strict"> strict</label>
+      <label>pair file
+        <input type="file" id="ops-import-file" accept=".tsv,.txt">
+      </label>
+      <button id="ops-import-run">Import</button>
+    </div>
+    <div class="table-head">
+      <textarea id="ops-import-text" rows="6" spellcheck="false" placeholder="NORMAL_ID&#9;TUMOR_ID&#10;N-001&#9;T-001"></textarea>
+    </div>
+    <div id="ops-import-result" class="hidden">
+      <div class="table-head">
+        <span id="ops-import-summary"></span>
+        <button id="ops-import-log">Download pairing log</button>
+      </div>
+      <div class="table-wrap">
+        <table id="ops-import-table">
+          <thead><tr><th>status</th><th>normal</th><th>tumor</th><th>detail</th><th>pairing</th></tr></thead>
+          <tbody id="ops-import-rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8b: audit log viewer — GET /v1/audit, visibility applied server-side -->
+  <section class="panel">
+    <h2>Audit log</h2>
+    <p class="hint">Append-only log of user actions and system events, scoped to what you may see (your logic groups + your own actions; admins see everything). Filters are applied by the server, exactly as named below.</p>
+    <div class="filters">
+      <label>from
+        <input type="datetime-local" id="ops-audit-from">
+      </label>
+      <label>to
+        <input type="datetime-local" id="ops-audit-to">
+      </label>
+      <label>actor
+        <input id="ops-audit-actor" placeholder="email or system">
+      </label>
+      <label>action
+        <input id="ops-audit-action" list="ops-audit-actions" placeholder="e.g. pairing.created">
+        <datalist id="ops-audit-actions">
+          <option value="pairing.created"></option>
+          <option value="pairing.retired"></option>
+          <option value="sample.created"></option>
+          <option value="sample.updated"></option>
+          <option value="sample.redacted"></option>
+          <option value="sample.unredacted"></option>
+          <option value="nats.ingest"></option>
+          <option value="cohort.published"></option>
+          <option value="logic.created"></option>
+          <option value="logic.updated"></option>
+          <option value="machine.created"></option>
+          <option value="bait_set.assigned"></option>
+          <option value="pair_assignment.imported"></option>
+          <option value="audit.reversed"></option>
+        </datalist>
+      </label>
+      <label>logic
+        <select id="ops-audit-logic"><option value="">any</option></select>
+      </label>
+      <label>per page
+        <select id="ops-audit-limit">
+          <option>50</option>
+          <option selected>100</option>
+          <option>250</option>
+          <option>500</option>
+        </select>
+      </label>
+      <button id="ops-audit-apply">Apply</button>
+      <button id="ops-audit-clear">Clear</button>
+      <button id="ops-audit-export">Export CSV</button>
+    </div>
+    <div class="table-head">
+      <span id="ops-audit-count" class="hint"></span>
+      <span>
+        <button id="ops-audit-prev">Prev</button>
+        <button id="ops-audit-next">Next</button>
+      </span>
+    </div>
+    <div class="table-wrap">
+      <table id="ops-audit-table">
+        <thead><tr><th>time</th><th>actor</th><th>action</th><th>entity</th><th>logic</th><th></th></tr></thead>
+        <tbody id="ops-audit-rows"></tbody>
+      </table>
+    </div>
+    <p id="ops-audit-empty" class="empty">No audit events match.</p>
+  </section>
+
+  <!-- 8c: redaction controls — the R-feature redact/unredact endpoints -->
+  <section class="panel">
+    <h2>Redaction</h2>
+    <p class="hint">Search samples and redact / un-redact them. A redacted sample is excluded from all pairing until un-redacted; the redaction audit fields (by / when / why) stay on the sample.</p>
+    <div class="filters">
+      <label>search
+        <input id="ops-redact-q" placeholder="primary_id or sample name">
+      </label>
+      <label>reason
+        <input id="ops-redact-reason" placeholder="why (stored on the sample)">
+      </label>
+      <button id="ops-redact-search">Search</button>
+    </div>
+    <div class="table-wrap">
+      <table id="ops-redact-table">
+        <thead><tr><th>id</th><th>sample name</th><th>type</th><th></th></tr></thead>
+        <tbody id="ops-redact-rows"></tbody>
+      </table>
+    </div>
+    <p id="ops-redact-empty" class="empty hidden">No samples match.</p>
   </section>
 </main>
 

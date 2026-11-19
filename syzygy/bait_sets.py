@@ -8,6 +8,7 @@ from typing import Iterable, Optional
 from sqlalchemy import and_, false, func, or_, select
 from sqlalchemy.orm import Session
 
+from syzygy import audit
 from syzygy.models import (
     DMP_LOGIC_NAME,
     HARMONY_LOGIC_NAME,
@@ -66,6 +67,17 @@ def seed_bait_sets(db: Session) -> None:
         logic = db.scalar(select(PairingLogic).where(PairingLogic.name == logic_name))
         if logic is not None:
             db.add(BaitSet(bait_set=name, pairing_logic_id=logic.id))
+            # AL1: bait_set.assigned (bootstrap seed — system actor;
+            # ids/names only).
+            audit.record(
+                db,
+                audit.SYSTEM_ACTOR,
+                "bait_set.assigned",
+                entity_type="bait_set",
+                entity_id=name,
+                pairing_logic=logic.name,
+                payload={"bait_set": name, "pairing_logic": logic.name},
+            )
     db.commit()
 
 
@@ -84,6 +96,17 @@ def resolve_bait_set_logic(db: Session, name: Optional[str]) -> Optional[Pairing
     if logic is None:
         return None
     db.add(BaitSet(bait_set=name.strip(), pairing_logic_id=logic.id))
+    # AL1: bait_set.assigned (lazy registration on first sight — system
+    # actor; ids/names only).
+    audit.record(
+        db,
+        audit.SYSTEM_ACTOR,
+        "bait_set.assigned",
+        entity_type="bait_set",
+        entity_id=name.strip(),
+        pairing_logic=logic.name,
+        payload={"bait_set": name.strip(), "pairing_logic": logic.name},
+    )
     db.commit()
     return logic
 

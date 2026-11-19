@@ -29,6 +29,12 @@ The file's NORMAL_ID/TUMOR_ID columns are cmoSampleNames; the API's
 normal_id/tumor_id fields are sample UUIDs — this script is the mapping
 layer between the two.
 
+The parsing, resolution, candidate-normal summary and the per-row loop
+live in ``syzygy/pairing_import.py`` (ticket AL3): the same code serves
+``POST /v1/pairing/import`` in the app, so the CLI and the API cannot
+diverge. This script keeps its CLI UX (flags, stdout/stderr layout,
+exit codes) unchanged.
+
 Usage (needs the app running and an API token):
 
     export SYZYGY_API_TOKEN=***        # dev: DEV_AUTH_TOKEN from .env
@@ -60,11 +66,20 @@ from typing import Optional
 
 import httpx
 
-EXPECTED_HEADER = ("NORMAL_ID", "TUMOR_ID")
-EXTENDED_HEADER = EXPECTED_HEADER + ("NORMAL_PRIMARY_ID", "TUMOR_PRIMARY_ID")
+# The script may be run as `python scripts/import_tempo_pairs.py`, where
+# sys.path[0] is scripts/ — make the repo root importable so the shared
+# import core resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
+from syzygy import pairing_import as _shared
+
+#: Re-exported for importers/tests; the shared core is the source of truth.
+EXPECTED_HEADER = _shared.EXPECTED_HEADER
+EXTENDED_HEADER = _shared.EXTENDED_HEADER
 #: Where the pairing log columns live; keep in sync with --log help.
-LOG_HEADER = ("status", "NORMAL_ID", "TUMOR_ID", "detail")
+LOG_HEADER = _shared.LOG_HEADER
 
 
 def parse_pairs_file(path: str) -> list[tuple]:
@@ -78,35 +93,9 @@ def parse_pairs_file(path: str) -> list[tuple]:
     contains empty cells is a hard error (fail fast, don't guess). Rows
     from a historical 2-column file carry ``None`` in the primary slots.
     """
-    rows: list[tuple] = []
     with open(path, newline="") as fh:
-        lines = [ln.rstrip("\r\n") for ln in fh]
-
-    content = [ln for ln in lines if ln.strip()]
-    if not content:
-        raise ValueError(f"{path}: file is empty")
-
-    header = [cell.strip().upper() for cell in content[0].split("\t")]
-    if tuple(header) == EXPECTED_HEADER:
-        width = 2
-    elif tuple(header) == EXTENDED_HEADER:
-        width = 4
-    else:
-        raise ValueError(
-            f"{path}: expected header 'NORMAL_ID<TAB>TUMOR_ID"
-            f"[<TAB>NORMAL_PRIMARY_ID<TAB>TUMOR_PRIMARY_ID]', "
-            f"got {content[0]!r}"
-        )
-
-    for lineno, line in enumerate(content[1:], start=2):
-        cells = [cell.strip() for cell in line.split("\t")]
-        if len(cells) != width or not all(cells):
-            raise ValueError(
-                f"{path}: line {lineno}: expected {width} tab-separated "
-                f"non-empty fields, got {line!r}"
-            )
-        rows.append(tuple(cells) + (None,) * (4 - width))
-    return rows
+        text = fh.read()
+    return _shared.parse_pairs_text(text, source=path)
 
 
 def resolve_sample(
@@ -127,36 +116,13 @@ def resolve_sample(
     Raises ValueError when the id matches zero or more than one sample of
     that side.
     """
-    key = (id_field, cmo_sample_name, tumor_or_normal)
-    if key in cache:
-        return cache[key]
-
-    resp = client.get(
-        f"{base}/v1/sample/",
-        params={
-            id_field: cmo_sample_name,
-            "tumor_or_normal": tumor_or_normal,
-        },
+    return _shared.resolve_sample(
+        _shared.HttpxTransport(client, base),
+        cmo_sample_name,
+        tumor_or_normal,
+        cache,
+        id_field,
     )
-    resp.raise_for_status()
-    exact = [
-        s for s in resp.json()
-        if s[id_field] == cmo_sample_name
-        and s["tumor_or_normal"] == tumor_or_normal
-    ]
-    if not exact:
-        raise ValueError(
-            f"no {tumor_or_normal.lower()} sample with {id_field} "
-            f"{cmo_sample_name!r}"
-        )
-    if len(exact) > 1:
-        ids = ", ".join(s["id"] for s in exact)
-        raise ValueError(
-            f"{id_field} {cmo_sample_name!r} matches {len(exact)} "
-            f"{tumor_or_normal.lower()} samples ({ids}); ambiguous"
-        )
-    cache[key] = exact[0]["id"]
-    return cache[key]
 
 
 def candidate_normal_summary(
@@ -172,25 +138,9 @@ def candidate_normal_summary(
     a curated pair from the pairing file is pinned regardless; callers
     must not let a failure here block the import.
     """
-    resp = client.get(
-        f"{base}/v1/sample/{tumor_id}/possible-matches",
-        params={"pairing_logic_name": logic},
+    return _shared.candidate_normal_summary(
+        _shared.HttpxTransport(client, base), tumor_id, logic
     )
-    resp.raise_for_status()
-    data = resp.json()
-    names: list[str] = []
-    cascade_pick: Optional[str] = None
-    count = int(data.get("other_matches_matched", 0))
-    current = data.get("current_match") or {}
-    if current and not current.get("mismatched_keys"):
-        count += 1
-        names.append(current["sample"]["cmo_sample_name"])
-    for cand in data.get("other_matches", []):
-        if cand.get("matched"):
-            names.append(cand["sample"]["cmo_sample_name"])
-            if cand.get("would_be_selected"):
-                cascade_pick = cand["sample"]["cmo_sample_name"]
-    return count, names, cascade_pick
 
 
 def extract_beagle_run_mode_rules(path: str) -> dict[str, str]:
@@ -250,11 +200,6 @@ def check_run_mode_alignment(beagle_root: str) -> tuple[bool, list[str]]:
     (case-insensitively — syzygy buckets are lower-cased). Returns
     ``(ok, report_lines)``.
     """
-    # The script may be run as `python scripts/import_tempo_pairs.py`,
-    # where sys.path[0] is scripts/ — make the repo root importable.
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
     from syzygy.pairing_strategies import TEMPO_RUN_MODE_MAP
 
     pattern = os.path.join(beagle_root, "runner", "operator", "*", "bin", "tempo_sample.py")
@@ -402,127 +347,35 @@ def main(argv: Optional[list[str]] = None) -> int:
         seen_tumors[tumor_name] = normal_name
 
     headers = {"Authorization": f"Bearer {args.token}"} if args.token else {}
-    cache: dict[tuple[str, str, str], str] = {}
-    pinned = 0
-    mismatched = 0
-    multi = 0
-    failed = 0
-    log_rows: list[tuple[str, str, str, str]] = []
-
+    # The shared core runs the row loop; HttpxTransport is the transport
+    # (the same GET /v1/sample/, possible-matches and POST trigger calls
+    # the CLI always made).
     with httpx.Client(headers=headers, timeout=30.0) as client:
-        for normal_name, tumor_name, normal_primary, tumor_primary in rows:
-            label = f"{normal_name} -> {tumor_name}"
-            try:
-                # primary_id columns from the extended file win: they are
-                # the stable registry ids; cmoSampleName is the fallback
-                if normal_primary is not None:
-                    normal_id = resolve_sample(
-                        client, base, normal_primary, "NORMAL", cache,
-                        "primary_id")
-                else:
-                    normal_id = resolve_sample(
-                        client, base, normal_name, "NORMAL", cache,
-                        args.id_field)
-                if tumor_primary is not None:
-                    tumor_id = resolve_sample(
-                        client, base, tumor_primary, "TUMOR", cache,
-                        "primary_id")
-                else:
-                    tumor_id = resolve_sample(
-                        client, base, tumor_name, "TUMOR", cache,
-                        args.id_field)
-            except httpx.HTTPError as exc:
-                print(f"FAIL  {label}: API error: {exc}", file=sys.stderr)
-                log_rows.append(("FAIL", normal_name, tumor_name, f"API error: {exc}"))
-                failed += 1
-                continue
-            except ValueError as exc:
-                print(f"FAIL  {label}: {exc}", file=sys.stderr)
-                log_rows.append(("FAIL", normal_name, tumor_name, str(exc)))
-                failed += 1
-                continue
+        result = _shared.run_import(
+            rows,
+            _shared.HttpxTransport(client, base),
+            logic=args.logic,
+            trigger_type=args.trigger_type,
+            strict=args.strict,
+            dry_run=args.dry_run,
+            id_field=args.id_field,
+        )
 
-            multi_note = None
-            try:
-                n_matched, names, pick = candidate_normal_summary(
-                    client, base, tumor_id, args.logic)
-                if n_matched > 1:
-                    if len(names) < n_matched:
-                        shown = f"{', '.join(names)} (+{n_matched - len(names)} more)"
-                    else:
-                        shown = ", ".join(names)
-                    extra = f"; cascade would pick {pick}" if pick else ""
-                    multi_note = (f"tumor has {n_matched} matching candidate "
-                                  f"normals ({shown}{extra}); pinning curated "
-                                  f"{normal_name}")
-                    print(f"MULTI {label}: {multi_note}")
-                    multi += 1
-            except httpx.HTTPError:
-                pass  # informational only — never block the curated pin
-
-            if args.dry_run:
-                note = f" — {multi_note}" if multi_note else ""
-                print(f"OK    {label}: resolves (dry run){note}")
-                if multi_note:
-                    log_rows.append(("MULTI", normal_name, tumor_name, multi_note))
-                pinned += 1
-                continue
-
-            resp = client.post(
-                f"{base}/v1/pairing/trigger",
-                json={
-                    "tumor_id": tumor_id,
-                    "normal_id": normal_id,
-                    "pairing_logic_name": args.logic,
-                    "trigger_type": args.trigger_type,
-                    "strict": args.strict,
-                },
-            )
-            if resp.status_code >= 400:
-                detail = resp.text[:300]
-                print(f"FAIL  {label}: HTTP {resp.status_code}: {detail}",
-                      file=sys.stderr)
-                log_rows.append(("FAIL", normal_name, tumor_name,
-                                 f"HTTP {resp.status_code}: {detail}"))
-                failed += 1
-                continue
-            pairing = resp.json()
-            keys = pairing.get("mismatched_keys")
-            if keys:
-                mismatched += 1
-                detail = "; ".join(keys)
-                if multi_note:
-                    detail = f"{detail} | {multi_note}"
-                print(f"WARN  {label}: paired under {pairing['pairing_logic']} "
-                      f"with mismatched keys: {detail}")
-                log_rows.append(("MISMATCH", normal_name, tumor_name, detail))
-            elif multi_note:
-                print(f"OK    {label}: paired under {pairing['pairing_logic']} "
-                      f"— {multi_note}")
-                log_rows.append(("MULTI", normal_name, tumor_name, multi_note))
-                pinned += 1
-            else:
-                pinned += 1
-                print(f"OK    {label}: paired under {pairing['pairing_logic']}")
+    for row in result.rows:
+        if row.multi_line:
+            print(row.multi_line)
+        if row.to_stderr:
+            print(row.line, file=sys.stderr)
+        else:
+            print(row.line)
 
     if args.log:
-        def _flat(text: str) -> str:
-            # keep the log strictly one row per line, tab-delimited
-            return " ".join(text.split())
         with open(args.log, "w", newline="") as fh:
-            fh.write("\t".join(LOG_HEADER) + "\n")
-            for status, n, t, detail in log_rows:
-                fh.write("\t".join((status, n, t, _flat(detail))) + "\n")
-        print(f"pairing log: {args.log} ({len(log_rows)} row(s))")
+            fh.write(result.log_tsv())
+        print(f"pairing log: {args.log} ({len(result.log_rows)} row(s))")
 
-    total = len(rows)
-    print(
-        f"\n{args.logic}: {pinned} pinned, {mismatched} pinned-with-mismatch, "
-        f"{multi} with multiple candidate normals, {failed} failed "
-        f"(of {total} rows)"
-        + (" [dry run]" if args.dry_run else "")
-    )
-    return 1 if failed else 0
+    print(result.summary_line(args.logic, args.dry_run))
+    return 1 if result.failed else 0
 
 
 if __name__ == "__main__":

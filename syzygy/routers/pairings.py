@@ -35,6 +35,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, aliased, joinedload
 
+from syzygy import audit, pairing_import
 from syzygy.auth import (
     consent_gate_active,
     get_current_user,
@@ -60,6 +61,7 @@ from syzygy.pairing_service import (
     trigger_pairing_for_unpaired_tumors,
 )
 from syzygy.pairing_strategies import get_pairing_strategy, strategies
+from syzygy.routers.audit import _viewer_for
 from syzygy.schemas import (
     DmpReportStatsRead,
     DmpSummaryRead,
@@ -67,6 +69,8 @@ from syzygy.schemas import (
     EvaluateRead,
     HarmonyFrameRead,
     HarmonyRow,
+    PairingImportCreate,
+    PairingImportRead,
     PairingJobStatusRead,
     PairingJobTriggerRead,
     PairingRead,
@@ -1706,6 +1710,7 @@ def export_pair_report(
 def trigger_pairing_endpoint(
     payload: PairingTriggerCreate,
     db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
     logic_admin: None = Depends(require_logic_admin),
 ) -> PairingTable:
     tumor = db.get(Sample, payload.tumor_id)
@@ -1740,6 +1745,7 @@ def trigger_pairing_endpoint(
         payload.trigger_type,
         payload.normal_id,
         strict=payload.strict,
+        actor=current_user,
     )
     if pairing is None:
         detail = "No valid pairing could be created"
@@ -1751,6 +1757,129 @@ def trigger_pairing_endpoint(
         raise HTTPException(status_code=404, detail=detail)
     _invalidate_dmp_report_stats(db)
     return pairing
+
+
+@router.post("/import", response_model=PairingImportRead)
+def pairing_import_endpoint(
+    payload: PairingImportCreate,
+    db: Session = Depends(get_db),
+    current_user: Optional[dict] = Depends(get_current_user),
+) -> dict:
+    """Bulk TEMPO pair assignment (ticket AL3, decision 8a).
+
+    Server-side counterpart of ``scripts/import_tempo_pairs.py``: the
+    same TSV, the same flags, the same per-row statuses and the same
+    pairing log — both paths run the shared core
+    (``syzygy/pairing_import.run_import``), so the UI import and the
+    CLI import cannot drift.
+
+    Access (decision 8): the Ops section is for admin-type accounts and
+    users with logic groups, so this endpoint requires the admin role
+    or membership in the import logic's group.
+
+    Audit (decision 3): one ``pair_assignment.imported`` event per
+    file; every pairing created also carries its own
+    ``pairing.created`` event via the pairing-service hook (actor =
+    the caller).
+    """
+    try:
+        rows = pairing_import.parse_pairs_text(payload.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not rows:
+        raise HTTPException(status_code=400, detail="no data rows below the header")
+
+    logic_name = payload.logic or settings.default_pairing_logic_name
+    if not logic_name:
+        raise HTTPException(
+            status_code=400,
+            detail="no pairing logic requested and no default configured",
+        )
+    logic = find_logic_by_name(db, logic_name)
+    if logic is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"pairing logic {logic_name!r} not found",
+        )
+
+    viewer = _viewer_for(db, current_user)
+    if viewer.role != "admin" and logic.name not in viewer.groups:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"importing under pairing logic {logic.name!r} requires the "
+                "admin role or membership in its logic group"
+            ),
+        )
+
+    result = pairing_import.run_import(
+        rows,
+        pairing_import.DbTransport(db, logic, actor=current_user),
+        logic=logic.name,
+        trigger_type=payload.trigger_type,
+        strict=payload.strict,
+        dry_run=payload.dry_run,
+        id_field=payload.id_field,
+    )
+
+    import_id = str(uuid4())
+    # Decision 3: one summary event per file — ids and names only.
+    audit.record(
+        db,
+        current_user,
+        "pair_assignment.imported",
+        entity_type="pairing_import",
+        entity_id=import_id,
+        pairing_logic=logic.name,
+        payload={
+            "pairing_logic": logic.name,
+            "trigger_type": payload.trigger_type,
+            "strict": payload.strict,
+            "dry_run": payload.dry_run,
+            "total": result.total,
+            "pinned": result.pinned,
+            "mismatched": result.mismatched,
+            "multi": result.multi,
+            "failed": result.failed,
+            "rows": [
+                {
+                    "status": r.status,
+                    "normal_name": r.normal_name,
+                    "tumor_name": r.tumor_name,
+                    "pairing_id": r.pairing_id,
+                }
+                for r in result.rows
+            ],
+        },
+    )
+    db.commit()
+
+    if result.pinned:
+        _invalidate_dmp_report_stats(db)
+
+    return {
+        "id": import_id,
+        "logic": logic.name,
+        "trigger_type": payload.trigger_type,
+        "strict": payload.strict,
+        "dry_run": payload.dry_run,
+        "total": result.total,
+        "pinned": result.pinned,
+        "mismatched": result.mismatched,
+        "multi": result.multi,
+        "failed": result.failed,
+        "rows": [
+            {
+                "status": r.status,
+                "normal_name": r.normal_name,
+                "tumor_name": r.tumor_name,
+                "detail": r.detail,
+                "pairing_id": r.pairing_id,
+            }
+            for r in result.rows
+        ],
+        "log_tsv": result.log_tsv(),
+    }
 
 
 @router.post("/trigger-all", response_model=TriggerAllRead)

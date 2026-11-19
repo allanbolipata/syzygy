@@ -45,11 +45,14 @@ def test_upsert_creates_then_updates(db):
     row = upsert_machine(
         PooledMachineUpsert(machine_name="bono", machine_class="hiseq", machine_type="HiSeq 3000"),
         db=db,
+        current_user=None,
     )
     assert row.machine_name == "bono"
     assert row.machine_class == "hiseq"
     again = upsert_machine(
-        PooledMachineUpsert(machine_name="bono", machine_class="novaseq"), db=db
+        PooledMachineUpsert(machine_name="bono", machine_class="novaseq"),
+        db=db,
+        current_user=None,
     )
     assert again.id == row.id
     assert again.machine_class == "novaseq"
@@ -59,7 +62,9 @@ def test_upsert_creates_then_updates(db):
 
 def test_upsert_normalizes_case_and_whitespace(db):
     row = upsert_machine(
-        PooledMachineUpsert(machine_name="  DIANA ", machine_class="NoVaSeq"), db=db
+        PooledMachineUpsert(machine_name="  DIANA ", machine_class="NoVaSeq"),
+        db=db,
+        current_user=None,
     )
     assert row.machine_name == "diana"
     assert row.machine_class == "novaseq"
@@ -67,5 +72,5 @@ def test_upsert_normalizes_case_and_whitespace(db):
 
 def test_upsert_requires_fields(db):
     with pytest.raises(HTTPException) as e:
-        upsert_machine(PooledMachineUpsert(machine_name="", machine_class="novaseq"), db=db)
+        upsert_machine(PooledMachineUpsert(machine_name="", machine_class="novaseq"), db=db, current_user=None)
     assert e.value.status_code == 400

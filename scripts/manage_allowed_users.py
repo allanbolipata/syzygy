@@ -17,10 +17,18 @@ remove --email EMAIL
 enable --email EMAIL
     Set active=True.
 list
-    Print the allow-list as a table: email, display_name, active.
+    Print the allow-list as a table: email, display_name, active,
+    role, logic_groups.
+set-role --email EMAIL --role {user,admin}
+    Set the audit-log visibility role (AUDIT_LOG_TICKETS.md, ticket
+    AL2, decision 5): admin sees every audit event, user sees the
+    events of their logic groups plus their own actions.
+set-groups --email EMAIL --groups A,B,C
+    Set the audit-visibility logic groups (comma-separated
+    pairing-logic names; an empty --groups value clears them).
 
-remove/enable on an unknown email print an error to stderr and exit
-non-zero. The database is selected by DATABASE_URL (env var or .env)
+remove/enable/set-role/set-groups on an unknown email print an error
+to stderr and exit non-zero. The database is selected by DATABASE_URL (env var or .env)
 via the settings in syzygy/database.py -- no connection string is hardcoded
 here.
 
@@ -110,10 +118,79 @@ def cmd_list(db) -> list:
     return list(db.scalars(select(AllowedUser).order_by(AllowedUser.email)).all())
 
 
+#: Audit-visibility roles (AUDIT_LOG_TICKETS.md, decision 5).
+ROLES = ("user", "admin")
+
+
+def _set_groups_value(groups: list[str]) -> list[str]:
+    """Normalize a group list: strip, drop empties, dedupe (order kept)."""
+    seen = set()
+    out = []
+    for g in groups:
+        g = g.strip()
+        if g and g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
+
+
+def cmd_set_role(db, email: str, role: str) -> str | None:
+    """Set the audit-visibility role (AL2, decision 5).
+
+    Returns a description of the action taken, or None if the email
+    is unknown. ``role`` must be one of :data:`ROLES` (the CLI
+    enforces this via argparse ``choices``).
+    """
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {ROLES}, got {role!r}")
+    user = _get_user(db, email)
+    if user is None:
+        return None
+    current = user.role or "user"
+    if current == role:
+        return f"no change for {email} (already role={role})"
+    user.role = role
+    db.commit()
+    return f"updated {email}: role={role}"
+
+
+def cmd_set_groups(db, email: str, groups: list[str]) -> str | None:
+    """Set the audit-visibility logic groups (AL2, decision 5).
+
+    ``groups`` is a list of pairing-logic names; the stored value is
+    normalized (stripped, deduped). An empty result clears the
+    groups — the user then sees only their own audit actions. Returns
+    a description of the action taken, or None if the email is
+    unknown.
+    """
+    user = _get_user(db, email)
+    if user is None:
+        return None
+    target = _set_groups_value(groups)
+    current = list(user.logic_groups or ())
+    if current == target:
+        shown = ",".join(target) if target else "none"
+        return f"no change for {email} (logic_groups={shown})"
+    user.logic_groups = target
+    db.commit()
+    shown = ",".join(target) if target else "none"
+    return f"updated {email}: logic_groups={shown}"
+
+
 def format_table(users) -> str:
-    """Render allow-list rows as an aligned email/display_name/active table."""
-    rows = [(u.email, u.display_name or "", str(u.active)) for u in users]
-    headers = ("email", "display_name", "active")
+    """Render allow-list rows as an aligned
+    email/display_name/active/role/logic_groups table."""
+    rows = [
+        (
+            u.email,
+            u.display_name or "",
+            str(u.active),
+            u.role or "user",
+            ",".join(u.logic_groups or ()),
+        )
+        for u in users
+    ]
+    headers = ("email", "display_name", "active", "role", "logic_groups")
     widths = [
         max([len(h)] + [len(r[i]) for r in rows])
         for i, h in enumerate(headers)
@@ -143,7 +220,20 @@ def main(argv: list[str] | None = None) -> int:
     p_enable = sub.add_parser("enable", help="set active=True")
     p_enable.add_argument("--email", required=True, help="user email address")
 
-    sub.add_parser("list", help="print the allow-list: email, display_name, active")
+    p_set_role = sub.add_parser(
+        "set-role", help="set the audit-visibility role (user|admin)")
+    p_set_role.add_argument("--email", required=True, help="user email address")
+    p_set_role.add_argument("--role", required=True, choices=list(ROLES),
+                            help="audit-log visibility role")
+
+    p_set_groups = sub.add_parser(
+        "set-groups", help="set the audit-visibility logic groups "
+                           "(comma-separated pairing-logic names)")
+    p_set_groups.add_argument("--email", required=True, help="user email address")
+    p_set_groups.add_argument("--groups", required=True,
+                              help="comma-separated logic names; empty value clears")
+
+    sub.add_parser("list", help="print the allow-list: email, display_name, active, role, logic_groups")
 
     args = ap.parse_args(argv)
 
@@ -163,6 +253,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in ("remove", "enable"):
             fn = cmd_remove if args.command == "remove" else cmd_enable
             msg = fn(db, args.email)
+            if msg is None:
+                print(f"error: no allowed user with email {args.email!r}",
+                      file=sys.stderr)
+                return 1
+            print(msg)
+            return 0
+        if args.command == "set-role":
+            msg = cmd_set_role(db, args.email, args.role)
+            if msg is None:
+                print(f"error: no allowed user with email {args.email!r}",
+                      file=sys.stderr)
+                return 1
+            print(msg)
+            return 0
+        if args.command == "set-groups":
+            groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+            msg = cmd_set_groups(db, args.email, groups)
             if msg is None:
                 print(f"error: no allowed user with email {args.email!r}",
                       file=sys.stderr)

@@ -41,6 +41,28 @@ function noteList(v) {
   return "<ul class='notes'>" + v.map((n) => `<li>${esc(n)}</li>`).join("") + "</ul>";
 }
 
+/* Redaction (spec R2, REDACTION_TICKETS.md): a distinct chip for a redacted
+ * sample, carrying the audit trail (reason / by / when) in its tooltip.
+ * ``sample`` is any SampleRead-shaped record; returns "" when not redacted. */
+function redactionBadge(sample) {
+  if (!sample || !sample.redacted) return "";
+  const bits = [];
+  if (sample.redaction_reason) bits.push("reason: " + sample.redaction_reason);
+  if (sample.redacted_by) bits.push("by " + sample.redacted_by);
+  if (sample.redacted_at) bits.push(fmtDate(sample.redacted_at));
+  const title = bits.length ? "REDACTED \u2014 " + bits.join(" \u00b7 ") : "REDACTED";
+  return `<span class="badge redacted" title="${esc(title)}">REDACTED</span>`;
+}
+
+/* Strike through a redacted sample's id text (spec R2). ``sample`` is the
+ * record ``text`` belongs to; returns the escaped text, wrapped in a
+ * strikethrough span when that sample is redacted. */
+function redactedId(sample, text) {
+  const safe = esc(text);
+  if (sample && sample.redacted) return `<span class="redacted-id">${safe}</span>`;
+  return safe;
+}
+
 let bannerTimer = null;
 function banner(kind, html, sticky) {
   const el = $("#banner");
@@ -101,7 +123,7 @@ function countLabel(total, rows, offset) {
  * Every navigation (tab switch, opening/closing a detail panel, opening
  * matches for a sample) pushes a history entry. */
 
-const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", "try"];
+const VIEWS = ["samples", "patients", "requests", "pooled", "pairs", "matches", "try", "ops"];
 let restoringNav = false;
 let PAIRING_LOGICS = [];
 
@@ -320,6 +342,13 @@ function pushNav() {
 }
 
 function showView(name) {
+  // Ops (decision 8) is visible only to admin / logic-group users — the
+  // tab stays hidden for everyone else (loadOpsAccess). A hand-typed
+  // #/ops from a non-entitled session bounces to Samples.
+  if (name === "ops" && !opsAccess) {
+    banner("error", "The Ops tab is restricted to admin and pairing-logic group members.", true);
+    name = "samples";
+  }
   const prev = currentViewName();
   const isPairs = name === "pairs";
   if (prev && prev !== "pairs" && isPairs) {
@@ -550,8 +579,8 @@ function renderSamples() {
   const rows = samplesState.results;
   const tbody = $("#samples-table tbody");
   tbody.innerHTML = rows.map((s) => `
-    <tr class="click" data-id="${s.id}">
-      <td>${esc(s.primary_id)}</td>
+    <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
+      <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
       <td>${esc(s.cmo_sample_name)}</td>
       <td>${esc(s.patient__cmo || "—")}</td>
       <td>${esc(s.patient__dmp || "—")}</td>
@@ -666,6 +695,8 @@ async function loadLogics() {
     const logics = await api("/pairing-logic/?limit=100");
     PAIRING_LOGICS = logics;
     renderViewSelect();
+    renderOpsImportLogic();
+    renderOpsAuditLogicOptions();
   } catch (e) {
     banner("error", `Failed to load pairing logics: ${esc(e.message)}`, true);
   }
@@ -695,8 +726,8 @@ function renderSampleResults(prefix, rows, selectedId, total, onSelect) {
   $(`#${prefix}-results`).classList.remove("hidden");
   const tbody = $(`#${prefix}-results-table tbody`);
   tbody.innerHTML = rows.map((s) => `
-    <tr class="click${selectedId != null && String(s.id) === String(selectedId) ? " selected" : ""}" data-id="${esc(s.id)}">
-      <td>${esc(s.primary_id)}</td>
+    <tr class="click${selectedId != null && String(s.id) === String(selectedId) ? " selected" : ""}${s.redacted ? " redacted-row" : ""}" data-id="${esc(s.id)}">
+      <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
       <td>${esc(s.cmo_sample_name)}</td>
       <td>${esc(s.patient__cmo || "—")}</td>
       <td>${esc(s.request_id || "—")}</td>
@@ -834,6 +865,37 @@ function hideMatchesPanels() {
   for (const id of ["m-summary", "m-current-panel", "m-others-panel"]) $(`#${id}`).classList.add("hidden");
 }
 
+/* Redaction controls for the sample detail panel (spec R2): the current
+ * redaction state + audit trail, a reason input, and the Redact / Un-redact
+ * buttons. The buttons are picked up by the #m-summary click handler via
+ * data-redact-action → handleRedactionAction. */
+function renderRedactionControl(s) {
+  if (s.redacted) {
+    const bits = [];
+    if (s.redacted_by) bits.push(`by ${esc(s.redacted_by)}`);
+    if (s.redacted_at) bits.push(fmtDate(s.redacted_at));
+    return `
+      <div class="redaction-block">
+        <h4>Redaction</h4>
+        <p class="redaction-state"><span class="badge redacted">REDACTED</span>${bits.length ? ` <span class="reason">${bits.join(" \u00b7 ")}</span>` : ""}</p>
+        ${s.redaction_reason ? `<p class="redaction-state reason">Reason: ${esc(s.redaction_reason)}</p>` : ""}
+        <div class="redaction-actions">
+          <button class="small" data-redact-action="unredact">Un-redact</button>
+          <span class="hint">This sample is excluded from all pairing (automatic and manual) until un-redacted.</span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="redaction-block">
+      <h4>Redaction</h4>
+      <div class="redaction-actions">
+        <input id="redact-reason" type="text" placeholder="reason (optional)" title="Reason recorded in the redaction audit trail">
+        <button class="small danger" data-redact-action="redact">Redact</button>
+      </div>
+      <p class="hint">A redacted sample is excluded from all pairing (automatic and manual). It keeps its id but appears flagged across candidate lists and pair reports. This can be undone.</p>
+    </div>`;
+}
+
 function renderMatches(data, logic) {
   const s = data.sample;
   $("#m-summary").classList.remove("hidden");
@@ -841,7 +903,7 @@ function renderMatches(data, logic) {
     <h2>Sample</h2>
     <dl class="kv">
       <dt>id</dt><dd>${esc(s.id)}</dd>
-      <dt>primary_id</dt><dd>${esc(s.primary_id)}</dd>
+      <dt>primary_id</dt><dd>${redactedId(s, s.primary_id)}${redactionBadge(s)}</dd>
       <dt>cmo_sample_name</dt><dd>${esc(s.cmo_sample_name)}</dd>
       <dt>patient__cmo</dt><dd>${s.patient__cmo ? `<span class="nav-link" data-nav-patient="${esc(s.patient__cmo)}" title="Go to the patient page">${esc(s.patient__cmo)}</span>` : "—"}</dd>
       <dt>patient__dmp</dt><dd>${esc(s.patient__dmp || "—")}</dd>
@@ -858,6 +920,7 @@ function renderMatches(data, logic) {
       <dt>sequencing_date</dt><dd>${fmtDate(s.sequencing_date)}</dd>
       <dt>errors</dt><dd>${s.errors && s.errors.length ? esc(s.errors.join("; ")) : "—"}</dd>
     </dl>
+    ${renderRedactionControl(s)}
     <p class="hint">Click patient__cmo / request_id to go to that patient's or request's page.</p>`;
 
   // Current matches: a tumor has at most one; a normal matches 1-to-many
@@ -875,7 +938,7 @@ function renderMatches(data, logic) {
         <div class="current-match">
           <dl class="kv">
             <dt>matched ${counterpartWord}</dt>
-            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${esc(c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient__cmo || "no patient")})</span></dd>
+            <dd><span class="nav-link" data-sample-id="${esc(c.id)}" title="Open this sample's matches &amp; overrides">${redactedId(c, c.primary_id)} — ${esc(c.cmo_sample_name)} (${esc(c.patient__cmo || "no patient")})</span>${redactionBadge(c)}</dd>
             <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
             <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
           </dl>
@@ -895,13 +958,18 @@ function renderMatches(data, logic) {
       : '<span class="badge bad">mismatch</span>';
     // Override is a logic-ADMIN capability (Layer C — require_logic_admin
     // server-side): rendered only for admins (UX only, 403 either way).
+    // Redaction (audit lane): a redacted sample cannot be paired — the
+    // button renders disabled with an explanation.
+    const redacted = !!cs.redacted;
     const overrideBtn = isTumor && isLogicAdmin()
-      ? `<button class="small danger" data-override="${cs.id}">Override</button>`
+      ? (redacted
+          ? `<button class="small danger" disabled title="Redacted: un-redact this sample to pair it">Override</button>`
+          : `<button class="small danger" data-override="${cs.id}">Override</button>`)
       : "";
     const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
     return `
-      <tr class="${c.would_be_selected ? "current click" : "click"}" data-sample-id="${esc(cs.id)}" title="Open this sample's matches &amp; overrides">
-        <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
+      <tr class="${c.would_be_selected ? "current click" : "click"}${redacted ? " redacted-row" : ""}" data-sample-id="${esc(cs.id)}" title="Open this sample's matches &amp; overrides">
+        <td>${redactedId(cs, cs.primary_id)} — ${esc(cs.cmo_sample_name)}${redactionBadge(cs)}${star}</td>
         <td>${esc(cs.patient__cmo || "—")}</td>
         <td>${esc(cs.patient__dmp || "—")}</td>
         <td><span class="badge tier">${esc(c.tier)}</span></td>
@@ -959,6 +1027,11 @@ $("#m-others-next").addEventListener("click", () => {
 
 /* Sample panel: click a patient__cmo / request_id value to go to its page. */
 $("#m-summary").addEventListener("click", (e) => {
+  const redactBtn = e.target.closest("[data-redact-action]");
+  if (redactBtn) {
+    handleRedactionAction(redactBtn.dataset.redactAction);
+    return;
+  }
   const el = e.target.closest("[data-nav-patient],[data-nav-request]");
   if (!el) return;
   if (el.dataset.navPatient) navigateToPatient(el.dataset.navPatient);
@@ -1015,6 +1088,52 @@ function submitOverride(normalId) {
       showMatches();
     })
     .catch((e) => banner("error", `Override failed: ${esc(e.message)}`, true));
+}
+
+/* Redact / un-redact the sample open in the detail panel (spec R2). Reads the
+ * reason from #redact-reason, confirms with the user, POSTs to the redaction
+ * endpoints, then re-fetches possible-matches (from the first candidate page)
+ * so the badge, audit trail and candidate scope are all fresh. Server-side
+ * redaction is the source of truth; this only drives the UI. */
+let redactionBusy = false;
+async function handleRedactionAction(action) {
+  const data = matchesState.data;
+  const s = data && data.sample;
+  if (!s || redactionBusy) return;
+  if (action === "redact") {
+    const reasonEl = $("#redact-reason");
+    const reason = reasonEl ? reasonEl.value.trim() : "";
+    const ok = window.confirm(
+      `Redact ${s.primary_id}?\n\nA redacted sample is excluded from all pairing (automatic and manual). ` +
+      `It keeps its id but appears flagged across candidate lists and pair reports. This can be undone.`
+    );
+    if (!ok) return;
+    redactionBusy = true;
+    try {
+      await api(`/sample/${s.id}/redact`, { method: "POST", body: JSON.stringify({ reason: reason || null }) });
+      banner("ok", `Redacted ${esc(s.primary_id)}.`);
+      matchesState.othersOffset = 0;
+      await showMatches();
+    } catch (e) {
+      banner("error", `Redact failed: ${esc(e.message)}`, true);
+    } finally {
+      redactionBusy = false;
+    }
+  } else if (action === "unredact") {
+    const ok = window.confirm(`Un-redact ${s.primary_id}? It becomes pairable again.`);
+    if (!ok) return;
+    redactionBusy = true;
+    try {
+      await api(`/sample/${s.id}/unredact`, { method: "POST" });
+      banner("ok", `Un-redacted ${esc(s.primary_id)}.`);
+      matchesState.othersOffset = 0;
+      await showMatches();
+    } catch (e) {
+      banner("error", `Un-redact failed: ${esc(e.message)}`, true);
+    } finally {
+      redactionBusy = false;
+    }
+  }
 }
 
 /* ---------- patients view ---------- */
@@ -1227,8 +1346,8 @@ async function openPatient(row) {
     ]);
     patientsState.patientSamples = samples;
     tbody.innerHTML = samples.map((s) => `
-      <tr class="click" data-id="${s.id}">
-        <td>${esc(s.primary_id)}</td>
+      <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
+        <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
         <td>${esc(s.cmo_sample_name)}</td>
         <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
         <td>${esc(s.sample_type)}</td>
@@ -1396,8 +1515,8 @@ async function openRequest(row) {
     requestsState.requestPatients = Object.keys(byPatient).sort().map((pid) => byPatient[pid]);
 
     sbody.innerHTML = samples.map((s) => `
-      <tr class="click" data-id="${s.id}">
-        <td>${esc(s.primary_id)}</td>
+      <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
+        <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
         <td>${esc(s.cmo_sample_name)}</td>
         <td><span class="badge ${s.tumor_or_normal.toLowerCase()}">${esc(s.tumor_or_normal)}</span></td>
         <td>${esc(s.sample_type)}</td>
@@ -1516,9 +1635,9 @@ function renderPooled() {
   const rows = pooledState.results;
   const tbody = $("#pooled-table tbody");
   tbody.innerHTML = rows.map((s) => `
-    <tr class="click" data-id="${s.id}">
+    <tr class="click${s.redacted ? " redacted-row" : ""}" data-id="${s.id}">
       <td>${esc(s.cmo_sample_name)}</td>
-      <td>${esc(s.primary_id)}</td>
+      <td>${redactedId(s, s.primary_id)}${redactionBadge(s)}</td>
       <td>${esc(s.request_id || "")}</td>
       <td>${esc(s.sample_type)}</td>
       <td>${esc(s.gene_panel)}</td>
@@ -2081,7 +2200,20 @@ function pairCellHtml(r, c) {
     : link.kind === "request" ? "data-nav-request" : "data-nav-dmp-patient";
   const cmo = link.kind === "dmp-patient" && link.cmo
     ? ` data-nav-cmo="${esc(String(link.cmo))}"` : "";
-  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}"${cmo} title="${esc(PAIR_LINK_TITLES[link.kind])}">${esc(raw)}</span></td>`;
+  // Redaction (spec R2): if this cell references a redacted sample, strike
+  // through its identity text and put a single REDACTED chip on the side's
+  // primary column (PAIR *_primary_id, DMP tumor_sample/normal_sample). PAIR/DMP
+  // rows carry full sample objects; HARMONY rows are flat primary_id strings
+  // (no redaction flag to read) and render via harmonyCellHtml.
+  let side = null;
+  if (link.kind === "sample") {
+    if (r.tumor && String(link.id) === String(r.tumor.id)) side = r.tumor;
+    else if (r.normal && String(link.id) === String(r.normal.id)) side = r.normal;
+  }
+  const isPrimary = c.key.endsWith("_primary_id") || c.key === "tumor_sample" || c.key === "normal_sample";
+  const text = (side && side.redacted) ? redactedId(side, raw) : esc(raw);
+  const badge = (side && side.redacted && isPrimary) ? redactionBadge(side) : "";
+  return `<td><span class="nav-link" ${attr}="${esc(String(link.id))}"${cmo} title="${esc(PAIR_LINK_TITLES[link.kind])}">${text}</span>${badge}</td>`;
 }
 
 /* HARMONY: normal-oriented table over the CHECKED HARMONY columns (via
@@ -2910,7 +3042,7 @@ async function selectTrySample(sample) {
   renderSelectedBar("tq", sample);
   tryRenderResults();
   const kv = [
-    ["primary_id", esc(sample.primary_id)],
+    ["primary_id", redactedId(sample, sample.primary_id) + redactionBadge(sample)],
     ["cmo_sample_name", esc(sample.cmo_sample_name)],
     ["patient__cmo", sample.patient__cmo ? esc(sample.patient__cmo) : "—"],
     ["patient__dmp", sample.patient__dmp ? esc(sample.patient__dmp) : "—"],
@@ -2972,7 +3104,7 @@ function renderTryResult(data, logic) {
       <div class="current-match">
         <dl class="kv">
           <dt>matched ${isTumor ? "normal" : "tumor"}</dt>
-          <dd>${esc(cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient__cmo || "no patient")})</dd>
+          <dd>${redactedId(cm.sample, cm.sample.primary_id)} — ${esc(cm.sample.cmo_sample_name)} (${esc(cm.sample.patient__cmo || "no patient")})${redactionBadge(cm.sample)}</dd>
           <dt>trigger_type</dt><dd>${esc(cm.trigger_type || "automatic")}</dd>
           <dt>mismatched_keys</dt><dd>${cm.mismatched_keys ? keyList(cm.mismatched_keys) : "—"}</dd>
         </dl>
@@ -2986,7 +3118,7 @@ function renderTryResult(data, logic) {
   if (isTumor) {
     if (winner) {
       parts.push(`<h3>Cascade outcome</h3>
-        <p>The cascade would pick <strong>${esc(winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong> (${esc(winner.sample.patient__cmo || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
+        <p>The cascade would pick <strong>${redactedId(winner.sample, winner.sample.primary_id)} — ${esc(winner.sample.cmo_sample_name)}</strong>${redactionBadge(winner.sample)} (${esc(winner.sample.patient__cmo || "no patient")}) in the <span class="badge tier">${esc(winner.tier)}</span> tier.</p>`);
     } else {
       parts.push(`<h3>Cascade outcome</h3>
         <p>No candidate would be selected — the sample would stay unpaired under this logic.</p>`);
@@ -3019,8 +3151,8 @@ function renderTryResult(data, logic) {
           ? '<span class="badge ok">matches all keys</span>'
           : '<span class="badge bad">mismatch</span>';
         const star = c.would_be_selected ? ' <span class="star" title="strategy cascade would pick this candidate">★</span>' : "";
-        return `<tr>
-          <td>${esc(cs.primary_id)} — ${esc(cs.cmo_sample_name)}${star}</td>
+        return `<tr${cs.redacted ? ' class="redacted-row"' : ""}>
+          <td>${redactedId(cs, cs.primary_id)} — ${esc(cs.cmo_sample_name)}${redactionBadge(cs)}${star}</td>
           <td>${esc(cs.patient__cmo || "—")}</td>
           <td>${esc(cs.patient__dmp || "—")}</td>
           <td><span class="badge tier">${esc(c.tier)}</span></td>
@@ -3135,6 +3267,373 @@ function signOut() {
 
 $("#logout-btn").addEventListener("click", signOut);
 
+/* ---------- Ops tab (AUDIT_LOG_TICKETS.md decision 8) ----------
+ * Visible only to identities with the admin role or >=1 pairing-logic
+ * group: /v1/audit/me returns role + logic_groups (server-side, decision
+ * 5). The three sections are the decision-8 panels:
+ *   a. pair assignment — POST /v1/pairing/import (shared core with the
+ *      CLI, so statuses cannot drift from scripts/import_tempo_pairs.py)
+ *   b. audit log viewer — GET /v1/audit (filters + payload expanders +
+ *      Reverse + CSV export; visibility applied server-side)
+ *   c. redaction controls — the R-feature redact/unredact endpoints */
+
+let opsAccess = null; // {email, role, logic_groups} or null when not entitled
+
+function opsTab() {
+  return document.querySelector('.tab[data-tab="ops"]');
+}
+
+async function loadOpsAccess() {
+  let me;
+  try {
+    me = await api("/audit/me");
+  } catch (_) {
+    return; // 401/403 already handled by api(): the user is sent to /login.
+  }
+  const entitled = me.role === "admin" || (me.logic_groups || []).length > 0;
+  opsAccess = entitled ? me : null;
+  opsTab().classList.toggle("hidden", !entitled);
+  if (!entitled) return;
+  const who = me.role === "admin" ? "admin" : `logic groups: ${me.logic_groups.join(", ")}`;
+  $("#ops-access-note").textContent = `Ops access — ${who}. The audit log below is already scoped to what you may see.`;
+  loadOpsAudit(0);
+}
+
+/* ---------- 8a: pair assignment (TEMPO import) ---------- */
+
+const opsImport = { busy: false, result: null };
+
+function renderOpsImportLogic() {
+  const sel = $("#ops-import-logic");
+  if (!sel) return;
+  sel.innerHTML = PAIRING_LOGICS.map((l) => {
+    const label = l.active ? l.name : `${l.name} (inactive)`;
+    return `<option value="${esc(l.name)}">${esc(label)}</option>`;
+  }).join("");
+}
+
+/* The file input only feeds the paste box — the user still reviews the
+ * TSV and presses Import (same as the CLI: the file never bypasses review). */
+$("#ops-import-file").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    $("#ops-import-text").value = String(reader.result);
+    banner("info", `Loaded ${esc(f.name)} into the paste box — review it, then Import.`);
+  };
+  reader.readAsText(f);
+});
+
+function opsStatusClass(status) {
+  if (status === "OK") return "ops-status-ok";
+  if (status === "MISMATCH") return "ops-status-mismatch";
+  if (status === "MULTI") return "ops-status-multi";
+  return "ops-status-fail";
+}
+
+async function runOpsImport() {
+  if (opsImport.busy) return;
+  const text = $("#ops-import-text").value;
+  if (!text.trim()) {
+    banner("error", "Paste (or upload) the pair TSV first — one NORMAL_ID<TAB>TUMOR_ID per line.", true);
+    return;
+  }
+  opsImport.busy = true;
+  $("#ops-import-run").disabled = true;
+  try {
+    opsImport.result = await api("/pairing/import", {
+      method: "POST",
+      body: JSON.stringify({
+        text,
+        logic: $("#ops-import-logic").value || null,
+        trigger_type: $("#ops-import-trigger").value,
+        id_field: $("#ops-import-idfield").value,
+        strict: $("#ops-import-strict").checked,
+        dry_run: $("#ops-import-dryrun").checked,
+      }),
+    });
+    const r = opsImport.result;
+    $("#ops-import-summary").innerHTML =
+      `<strong>${esc(r.logic)}</strong> &middot; ${esc(r.trigger_type)} &middot; ` +
+      (r.dry_run ? "<em>dry run — nothing pinned</em> " : "") +
+      `${r.total} rows: ` +
+      `<span class="ops-status-ok">${r.pinned} OK</span> &middot; ` +
+      `<span class="ops-status-mismatch">${r.mismatched} MISMATCH</span> &middot; ` +
+      `<span class="ops-status-multi">${r.multi} MULTI</span> &middot; ` +
+      `<span class="ops-status-fail">${r.failed} FAIL</span>`;
+    $("#ops-import-rows").innerHTML = r.rows.map((row) =>
+      `<tr><td class="${opsStatusClass(row.status)}">${esc(row.status)}</td>` +
+      `<td>${esc(row.normal_name)}</td><td>${esc(row.tumor_name)}</td>` +
+      `<td>${esc(row.detail || "")}</td><td>${esc(row.pairing_id || "")}</td></tr>`
+    ).join("");
+    $("#ops-import-result").classList.remove("hidden");
+  } catch (e) {
+    banner("error", `Import failed: ${esc(e.message)}`, true);
+  } finally {
+    opsImport.busy = false;
+    $("#ops-import-run").disabled = false;
+  }
+}
+
+function downloadText(name, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$("#ops-import-run").addEventListener("click", runOpsImport);
+
+$("#ops-import-log").addEventListener("click", () => {
+  const r = opsImport.result;
+  if (!r) return;
+  // log_tsv is the exact --log file content the CLI would have written.
+  downloadText(`pairing-import-${r.id}.tsv`, r.log_tsv);
+});
+
+/* ---------- 8b: audit log viewer ---------- */
+
+const opsAudit = { offset: 0, rows: [], total: 0 };
+
+function renderOpsAuditLogicOptions() {
+  const sel = $("#ops-audit-logic");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML =
+    `<option value="">any</option>` +
+    PAIRING_LOGICS.map((l) => `<option value="${esc(l.name)}">${esc(l.name)}</option>`).join("");
+  if (cur) sel.value = cur;
+}
+
+/* The filter bar's values, as the API's exact query names (decision 7):
+ * the time bounds are aliased `from`/`to`, newest first, limit <= 500.
+ * ``export`` mode ignores the page offset and pulls the 500-row cap. */
+function opsAuditParams(exportMode) {
+  const p = new URLSearchParams();
+  const from = $("#ops-audit-from").value;
+  const to = $("#ops-audit-to").value;
+  if (from) p.set("from", from + ":00");
+  if (to) p.set("to", to + ":59"); // datetime-local has no seconds: keep the whole "to" minute
+  const actor = $("#ops-audit-actor").value.trim();
+  if (actor) p.set("actor", actor);
+  const action = $("#ops-audit-action").value.trim();
+  if (action) p.set("action", action);
+  const logic = $("#ops-audit-logic").value;
+  if (logic) p.set("pairing_logic", logic);
+  p.set("limit", String(exportMode ? 500 : Number($("#ops-audit-limit").value)));
+  p.set("offset", String(exportMode ? 0 : opsAudit.offset));
+  return p;
+}
+
+function opsAuditRowHtml(row) {
+  const actor =
+    row.actor_kind === "system"
+      ? `<span title="system event">${esc(row.actor)}</span>`
+      : esc(row.actor);
+  return (
+    `<tr><td class="nowrap">${esc(fmtDate(row.occurred_at))}</td>` +
+    `<td>${actor}</td>` +
+    `<td><code>${esc(row.action)}</code></td>` +
+    `<td>${esc(row.entity_type)}/${esc(row.entity_id)}</td>` +
+    `<td>${esc(row.pairing_logic || "")}</td>` +
+    `<td class="ops-audit-actions">` +
+    `<button class="ops-payload-toggle" data-ops-audit-id="${esc(row.id)}">payload</button>` +
+    (row.reversible
+      ? `<button class="ops-reverse" data-ops-audit-id="${esc(row.id)}" title="Compensating action — runs the normal code path, is itself audited, and is linked to this event. The original row is never modified.">Reverse</button>`
+      : "") +
+    `</td></tr>` +
+    `<tr><td colspan="6"><pre class="ops-payload hidden">${esc(JSON.stringify(row.payload, null, 2))}</pre></td></tr>`
+  );
+}
+
+async function loadOpsAudit(offset) {
+  opsAudit.offset = offset || 0;
+  let body;
+  try {
+    body = await api(`/audit/?${opsAuditParams()}`);
+  } catch (e) {
+    banner("error", `Audit log failed: ${esc(e.message)}`, true);
+    return;
+  }
+  opsAudit.total = body.total;
+  opsAudit.rows = body.rows;
+  const per = Number($("#ops-audit-limit").value);
+  $("#ops-audit-count").textContent =
+    body.total === 0
+      ? ""
+      : `Showing ${opsAudit.offset + 1}–${Math.min(opsAudit.offset + per, body.total)} of ${body.total.toLocaleString("en-US")}`;
+  $("#ops-audit-prev").disabled = opsAudit.offset === 0;
+  $("#ops-audit-next").disabled = opsAudit.offset + per >= body.total;
+  $("#ops-audit-empty").classList.toggle("hidden", body.rows.length > 0);
+  $("#ops-audit-rows").innerHTML = body.rows.map(opsAuditRowHtml).join("");
+}
+
+/* One delegated handler: rows are replaced on every load, so the payload
+ * expanders and Reverse buttons are found by data attribute, not bound. */
+$("#ops-audit-rows").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-ops-audit-id]");
+  if (!btn) return;
+  const row = opsAudit.rows.find((r) => r.id === btn.dataset.opsAuditId);
+  if (!row) return;
+  if (btn.classList.contains("ops-payload-toggle")) {
+    const pre = btn.closest("td").parentElement.nextElementSibling.querySelector(".ops-payload");
+    if (pre) pre.classList.toggle("hidden");
+  } else {
+    reverseOpsAuditEvent(row);
+  }
+});
+
+async function reverseOpsAuditEvent(row) {
+  const note = row.action === "pair_assignment.imported"
+    ? "This reverses each pairing the import created — for every pair that is still in place, the strategy's own selection replaces the imported pairing. "
+    : "";
+  const ok = window.confirm(
+    `Reverse ${row.action} (${row.entity_type}/${row.entity_id})?\n\n` +
+    note +
+    "This runs the compensating action through the normal code path — it is itself audited and linked to this event. The original row is never modified."
+  );
+  if (!ok) return;
+  try {
+    const done = await api(`/audit/${row.id}/reverse`, { method: "POST" });
+    banner(
+      "ok",
+      `Reversed — ${done.length} compensating event${done.length === 1 ? "" : "s"} written and linked.`
+    );
+    loadOpsAudit(opsAudit.offset);
+  } catch (e) {
+    banner("error", `Reverse failed: ${esc(e.message)}`, true);
+  }
+}
+
+function csvCell(v) {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/* CSV export of the CURRENT filter set (decision 8b: "respecting
+ * visibility" — the server already scopes the query; the export just
+ * serializes what the viewer sees, capped at the API's 500-row limit). */
+async function exportOpsAuditCsv() {
+  let body;
+  try {
+    body = await api(`/audit/?${opsAuditParams(true)}`);
+  } catch (e) {
+    banner("error", `CSV export failed: ${esc(e.message)}`, true);
+    return;
+  }
+  if (!body.rows.length) {
+    banner("info", "Nothing to export — no events match the current filters.");
+    return;
+  }
+  const header = ["id", "occurred_at", "actor", "actor_kind", "action", "entity_type", "entity_id", "pairing_logic", "reverse_of", "request_id", "reversible", "payload"];
+  const lines = [header.join(",")];
+  for (const r of body.rows) {
+    lines.push(
+      [r.id, r.occurred_at, r.actor, r.actor_kind, r.action, r.entity_type, r.entity_id,
+       r.pairing_logic || "", r.reverse_of || "", r.request_id || "", r.reversible,
+       JSON.stringify(r.payload)].map(csvCell).join(",")
+    );
+  }
+  if (body.total > body.rows.length) {
+    banner("info", `Exported the first ${body.rows.length.toLocaleString("en-US")} of ${body.total.toLocaleString("en-US")} matching events — one query is capped at 500. Narrow the filters to get the rest.`, true);
+  } else {
+    banner("ok", `Exported ${body.rows.length.toLocaleString("en-US")} events.`);
+  }
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  downloadText(`audit-log-${stamp}.csv`, lines.join("\n"));
+}
+
+$("#ops-audit-apply").addEventListener("click", () => loadOpsAudit(0));
+$("#ops-audit-prev").addEventListener("click", () => loadOpsAudit(Math.max(0, opsAudit.offset - Number($("#ops-audit-limit").value))));
+$("#ops-audit-next").addEventListener("click", () => loadOpsAudit(opsAudit.offset + Number($("#ops-audit-limit").value)));
+$("#ops-audit-export").addEventListener("click", exportOpsAuditCsv);
+$("#ops-audit-clear").addEventListener("click", () => {
+  for (const id of ["ops-audit-from", "ops-audit-to", "ops-audit-actor", "ops-audit-action"]) $(`#${id}`).value = "";
+  $("#ops-audit-logic").value = "";
+  loadOpsAudit(0);
+});
+
+/* ---------- 8c: redaction controls ---------- */
+
+const opsRedact = { busy: false, rows: [] };
+
+async function searchOpsSamples() {
+  const q = $("#ops-redact-q").value.trim();
+  if (!q) {
+    opsRedact.rows = [];
+    $("#ops-redact-rows").innerHTML = "";
+    $("#ops-redact-empty").classList.remove("hidden");
+    return;
+  }
+  let rows;
+  try {
+    rows = await api(`/sample/?q=${encodeURIComponent(q)}&limit=50`);
+  } catch (e) {
+    banner("error", `Search failed: ${esc(e.message)}`, true);
+    return;
+  }
+  opsRedact.rows = rows;
+  $("#ops-redact-empty").classList.toggle("hidden", rows.length > 0);
+  $("#ops-redact-rows").innerHTML = rows.map((s) =>
+    `<tr><td>${redactedId(s, s.primary_id)} ${redactionBadge(s)}</td>` +
+    `<td>${redactedId(s, s.cmo_sample_name)}</td>` +
+    `<td>${esc(s.tumor_or_normal)}</td>` +
+    `<td>${
+      s.redacted
+        ? `<button data-ops-redact-id="${esc(s.id)}" data-ops-redact-act="unredact">Un-redact</button>`
+        : `<button data-ops-redact-id="${esc(s.id)}" data-ops-redact-act="redact">Redact</button>`
+    }</td></tr>`
+  ).join("");
+}
+
+$("#ops-redact-search").addEventListener("click", searchOpsSamples);
+$("#ops-redact-q").addEventListener("keydown", (e) => { if (e.key === "Enter") searchOpsSamples(); });
+
+$("#ops-redact-rows").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-ops-redact-id]");
+  if (!btn || opsRedact.busy) return;
+  const s = opsRedact.rows.find((x) => x.id === btn.dataset.opsRedactId);
+  if (!s) return;
+  if (btn.dataset.opsRedactAct === "redact") redactOpsSample(s);
+  else unredactOpsSample(s);
+});
+
+async function redactOpsSample(s) {
+  const reason = $("#ops-redact-reason").value.trim();
+  const ok = window.confirm(
+    `Redact ${s.primary_id}?\n\nA redacted sample is excluded from all pairing (automatic and manual). It keeps its id but appears flagged across candidate lists and pair reports. This can be undone.`
+  );
+  if (!ok) return;
+  opsRedact.busy = true;
+  try {
+    await api(`/sample/${s.id}/redact`, { method: "POST", body: JSON.stringify({ reason: reason || null }) });
+    banner("ok", `Redacted ${esc(s.primary_id)}.`);
+    $("#ops-redact-reason").value = "";
+    searchOpsSamples();
+  } catch (e) {
+    banner("error", `Redact failed: ${esc(e.message)}`, true);
+  } finally {
+    opsRedact.busy = false;
+  }
+}
+
+async function unredactOpsSample(s) {
+  const ok = window.confirm(`Un-redact ${s.primary_id}? It becomes pairable again.`);
+  if (!ok) return;
+  opsRedact.busy = true;
+  try {
+    await api(`/sample/${s.id}/unredact`, { method: "POST" });
+    banner("ok", `Un-redacted ${esc(s.primary_id)}.`);
+    searchOpsSamples();
+  } catch (e) {
+    banner("error", `Un-redact failed: ${esc(e.message)}`, true);
+  } finally {
+    opsRedact.busy = false;
+  }
+}
+
 /* ---------- init ---------- */
 
 (async function init() {
@@ -3143,6 +3642,7 @@ $("#logout-btn").addEventListener("click", signOut);
   // key off /auth/me (ticket C5).
   await loadCurrentUser();
   await loadLogics();
+  await loadOpsAccess();
   // Resolve the session View: saved localStorage choice → server default
   // (if active AND allowed) → unselected (pairing tabs gated). Don't
   // persist an auto-resolved default — only an explicit user pick is
