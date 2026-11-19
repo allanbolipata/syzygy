@@ -80,6 +80,19 @@ GROUP_NAMES: Tuple[str, ...] = ("ARGOS", "DMP", "HARMONY", "ACCESS", "TEMPO")
 LOGIC_CLAIM = "syzygy_logics"
 #: Access-token claim holding the truthy logic-admin flag.
 ADMIN_CLAIM = "syzygy_admin"
+#: P3 consent gate — the NONCONSENT realm group carries the
+#: non-consent DMP entitlement. Deliberately NOT part of GROUP_NAMES:
+#: that tuple drives the ``syzygy_logics`` claim, and NONCONSENT is an
+#: entitlement, not a pairing logic.
+NONCONSENT_GROUP = "NONCONSENT"
+#: Access-token claim set by the NONCONSENT group mapper. Verified live
+#: on KC 26.8.1 (class GroupMembershipMapper): the built-in mapper
+#: ignores its configured group as a filter and emits ALL of the
+#: user's group names for any user who has a group — so the claim
+#: value is the user's full group-name list, present in most tokens,
+#: and the app's entitlement check is "NONCONSENT" IN that list, not
+#: claim truthiness. App env vars: NONCONSENT_CLAIM / NONCONSENT_GROUP.
+NONCONSENT_CLAIM = "syzygy_nonconsent"
 #: App env vars that name those claims (integration option b in the
 #: handoff one-pager).
 APP_CLAIM_ENV: Tuple[str, str] = ("LOGIC_CLAIM_NAME", "LOGIC_ADMIN_CLAIM")
@@ -98,24 +111,29 @@ MAPPER_PROTOCOL = "openid-connect"
 LEGACY_GROUP_MAPPER_NAME = "syzygy logics"
 
 
-def group_mapper_spec(group_name: str) -> Dict[str, Any]:
+def group_mapper_spec(
+    group_name: str,
+    claim_name: str = LOGIC_CLAIM,
+    mapper_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """Spec for the built-in "Group Membership"
-    (oidc-group-membership-mapper) mapper of ONE logic group.
+    (oidc-group-membership-mapper) mapper of ONE group.
 
     ``claim.value`` must name the group — a group mapper without one is
     a no-op on 26.8.1 — and ``full.path`` stays OFF: the groups are
-    flat, so the exact name is the whole path. Every mapper of the
-    family feeds the same ``syzygy_logics`` claim: when a user is a
-    member of the mapper's group, Keycloak adds the user's group names
-    to the claim, so across the family the claim accumulates into a
-    JSON list of all of the user's logic-group memberships (verified
-    live on 26.8.1).
+    flat, so the exact name is the whole path. The default logic family
+    feeds the same ``syzygy_logics`` claim: when a user is a member of
+    the mapper's group, Keycloak adds the user's group names to the
+    claim, so across the family the claim accumulates into a JSON list
+    of all of the user's logic-group memberships (verified live on
+    26.8.1). ``claim_name``/``mapper_name`` exist for the P3
+    NONCONSENT mapper (a separate entitlement claim, not ``syzygy_logics``).
     """
     return {
-        "name": f"syzygy logics: {group_name}",
+        "name": mapper_name or f"syzygy logics: {group_name}",
         "protocolMapper": "oidc-group-membership-mapper",
         "config": {
-            "claim.name": LOGIC_CLAIM,
+            "claim.name": claim_name,
             "claim.value": group_name,
             "full.path": "false",
             "id.token.claim": "false",
@@ -128,6 +146,25 @@ def group_mapper_spec(group_name: str) -> Dict[str, Any]:
 def group_mapper_specs() -> List[Dict[str, Any]]:
     """One group-membership mapper spec per logic group (full family)."""
     return [group_mapper_spec(name) for name in GROUP_NAMES]
+
+
+def nonconsent_mapper_spec() -> Dict[str, Any]:
+    """P3 consent gate: the NONCONSENT group mapper.
+
+    Same built-in group-membership pattern as the logic family (stored
+    under MAPPER_PROTOCOL — any other protocol is silently skipped on
+    26.8.1), but feeding the ``syzygy_nonconsent`` claim instead of
+    ``syzygy_logics``. Note (verified live on 26.8.1): the built-in
+    mapper emits ALL of the user's group names into the claim for any
+    user who has a group — it does not filter on claim.value — so the
+    app derives the entitlement as the NONCONSENT group name appearing
+    in the list (see ``_nonconsent_entitlement``).
+    """
+    return group_mapper_spec(
+        NONCONSENT_GROUP,
+        claim_name=NONCONSENT_CLAIM,
+        mapper_name=f"syzygy nonconsent: {NONCONSENT_GROUP}",
+    )
 
 
 #: The "User Attribute" (oidc-usermodel-attribute-mapper) mapper on the
@@ -171,8 +208,9 @@ UNMANAGED_ATTRIBUTE_POLICY = "ADMIN"
 
 #: Dev personas (``--personas``; DEV COMPOSE ONLY — never against a
 #: shared/federated realm; see the --allow-user-creation guard).
-#: Mirrors the rollout UAT: an ARGOS-only user, a DMP-only user, and a
-#: logic admin (all groups + the admin attribute).
+#: Mirrors the rollout UAT: an ARGOS-only user, a DMP-only user, a
+#: DMP user WITH the P3 non-consent entitlement, and a logic admin
+#: (all groups incl. NONCONSENT + the admin attribute).
 PERSONAS: Tuple[Dict[str, Any], ...] = (
     {
         "username": "argos-only",
@@ -189,10 +227,17 @@ PERSONAS: Tuple[Dict[str, Any], ...] = (
         "admin": False,
     },
     {
+        "username": "dmp-nonconsent",
+        "email": "dmp-nonconsent@syzygy.dev",
+        "password": "dmp-nonconsent-dev-2026",
+        "groups": ("DMP", NONCONSENT_GROUP),
+        "admin": False,
+    },
+    {
         "username": "logic-admin",
         "email": "logic-admin@syzygy.dev",
         "password": "logic-admin-dev-2026",
-        "groups": GROUP_NAMES,
+        "groups": GROUP_NAMES + (NONCONSENT_GROUP,),
         "admin": True,
     },
 )
@@ -428,7 +473,8 @@ def ensure_client(admin: KcAdmin, client_id: str, client_secret: str) -> Tuple[d
 
 
 def ensure_groups(admin: KcAdmin) -> Tuple[Dict[str, str], List[str]]:
-    """Create the flat exact-case logic groups; returns (name->id, changed).
+    """Create the flat exact-case logic groups (+ the NONCONSENT
+    entitlement group, P3); returns (name->id, changed).
 
     GET /groups has no name filter — the full (top-level) list is
     fetched and filtered by path ("/<name>" = top-level, flat layout).
@@ -440,7 +486,7 @@ def ensure_groups(admin: KcAdmin) -> Tuple[Dict[str, str], List[str]]:
         if g.get("path") == "/" + g["name"]
     }
     changed: List[str] = []
-    for name in GROUP_NAMES:
+    for name in GROUP_NAMES + (NONCONSENT_GROUP,):
         if name in group_ids:
             continue
         admin.post("/groups", {"name": name})  # 201 with an EMPTY body
@@ -620,7 +666,7 @@ def ensure_mappers(admin: KcAdmin, scope: dict) -> List[str]:
         _create(spec)
         changes.append(f"mapper {spec['name']!r} recreated ({why})")
 
-    for spec in group_mapper_specs() + [ADMIN_MAPPER]:
+    for spec in group_mapper_specs() + [nonconsent_mapper_spec(), ADMIN_MAPPER]:
         current = by_name.get(spec["name"])
         if current is None:
             _create(spec)
@@ -762,7 +808,8 @@ def print_persona_claims(
         )
         claims = decode_jwt_payload(token)
         print(f"\n{persona['username']} ({persona['email']})")
-        for key in ("preferred_username", "email", LOGIC_CLAIM, ADMIN_CLAIM):
+        for key in ("preferred_username", "email", LOGIC_CLAIM,
+                    NONCONSENT_CLAIM, ADMIN_CLAIM):
             value = claims.get(key)
             shown = json.dumps(value) if value is not None else "(absent)"
             print(f"  {key}: {shown}")
@@ -781,7 +828,14 @@ def render_handoff() -> str:
     to Keycloak — so this document and the script cannot drift apart.
     """
     groups_rows = "\n".join(f"| `{name}` | `{name}` |" for name in GROUP_NAMES)
+    groups_rows += (
+        f"\n| `{NONCONSENT_GROUP}` | (entitlement, not a pairing logic — P3 consent gate) |"
+    )
     group_specs = group_mapper_specs()
+    nonconsent_spec = nonconsent_mapper_spec()
+    nonconsent_rows = "\n".join(
+        f"| `{k}` | `{v}` |" for k, v in nonconsent_spec["config"].items()
+    )
     shared_group_rows = "\n".join(
         f"| `{k}` | `{v}` |"
         for k, v in group_specs[0]["config"].items()
@@ -815,6 +869,26 @@ def render_handoff() -> str:
         f"- Protocol: `{MAPPER_PROTOCOL}`\n\n"
         "| Config key | Value |\n|---|---|\n"
         f"{admin_rows}\n\n"
+        f"### Non-consent entitlement mapper (P3): `{nonconsent_spec['name']}`\n\n"
+        f"- Protocol mapper: `{nonconsent_spec['protocolMapper']}`\n"
+        "- Placement: the `syzygy` client's **dedicated client scope**\n"
+        f"- Protocol: `{MAPPER_PROTOCOL}`\n\n"
+        "Same built-in group-membership pattern as the logic family, "
+        f"feeding the `{NONCONSENT_CLAIM}` claim. Important (verified "
+        "live on Keycloak 26.8.1): the built-in mapper does NOT filter "
+        "on its configured group — it emits ALL of the user's group "
+        "names into the claim for any user who has at least one group. "
+        "The claim is therefore present in most tokens, and the app "
+        f"derives the entitlement as `{NONCONSENT_GROUP!r}` appearing "
+        "in that list (NOT claim presence): a NONCONSENT member's list "
+        f"contains `{NONCONSENT_GROUP!r}`, a non-member's does not. "
+        "While gating is on, only users with the entitlement may see "
+        "DMP-family samples whose consent is FALSE. (A NONCONSENT "
+        f"member also carries `{NONCONSENT_GROUP}` inside "
+        f"`{LOGIC_CLAIM}` — the app ignores unknown logic names "
+        "(warning only), so this is cosmetic, not an entitlement.)\n\n"
+        "| Config key | Value |\n|---|---|\n"
+        f"{nonconsent_rows}\n\n"
     )
     return f"""# Syzygy pairing-logic gating — identity-team handoff (Keycloak)
 
@@ -827,20 +901,23 @@ def render_handoff() -> str:
 While `LOGIC_GATING_ENABLED=true`, the app derives each user's
 pairing-logic entitlements from the **access token** of its confidential
 `syzygy` client (`syzygy/auth.py`; full behavior in
-`docs/logic_gating_setup.md`, "How the app reads entitlements"). Two
-claims, both optional — an absent claim is fail-closed (no logics):
+`docs/logic_gating_setup.md`, "How the app reads entitlements"). Three
+claims, all optional — absent claims are fail-closed (no logics / no
+non-consent entitlement):
 
 | Claim | Shape | Meaning |
 |---|---|---|
 | `{LOGIC_CLAIM}` | JSON list of exact logic names, e.g. `["ARGOS", "DMP"]` | pairing logics the user may see |
 | `{ADMIN_CLAIM}` | truthy value (reference shape `true`) | may trigger pairing and edit pairing logics |
+| `{NONCONSENT_CLAIM}` | JSON list of the user's group names (built-in mapper emits all groups; reference member shape `["DMP", "{NONCONSENT_GROUP}"]`) | P3 consent gate: the `{NONCONSENT_GROUP}` group name must appear in this list to see non-consent DMP samples (consent IS FALSE) |
 
 Logic names must match the app's `pairing_logics` table **exactly,
 case-sensitive**; unknown names are ignored server-side with a warning.
 
 ## Option (a) — realm groups (the reference shape)
 
-Flat **top-level** groups, **exact case**, one per pairing logic:
+Flat **top-level** groups, **exact case**, one per pairing logic, plus
+the NONCONSENT entitlement group (P3, not a pairing logic):
 
 | Group | Pairing logic |
 |---|---|
@@ -876,6 +953,7 @@ are needed at all: set the app's env vars to the org claim names (a
 |---|---|
 | `{APP_CLAIM_ENV[0]}` | `{LOGIC_CLAIM}` |
 | `{APP_CLAIM_ENV[1]}` | `{ADMIN_CLAIM}` |
+| `NONCONSENT_CLAIM` | `{NONCONSENT_CLAIM}` |
 
 The claim shapes must match the table above (exact-name JSON list /
 truthy boolean) and the claims must ride in the **access token** of the
@@ -998,7 +1076,7 @@ def run(args: argparse.Namespace) -> int:
 
         group_ids, group_changes = ensure_groups(admin)
         print("groups: " + (", ".join(f"created {g!r}" for g in group_changes)
-                            if group_changes else f"unchanged ({', '.join(GROUP_NAMES)})"))
+                            if group_changes else f"unchanged ({', '.join(GROUP_NAMES + (NONCONSENT_GROUP,))})"))
 
         profile_changes = ensure_user_profile(admin)
         print("user profile: " + (", ".join(profile_changes)

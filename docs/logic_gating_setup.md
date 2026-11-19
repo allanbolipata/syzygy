@@ -73,6 +73,38 @@ null-bait families are disjoint from each other and from the registered-bait
 families, so a HARMONY-enrolled principal sees only HARMONY-family samples
 and a DMP-enrolled principal sees only DMP-family samples.
 
+## Consent gate (P3): non-consent DMP samples
+
+While `LOGIC_GATING_ENABLED=true`, a second gate applies on top of the
+logic entitlements: **DMP-family samples whose `consent` is `FALSE` are
+visible only to principals holding the non-consent entitlement**. `consent`
+`TRUE` and `NULL` samples, and all non-DMP samples, are unaffected (a
+non-DMP sample's consent can never be `FALSE`, so the single SQL predicate
+`consent IS NOT FALSE` hides exactly the non-consent DMP samples).
+
+- **Entitlement.** `NONCONSENT_CLAIM` (default `syzygy_nonconsent`) names
+  the access-token claim; `NONCONSENT_GROUP` (default `NONCONSENT`) names
+  the realm group that carries it. Reference shape (Keycloak 26.8.1 built-in
+  *Group Membership* mapper on the `NONCONSENT` group): the claim value is a
+  **JSON list of the user's group names** — the mapper emits *all* of the
+  user's groups for any user who has a group (it does not filter on its
+  configured group; verified live against the 26.8.1 `GroupMembershipMapper`
+  class). The app therefore derives the entitlement as **the
+  `NONCONSENT_GROUP` name appearing in that list** — not claim presence; a
+  non-member's token still carries the claim (with their other group names).
+  A scalar truthy org claim (integration option b) is honored as well.
+  Absent claim = fail-closed (the gate applies). Dark launch (gating off)
+  never applies the gate.
+- **Where it applies.** Layer B row filter on the four listings (samples /
+  patients / requests / pairings) and on the Layer A logic-scoped DMP sample
+  read (`GET /pairing/unmatched/`). `GET /auth/me` exposes the flag as
+  `can_see_nonconsent` so the UI can react (UX only — the server-side filter
+  is the real gate).
+- **IdP side.** Add the `NONCONSENT` realm group (not a pairing logic — it
+  never appears in `syzygy_logics` entitlements) and one *Group Membership*
+  mapper feeding `syzygy_nonconsent`; `scripts/keycloak_gating_setup.py`
+  does both (see the handoff one-pager, `docs/keycloak_gating_handoff.md`).
+
 ## Env flags (app)
 
 | Env var | Default | Meaning |
@@ -81,8 +113,10 @@ and a DMP-enrolled principal sees only DMP-family samples.
 | `LOGIC_CLAIM_NAME` | `syzygy_logics` | Access-token claim holding the list of logic names. |
 | `LOGIC_ADMIN_CLAIM` | `syzygy_admin` | Access-token claim holding the logic-admin flag. |
 | `GATING_OPEN_LOGICS` | `ARGOS,TEMPO,ACCESS` | Comma list of default-open logics (visible to every authenticated user without enrollment). Empty = uniform fail-closed (claim-only). |
+| `NONCONSENT_CLAIM` | `syzygy_nonconsent` | Access-token claim for the P3 consent gate (non-consent DMP samples). List of the user's group names; the app checks for the `NONCONSENT_GROUP` name in it. |
+| `NONCONSENT_GROUP` | `NONCONSENT` | The realm-group name that carries the P3 consent-gate entitlement (checked inside `NONCONSENT_CLAIM`). |
 
-All four are documented in `.env.example` (the `Logic gating` section) and
+All six are documented in `.env.example` (the `Logic gating` section) and
 map 1:1 to `Settings` fields in `syzygy/database.py`.
 
 ## Reference Keycloak layout (dev compose)
@@ -105,6 +139,13 @@ any Keycloak version):
    HARMONY
    ACCESS
    TEMPO
+   ```
+
+   plus the P3 consent-gate entitlement group (step 4) — **not** a pairing
+   logic, so it never belongs in the list above:
+
+   ```
+   NONCONSENT
    ```
 
    Assign users to the groups for the logics they should access (Admin
@@ -167,6 +208,26 @@ any Keycloak version):
    > access-token switch, that is fine — dedicated-scope mappers land in the
    > access token by default; verify the claim via the raw-token decode below.
 
+4. **Non-consent entitlement mapper (P3)** — a second *Group Membership*
+   mapper, same field values as step 2 except:
+
+   | Field | Value |
+   |---|---|
+   | Name | `syzygy nonconsent` |
+   | Token claim name | `syzygy_nonconsent` |
+   | Group (claim value) | `NONCONSENT` |
+   | **Full group path** | **OFF** |
+   | **Add to access token** | **ON** |
+
+   Assign the entitlement by putting a user in the `NONCONSENT` group.
+   **Caveat (verified live on 26.8.1):** the built-in mapper ignores the
+   configured group as a filter — it emits *all* of the user's group names
+   into the claim for any user who has a group. So the claim is present in
+   most tokens and the app's entitlement check is "`NONCONSENT` in the
+   list", not claim presence (see [Consent gate (P3)](#consent-gate-p3-non-consent-dmp-samples)).
+   A NONCONSENT member also gets `NONCONSENT` inside `syzygy_logics` — the
+   app ignores unknown logic names (warning only), so this is cosmetic.
+
 Notes:
 
 - The Group Membership mapper puts **every** realm group the user belongs
@@ -201,7 +262,9 @@ everyone (dark launch), so verify the **raw access token**:
    (or paste the token into jwt.io — dev tokens only, never prod material).
 
    Check: `syzygy_logics` = the expected list of **exact** logic names for
-   the user, and `syzygy_admin` = `true` for logic admins only.
+   the user, `syzygy_admin` = `true` for logic admins only, and
+   `syzygy_nonconsent` contains the `NONCONSENT` group name exactly for the
+   users who should see non-consent DMP samples (P3).
 
 ## Production guidance (org-managed Keycloak)
 

@@ -9,20 +9,23 @@
 While `LOGIC_GATING_ENABLED=true`, the app derives each user's
 pairing-logic entitlements from the **access token** of its confidential
 `syzygy` client (`syzygy/auth.py`; full behavior in
-`docs/logic_gating_setup.md`, "How the app reads entitlements"). Two
-claims, both optional — an absent claim is fail-closed (no logics):
+`docs/logic_gating_setup.md`, "How the app reads entitlements"). Three
+claims, all optional — absent claims are fail-closed (no logics / no
+non-consent entitlement):
 
 | Claim | Shape | Meaning |
 |---|---|---|
 | `syzygy_logics` | JSON list of exact logic names, e.g. `["ARGOS", "DMP"]` | pairing logics the user may see |
 | `syzygy_admin` | truthy value (reference shape `true`) | may trigger pairing and edit pairing logics |
+| `syzygy_nonconsent` | JSON list of the user's group names (built-in mapper emits all groups; reference member shape `["DMP", "NONCONSENT"]`) | P3 consent gate: the `NONCONSENT` group name must appear in this list to see non-consent DMP samples (consent IS FALSE) |
 
 Logic names must match the app's `pairing_logics` table **exactly,
 case-sensitive**; unknown names are ignored server-side with a warning.
 
 ## Option (a) — realm groups (the reference shape)
 
-Flat **top-level** groups, **exact case**, one per pairing logic:
+Flat **top-level** groups, **exact case**, one per pairing logic, plus
+the NONCONSENT entitlement group (P3, not a pairing logic):
 
 | Group | Pairing logic |
 |---|---|
@@ -31,6 +34,7 @@ Flat **top-level** groups, **exact case**, one per pairing logic:
 | `HARMONY` | `HARMONY` |
 | `ACCESS` | `ACCESS` |
 | `TEMPO` | `TEMPO` |
+| `NONCONSENT` | (entitlement, not a pairing logic — P3 consent gate) |
 
 The mappers — all **built-in** types, no scripting — live on the
 `syzygy` client's **dedicated client scope** (attached as a default
@@ -81,6 +85,23 @@ plus `claim.value` set to the exact group name — one mapper per group:
 | `access.token.claim` | `true` |
 | `userinfo.token.claim` | `false` |
 
+### Non-consent entitlement mapper (P3): `syzygy nonconsent: NONCONSENT`
+
+- Protocol mapper: `oidc-group-membership-mapper`
+- Placement: the `syzygy` client's **dedicated client scope**
+- Protocol: `openid-connect`
+
+Same built-in group-membership pattern as the logic family, feeding the `syzygy_nonconsent` claim. Important (verified live on Keycloak 26.8.1): the built-in mapper does NOT filter on its configured group — it emits ALL of the user's group names into the claim for any user who has at least one group. The claim is therefore present in most tokens, and the app derives the entitlement as `'NONCONSENT'` appearing in that list (NOT claim presence): a NONCONSENT member's list contains `'NONCONSENT'`, a non-member's does not. While gating is on, only users with the entitlement may see DMP-family samples whose consent is FALSE. (A NONCONSENT member also carries `NONCONSENT` inside `syzygy_logics` — the app ignores unknown logic names (warning only), so this is cosmetic, not an entitlement.)
+
+| Config key | Value |
+|---|---|
+| `claim.name` | `syzygy_nonconsent` |
+| `claim.value` | `NONCONSENT` |
+| `full.path` | `false` |
+| `id.token.claim` | `false` |
+| `access.token.claim` | `true` |
+| `userinfo.token.claim` | `false` |
+
 
 User-profile requirement (Keycloak >= 26 hides the user *Attributes*
 tab behind the User Profile feature): declare `syzygy_admin` as a
@@ -103,6 +124,7 @@ are needed at all: set the app's env vars to the org claim names (a
 |---|---|
 | `LOGIC_CLAIM_NAME` | `syzygy_logics` |
 | `LOGIC_ADMIN_CLAIM` | `syzygy_admin` |
+| `NONCONSENT_CLAIM` | `syzygy_nonconsent` |
 
 The claim shapes must match the table above (exact-name JSON list /
 truthy boolean) and the claims must ride in the **access token** of the

@@ -141,12 +141,39 @@ def test_mapper_protocol_is_the_scope_protocol():
 
 
 def test_personas_cover_uat_shape():
-    """The UAT personas: an ARGOS-only user, a DMP-only user, a logic admin."""
+    """The UAT personas: an ARGOS-only user, a DMP-only user, a DMP user
+    WITH the P3 non-consent entitlement, and a logic admin (all groups
+    incl. NONCONSENT)."""
     by_user = {p["username"]: p for p in kgs.PERSONAS}
     assert set(by_user["argos-only"]["groups"]) == {"ARGOS"}
     assert set(by_user["dmp-only"]["groups"]) == {"DMP"}
+    assert set(by_user["dmp-nonconsent"]["groups"]) == {
+        "DMP", kgs.NONCONSENT_GROUP}
+    assert by_user["dmp-nonconsent"]["admin"] is False
     assert by_user["logic-admin"]["admin"] is True
-    assert set(by_user["logic-admin"]["groups"]) == set(kgs.GROUP_NAMES)
+    assert set(by_user["logic-admin"]["groups"]) == (
+        set(kgs.GROUP_NAMES) | {kgs.NONCONSENT_GROUP})
+
+
+def test_nonconsent_mapper_is_entitlement_not_logic():
+    """P3: the NONCONSENT group mapper feeds the syzygy_nonconsent
+    entitlement claim (NOT syzygy_logics — NONCONSENT is not a pairing
+    logic), reuses the group-membership pattern (claim.value = group
+    name, full.path OFF) and rides in the ACCESS token (that's what
+    the app reads)."""
+    spec = kgs.nonconsent_mapper_spec()
+    assert spec["name"] == f"syzygy nonconsent: {kgs.NONCONSENT_GROUP}"
+    assert spec["protocolMapper"] == "oidc-group-membership-mapper"
+    assert spec["config"]["claim.name"] == kgs.NONCONSENT_CLAIM
+    assert spec["config"]["claim.value"] == kgs.NONCONSENT_GROUP
+    assert spec["config"]["full.path"] == "false"
+    assert spec["config"]["access.token.claim"] == "true"
+    assert spec["config"]["id.token.claim"] == "false"
+    # The entitlement group must never leak into the logics claim.
+    assert kgs.NONCONSENT_GROUP not in kgs.GROUP_NAMES
+    assert [s["config"]["claim.value"] for s in kgs.group_mapper_specs()] == (
+        list(kgs.GROUP_NAMES))
+    assert kgs.NONCONSENT_CLAIM == "syzygy_nonconsent"
 
 
 # --------------------------------------------------------------------------
@@ -158,16 +185,19 @@ def test_handoff_contains_exact_groups():
     text = kgs.render_handoff()
     for name in kgs.GROUP_NAMES:
         assert f"`{name}`" in text
+    assert f"`{kgs.NONCONSENT_GROUP}`" in text
 
 
 def test_handoff_contains_mapper_specs_from_source_of_truth():
-    """The one-pager must name every mapper (per-group family + admin),
-    its protocol-mapper type, and every config key/value, plus the
-    required mapper protocol — read from the same source of truth the
-    script applies, so doc and script can't drift."""
+    """The one-pager must name every mapper (per-group family +
+    nonconsent entitlement + admin), its protocol-mapper type, and
+    every config key/value, plus the required mapper protocol — read
+    from the same source of truth the script applies, so doc and
+    script can't drift."""
     text = kgs.render_handoff()
     assert f"`{kgs.MAPPER_PROTOCOL}`" in text
-    for spec in kgs.group_mapper_specs() + [kgs.ADMIN_MAPPER]:
+    for spec in (kgs.group_mapper_specs()
+                 + [kgs.nonconsent_mapper_spec(), kgs.ADMIN_MAPPER]):
         assert f"`{spec['name']}`" in text
         assert f"`{spec['protocolMapper']}`" in text
         for key, value in spec["config"].items():
@@ -258,7 +288,7 @@ def test_ensure_mappers_repairs_legacy_openid_protocol_mappers():
     changes = kgs.ensure_mappers(fake, {"id": "s1"})
     names = {b["name"] for b in fake.created}
     assert names == ({f"syzygy logics: {g}" for g in kgs.GROUP_NAMES}
-                     | {"syzygy admin"})
+                     | {kgs.nonconsent_mapper_spec()["name"], "syzygy admin"})
     for body in fake.created:
         assert body["protocol"] == "openid-connect"
         assert body["protocolMapper"] in (
@@ -272,7 +302,9 @@ def test_ensure_mappers_idempotent_on_second_run():
     """A run over an already-correct scope (server-normalized extra
     config keys included) must change nothing."""
     mappers = []
-    for i, spec in enumerate(kgs.group_mapper_specs() + [kgs.ADMIN_MAPPER]):
+    for i, spec in enumerate(
+            kgs.group_mapper_specs()
+            + [kgs.nonconsent_mapper_spec(), kgs.ADMIN_MAPPER]):
         cfg = dict(spec["config"])
         cfg["introspection.token.claim"] = "true"  # server adds this on write
         mappers.append({"id": f"i{i}", "name": spec["name"],

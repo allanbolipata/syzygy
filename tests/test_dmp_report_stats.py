@@ -701,7 +701,10 @@ def test_dmp_stats_walk_runs_once_across_pages(db, monkeypatch):
     monkeypatch.setattr(
         pairings,
         "_dmp_report_stats",
-        lambda database, logic: (calls.append(logic.id), real(database, logic))[1],
+        lambda database, logic, consent_gated=False: (
+            calls.append(logic.id),
+            real(database, logic, consent_gated),
+        )[1],
     )
     _logic(db)
     page1 = pairing_report("DMP", 1, 50, db, q=None)
@@ -719,7 +722,10 @@ def test_stats_cache_invalidates_when_pairing_changes(db, monkeypatch):
     monkeypatch.setattr(
         pairings,
         "_dmp_report_stats",
-        lambda database, logic: (calls.append(logic.id), real(database, logic))[1],
+        lambda database, logic, consent_gated=False: (
+            calls.append(logic.id),
+            real(database, logic, consent_gated),
+        )[1],
     )
     _logic(db)
     pairing_report("DMP", 1, 50, db, q=None)

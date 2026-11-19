@@ -3,9 +3,9 @@ from typing import Callable, Optional
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from syzygy.models import (
     DMP_LOGIC_NAME,
@@ -16,7 +16,11 @@ from syzygy.models import (
     Sample,
     utcnow,
 )
-from syzygy.bait_sets import classify_bait_set, resolve_bait_set_logic
+from syzygy.bait_sets import (
+    classify_bait_set,
+    consent_gate_condition,
+    resolve_bait_set_logic,
+)
 from syzygy.pairing_strategies import get_pairing_strategy, strategies
 from syzygy.schemas import TumorOrNormal
 
@@ -1022,7 +1026,7 @@ def evaluate_logic(db: Session, logic_name: str) -> dict:
     }
 
 
-def count_unpaired(db: Session, logic_name: str) -> dict:
+def count_unpaired(db: Session, logic_name: str, consent_gated: bool = False) -> dict:
     """Per-logic paired/unpaired counts for the Pairing overview strip.
 
     ``paired``: the logic's latest report rows where both the tumor
@@ -1033,25 +1037,47 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
     latest DMP-logic pairing. Any other logic: the logic's unpaired
     tumor population (the backfill scope, see ``_logic_tumor_scope``).
     Read-only.
+
+    ``consent_gated`` (P3): when set (gating ON and the caller lacks
+    the NONCONSENT entitlement), non-consent DMP samples (``consent IS
+    FALSE``) are withheld from both counts — the same rule the Layer B
+    listings and the Pair Report apply. Hidden samples must not count
+    toward the strip's aggregates (a security boundary: a count leak is
+    a leak). Non-DMP samples are provably unaffected (their consent is
+    NULL), so only the DMP branches gain the predicate.
     """
     logic = find_logic_by_name(db, logic_name)
     if logic is None:
         raise HTTPException(status_code=404, detail="Pairing logic not found")
     # "Paired" strip value: this logic's latest rows with both sides
     # present (the explicit null guards state the report row rule).
-    paired_count = int(
-        db.scalar(
-            select(func.count())
-            .select_from(PairingTable)
+    paired_stmt = (
+        select(func.count())
+        .select_from(PairingTable)
+        .where(
+            PairingTable.pairing_logic_id == logic.id,
+            PairingTable.latest.is_(True),
+            PairingTable.tumor_id.isnot(None),
+            PairingTable.normal_id.isnot(None),
+        )
+    )
+    if consent_gated:
+        # P3 consent gate: hide a paired row when EITHER side is a
+        # non-consent DMP sample (consent IS NOT FALSE on both sides).
+        tumor_alias = aliased(Sample)
+        normal_alias = aliased(Sample)
+        paired_stmt = (
+            paired_stmt
+            .join(tumor_alias, PairingTable.tumor_id == tumor_alias.id)
+            .join(normal_alias, PairingTable.normal_id == normal_alias.id)
             .where(
-                PairingTable.pairing_logic_id == logic.id,
-                PairingTable.latest.is_(True),
-                PairingTable.tumor_id.isnot(None),
-                PairingTable.normal_id.isnot(None),
+                and_(
+                    consent_gate_condition(sample=tumor_alias),
+                    consent_gate_condition(sample=normal_alias),
+                )
             )
         )
-        or 0
-    )
+    paired_count = int(db.scalar(paired_stmt) or 0)
     paired = exists(
         select(PairingTable.id).where(
             or_(
@@ -1066,6 +1092,9 @@ def count_unpaired(db: Session, logic_name: str) -> dict:
         stmt = select(func.count()).select_from(Sample).where(
             Sample.sample_type == "DMP", ~paired
         )
+        if consent_gated:
+            # P3 consent gate: same rule as the /pairing/unmatched/ read.
+            stmt = stmt.where(consent_gate_condition())
     else:
         names = _logic_bait_set_names(db, logic)
         if not names:

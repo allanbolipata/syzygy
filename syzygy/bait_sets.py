@@ -168,3 +168,25 @@ def allowed_logics_condition(db: Session, allowed_logics: Iterable[str], sample=
         return false()
     conds = [logic_membership_condition(logic, sample=sample) for logic in logics]
     return conds[0] if len(conds) == 1 else or_(*conds)
+
+
+def consent_gate_condition(sample=None):
+    """SQL boolean condition on a sample row: the row is NOT a
+    non-consent DMP sample — the P3 consent gate (Layer B entitlement,
+    and the Layer A logic-scoped reads that honor the same rule).
+
+    Expresses ``consent IS NOT FALSE``: a row passes when its ``consent``
+    is TRUE, NULL, or the column is absent. Because the ``consent``
+    column is DMP-only (NULL for LIMS/IGO samples), this naturally keeps
+    every non-DMP sample (consent NULL), every DMP sample with consent
+    TRUE, and every DMP sample with consent NULL — hiding ONLY the
+    consent=FALSE DMP samples. The spec's "DMP family" scope is thus
+    satisfied without an extra ``sample_type`` predicate: a non-DMP
+    sample's consent can never be FALSE.
+
+    ``sample`` is the mapped class or column alias (the pairing listing
+    passes its tumor/normal aliases); defaults to ``Sample``.
+    """
+    if sample is None:
+        sample = Sample
+    return sample.consent.isnot(False)

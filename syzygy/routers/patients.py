@@ -6,10 +6,15 @@ from sqlalchemy.orm import Session
 
 from syzygy.auth import (
     LOGIC_ACCESS_DENIED_DETAIL,
+    consent_gate_active,
     get_current_user,
     gating_allowed_logics,
 )
-from syzygy.bait_sets import allowed_logics_condition, logic_membership_condition
+from syzygy.bait_sets import (
+    allowed_logics_condition,
+    consent_gate_condition,
+    logic_membership_condition,
+)
 from syzygy.database import get_db
 from syzygy.models import DMP_LOGIC_NAME, PairingLogic, Sample
 from syzygy.pairing_service import resolve_filter_logic
@@ -124,6 +129,7 @@ def _apply_patient_filters(
     request_id: Optional[str] = None,
     logic: Optional[PairingLogic] = None,
     gating=None,
+    consent_gate=None,
 ):
     """Filter clauses shared by the page query and the total query, so
     the reported total always reflects the currently active filter set.
@@ -136,6 +142,14 @@ def _apply_patient_filters(
     group-level HAVING clauses on the unfiltered group rows — the group is
     included when at least one of its samples matches, but its aggregate
     counts still cover ALL of its samples.
+
+    ``consent_gate`` (P3) is a ROW-level (WHERE) restriction, not a
+    group HAVING: a non-consent DMP sample (``consent IS FALSE``) is
+    hidden from a principal without the non-consent entitlement, so it
+    must not count toward the group's sample/tumor/normal counts (a
+    security boundary — unlike the logic gate's all-samples counting, the
+    hidden sample's data must not leak through the aggregates). A group
+    whose samples are all hidden simply has no rows and does not appear.
     """
     if group_key is Sample.patient__cmo:
         stmt = stmt.where(Sample.patient__cmo.is_not(None))
@@ -150,6 +164,10 @@ def _apply_patient_filters(
         )
         if q is not None:
             stmt = stmt.where(Sample.patient__dmp.ilike(f"%{q}%"))
+    if consent_gate is not None:
+        # P3 consent gate: hide non-consent DMP samples (consent IS
+        # FALSE) before the GROUP BY, so the aggregates exclude them.
+        stmt = stmt.where(consent_gate)
     having = _patient_advanced_having(
         species=species,
         sex=sex,
@@ -281,6 +299,7 @@ def list_patients(
     if dmp_only and allowed is not None and DMP_LOGIC_NAME not in allowed:
         raise HTTPException(status_code=403, detail=LOGIC_ACCESS_DENIED_DETAIL)
     gating = allowed_logics_condition(db, allowed) if allowed is not None else None
+    consent_gate = consent_gate_condition() if consent_gate_active(current_user) else None
     group_key = Sample.patient__dmp if dmp_only else Sample.patient__cmo
     advanced = {
         "species": species,
@@ -290,17 +309,19 @@ def list_patients(
         "request_id": request_id,
         "logic": resolve_filter_logic(db, pairing_logic),
         "gating": gating,
+        "consent_gate": consent_gate,
     }
     rows = _patient_page(db, limit, offset, q=q, group_key=group_key, **advanced)
 
     by_group: dict[str, list[Sample]] = {}
     if rows:
         group_ids = [getattr(row, "patient__dmp" if dmp_only else "patient__cmo") for row in rows]
-        samples = db.scalars(
-            select(Sample).where(
-                (Sample.patient__dmp if dmp_only else Sample.patient__cmo).in_(group_ids)
-            )
-        ).all()
+        post_cond = (Sample.patient__dmp if dmp_only else Sample.patient__cmo).in_(group_ids)
+        if consent_gate is not None:
+            # The hidden samples must not leak into requests / metadata
+            # either — mirror the WHERE restriction on the GROUP BY.
+            post_cond = and_(post_cond, consent_gate)
+        samples = db.scalars(select(Sample).where(post_cond)).all()
         for s in samples:
             group_id = s.patient__dmp if dmp_only else s.patient__cmo
             by_group.setdefault(group_id, []).append(s)

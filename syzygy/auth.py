@@ -66,6 +66,7 @@ def _dev_user(db: Session) -> dict:
         "display_name": "Dev Admin (local)",
         "allowed_logics": _known_logic_names(db),
         "is_logic_admin": True,
+        "can_see_nonconsent": True,
     }
 
 
@@ -178,9 +179,15 @@ def verify_token(token: str) -> dict:
         "preferred_username": claims.get("preferred_username"),
     }
     # Pass the entitlement claims through, BY THE CONFIGURED NAMES, so
-    # _user_from_claims can derive allowed_logics / is_logic_admin.
-    # Tokens without them are left untouched (the three-key shape).
-    for claim_name in (settings.logic_claim_name, settings.logic_admin_claim):
+    # _user_from_claims can derive allowed_logics / is_logic_admin /
+    # can_see_nonconsent. Tokens without them are left untouched (the
+    # three-key shape). The P3 consent-gate claim (``nonconsent_claim``)
+    # rides along here too — _nonconsent_entitlement reads it.
+    for claim_name in (
+        settings.logic_claim_name,
+        settings.logic_admin_claim,
+        settings.nonconsent_claim,
+    ):
         if claim_name in claims:
             user[claim_name] = claims[claim_name]
     return user
@@ -336,6 +343,36 @@ def _logic_entitlements(claims: dict, db: Session) -> Tuple[Set[str], bool]:
     return allowed, is_admin
 
 
+def _nonconsent_entitlement(claims: dict) -> bool:
+    """Whether the principal holds the P3 non-consent entitlement.
+
+    The configured claim (``nonconsent_claim``, default
+    ``syzygy_nonconsent``) must carry the ``nonconsent_group`` name.
+    Reference shape (KC 26.8.1 built-in Group Membership mapper): the
+    claim value is a JSON list of the user's group names — the mapper
+    emits ALL of the user's group names for any user who has a group
+    and does NOT filter on its configured group (verified live: the
+    class never references claim.value). So the entitlement is list
+    MEMBERSHIP (the group name in the list), not claim presence: a
+    non-member's token still carries the claim (their other group
+    names), and a truthy check would grant the gate to everyone.
+    A scalar truthy claim (integration option b, org-configured) is
+    honored as well. Gating off (dark launch): the consent gate never
+    applies, so every principal is treated as able to see non-consent
+    DMP samples (the flag is True and the filter is never reached).
+    Fail-closed: gating on with an absent claim -> False (non-consent
+    DMP samples hidden).
+    """
+    if not settings.logic_gating_enabled:
+        return True
+    value = claims.get(settings.nonconsent_claim)
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return settings.nonconsent_group in {str(v) for v in value}
+    return bool(value)
+
+
 def _user_from_claims(
     claims: dict, db: Session
 ) -> Tuple[str, Optional[dict], Optional[dict]]:
@@ -359,6 +396,7 @@ def _user_from_claims(
     principal["allowed_logics"], principal["is_logic_admin"] = _logic_entitlements(
         claims, db
     )
+    principal["can_see_nonconsent"] = _nonconsent_entitlement(claims)
     return ("ok", principal, claims)
 
 
@@ -638,6 +676,25 @@ def gating_allowed_logics(current_user) -> Optional[Set[str]]:
         if isinstance(allowed, (set, frozenset, list, tuple)):
             return set(allowed)
     return set()
+
+
+def consent_gate_active(current_user) -> bool:
+    """Whether the P3 consent gate applies to this principal's listings
+    (and Layer A logic-scoped reads that honor the same rule): gating is
+    ON and the principal lacks the non-consent entitlement.
+
+    Dark launch (``logic_gating_enabled`` False): the gate never applies
+    (returns False) — listings behave exactly as today. Fail-closed: a
+    missing / non-dict principal, or one without a ``can_see_nonconsent``
+    flag, gets the gate (non-consent DMP samples hidden). A principal
+    whose flag is True (holds the entitlement, or the dev admin) sees
+    non-consent samples.
+    """
+    if not settings.logic_gating_enabled:
+        return False
+    if isinstance(current_user, dict) and current_user.get("can_see_nonconsent"):
+        return False
+    return True
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])

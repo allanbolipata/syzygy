@@ -3552,7 +3552,9 @@ def test_unmatched_count_endpoint(db):
     _bait_logic(db, name="UC-EP", bait="BAIT-UCEP")
     _sample(db, "UCEP-T-1", tumor_or_normal=TumorOrNormal.TUMOR.value, bait_set="BAIT-UCEP")
 
-    result = unmatched_count_endpoint(pairing_logic_name="UC-EP", db=db)
+    result = unmatched_count_endpoint(
+        pairing_logic_name="UC-EP", db=db, current_user={}
+    )
 
     assert result["pairing_logic"] == "UC-EP"
     assert result["unpaired"] == 1

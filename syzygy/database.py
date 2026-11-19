@@ -33,6 +33,25 @@ class Settings(BaseSettings):
     logic_gating_enabled: bool = False
     logic_claim_name: str = "syzygy_logics"
     logic_admin_claim: str = "syzygy_admin"
+    # P3 consent gate: name of the access-token claim carrying the
+    # non-consent DMP entitlement. Reference shape (integration option a):
+    # the built-in Group Membership mapper on the NONCONSENT realm group.
+    # CAUTION — verified live on Keycloak 26.8.1 (class
+    # GroupMembershipMapper, oidc-group-membership-mapper): that mapper
+    # ignores ``claim.value`` as a filter — its bytecode never references
+    # it — and emits ALL of the user's group names into the claim for ANY
+    # user who has at least one group. So the claim's value is the
+    # user's full group-name list, present for essentially everyone, and
+    # the entitlement is "the NONCONSENT group name is IN that list",
+    # not "the claim is truthy". A scalar truthy claim (integration
+    # option b, org-configured) is also honored. Fail-closed: absent
+    # claim -> non-consent samples hidden. Gating off (dark launch) ->
+    # the flag is ignored and the gate never applies (every principal
+    # sees everything, as today).
+    nonconsent_claim: str = "syzygy_nonconsent"
+    # The realm-group name that carries the P3 entitlement; the app
+    # checks for this exact name inside the list claim above.
+    nonconsent_group: str = "NONCONSENT"
     # Default-open pairing logics (P1, asymmetric policy): a comma list of
     # EXACT pairing-logic names that every authenticated principal sees
     # WITHOUT enrollment, on top of the claim-derived set (allowed = open
