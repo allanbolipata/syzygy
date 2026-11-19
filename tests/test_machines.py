@@ -37,6 +37,12 @@ def test_seed_pooled_machines_idempotent(db):
     seed_pooled_machines(db)
     rows = list_machines(db=db)
     assert {r.machine_name for r in rows} == {n for n, _, _ in DEFAULT_POOLED_MACHINES}
+    # The two NovaSeq X pool machines (beagle v2.3.0 "novaseq X change")
+    # are registered as the novaseq family for the argos pooled tier.
+    by_name = {r.machine_name: r for r in rows}
+    for name in ("fauci2", "bono"):
+        assert by_name[name].machine_class == "novaseq"
+        assert by_name[name].machine_type == "NovaSeq X"
     seed_pooled_machines(db)
     assert len(list_machines(db=db)) == len(DEFAULT_POOLED_MACHINES)
 

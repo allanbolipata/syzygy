@@ -108,8 +108,13 @@ DEFAULT_POOLED_SAMPLE_TYPES: tuple = ("Pooled Normal",)
 # Default machine reference rows for the pooled_machines table (used by
 # seed_pooled_machines at startup and by tests). machine_class is the
 # family used for pooled run-mode matching; machine_type is display-only.
+# The NovaSeq X pool machines (fauci2/bono) are registered as the
+# novaseq family: beagle v2.3.0 collapses NovaSeq X into novaseq for
+# pooled matching, mirroring _tumor_machine_family on the tumor side.
 DEFAULT_POOLED_MACHINES: tuple = (
+    ("bono", "novaseq", "NovaSeq X"),
     ("diana", "novaseq", "NovaSeq 6000"),
+    ("fauci2", "novaseq", "NovaSeq X"),
     ("jax", "hiseq", "HiSeq 4000"),
     ("kim", "hiseq", "HiSeq 2500"),
     ("liz", "hiseq", "HiSeq 2500"),

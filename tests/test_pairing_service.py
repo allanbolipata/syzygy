@@ -875,11 +875,46 @@ def test_argos_pooled_unknown_machine_blocks(db):
     )
     pooled = _sample(
         db, "NORM-POOL-U", patient__cmo=None, sample_type="Pooled Normal",
-        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="bono",
+        preservation=["FFPE"], sample_origin=["FFPE"], run_mode="zephyr",
     )
     selection = strategies["argos"].select_latest_normal(db, tumor)
     assert selection.normal is None
     assert any("pooled machine not in table" in note for note in selection.notes)
+
+
+def test_argos_pooled_novaseqx_pool_machines_auto_pair(db):
+    """beagle v2.3.0 "novaseq X change": the NovaSeq X pool machines
+    (fauci2/bono) are registered as the novaseq family, so a frozen
+    HC_IMPACT / IMPACT505_BAITS NovaSeq X tumor auto-pairs through the
+    pooled tier (NovaSeq X collapses into the novaseq family)."""
+    logic = _argos_logic(db)
+    seed_pooled_machines(db)
+    tumor = _sample(
+        db, "TUMOR-POOL-NSX-1", tumor_or_normal=TumorOrNormal.TUMOR.value,
+        gene_panel="HC_IMPACT", bait_set="IMPACT505_BAITS",
+        run_mode="NovaSeq X 25B", preservation=["Frozen"],
+    )
+    fauci2_pool = _sample(
+        db, "NORM-POOL-NSX-1", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="fauci2", preservation=["frozen"],
+    )
+    bono_pool = _sample(
+        db, "NORM-POOL-NSX-2", patient__cmo=None, sample_type="Pooled Normal",
+        gene_panel="hc_impact", bait_set="impact505_baits",
+        run_mode="bono", preservation=["frozen"],
+    )
+    # Both NovaSeq X pool machines pass the pooled gate: the tumor's
+    # "NovaSeq X 25B" collapses to the novaseq family, and each machine
+    # resolves to novaseq via the pooled_machines table.
+    argos = strategies["argos"]
+    assert argos.mismatch_reasons(tumor, fauci2_pool, db) == []
+    assert argos.mismatch_reasons(tumor, bono_pool, db) == []
+
+    result = trigger_pairing(db, tumor, logic, "automatic")
+    assert result is not None
+    assert result.normal_id in {fauci2_pool.id, bono_pool.id}
+    assert result.trigger_type == "automatic"
 
 
 def test_argos_pooled_unresolvable_tumor_run_mode_blocks(db):
