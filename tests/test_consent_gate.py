@@ -25,10 +25,13 @@ in-memory SQLite session; ``current_user`` is a plain kwarg carrying the
 reaches the query through the real ``Depends(get_current_user)`` graph and
 that ``/auth/me`` surfaces it.
 
-NOTE: the DMP Pair Report (``/pairing/report/``, ``/report-stats/``,
-``/export/``) is a separate, aggregate+streaming surface tracked as a
-follow-up card; this ticket gates the sample-level listing reads.
+The DMP Pair Report surface (``/pairing/report/``, ``/report-stats/``,
+``/export/``) honors the same rule: the report's rows and total, the stats
+frame, and the streaming export are all scoped to the rows the principal
+may see — a non-consent DMP sample is absent from the export's streamed
+bytes without the claim (paired and unmatched alike) and present with it.
 """
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -41,8 +44,12 @@ from sqlalchemy.pool import StaticPool
 from syzygy.auth import _nonconsent_entitlement, get_current_user
 from syzygy.database import Base, get_db, settings
 from syzygy.main import app
-from syzygy.models import BaitSet, PairingLogic, Sample
-from syzygy.routers.pairings import list_unmatched_dmp_samples
+from syzygy.models import BaitSet, PairingLogic, PairingTable, Sample
+from syzygy.routers.pairings import (
+    export_pair_report,
+    list_unmatched_dmp_samples,
+    pairing_report,
+)
 from syzygy.routers.patients import list_patients
 from syzygy.routers.samples import list_samples
 
@@ -453,3 +460,187 @@ def test_http_consent_gate_reaches_query(consent_world, db, monkeypatch):
     finally:
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_user, None)
+
+
+# ---------------------------------------------------------------------------
+# Layer A logic-scoped streaming export: GET /pairing/export/
+#
+# The export streams the FULL merged pair frame (paired rows, then — DMP
+# logics only — unmatched DMP tumor rows) through its own session; the
+# consent gate must scope that stream the same way it scopes the
+# report's rows and total. Regression for the defect where gen()
+# dropped the gate and let a claimless DMP member export consent=FALSE
+# samples.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def export_stream(db, engine, monkeypatch):
+    """Point the export's stream session at the in-memory test engine.
+
+    The endpoint validates with the request session but streams through
+    its own session (the request session may be closed before the body
+    finishes); redirecting that factory makes the stream see the fixture
+    data.
+    """
+    monkeypatch.setattr(
+        "syzygy.routers.pairings._open_stream_session", sessionmaker(bind=engine)
+    )
+
+
+def _pair(db, logic, tumor, normal, created):
+    """A latest pairing between two samples."""
+    p = PairingTable(
+        tumor_id=tumor.id,
+        normal_id=normal.id,
+        pairing_logic_id=logic.id,
+        latest=True,
+        trigger_type="automatic",
+        created_date=created,
+    )
+    db.add(p)
+    db.flush()
+    return p
+
+
+def _add_paired_nonconsent_dmp(consent_world, db):
+    """A consent=FALSE DMP TUMOR with a latest pairing (normal side
+    consent=TRUE) — the paired-section case. Returns the tumor."""
+    dmp = consent_world["logics"]["DMP"]
+    tumor = Sample(
+        primary_id="S-NCP-T",
+        cmo_sample_name="S-NCP-T_name",
+        patient__cmo="P-NCP",
+        request_id="R-NCP",
+        sample_type="DMP",
+        gene_panel="IMPACT468",
+        bait_set=None,
+        tumor_or_normal="TUMOR",
+        consent=False,
+        created_date=BASE_TIME + timedelta(minutes=10),
+    )
+    normal = Sample(
+        primary_id="S-NCP-N",
+        cmo_sample_name="S-NCP-N_name",
+        patient__cmo="P-NCP",
+        request_id="R-NCP",
+        sample_type="DMP",
+        gene_panel="IMPACT468",
+        bait_set=None,
+        tumor_or_normal="NORMAL",
+        consent=True,
+        created_date=BASE_TIME + timedelta(minutes=10),
+    )
+    db.add_all([tumor, normal])
+    db.flush()
+    _pair(db, dmp, tumor, normal, BASE_TIME + timedelta(minutes=10))
+    return tumor
+
+
+def _export_body(db, current_user, logic_name="DMP", columns=None, fmt="tsv"):
+    """Stream the full export body for a principal and return it as text.
+
+    The stream session shares the single StaticPool connection, so commit
+    first (safe against the stream session's close-rollback on that shared
+    connection). Starlette wraps the sync generator in an async iterator
+    (threadpool), so the body must be drained with asyncio.
+    """
+    db.commit()
+    resp = export_pair_report(
+        logic_name,
+        q=None,
+        columns=columns,
+        fmt=fmt,
+        db=db,
+        current_user=current_user,
+    )
+
+    async def _drain():
+        return "".join([chunk async for chunk in resp.body_iterator])
+
+    return asyncio.run(_drain())
+
+
+def _export_tumor_samples(body, sep="\t"):
+    """The tumor_sample column of each data row of a pair-file export."""
+    lines = [line for line in body.splitlines() if line]
+    header = lines[0].split(sep)
+    idx = header.index("tumor_sample")
+    return [line.split(sep)[idx] for line in lines[1:]]
+
+
+def test_export_hides_nonconsent_dmp_rows_without_claim(
+    consent_world, db, monkeypatch, export_stream
+):
+    """Accept: a consent=FALSE DMP sample is absent from the streamed
+    export for a DMP member without the non-consent entitlement — both
+    with a latest pairing (paired section) and without one (unmatched
+    section) — and present once the principal holds it; consent=TRUE/NULL
+    rows are unaffected and the streamed rows stay consistent with the
+    report's total."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    _add_paired_nonconsent_dmp(consent_world, db)
+    columns = "tumor_sample,normal_sample"
+
+    # Without the claim: both non-consent rows (S-NCP-T paired, S-NC
+    # unmatched) are absent from the streamed bytes; S-C/S-NULL survive.
+    body = _export_body(db, DMP_NO_CLAIM, columns=columns)
+    tumors = _export_tumor_samples(body)
+    assert tumors == ["S-NULL", "S-C"]
+    assert "S-NCP-N" not in body
+    # Total-consistent: the stream serves exactly the report's total.
+    total = pairing_report(
+        "DMP", 1, 50, db, q=None, current_user=DMP_NO_CLAIM, include_stats=False
+    ).total
+    assert total == len(tumors)
+
+    # With the claim: both non-consent rows are present (paired section
+    # first, unmatched after, newest first).
+    body = _export_body(db, DMP_WITH_CLAIM, columns=columns)
+    tumors = _export_tumor_samples(body)
+    assert tumors == ["S-NCP-T", "S-NULL", "S-C", "S-NC"]
+    total = pairing_report(
+        "DMP", 1, 50, db, q=None, current_user=DMP_WITH_CLAIM, include_stats=False
+    ).total
+    assert total == len(tumors)
+
+
+def test_export_dark_launch_byte_identical(consent_world, db, monkeypatch, export_stream):
+    """Dark launch (gating off): the export stream is byte-identical to
+    the ungated frame — a claimless DMP member gets every row."""
+    _add_paired_nonconsent_dmp(consent_world, db)
+    monkeypatch.setattr(settings, "logic_gating_enabled", False)
+    dark = _export_body(db, DMP_NO_CLAIM)
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    open_frame = _export_body(db, DMP_WITH_CLAIM)
+    assert dark == open_frame
+    assert "S-NC" in dark and "S-NCP-T" in dark
+
+
+def test_export_non_dmp_rows_unaffected(consent_world, db, monkeypatch, export_stream):
+    """The non-DMP branch threads the gate without over-hiding: a
+    non-DMP (consent NULL) pair is exported for a claimless principal,
+    under the non-DMP logic's default columns."""
+    monkeypatch.setattr(settings, "logic_gating_enabled", True)
+    argos = consent_world["logics"]["ARGOS"]
+    argos_tumor = consent_world["samples"]["S-ARG"]
+    argos_normal = Sample(
+        primary_id="S-ARGN",
+        cmo_sample_name="S-ARGN_name",
+        patient__cmo="P-ARG",
+        request_id="R-ARG",
+        sample_type="tissue",
+        gene_panel="IMPACT468",
+        bait_set="ARGOS-BAIT",
+        tumor_or_normal="NORMAL",
+        consent=None,
+        created_date=BASE_TIME + timedelta(minutes=4),
+    )
+    db.add(argos_normal)
+    db.flush()
+    _pair(db, argos, argos_tumor, argos_normal, BASE_TIME + timedelta(minutes=11))
+
+    body = _export_body(db, DMP_NO_CLAIM, logic_name="ARGOS", fmt="csv")
+    lines = [line for line in body.splitlines() if line]
+    assert lines[0] == "TUMOR_SAMPLE,NORMAL_SAMPLE,BAIT_SET"
+    assert lines[1:] == ["S-ARG,S-ARGN,ARGOS-BAIT"]

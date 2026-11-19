@@ -1685,12 +1685,12 @@ def export_pair_report(
                 # cells (spec c) restricted to col_defs; the unmatched
                 # section is tumor rows only.
                 for it in (
-                    _iter_paired_export_rows(db, logic, q),
-                    _iter_unmatched_export_rows(db, logic, q),
+                    _iter_paired_export_rows(db, logic, q, consent_gated),
+                    _iter_unmatched_export_rows(db, logic, q, consent_gated),
                 ):
                     yield from _iter_dmp_pair_lines(it, col_defs, sep)
             else:
-                for row in _iter_paired_export_rows(db, logic, q):
+                for row in _iter_paired_export_rows(db, logic, q, consent_gated):
                     yield _csv_line([c["text"](row) for c in col_defs], sep)
         finally:
             db.close()
