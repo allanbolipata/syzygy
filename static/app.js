@@ -141,6 +141,43 @@ const VIEW_GATE_IDS = { pairs: "pairs-gate", matches: "matches-gate", try: "try-
 const VIEW_TAG_IDS = { pairs: "pr-view-label", matches: "m-view-label", try: "tq-view-label" };
 let viewLogic = null;
 
+/* Pair Report "show unpaired" toggle (PRT1). OFF (the default): unpaired
+ * samples are hidden in EVERY pair-report view — the server-side
+ * include_unpaired=false filter keeps rows, totals, summary counts and the
+ * download paired-only (no client-side row hiding). ON: the current merged
+ * list. Persisted in localStorage like the session View (VIEW_LOGIC_KEY);
+ * unset/other values mean OFF (paired-only). */
+const PAIR_UNPAIRED_KEY = "syzygy.pair_report_show_unpaired";
+function readShowUnpairedPref() {
+  try {
+    return localStorage.getItem(PAIR_UNPAIRED_KEY) === "1";
+  } catch (_) {
+    return false; // private mode: paired-only default
+  }
+}
+
+/* PRT1: wire the pair-report "show unpaired" checkbox. Restores the
+ * persisted pref into pairsState.showUnpaired — the single source of
+ * truth every report/harmony/export request reads — and on change
+ * persists it (like the session View) and reloads the current view so
+ * rows, counts and the summary strip all follow the toggle. */
+function initShowUnpairedToggle() {
+  const box = $("#pr-show-unpaired");
+  if (!box) return;
+  pairsState.showUnpaired = readShowUnpairedPref();
+  box.checked = pairsState.showUnpaired;
+  box.addEventListener("change", () => {
+    pairsState.showUnpaired = box.checked;
+    try {
+      localStorage.setItem(PAIR_UNPAIRED_KEY, box.checked ? "1" : "0");
+    } catch (_) { /* private mode: session-scoped only */ }
+    if (viewLogic) {
+      invalidatePrPrefetch(); // the prefetch key includes the toggle
+      loadPairs();
+    }
+  });
+}
+
 function activeLogics() {
   return PAIRING_LOGICS.filter((l) => l.active);
 }
@@ -2011,6 +2048,12 @@ const pairsState = {
   // searched frame ({matched, unmatched, prevNormal}) — a page's rows can
   // never produce them. null until the first harmony page lands.
   harmonyStats: null,
+  // PRT1 "show unpaired" toggle (default OFF = paired-only). Sent to the
+  // server on every report/harmony/export request as include_unpaired, so
+  // rows, totals, summary counts and the download all follow it — this is
+  // the single source of truth the toggle writes (and init restores from
+  // localStorage).
+  showUnpaired: false,
 };
 
 /* HARMONY is its own pairing logic and its own normal-oriented view
@@ -2155,6 +2198,9 @@ function harmonyPageParams(page, pageSize) {
   const params = new URLSearchParams({
     page: String(page),
     page_size: String(pageSize),
+    // PRT1 "show unpaired" toggle (server-side filter): OFF (default)
+    // keeps the frame, total/matched/unmatched and the CSV paired-only.
+    include_unpaired: String(!!pairsState.showUnpaired),
   });
   const q = (pairsState.query || "").trim().toLowerCase();
   if (q) params.set("q", q);
@@ -2521,6 +2567,10 @@ function reportPageParams(logic, page, pageSize) {
     // full-frame walk to compute; a page doesn't wait for them (see
     // loadDmpReportStats, which fetches them in the background).
     include_stats: "false",
+    // PRT1 "show unpaired" toggle (server-side filter, not client-side row
+    // hiding): OFF (default) returns the paired rows only, so rows, total,
+    // the count line and pagination all follow the toggle.
+    include_unpaired: String(!!pairsState.showUnpaired),
   });
   const q = (pairsState.query || "").trim().toLowerCase();
   if (q) params.set("q", q);
@@ -2669,7 +2719,9 @@ async function loadPairs() {
  * real page turn re-fetches and surfaces the error. */
 let prPrefetch = null; // { key, page, abort, promise, data }
 function prPrefetchKey() {
-  return `${pairsState.logic}|${pairsState.query}|${pairsState.pageSize}`;
+  // The "show unpaired" toggle (PRT1) changes the server-side frame, so a
+  // prefetched page for the other state must never be served.
+  return `${pairsState.logic}|${pairsState.query}|${pairsState.pageSize}|${pairsState.showUnpaired ? "u" : "p"}`;
 }
 function invalidatePrPrefetch() {
   if (prPrefetch) {
@@ -2728,6 +2780,9 @@ async function downloadPairs() {
     pairing_logic_name: logic,
     fmt: tsv ? "tsv" : "csv",
     columns: cols.map((c) => c.key).join(","),
+    // PRT1 "show unpaired" toggle: the file covers exactly what the view
+    // shows — paired-only when OFF (the default).
+    include_unpaired: String(!!pairsState.showUnpaired),
   });
   const q = (pairsState.query || "").trim().toLowerCase();
   if (q) params.set("q", q);
@@ -2772,6 +2827,9 @@ function downloadHarmonyCsv() {
   if (cols.length === 0) return;
   const params = new URLSearchParams({ format: "csv" });
   if (pairsState.query) params.set("q", pairsState.query);
+  // PRT1 "show unpaired" toggle: the file covers exactly what the view
+  // shows — the matched pairs only when OFF (the default).
+  params.set("include_unpaired", String(!!pairsState.showUnpaired));
   if (cols.length < HARMONY_COLUMNS.length) params.set("columns", cols.map((c) => c.key).join(","));
   const a = document.createElement("a");
   a.href = `${API}/pairing/harmony/?${params}`;
@@ -2805,10 +2863,15 @@ async function loadPrOverviewStats() {
   if (!el || !logic) return;
   if (isDmpLogic(logic)) {
     const s = pairsState.dmpSummary;
+    // PRT1: with "show unpaired" OFF (the default) the view is paired-only,
+    // so the unmatched-tumors chip hides with the rows (the other two
+    // counts are paired-frame counts and stay).
     el.innerHTML = s
       ? `<span class="pr-stat"># of patients <strong>${s.patients}</strong></span>` +
         `<span class="pr-stat"># of Tumor-Normal pairs <strong>${s.tn_pairs}</strong></span>` +
-        `<span class="pr-stat"># of unmatched tumors <strong>${s.unmatched_tumors}</strong></span>`
+        (pairsState.showUnpaired
+          ? `<span class="pr-stat"># of unmatched tumors <strong>${s.unmatched_tumors}</strong></span>`
+          : "")
       : `<span class="pr-stat">summary <strong>…</strong></span>`;
     return;
   }
@@ -2817,9 +2880,11 @@ async function loadPrOverviewStats() {
   // for it (Paired = HARMONY's latest rows with both sides present,
   // Unpaired = its unpaired samples), so no client-side count is needed.
   const paint = (pairedHtml, unpairedHtml) => {
+    // PRT1: with "show unpaired" OFF (the default) the view is paired-only,
+    // so the Unpaired chip hides with the rows.
     el.innerHTML =
       `<span class="pr-stat">Paired ${pairedHtml}</span>` +
-      `<span class="pr-stat">Unpaired ${unpairedHtml}</span>`;
+      (pairsState.showUnpaired ? `<span class="pr-stat">Unpaired ${unpairedHtml}</span>` : "");
   };
   paint("<strong>…</strong>", "<strong>…</strong>");
   try {
@@ -3650,6 +3715,9 @@ async function unredactOpsSample(s) {
   // Allan picks.
   viewLogic = await resolveInitialViewLogic();
   applyViewState();
+  // PRT1: restore the persisted "show unpaired" pref before the first load
+  // so the very first report/harmony request already carries the frame.
+  initShowUnpairedToggle();
   if (viewLogic) {
     pairsState.logic = viewLogic;
     renderPrGroups();

@@ -558,6 +558,15 @@ def pairing_report(
             "/pairing/report-stats/. Default true keeps the 5/8 contract."
         ),
     ),
+    include_unpaired: bool = Query(
+        True,
+        description=(
+            "DMP logics only: when false, the unmatched DMP TUMOR section "
+            "is excluded — rows and total cover the paired rows only. "
+            "Default true keeps the current merged-list contract (paired "
+            "rows, then unmatched DMP tumors)."
+        ),
+    ),
     current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
 ):
@@ -576,6 +585,13 @@ def pairing_report(
     query matches on either side — the server-side form of the former
     client-side ``pairMatchesQuery`` — and ``total`` becomes the count of the
     filtered list, so pages and counts reflect the search.
+
+    ``include_unpaired`` (PRT1, DMP logics only): when false, the unmatched
+    DMP TUMOR section is excluded — rows and total cover the paired rows
+    only, so pagination and any count built on this list follow the
+    paired-only frame. Default true keeps the current merged list; the
+    pair-report UI's "show unpaired" toggle (default OFF) sends the param
+    explicitly, and toggling it ON restores this exact behavior.
 
     DMP logics only (5/8): ``summary`` and ``warnings`` carry the
     reference's summary counts and QC warnings (spec d/e), computed over
@@ -621,8 +637,9 @@ def pairing_report(
     # the rows are served with. We do NOT reuse count_unpaired's "unpaired"
     # here: for a bait-set-less DMP logic it falls back to
     # total-minus-paired, which can overcount and would make "total" drift
-    # from the rows actually returned.
-    if _is_dmp_strategy(logic):
+    # from the rows actually returned. PRT1: skipped entirely when
+    # include_unpaired=false — the paired rows are the whole list then.
+    if _is_dmp_strategy(logic) and include_unpaired:
         unmatched_total = _report_unmatched_total(db, logic, q, consent_gated)
     else:
         unmatched_total = 0
@@ -1639,6 +1656,15 @@ def export_pair_report(
         "the logic's default column set when omitted",
     ),
     fmt: str = Query("csv", description="csv or tsv"),
+    include_unpaired: bool = Query(
+        True,
+        description=(
+            "DMP logics only: when false, the unmatched DMP TUMOR section is "
+            "excluded — the file streams the paired rows only. Default true "
+            "keeps the current merged-list contract (paired rows, then "
+            "unmatched DMP tumors)."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     logic_access: None = Depends(require_logic_access()),
@@ -1654,6 +1680,11 @@ def export_pair_report(
     DMP logics (4/8) export the reference's 15-column pair file: tumor rows
     only (unpaired normals never appear), real values from the remapped DMP
     record — no placeholders (spec c).
+
+    ``include_unpaired`` (PRT1, DMP logics only): when false, the unmatched
+    DMP TUMOR rows never enter the stream — the export covers the paired
+    rows only, matching the report's paired-only frame. Default true keeps
+    the current merged file.
     """
     # Validate the logic, search, format, and column set up front so the
     # response is a clean 4xx rather than a broken stream.
@@ -1687,11 +1718,12 @@ def export_pair_report(
             if is_dmp:
                 # DMP pair file: each row renders as the reference's 15
                 # cells (spec c) restricted to col_defs; the unmatched
-                # section is tumor rows only.
-                for it in (
-                    _iter_paired_export_rows(db, logic, q, consent_gated),
-                    _iter_unmatched_export_rows(db, logic, q, consent_gated),
-                ):
+                # section is tumor rows only (PRT1: skipped when
+                # include_unpaired=false — the paired rows are the file).
+                sections = [_iter_paired_export_rows(db, logic, q, consent_gated)]
+                if include_unpaired:
+                    sections.append(_iter_unmatched_export_rows(db, logic, q, consent_gated))
+                for it in sections:
                     yield from _iter_dmp_pair_lines(it, col_defs, sep)
             else:
                 for row in _iter_paired_export_rows(db, logic, q, consent_gated):
@@ -2135,7 +2167,7 @@ HARMONY_FRAME_COLUMNS = HARMONY_COLUMNS
 HARMONY_FRAME_ORDER = ("sort_normal", "sort_tumor", "row_id")
 
 
-def _harmony_frame_subquery(logic: PairingLogic, q: Optional[str]):
+def _harmony_frame_subquery(logic: PairingLogic, q: Optional[str], include_unpaired: bool = True):
     """The whole merged frame as one subquery: paired rows UNION ALL unmatched.
 
     UNION ALL, not UNION: the two sections are disjoint BY CONSTRUCTION (the
@@ -2145,11 +2177,18 @@ def _harmony_frame_subquery(logic: PairingLogic, q: Optional[str]):
     primary_id, so a page cannot be assembled from the two sections
     independently (the old code built the whole frame as a list of dicts,
     twice per request, and the browser then held all 169k rows).
+
+    ``include_unpaired`` (PRT1): when false the frame is the paired section
+    alone — the unmatched DMP samples never enter it, so pages, counts and
+    the CSV all follow the paired-only frame. Default true keeps the current
+    merged frame.
     """
-    return union_all(
-        _harmony_paired_select(logic, q),
-        _harmony_unmatched_select(logic, q),
-    ).subquery("harmony_frame")
+    if include_unpaired:
+        return union_all(
+            _harmony_paired_select(logic, q),
+            _harmony_unmatched_select(logic, q),
+        ).subquery("harmony_frame")
+    return _harmony_paired_select(logic, q).subquery("harmony_frame")
 
 
 def _harmony_section_total(db: Session, section_select) -> int:
@@ -2158,7 +2197,12 @@ def _harmony_section_total(db: Session, section_select) -> int:
 
 
 def _harmony_frame_page(
-    db: Session, logic: PairingLogic, q: Optional[str], offset: int, limit: int
+    db: Session,
+    logic: PairingLogic,
+    q: Optional[str],
+    offset: int,
+    limit: int,
+    include_unpaired: bool = True,
 ) -> tuple[list[dict], Optional[str]]:
     """One slice of the merged frame, in frame order: ``(rows, prev_normal)``.
 
@@ -2168,7 +2212,7 @@ def _harmony_frame_page(
     row can still be marked as the tail of a group that began on an earlier
     page.
     """
-    frame = _harmony_frame_subquery(logic, q)
+    frame = _harmony_frame_subquery(logic, q, include_unpaired)
     stmt = select(*(frame.c[name] for name in HARMONY_FRAME_COLUMNS)).order_by(
         *(frame.c[name] for name in HARMONY_FRAME_ORDER)
     )
@@ -2184,14 +2228,14 @@ def _harmony_frame_page(
     return rows, prev_normal_sample
 
 
-def _iter_harmony_frame_rows(db: Session, logic: PairingLogic, q: Optional[str]):
+def _iter_harmony_frame_rows(db: Session, logic: PairingLogic, q: Optional[str], include_unpaired: bool = True):
     """Stream the WHOLE merged frame in frame order, via keyset pagination.
 
     The export path: ``(sort_normal, sort_tumor, row_id)`` replaces OFFSET, so
     a full-frame download is the same constant-size batches from the first row
     to the last, at any frame size, and never materializes the frame.
     """
-    frame = _harmony_frame_subquery(logic, q)
+    frame = _harmony_frame_subquery(logic, q, include_unpaired)
     base = (
         select(
             *(frame.c[name] for name in HARMONY_FRAME_COLUMNS),
@@ -2229,7 +2273,11 @@ def _iter_harmony_frame_rows(db: Session, logic: PairingLogic, q: Optional[str])
 
 
 def _iter_harmony_csv_lines(
-    db: Session, logic: PairingLogic, q: Optional[str], columns: tuple
+    db: Session,
+    logic: PairingLogic,
+    q: Optional[str],
+    columns: tuple,
+    include_unpaired: bool = True,
 ):
     """Yield the HARMONY CSV as batch-sized chunks of text.
 
@@ -2257,7 +2305,7 @@ def _iter_harmony_csv_lines(
         return chunk
 
     written = 0
-    for rec in _iter_harmony_frame_rows(db, logic, q):
+    for rec in _iter_harmony_frame_rows(db, logic, q, include_unpaired):
         writer.writerow(
             [
                 _harmony_csv_consent(rec[pos])
@@ -2309,6 +2357,15 @@ def get_harmony_pairings(
         "exactly those columns in the order given; omit for all 8 columns. An "
         "unknown key is a 400 (rejected even when the frame is empty).",
     ),
+    include_unpaired: bool = Query(
+        True,
+        description=(
+            "When false, the unmatched DMP section never enters the frame — "
+            "rows, total/matched/unmatched and the CSV cover the matched "
+            "pairs only (unmatched is 0). Default true keeps the current "
+            "merged frame."
+        ),
+    ),
     db: Session = Depends(get_db),
     logic_access: None = Depends(
         require_logic_access(param=None, logic=HARMONY_LOGIC_NAME)
@@ -2345,6 +2402,12 @@ def get_harmony_pairings(
     FULL searched frame, ignoring page/page_size — the download is the whole
     set, not the loaded page (same as GET /pairing/export/) — streamed in
     keyset batches on its own session.
+
+    ``include_unpaired`` (PRT1): when false, the unmatched DMP samples never
+    enter the frame — the page rows, ``total`` (== ``matched``),
+    ``unmatched`` (== 0) and the CSV all cover the matched pairs only.
+    Default true keeps the current merged frame; the pair-report UI's
+    "show unpaired" toggle (default OFF) sends the param explicitly.
     """
     logic = find_logic_by_name(db, HARMONY_LOGIC_NAME)
     if logic is None:
@@ -2379,7 +2442,7 @@ def get_harmony_pairings(
                 stream_logic = db2.get(PairingLogic, logic_id)
                 if stream_logic is None:
                     return
-                yield from _iter_harmony_csv_lines(db2, stream_logic, q, csv_columns)
+                yield from _iter_harmony_csv_lines(db2, stream_logic, q, csv_columns, include_unpaired)
             finally:
                 db2.close()
 
@@ -2391,12 +2454,18 @@ def get_harmony_pairings(
 
     page_size = min(page_size, REPORT_MAX_PAGE_SIZE)  # same clamp as the report
     matched = _harmony_section_total(db, _harmony_paired_select(logic, q))
-    unmatched = _harmony_section_total(db, _harmony_unmatched_select(logic, q))
+    # PRT1: with the unpaired section excluded, the frame IS the paired
+    # section — unmatched is 0 and the page comes from the paired-only frame.
+    unmatched = (
+        _harmony_section_total(db, _harmony_unmatched_select(logic, q))
+        if include_unpaired
+        else 0
+    )
     total = matched + unmatched
     offset = (page - 1) * page_size
     if offset >= total:
         return HarmonyFrameRead(rows=[], total=total, matched=matched, unmatched=unmatched)
-    rows, prev_normal_sample = _harmony_frame_page(db, logic, q, offset, page_size)
+    rows, prev_normal_sample = _harmony_frame_page(db, logic, q, offset, page_size, include_unpaired)
     return HarmonyFrameRead(
         rows=rows,
         total=total,
