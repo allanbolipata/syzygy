@@ -6,8 +6,24 @@ module is the single point of translation so the same mapping can be
 used by the dev ingestion script (``scripts/populate_from_beagle.py``)
 and, later, the real DMP connector.
 
-The ENTIRE DMP record is stored. Field mapping (DMP metadata ->
-syzygy Sample):
+ACELA envelope (contract supplied by Allan 2026-11-20)
+-------------------------------------------------------
+Since 2026-11-20 the DMP BAM records arrive as an ACELA envelope::
+
+    { "path": "/…/test.bam",
+      "metadata": { …the flat DMP metadata… },
+      "pathChecks": { "mirror": {status, size_bytes, checked_at},
+                      "dms":    {…} } }
+
+``flatten_acela_record`` is the single flatten point: it unwraps the
+envelope into the flat DMP vocabulary (the ``metadata`` keys plus
+``bam_path`` / ``path_checks`` / ``bam_exists``) so every ingest path
+(NATS dmp-sample handler, beagle dump importer) funnels through one
+mapping. A record whose ``metadata`` is not a dict is not an envelope
+and passes through unchanged.
+
+The ENTIRE (flattened) DMP record is stored. Field mapping (flat DMP
+record -> syzygy Sample):
     sample              -> primary_id            (cmo_sample_name fallback)
     external_id         -> cmo_sample_name       (DMP's CMO sample label)
     patient.cmo         -> patient__cmo            ("C-" prefixed)
@@ -16,11 +32,26 @@ syzygy Sample):
     cmo_assay           -> gene_panel            (fallback: ASSAY_MAPPING[assay])
     type ("T"/"N")      -> tumor_or_normal       (TUMOR / NORMAL)
     "DMP" (constant)    -> sample_type           (provenance marker)
-    False (constant)    -> consent               (PLACEHOLDER — the real source is
-                                                  a future DMP-payload field)
+    False (constant)    -> consent               (PLACEHOLDER — see CONSENT
+                                                  below; NOT part_c_consent)
+    bam_path            -> additional_metadata   (envelope bam path, verbatim)
+    path_checks         -> additional_metadata   (envelope pathChecks, verbatim)
+    bam_exists          -> additional_metadata   (1 iff path non-empty AND every
+                                                  pathCheck status == "OK", else 0)
     every other key     -> additional_metadata   (verbatim under the
                                                   original key; null/empty
                                                   values skipped)
+
+CONSENT: ``consent`` is a PLACEHOLDER ``False`` for every DMP record.
+The real consent source is a FUTURE, DIFFERENT ACELA field whose name is
+not yet determined (Allan 2026-11-20) — it is NOT ``part_c_consent``,
+which is stored verbatim in ``additional_metadata`` and must never drive
+``Sample.consent``. Do not wire any payload key to ``consent`` here.
+
+``bam_path`` / ``path_checks`` / ``bam_exists`` land in the JSON
+``additional_metadata`` column (no migration — same precedent as
+``run_ids``); ``bam_exists`` is also the stored value that
+``remap_dmp_record`` falls back to when the caller passes the default 0.
 
 Only the column-mapped fields (EXCLUDED_DMP_KEYS) are excluded from
 additional_metadata; everything else is kept, including project_name and
@@ -86,6 +117,52 @@ def unmapped_metadata(meta: dict) -> dict:
     }
 
 
+def flatten_acela_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten an ACELA DMP bam-file envelope into the flat DMP record.
+
+    The ACELA envelope (contract supplied by Allan 2026-11-20) wraps the
+    flat DMP metadata under ``metadata`` and adds the bam ``path`` plus
+    per-mirror ``pathChecks``::
+
+        { "path": "/…/test.bam",
+          "metadata": { …the flat DMP metadata… },
+          "pathChecks": { "mirror": {status, …}, "dms": {…} } }
+
+    A record whose ``metadata`` is a dict is an envelope and is unwrapped
+    to the flat vocabulary: the ``metadata`` keys plus ``bam_path`` (the
+    envelope ``path``), ``path_checks`` (``pathChecks`` verbatim) and
+    ``bam_exists`` (1 iff the path is non-empty AND every present
+    ``pathCheck`` has ``status == "OK"``, else 0). A record whose
+    ``metadata`` is absent or not a dict is not an envelope and is
+    returned unchanged.
+
+    This is the SINGLE flatten point: every ingest path (NATS dmp-sample
+    handler, beagle dump importer) funnels through it so one vocabulary
+    is used everywhere. The three added keys are not column-mapped, so
+    ``unmapped_metadata`` carries them verbatim into
+    ``additional_metadata`` (JSON column, no migration).
+    """
+    if not isinstance(record, dict):
+        return record
+    meta = record.get("metadata")
+    if not isinstance(meta, dict):
+        # Not an ACELA envelope (legacy flat record) — pass through as-is.
+        return record
+
+    path = record.get("path") or ""
+    path_checks = record.get("pathChecks")
+    checks = path_checks if isinstance(path_checks, dict) else {}
+    all_ok = all(
+        isinstance(check, dict) and check.get("status") == "OK"
+        for check in checks.values()
+    )
+    flat = dict(meta)
+    flat["bam_path"] = path
+    flat["path_checks"] = path_checks
+    flat["bam_exists"] = 1 if (path and all_ok) else 0
+    return flat
+
+
 def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
     """Build ``Sample`` kwargs for one DMP record (the entire record).
 
@@ -125,11 +202,13 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
         additional_metadata=unmapped_metadata(meta) or None,
         errors=None,
     )
-    # PLACEHOLDER default (user decision 2026-11-05): every DMP sample is
-    # recorded as non-consented (consent=False) until the DMP payload
-    # carries the real consent value. This is the SINGLE placeholder
-    # point — the real source is a future DMP-payload field whose name is
-    # NOT agreed yet; do not guess or hardcode a payload key here.
+    # PLACEHOLDER (user decision 2026-11-05; ACELA contract 2026-11-20):
+    # every DMP sample is recorded as non-consented (consent=False) until
+    # the payload carries the real consent value. The real source is a
+    # FUTURE, DIFFERENT ACELA field whose name is TBD — it is NOT
+    # part_c_consent, which is stored verbatim in additional_metadata and
+    # must never drive Sample.consent. This is the SINGLE placeholder
+    # point; do not guess or hardcode a payload key here.
     kw["consent"] = False
     return kw
 
@@ -183,9 +262,12 @@ def remap_dmp_record(sample, bam_exists: int = 0) -> Dict[str, Any]:
     - ``group``: no source in the real record format (audited absent) —
       an explicit value is passed through, else ``None``; consumers
       render "NA".
-    - ``bam_exists``: the caller passes the value resolved from the
-      beagle file record (non-empty path → 1, else 0 — the sanctioned
-      deviation); the default 0 applies when it cannot be resolved.
+    - ``bam_exists``: an explicit non-zero caller resolution (resolved
+      from the beagle file record) wins; the caller default 0 (=
+      unresolved) falls back to the value stored at ingest in
+      ``additional_metadata["bam_exists"]`` (computed by
+      ``flatten_acela_record`` from the ACELA envelope's pathChecks),
+      else 0.
     - ``is_matched``: an explicit ``matched_tag`` metadata value is passed
       through; otherwise ``None`` — the pairing strategy derives match
       status from the pairing result (audited absent from real records).
@@ -194,6 +276,11 @@ def remap_dmp_record(sample, bam_exists: int = 0) -> Dict[str, Any]:
       distinct warning-4 case).
     """
     meta = sample.additional_metadata or {}
+    # bam_exists: an explicit non-zero caller resolution wins; the default
+    # 0 (= unresolved) falls back to the value stored at ingest in
+    # additional_metadata (computed by flatten_acela_record from the ACELA
+    # envelope's pathChecks), else 0.
+    bam_exists = bam_exists or meta.get("bam_exists") or 0
     primary_id = sample.primary_id or ""
     match = re.search(r"(P-\d+)-(\w+)-(\w+)", primary_id)
     idx = match.group(2) if match else ""

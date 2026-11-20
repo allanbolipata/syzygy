@@ -2158,9 +2158,10 @@ function renderPrGroups() {
   }
 }
 
-/* HARMONY cells: the endpoint already resolves display values (em-dash
- * placeholders for missing bam paths, null for the absent side); consent
- * renders "true"/"false"/empty per the endpoint's value. */
+/* HARMONY cells: the endpoint already resolves display values (the stored
+ * ACELA bam path, em-dash when a sample never received an envelope, null
+ * for the absent side); consent renders "true"/"false"/empty per the
+ * endpoint's value. */
 function harmonyCellText(r, key) {
   const v = r[key];
   if (key === "consent") return v === null || v === undefined ? "" : (v ? "true" : "false");
@@ -2173,7 +2174,8 @@ function harmonyCellText(r, key) {
  * the name as the Samples-tab search term; the patient column is
  * coalesce(tumor, normal).patient__dmp — a DMP id — so it goes through the
  * same conditional DMP-patient flow (no-op when no patient record matches).
- * The bam-path columns keep their em-dash placeholder rendering untouched. */
+ * The bam-path columns render the endpoint's value untouched (the stored
+ * ACELA path, or the em-dash placeholder for samples without one). */
 function harmonyCellHtml(r, key) {
   const text = harmonyCellText(r, key);
   if (text === "") return "";

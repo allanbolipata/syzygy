@@ -938,6 +938,95 @@ def test_bam_exists_map_empty_when_beagle_unset(monkeypatch):
     assert pairings._beagle_bam_exists_map({"P-1-T01-IM6"}) == {}
 
 
+# ---------------------------------------------------------------------------
+# (h) DA4 end-to-end: ACELA envelope ingest -> remap -> DMP report.
+#
+# Card accept: a pathChecks-OK sample reports bam_exists=1, a MISSING one
+# reports 0; a sample that never received an envelope renders exactly as
+# before (beagle unset -> the remap fallback -> 0).
+# ---------------------------------------------------------------------------
+
+
+def _acela_envelope(db, sample_id, stype, patient_dmp, path, mirror_status="OK"):
+    """Ingest a DMP sample through the REAL NATS ingest path (the ACELA
+    envelope: {path, metadata, pathChecks} — the DA2 surface)."""
+    from syzygy.nats_ingest import handle_dmp_sample
+
+    result = handle_dmp_sample(db, {
+        "path": path,
+        "metadata": {
+            "sample": sample_id,
+            "type": stype,
+            "assay": "IM6",
+            "patient": {"cmo": f"ACEL{patient_dmp[-2:]}", "dmp": patient_dmp},
+            "cmo_assay": "IMPACT468",
+        },
+        "pathChecks": {
+            "mirror": {"status": mirror_status, "size_bytes": 1, "checked_at": "t"}
+        },
+    })
+    assert result["status"] == "ok", result
+
+
+def test_acela_envelope_flows_ingest_remap_report(db, export_stream, monkeypatch):
+    """DA4 accept, end to end: ingest -> remap -> report. The bam_exists the
+    envelope stored reaches the export pair file and the report stats; a
+    sample without any envelope renders exactly as it did before DA4."""
+    import syzygy.routers.pairings as pairings
+    from syzygy.pairing_service import trigger_dmp_pairing
+
+    # Beagle unset: the remap's DA1 fallback (stored bam_exists) decides.
+    monkeypatch.setattr(pairings.settings, "beagle_database_url", None)
+    monkeypatch.setattr(pairings, "_beagle_engine_cache", None)
+
+    _logic(db, "DMP", "dmp")
+    # The pair: both sides ingested via ACELA envelopes — the tumor's
+    # pathChecks OK (bam_exists 1), the normal's MISSING (bam_exists 0).
+    _acela_envelope(db, "P-00045910-T01-IM6", "T", "P-00045910",
+                    "/dmp/mirror/impact468/T/045910T.bam")
+    _acela_envelope(db, "P-00045910-N01-IM6", "N", "P-00045910",
+                    "/dmp/mirror/impact468/N/045910N.bam",
+                    mirror_status="MISSING")
+    # A legacy flat tumor that never received an envelope (no bam keys).
+    _dmp_sample(db, "P-00045911-T01-IM6", TumorOrNormal.TUMOR.value,
+                BASE_DATE + timedelta(hours=1), patient_dmp="P-00045911")
+
+    # The real cascade pairs the envelope pair (the strategy-side remap
+    # caller) and leaves P-00045911 unmatched.
+    result = trigger_dmp_pairing(db)
+    assert result["paired"] == 1
+    assert result["unpaired"] == 1
+
+    # Export pair file: bam_exists comes from the stored envelope.
+    lines = _export_lines("DMP", db, fmt="tsv")
+    header = lines[0].split("\t")
+    by = {h: i for i, h in enumerate(header)}
+    rows = {line.split("\t")[by["tumor_sample"]]: line.split("\t")
+            for line in lines[1:]}
+    pair = rows["P-00045910-T01-IM6"]
+    assert pair[by["tumor_bam_exists"]] == "1"     # pathChecks OK
+    assert pair[by["normal_bam_exists"]] == "0"    # pathChecks MISSING
+    legacy = rows["P-00045911-T01-IM6"]
+    # Rendered exactly as before DA4: 0 (unresolvable), NA on the NA side.
+    assert legacy[by["tumor_bam_exists"]] == "0"
+    assert legacy[by["normal_bam_exists"]] == "NA"
+
+    # Report stats: the flagged pair row (normal side bam_exists == "0")
+    # lists BOTH sides — the reference's samples_with_bams_missing
+    # semantics (either side of a flagged row is listed; pinned by
+    # test_dmp_report_stats.py::test_samples_with_bams_missing_lists_both_sides
+    # and the R conformance suite). The OK tumor's own bam_exists column
+    # is proven "1" above in the export pair file. The legacy flat tumor
+    # (unmatched, never enveloped) surfaces as missing as before.
+    report = pairing_report("DMP", 1, 50, db, q=None)
+    assert report.summary.tn_pairs == 1
+    assert report.summary.unmatched_tumors == 1
+    missing = report.warnings.samples_with_bams_missing
+    assert missing == [
+        "P-00045910-T01-IM6",       # flagged row: tumor side listed too
+        "P-00045910-N01-IM6",       # pathChecks MISSING
+        "P-00045911-T01-IM6",       # legacy flat: still 0
+    ]
 # --- PRT1: include_unpaired toggle (paired-only default in the UI) ---------
 #
 # The pair-report UI's "show unpaired" toggle sends include_unpaired=false

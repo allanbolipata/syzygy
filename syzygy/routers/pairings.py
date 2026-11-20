@@ -2032,9 +2032,26 @@ HARMONY_COLUMNS = (
     "consent",
 )
 
-#: Placeholder for the bam-path columns: syzygy stores no bam paths (future
-#: DMP-payload field), so the column is emitted as an em dash.
+#: Fallback for the bam-path columns: a sample that never received an ACELA
+#: envelope has no stored bam path, so its rows keep the em-dash rendering
+#: (DA4: samples WITH an envelope surface the stored bam FILE PATH).
 HARMONY_BAM_PATH_PLACEHOLDER = "\u2014"
+
+
+def _harmony_bam_path(side):
+    """One side's bam FILE PATH (DA4): the ``bam_path`` the ACELA envelope
+    flattened into ``additional_metadata`` at ingest (same DMP records back
+    both views — Allan 2026-11-20), or the em-dash placeholder when the
+    sample never received an envelope.
+
+    ``as_string()`` (not ``cast(col[key], String)``): on SQLite the latter
+    compiles to ``CAST(JSON_QUOTE(JSON_EXTRACT(...)) AS VARCHAR)``, which
+    yields the literal text ``'null'`` for an absent key (and JSON-quotes a
+    real path); ``as_string()`` is ``CAST(JSON_EXTRACT(...) AS VARCHAR)``
+    there and ``col ->> 'bam_path'`` on Postgres — SQL NULL for an absent
+    key on both, so the placeholder branch below fires correctly."""
+    path = side.additional_metadata["bam_path"].as_string()
+    return case((path.is_not(None), path), else_=HARMONY_BAM_PATH_PLACEHOLDER)
 
 
 
@@ -2055,9 +2072,10 @@ def _harmony_csv_consent(consent) -> str:
 # substring (the SAME _search_pattern as the Pair Report search) matched
 # against the frame's searchable columns on either side. Two deliberate
 # departures from what the client filter used to do: the *_bam_path columns
-# are the constant em-dash placeholder, so matching them matched every row
-# with any present side, and consent as a substring matched "true"/"false"
-# for almost every row — both made short searches match everything. Consent
+# are display-only — long mirror paths, and before the ACELA envelope stored
+# them they were the constant em-dash placeholder, which matched every row
+# with any present side — and consent as a substring matched "true"/"false"
+# for almost every row. Both made short searches match everything. Consent
 # therefore matches only when the whole query is exactly true/false.
 HARMONY_SEARCH_FIELDS = ("primary_id", "anon_id", "patient__dmp")
 
@@ -2093,9 +2111,9 @@ def _harmony_paired_select(logic: PairingLogic, q: Optional[str]):
             normal.primary_id.label("normal_sample"),
             tumor.primary_id.label("tumor_sample"),
             normal.anon_id.label("normal_bamname"),
-            cast(HARMONY_BAM_PATH_PLACEHOLDER, String).label("normal_bam_path"),
+            _harmony_bam_path(normal).label("normal_bam_path"),
             tumor.anon_id.label("tumor_bamname"),
-            cast(HARMONY_BAM_PATH_PLACEHOLDER, String).label("tumor_bam_path"),
+            _harmony_bam_path(tumor).label("tumor_bam_path"),
             func.coalesce(tumor.patient__dmp, normal.patient__dmp).label("patient"),
             func.coalesce(tumor.consent, normal.consent).label("consent"),
             func.coalesce(normal.primary_id, "").label("sort_normal"),
@@ -2143,11 +2161,11 @@ def _harmony_unmatched_select(logic: PairingLogic, q: Optional[str]):
         case((is_normal, Sample.primary_id), else_=None).label("normal_sample"),
         case((is_tumor, Sample.primary_id), else_=None).label("tumor_sample"),
         case((is_normal, Sample.anon_id), else_=None).label("normal_bamname"),
-        case((is_normal, cast(HARMONY_BAM_PATH_PLACEHOLDER, String)), else_=None).label(
+        case((is_normal, _harmony_bam_path(Sample)), else_=None).label(
             "normal_bam_path"
         ),
         case((is_tumor, Sample.anon_id), else_=None).label("tumor_bamname"),
-        case((is_tumor, cast(HARMONY_BAM_PATH_PLACEHOLDER, String)), else_=None).label(
+        case((is_tumor, _harmony_bam_path(Sample)), else_=None).label(
             "tumor_bam_path"
         ),
         Sample.patient__dmp.label("patient"),
@@ -2392,8 +2410,9 @@ def get_harmony_pairings(
     otherwise lose mid-group.
 
     ``?format=csv`` returns a ``text/csv`` attachment: one row per (normal,
-    tumor) pair, ``normal_bam_path``/``tumor_bam_path`` as em-dash placeholders
-    (no bam paths in syzygy yet), ``consent`` rendered as lowercase
+    tumor) pair, ``normal_bam_path``/``tumor_bam_path`` as the stored ACELA
+    bam file paths (em-dash placeholder when a sample never received an
+    envelope), ``consent`` rendered as lowercase
     ``true``/``false`` (empty when unknown). Without ``columns`` the header is
     exactly the 8 HARMONY columns (``normal_sample, tumor_sample,
     normal_bamname, normal_bam_path, tumor_bamname, tumor_bam_path, patient,

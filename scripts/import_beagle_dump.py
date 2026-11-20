@@ -16,7 +16,13 @@ Record sources (all from ``file_system_filemetadata`` latest rows):
   :func:`dmp_translator.to_dmp_sample_kwargs`, which stores the ENTIRE
   record: every field mapped to a column (including anon_id and patient.dmp)
   goes to its column, and every remaining key goes verbatim into
-  additional_metadata. DMP samples are auto-paired ONLY when --trigger-dmp
+  additional_metadata. Since 2026-11-20 the rows may arrive as ACELA
+  envelopes (``{path, metadata, pathChecks}``); each record is passed
+  through :func:`dmp_translator.flatten_acela_record` — the single flatten
+  point, the same call the NATS dmp-sample handler makes — before the
+  merge, so DMP rows store ``bam_path`` / ``path_checks`` / ``bam_exists``
+  in additional_metadata and both ingest paths store one shared
+  vocabulary. DMP samples are auto-paired ONLY when --trigger-dmp
   is set (under the "DMP" pairing logic); without the flag they are
   imported unpaired. Manual DMP pairing (dashboard pin or
   ``POST /v1/pairing/trigger``) still exists and always takes precedence:
@@ -74,7 +80,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from fastapi import HTTPException
 
 from syzygy.database import engine
-from syzygy.dmp_translator import to_dmp_sample_kwargs
+from syzygy.dmp_translator import flatten_acela_record, to_dmp_sample_kwargs
 from syzygy.models import DMP_LOGIC_NAME, PairingLogic, Sample
 from syzygy.pairing_service import (
     ensure_pooled_machine,
@@ -215,9 +221,21 @@ def to_pooled_normal_kwargs(row: Any) -> dict[str, Any]:
 
 def merge_dmp_samples(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
     """Merge DMP-structure rows keyed by their ``sample`` id (DMP records
-    carry no ``primaryId``). First-non-null-wins across a sample's files."""
+    carry no ``primaryId``). First-non-null-wins across a sample's files.
+
+    Each row's record is first passed through
+    :func:`syzygy.dmp_translator.flatten_acela_record` — the single flatten
+    point (DMP_ACELA_ENVELOPE_TICKETS.md): since 2026-11-20 the
+    ``file_system_filemetadata`` latest rows may be ACELA envelopes
+    (``{path, metadata, pathChecks}``); flattening unwraps them to the flat
+    DMP vocabulary (gaining ``bam_path`` / ``path_checks`` / ``bam_exists``)
+    before the merge, so the importer stores the same keys the NATS
+    dmp-sample handler stores for the same record. Legacy flat rows (no
+    dict ``metadata``) pass through unchanged.
+    """
     samples: dict[str, dict[str, Any]] = {}
     for _fg, meta in rows:
+        meta = flatten_acela_record(meta)
         key = str(meta.get("sample") or "").strip()
         if not key:
             continue
@@ -436,6 +454,10 @@ def main() -> None:
             ):
                 dmp_rows.append((fg, meta))
         print(f"  rows: {len(dmp_rows)}")
+        # merge_dmp_samples flattens ACELA envelopes ({path, metadata,
+        # pathChecks}) through flatten_acela_record — the single flatten
+        # point — so envelope rows key on metadata.sample and store
+        # bam_path/path_checks/bam_exists.
         dmp_samples = merge_dmp_samples(dmp_rows)
         del dmp_rows
         dmp_list, dmp_skipped, _ = build_samples(dmp_samples, is_dmp=True)
