@@ -573,7 +573,7 @@ def export_stream(db, engine, monkeypatch):
     )
 
 
-def _export_lines(logic, db, q=None, columns=None, fmt="csv"):
+def _export_lines(logic, db, q=None, columns=None, fmt="csv", include_unpaired=None):
     """Call the endpoint and return the non-empty lines of its body.
 
     The fixture data is flushed, not committed, and the stream session
@@ -581,11 +581,15 @@ def _export_lines(logic, db, q=None, columns=None, fmt="csv"):
     data visible to the stream and safe against the stream session's
     close-rollback on that shared connection.
 
+    ``include_unpaired=None`` omits the param (the endpoint default);
+    pass True/False to exercise the PRT1 toggle explicitly.
+
     Starlette wraps the sync generator in an async iterator (threadpool),
     so the response must be drained with asyncio.
     """
     db.commit()
-    resp = export_pair_report(logic, q=q, columns=columns, fmt=fmt, db=db)
+    extra = {} if include_unpaired is None else {"include_unpaired": include_unpaired}
+    resp = export_pair_report(logic, q=q, columns=columns, fmt=fmt, db=db, **extra)
 
     async def _drain():
         return "".join([chunk async for chunk in resp.body_iterator])
@@ -1023,3 +1027,125 @@ def test_acela_envelope_flows_ingest_remap_report(db, export_stream, monkeypatch
         "P-00045910-N01-IM6",       # pathChecks MISSING
         "P-00045911-T01-IM6",       # legacy flat: still 0
     ]
+# --- PRT1: include_unpaired toggle (paired-only default in the UI) ---------
+#
+# The pair-report UI's "show unpaired" toggle sends include_unpaired=false
+# by default (paired-only) and true to restore the current merged list.
+# The filter is server-side, so rows, totals, pagination and the export all
+# follow it. Per logic frame: DMP report, non-DMP (default) report, DMP
+# export, and the HARMONY frame (tests/test_harmony_endpoint.py).
+
+def _prt1_fixture(db, logic_name="DMP", strategy="dmp"):
+    """2 latest pairings, 3 unmatched DMP TUMORs, 1 unmatched DMP NORMAL."""
+    logic = _logic(db, logic_name, strategy)
+    for i in range(2):
+        tumor = _sample(db, f"PRT1-T{i}", "DMP", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"PRT1-N{i}", "DMP", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    for i in range(3):
+        _sample(db, f"PRT1-U{i}", "DMP", TumorOrNormal.TUMOR.value,
+                BASE_DATE + timedelta(hours=1, minutes=i))
+    # An unpaired DMP NORMAL: never part of the pair file (tumor-driven).
+    _sample(db, "PRT1-UN", "DMP", TumorOrNormal.NORMAL.value,
+            BASE_DATE + timedelta(hours=2))
+    return logic
+
+
+def _row_keys(result):
+    return [
+        (r.tumor.primary_id if r.tumor else None,
+         r.normal.primary_id if r.normal else None)
+        for r in result.rows
+    ]
+
+
+def test_include_unpaired_off_paired_only_dmp(db):
+    _prt1_fixture(db)
+    result = pairing_report("DMP", 1, 50, db, q=None, include_unpaired=False)
+    # total and the page cover the paired rows only.
+    assert result.total == 2
+    assert len(result.rows) == 2
+    assert all(r.tumor is not None and r.normal is not None for r in result.rows)
+
+
+def test_include_unpaired_off_pagination_paired_only_dmp(db):
+    _prt1_fixture(db)  # 2 paired, 3 unmatched
+    p1 = pairing_report("DMP", 1, 1, db, q=None, include_unpaired=False)
+    p2 = pairing_report("DMP", 2, 1, db, q=None, include_unpaired=False)
+    p3 = pairing_report("DMP", 3, 1, db, q=None, include_unpaired=False)
+    # Pagination runs over the paired-only list: two one-row pages, then
+    # empty — the unmatched section never appears.
+    assert p1.total == p2.total == p3.total == 2
+    assert [len(p1.rows), len(p2.rows), len(p3.rows)] == [1, 1, 0]
+    assert all(r.tumor is not None and r.normal is not None
+               for r in p1.rows + p2.rows)
+
+
+def test_include_unpaired_on_restores_current_dmp(db):
+    """Toggle ON is the endpoint default and must be byte-identical to the
+    current behavior: explicit true == default == today's merged list, and
+    OFF is exactly its paired prefix (same order)."""
+    _prt1_fixture(db)
+    default = pairing_report("DMP", 1, 50, db, q=None)
+    explicit_on = pairing_report("DMP", 1, 50, db, q=None, include_unpaired=True)
+    off = pairing_report("DMP", 1, 50, db, q=None, include_unpaired=False)
+    assert default.total == 5  # 2 paired + 3 unmatched (current contract)
+    assert [r.model_dump() for r in explicit_on.rows] == \
+        [r.model_dump() for r in default.rows]
+    assert explicit_on.total == default.total
+    assert off.total == 2
+    assert _row_keys(off) == _row_keys(default)[:2]
+
+
+def test_include_unpaired_noop_for_non_dmp(db):
+    """Default (non-DMP) logic frame: the report list has no unmatched
+    section at all, so both toggle states return the identical page."""
+    logic = _logic(db, "ARGOS", "argos")
+    for i in range(2):
+        tumor = _sample(db, f"PRT1-AT{i}", "IMPACT", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"PRT1-AN{i}", "IMPACT", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    on = pairing_report("ARGOS", 1, 50, db, q=None, include_unpaired=True)
+    off = pairing_report("ARGOS", 1, 50, db, q=None, include_unpaired=False)
+    assert on.total == off.total == 2
+    assert [r.model_dump() for r in on.rows] == [r.model_dump() for r in off.rows]
+
+
+def test_export_include_unpaired_off_dmp_paired_only(db, export_stream):
+    _prt1_fixture(db)
+    on = _export_lines("DMP", db, columns="tumor_sample,normal_sample",
+                       include_unpaired=True)
+    off = _export_lines("DMP", db, columns="tumor_sample,normal_sample",
+                        include_unpaired=False)
+    assert len(on) == 1 + 5    # header + 2 pairs + 3 unmatched tumors
+    assert len(off) == 1 + 2   # header + the paired rows only
+
+
+def test_export_include_unpaired_on_restores_current_file(db, export_stream):
+    """The default (param omitted) and explicit-true files are byte-identical
+    to today's, and the OFF file is exactly the paired prefix of it."""
+    _prt1_fixture(db)
+    default = _export_lines("DMP", db, columns="tumor_sample,normal_sample")
+    on = _export_lines("DMP", db, columns="tumor_sample,normal_sample",
+                       include_unpaired=True)
+    off = _export_lines("DMP", db, columns="tumor_sample,normal_sample",
+                        include_unpaired=False)
+    assert default == on
+    assert off == on[: len(off)]  # same header, then the 2 paired rows
+
+
+def test_export_include_unpaired_noop_for_non_dmp(db, export_stream):
+    logic = _logic(db, "ARGOS", "argos")
+    for i in range(2):
+        tumor = _sample(db, f"PRT1-AT{i}", "IMPACT", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"PRT1-AN{i}", "IMPACT", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    on = _export_lines("ARGOS", db, include_unpaired=True)
+    off = _export_lines("ARGOS", db, include_unpaired=False)
+    assert on == off

@@ -839,3 +839,73 @@ def test_harmony_rows_without_envelope_keep_placeholder(client, db, dmp_logic, h
     row = rows[1]
     assert row[by["tumor_bam_path"]] == "/dmp/mirror/impact468/T/DA42T.bam"
     assert row[by["normal_bam_path"]] == HARMONY_BAM_PATH_PLACEHOLDER
+# --- PRT1: include_unpaired toggle on the HARMONY frame --------------------
+#
+# The pair-report UI's "show unpaired" toggle applies to every view,
+# including the HARMONY frame: include_unpaired=false keeps the frame,
+# total/matched/unmatched and the CSV to the matched pairs only; the
+# default (param omitted / true) is the current merged frame, byte-identical.
+
+def _seed_harmony_prt1_frame(client, db):
+    """1 pair (P-1000), 1 unmatched TUMOR (P-3000), 1 unmatched NORMAL
+    (P-4000): the HARMONY frame is 3 rows (1 paired + 2 one-sided)."""
+    _dmp_sample(db, "P-1000-T01-IM6", "P-1000",
+                tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t1")
+    _dmp_sample(db, "P-1000-N01-IM6", "P-1000", anon_id="anon-n1")
+    _dmp_sample(db, "P-3000-T01-IM6", "P-3000",
+                tumor_or_normal=TumorOrNormal.TUMOR.value, anon_id="anon-t3")
+    _dmp_sample(db, "P-4000-N01-IM6", "P-4000", anon_id="anon-n4")
+    final = _trigger(client, "/v1/pairing/trigger-harmony")
+    assert final["paired"] == 1  # P-1000's pair only
+    return final
+
+
+def test_harmony_include_unpaired_off_paired_only(client, db, dmp_logic,
+                                                  harmony_logic):
+    _seed_harmony_prt1_frame(client, db)
+    off = client.get("/v1/pairing/harmony/",
+                     params={"include_unpaired": "false"}).json()
+    # The frame is the matched pair: rows, total and the counts all follow.
+    assert off["total"] == 1
+    assert off["matched"] == 1
+    assert off["unmatched"] == 0
+    assert len(off["rows"]) == 1
+    row = off["rows"][0]
+    assert row["normal_sample"] == "P-1000-N01-IM6"
+    assert row["tumor_sample"] == "P-1000-T01-IM6"
+
+
+def test_harmony_include_unpaired_on_restores_current(client, db, dmp_logic,
+                                                      harmony_logic):
+    """Explicit true and the default (param omitted) are byte-identical to
+    the current merged frame, and OFF is its matched subset in frame order."""
+    _seed_harmony_prt1_frame(client, db)
+    default = client.get("/v1/pairing/harmony/").json()
+    explicit_on = client.get("/v1/pairing/harmony/",
+                             params={"include_unpaired": "true"}).json()
+    off = client.get("/v1/pairing/harmony/",
+                     params={"include_unpaired": "false"}).json()
+    assert default["total"] == explicit_on["total"] == 3
+    assert explicit_on["matched"] == default["matched"] == 1
+    assert explicit_on["unmatched"] == default["unmatched"] == 2
+    assert explicit_on["rows"] == default["rows"]  # byte-identical
+    # OFF = the matched rows of the merged frame, in the same order.
+    assert off["rows"] == [
+        r for r in default["rows"]
+        if r["normal_sample"] and r["tumor_sample"]
+    ]
+
+
+def test_harmony_csv_include_unpaired_off_paired_only(client, db, dmp_logic,
+                                                      harmony_logic):
+    _seed_harmony_prt1_frame(client, db)
+    on = _csv_rows(client.get("/v1/pairing/harmony/",
+                              params={"format": "csv"}))
+    off = _csv_rows(client.get("/v1/pairing/harmony/",
+                               params={"format": "csv",
+                                       "include_unpaired": "false"}))
+    assert len(on) == 1 + 3   # header + 1 paired + 2 one-sided
+    assert len(off) == 1 + 1  # header + the matched pair only
+    assert off[0] == on[0]    # same 8-column header
+    # OFF's data rows are the matched rows of the full file, in order.
+    assert off[1:] == [r for r in on[1:] if r[0] and r[1]]

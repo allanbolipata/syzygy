@@ -50,7 +50,7 @@ class Sample(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     primary_id: Mapped[str] = mapped_column(sa.String(255), index=True)
-    cmo_sample_name: Mapped[str] = mapped_column(sa.String(255))
+    cmo_sample_name: Mapped[str] = mapped_column(sa.String(255), index=True)
     # Nullable: shared (pooled) normals belong to no patient.
     patient__cmo: Mapped[Optional[str]] = mapped_column(sa.String(255), nullable=True, index=True)
     # DMP-only (sample_type == "DMP"): the DMP "P-" patient id
