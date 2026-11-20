@@ -240,6 +240,62 @@ def test_dmp_non_object_payload_rejected(db):
     assert "JSON object" in result["detail"]
 
 
+def test_dmp_acela_envelope_ingest(db):
+    # ACELA delivers {path, metadata, pathChecks}; the handler flattens it
+    # through the same translator as legacy flat records.
+    result = dispatch(db, DMP_SAMPLE, {
+        "path": "/dmp/mirror/impact468/I/N/dev.bam",
+        "metadata": {
+            "sample": "P-00ACEL01-T01-IM6",
+            "type": "T",
+            "assay": "IM6",
+            "anon_id": "acel01t01im6",
+            "patient": {"cmo": "ACEL01", "dmp": "P-00ACEL01"},
+            "coverage": 500,
+            "cmo_assay": "IMPACT468",
+            "project_name": "ISFAKE0000000001",
+            "part_c_consent": 1,
+        },
+        "pathChecks": {
+            "mirror": {"status": "OK", "size_bytes": 100, "checked_at": "t"},
+            "dms": {"status": "OK", "size_bytes": 100, "checked_at": "t"},
+        },
+    })
+    assert result["status"] == "ok"
+    sample = db.scalar(
+        select(Sample).where(Sample.primary_id == "P-00ACEL01-T01-IM6")
+    )
+    assert sample is not None
+    assert sample.file_group == "DMP BAMs"
+    assert sample.consent is True
+    meta = sample.additional_metadata
+    assert meta["bam_path"] == "/dmp/mirror/impact468/I/N/dev.bam"
+    assert meta["bam_exists"] == 1
+    assert meta["path_checks"]["mirror"]["status"] == "OK"
+
+
+def test_dmp_acela_recheck_updates_bam_exists(db):
+    envelope = {
+        "path": "/dmp/mirror/impact468/I/N/dev.bam",
+        "metadata": {
+            "sample": "P-00ACEL02-T01-IM6",
+            "type": "T",
+            "assay": "IM6",
+            "patient": {"cmo": "ACEL02", "dmp": "P-00ACEL02"},
+            "cmo_assay": "IMPACT468",
+        },
+        "pathChecks": {"mirror": {"status": "OK", "size_bytes": 1, "checked_at": "t"}},
+    }
+    assert dispatch(db, DMP_SAMPLE, envelope)["status"] == "ok"
+    # A later pathCheck reports the bam gone: bam_exists flips to 0.
+    envelope["pathChecks"]["mirror"]["status"] = "MISSING"
+    assert dispatch(db, DMP_SAMPLE, envelope)["status"] == "ok"
+    sample = db.scalar(
+        select(Sample).where(Sample.primary_id == "P-00ACEL02-T01-IM6")
+    )
+    assert sample.additional_metadata["bam_exists"] == 0
+
+
 def test_router_dispatch_returns_200_shape(monkeypatch, db, caplog):
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(database.settings, "nats_ingest_token", "secret")

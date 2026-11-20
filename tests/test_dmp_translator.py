@@ -4,6 +4,7 @@ from syzygy.dmp_translator import (
     ASSAY_MAPPING,
     DMP_REF_COLUMNS,
     EXCLUDED_DMP_KEYS,
+    flatten_acela_record,
     remap_dmp_record,
     to_dmp_sample_kwargs,
 )
@@ -240,3 +241,75 @@ def test_remap_coverage_none_is_not_zero():
     # never coerce NA to 0.
     s = _dmp_sample(coverage=None)
     assert remap_dmp_record(s)["coverage"] is None
+
+
+# ---------------------------------------------------------------------------
+# ACELA DMP bam-file envelope (contract supplied by Allan, 2026-11-20).
+# Synthetic values only.
+# ---------------------------------------------------------------------------
+
+def _acela(**overrides):
+    record = {
+        "path": "/dmp/mirror/impact468/I/N/test.bam",
+        "metadata": _meta(type="T", sample="P-0001234-T01-IM6", part_c_consent=1),
+        "pathChecks": {
+            "mirror": {"status": "OK", "size_bytes": 4361320375,
+                       "checked_at": "2026-05-28T21:00:21"},
+            "dms": {"status": "OK", "size_bytes": 4361320375,
+                    "checked_at": "2026-05-28T21:00:21"},
+        },
+    }
+    record.update(overrides)
+    return record
+
+
+def test_acela_envelope_flattens():
+    flat = flatten_acela_record(_acela())
+    assert flat["sample"] == "P-0001234-T01-IM6"
+    assert flat["bam_path"] == "/dmp/mirror/impact468/I/N/test.bam"
+    assert flat["bam_exists"] == 1
+    assert flat["path_checks"] == _acela()["pathChecks"]
+    # metadata keys survive verbatim into the flat record
+    assert flat["tumor_type"] == "lung"
+    assert flat["part_c_consent"] == 1
+
+
+def test_acela_failed_path_check_zeroes_bam_exists():
+    record = _acela()
+    record["pathChecks"]["dms"]["status"] = "MISSING"
+    assert flatten_acela_record(record)["bam_exists"] == 0
+
+
+def test_acela_empty_path_zeroes_bam_exists():
+    assert flatten_acela_record(_acela(path=""))["bam_exists"] == 0
+
+
+def test_non_envelope_record_passes_through_unchanged():
+    legacy = {"sample": "P-1-T01-IM6", "type": "T"}
+    assert flatten_acela_record(legacy) == legacy
+
+
+def test_consent_sourced_from_part_c_consent():
+    # part_c_consent is the agreed consent source (ACELA contract):
+    # 1 -> consented, 0 -> not consented; absent -> placeholder False.
+    kw = to_dmp_sample_kwargs("P-0001234-T01-IM6", flatten_acela_record(_acela()))
+    assert kw["consent"] is True
+    meta_zero = _meta(part_c_consent=0)
+    assert to_dmp_sample_kwargs("P-1", meta_zero)["consent"] is False
+    meta_absent = _meta()
+    meta_absent.pop("part_c_consent")
+    assert to_dmp_sample_kwargs("P-1", meta_absent)["consent"] is False
+
+
+def test_remap_bam_exists_falls_back_to_stored_metadata():
+    sample = Sample(primary_id="P-0001234-T01-IM6", patient__dmp="P-0001234",
+                    anon_id="anon-0001234",
+                    additional_metadata={"bam_exists": 1, "coverage": 687,
+                                         "project_name": "proj"})
+    # caller default (0 = unresolved) falls back to the stored value
+    assert remap_dmp_record(sample)["bam_exists"] == 1
+    assert remap_dmp_record(sample, bam_exists=0)["bam_exists"] == 1
+    # an explicit caller resolution still wins over metadata
+    sample0 = Sample(primary_id="P-0001234-T01-IM6",
+                     additional_metadata={"bam_exists": 0})
+    assert remap_dmp_record(sample0, bam_exists=1)["bam_exists"] == 1
