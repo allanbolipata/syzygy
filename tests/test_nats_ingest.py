@@ -312,6 +312,73 @@ def test_dmp_envelope_non_dict_metadata_error_not_crash(db):
     assert db.scalar(select(Sample).limit(1)) is None
 
 
+def _runid_request(run_ids_by_lib):
+    """New-request payload whose single tumor carries the given runIds
+    spread across libraries (one run per library entry)."""
+    return {
+        "igoRequestId": "99909_RUN",
+        "requestJson": json.dumps(
+            {"requestId": "99909_RUN", "projectId": "PRJ_RUN", "dataAccessEmails": []}
+        ),
+        "samples": [
+            {
+                "primaryId": "RUNID_T1",
+                "cmoSampleName": "RUN-T1",
+                "cmoPatientId": "C-RUN-1",
+                "sampleType": "Biopsy",
+                "tumorOrNormal": "Tumor",
+                "genePanel": "HC_IMPACT",
+                "baitSet": "IMPACT505_BAITS",
+                "libraries": [
+                    {"runs": [{"runId": rid, "runMode": "NovaSeq X", "runDate": "2026-01-01"}]}
+                    for rid in run_ids_by_lib
+                ],
+            }
+        ],
+    }
+
+
+def _stored_run_ids(db):
+    sample = db.scalar(select(Sample).where(Sample.primary_id == "RUNID_T1"))
+    assert sample is not None
+    return (sample.additional_metadata or {}).get("run_ids")
+
+
+def test_new_request_carries_run_ids(db):
+    # ARGOS pooled beagle-exact matching reads additional_metadata["run_ids"]
+    # (raw runIds, normalized at pairing time). SMILE carries runId in
+    # libraries[].runs[].runId — ingest must accumulate it, deduped,
+    # order-preserving (mirrors import_beagle_dump._accumulate_run_ids).
+    result = dispatch(db, NEW_REQUEST, _runid_request(["ST-001_1", "ST-002_2", "ST-001_1"]))
+    assert result["status"] == "ok"
+    assert _stored_run_ids(db) == ["ST-001_1", "ST-002_2"]
+
+
+def test_new_request_rerun_accumulates_run_ids(db):
+    dispatch(db, NEW_REQUEST, _runid_request(["ST-001_1"]))
+    # A later message for the same sample adds a run; prior runIds survive
+    # (beagle accumulates distinct runIds across the sample's history).
+    dispatch(db, NEW_REQUEST, _runid_request(["ST-003_3", "ST-001_1"]))
+    assert _stored_run_ids(db) == ["ST-001_1", "ST-003_3"]
+
+
+def test_sample_update_accumulates_run_ids(db):
+    dispatch(db, NEW_REQUEST, _runid_request(["ST-001_1"]))
+    result = dispatch(
+        db,
+        SAMPLE_UPDATE,
+        {
+            "latestSampleMetadata": {
+                "primaryId": "RUNID_T1",
+                "igoRequestId": "99909_RUN",
+                "libraries": [{"runs": [{"runId": "ST-004_4", "runMode": "NovaSeq X"}]}],
+            }
+        },
+    )
+    assert result["status"] == "ok"
+    assert _stored_run_ids(db) == ["ST-001_1", "ST-004_4"]
+
+
 def test_router_dispatch_returns_200_shape(monkeypatch, db, caplog):
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(database.settings, "nats_ingest_token", "secret")
