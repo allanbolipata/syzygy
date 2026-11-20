@@ -743,3 +743,99 @@ def test_harmony_consent_comes_from_the_present_side_tumor_preferred(
         r[header.index("patient")]: r[header.index("consent")] for r in rows[1:]
     }
     assert got == {"P-8000": "true", "P-8100": "true"}
+
+
+# ---------------------------------------------------------------------------
+# DA4: HARMONY rows surface the bam FILE PATHS the ACELA envelope stored.
+#
+# HARMONY and DMP are the SAME dataset viewed differently (Allan 2026-11-20):
+# the same DMP records back both views, so the paths come straight out of
+# additional_metadata["bam_path"] that ingest flattened from the envelope —
+# no separate HARMONY ingest. Samples that never received an envelope keep
+# the em-dash placeholder they always rendered.
+# ---------------------------------------------------------------------------
+
+
+def _dmp_envelope(db, sample_id, stype, patient_dmp, path, cmo,
+                  mirror_status="OK"):
+    """Ingest a DMP sample through the REAL NATS ingest path with an ACELA
+    envelope ({path, metadata, pathChecks})."""
+    from syzygy.nats_ingest import handle_dmp_sample
+
+    result = handle_dmp_sample(db, {
+        "path": path,
+        "metadata": {
+            "sample": sample_id,
+            "type": stype,
+            "assay": "IM6",
+            "patient": {"cmo": cmo, "dmp": patient_dmp},
+            "cmo_assay": "IMPACT468",
+        },
+        "pathChecks": {
+            "mirror": {"status": mirror_status, "size_bytes": 1, "checked_at": "t"}
+        },
+    })
+    assert result["status"] == "ok", result
+    return db.scalar(select(Sample).where(Sample.primary_id == sample_id))
+
+
+def test_harmony_frame_surfaces_stored_bam_paths(client, db, dmp_logic, harmony_logic):
+    """DA4: a paired HARMONY row surfaces both sides' stored bam file paths,
+    in the JSON frame and in the CSV export."""
+    _dmp_envelope(db, "P-00045940-N01-IM6", "N", "P-00045940",
+                  "/dmp/mirror/impact468/N/DA40N.bam", "ACELDA40")
+    _dmp_envelope(db, "P-00045940-T01-IM6", "T", "P-00045940",
+                  "/dmp/mirror/impact468/T/DA40T.bam", "ACELDA40")
+
+    assert _trigger(client, "/v1/pairing/trigger-harmony")["paired"] == 1
+
+    # JSON frame: both sides carry the stored paths.
+    data = client.get("/v1/pairing/harmony/").json()
+    assert data["total"] == 1 and data["matched"] == 1
+    row = data["rows"][0]
+    assert row["normal_sample"] == "P-00045940-N01-IM6"
+    assert row["tumor_sample"] == "P-00045940-T01-IM6"
+    assert row["normal_bam_path"] == "/dmp/mirror/impact468/N/DA40N.bam"
+    assert row["tumor_bam_path"] == "/dmp/mirror/impact468/T/DA40T.bam"
+
+    # Same paths through the 8-column CSV contract.
+    rows = _csv_rows(client.get("/v1/pairing/harmony/", params={"format": "csv"}))
+    by = {h: i for i, h in enumerate(rows[0])}
+    assert rows[1][by["normal_bam_path"]] == "/dmp/mirror/impact468/N/DA40N.bam"
+    assert rows[1][by["tumor_bam_path"]] == "/dmp/mirror/impact468/T/DA40T.bam"
+
+
+def test_harmony_unmatched_row_surfaces_stored_bam_path(client, db, dmp_logic, harmony_logic):
+    """DA4: a one-sided (unmatched) row surfaces the present side's stored
+    bam path; the absent side stays null."""
+    _dmp_envelope(db, "P-00045941-T01-IM6", "T", "P-00045941",
+                  "/dmp/mirror/impact468/T/DA41T.bam", "ACELDA41")
+
+    final = _trigger(client, "/v1/pairing/trigger-harmony")
+    assert final["paired"] == 0 and final["unpaired"] == 1
+
+    data = client.get("/v1/pairing/harmony/").json()
+    assert data["total"] == 1 and data["unmatched"] == 1
+    row = data["rows"][0]
+    assert row["tumor_sample"] == "P-00045941-T01-IM6"
+    assert row["tumor_bam_path"] == "/dmp/mirror/impact468/T/DA41T.bam"
+    assert row["normal_sample"] is None
+    assert row["normal_bam_path"] is None
+
+
+def test_harmony_rows_without_envelope_keep_placeholder(client, db, dmp_logic, harmony_logic):
+    """DA4: a sample that never received an ACELA envelope renders exactly
+    as before — the em-dash placeholder — including the envelope-less side
+    of a mixed pair."""
+    # Normal ingested on the legacy flat path (no envelope, no bam keys).
+    _dmp_sample(db, "P-00045942-N01-IM6", "P-00045942", anon_id="anon-n42")
+    _dmp_envelope(db, "P-00045942-T01-IM6", "T", "P-00045942",
+                  "/dmp/mirror/impact468/T/DA42T.bam", "ACELDA42")
+
+    assert _trigger(client, "/v1/pairing/trigger-harmony")["paired"] == 1
+
+    rows = _csv_rows(client.get("/v1/pairing/harmony/", params={"format": "csv"}))
+    by = {h: i for i, h in enumerate(rows[0])}
+    row = rows[1]
+    assert row[by["tumor_bam_path"]] == "/dmp/mirror/impact468/T/DA42T.bam"
+    assert row[by["normal_bam_path"]] == HARMONY_BAM_PATH_PLACEHOLDER

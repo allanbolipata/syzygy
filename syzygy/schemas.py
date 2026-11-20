@@ -258,8 +258,9 @@ class HarmonyRow(BaseModel):
     (1-to-many). Unmatched DMP samples appear with the opposite side's
     columns null. ``normal_sample``/``tumor_sample`` are the samples'
     ``primary_id``; ``normal_bamname``/``tumor_bamname`` are their
-    ``anon_id``; the ``*_bam_path`` columns are placeholders (no bam paths
-    in syzygy yet). ``patient`` and ``consent`` come from the present side
+    ``anon_id``; the ``*_bam_path`` columns are the stored ACELA envelope
+    bam file paths (em-dash placeholder when a sample never received an
+    envelope). ``patient`` and ``consent`` come from the present side
     (tumor preferred).
     """
 
