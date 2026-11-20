@@ -2,12 +2,14 @@
 
 Spec: Projects/Syzygy/Factory/TEMPO_EXPORT_TICKETS.md.
 
-``GET /v1/export/tempo/{pairing,unpaired,tracker}`` stream the beagle
-files as ``text/plain`` downloads with beagle's filenames
+``GET /v1/export/tempo/{pairing,unpaired,tracker,conflict}`` stream the
+beagle files as ``text/plain`` downloads with beagle's filenames
 (``sample_pairing.txt`` / ``sample_unpaired.txt`` /
-``sample_tracker.txt``). Auth required (router mounted under the global
-auth dependency in ``main.py``); the ``?pairing_logic_name`` query param
-defaults to ``TEMPO`` and an unknown logic name is a 404.
+``sample_tracker.txt`` / ``sample_conflict.txt``). Auth required (router
+mounted under the global auth dependency in ``main.py``); the
+``?pairing_logic_name`` query param defaults to ``TEMPO`` and an unknown
+logic name is a 404 (conflict is logic-agnostic: no logic param, per the
+spec's "all samples with errors" scope).
 
 The response bodies are produced by ``syzygy.export.tempo_files``:
 
@@ -27,8 +29,11 @@ The response bodies are produced by ``syzygy.export.tempo_files``:
   ``additional_metadata["requestMetadata"]`` -> empty cell, missing keys
   never raise, DMP samples put ``primary_id`` in the Collaborator_ID
   column.
-
-E3 (conflict) adds its route here.
+- conflict -- beagle's byte-equal conflict header (the 8 sample fields
+  + ``Conflict Reason``; ``sample_conflict.txt`` shape), one row per
+  sample whose ``errors`` is non-null and non-empty (ingest validation
+  failures), logic-agnostic (no logic param), reasons joined with
+  ``;`` and flattened so no cell can break the TSV grid.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
@@ -36,9 +41,11 @@ from sqlalchemy.orm import Session
 
 from syzygy.database import get_db
 from syzygy.export.tempo_files import (
+    CONFLICT_FILENAME,
     PAIRING_FILENAME,
     TRACKER_FILENAME,
     UNPAIRED_FILENAME,
+    build_conflict_tsv,
     build_pairing_tsv,
     build_tracker_tsv,
     build_unpaired_tsv,
@@ -100,3 +107,14 @@ def export_tempo_tracker(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return _download(TRACKER_FILENAME, body)
+
+
+@router.get(
+    "/conflict",
+    response_class=PlainTextResponse,
+    summary="beagle sample_conflict.txt (samples with validation errors; logic-agnostic)",
+)
+def export_tempo_conflict(db: Session = Depends(get_db)):
+    # Spec: conflict = all samples with errors, logic-agnostic — no
+    # pairing_logic_name param on this route.
+    return _download(CONFLICT_FILENAME, build_conflict_tsv(db))

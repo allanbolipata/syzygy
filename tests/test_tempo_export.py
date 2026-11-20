@@ -24,6 +24,17 @@ both:
 
 - ``GET /v1/export/tempo/{pairing,unpaired,tracker}`` serve
   ``text/plain`` downloads with beagle's filenames and require auth.
+
+E3:
+
+- the conflict header is byte-equal to beagle's conflict header
+  (``BEAGLE_CONFLICT_HEADER`` below, captured from beagle's
+  ``create_conflict_samples_txt_file``),
+- samples without errors (``errors`` null or empty) never appear,
+- error strings joined into ``Conflict Reason`` with tabs/newlines
+  flattened,
+- ``GET /v1/export/tempo/conflict`` serves the ``text/plain`` download
+  with beagle's filename and requires auth.
 """
 import httpx
 import pytest
@@ -35,11 +46,14 @@ from sqlalchemy.pool import StaticPool
 from syzygy.auth import get_current_user
 from syzygy.database import Base, get_db
 from syzygy.export.tempo_files import (
+    CONFLICT_FILENAME,
+    CONFLICT_HEADER,
     PAIRING_FILENAME,
     TRACKER_FILENAME,
     TRACKER_HEADER,
     UNPAIRED_FILENAME,
     UNPAIRED_HEADER,
+    build_conflict_tsv,
     build_pairing_tsv,
     build_tracker_tsv,
     build_unpaired_tsv,
@@ -114,6 +128,7 @@ def _sample(
     sequencing_date=None,
     redacted: bool = False,
     additional_metadata=None,
+    errors: list[str] | None = None,
 ):
     sample = Sample(
         primary_id=primary_id,
@@ -129,6 +144,7 @@ def _sample(
         sequencing_date=sequencing_date,
         redacted=redacted,
         additional_metadata=additional_metadata,
+        errors=errors,
     )
     db.add(sample)
     db.commit()
@@ -378,6 +394,7 @@ def test_export_endpoints_require_auth(db, tempo):
     assert client.get("/v1/export/tempo/pairing").status_code == 401
     assert client.get("/v1/export/tempo/unpaired").status_code == 401
     assert client.get("/v1/export/tempo/tracker").status_code == 401
+    assert client.get("/v1/export/tempo/conflict").status_code == 401
 
 
 def test_export_endpoints_text_plain_beagle_filenames(authed_client, db, tempo):
@@ -424,6 +441,7 @@ def test_openapi_lists_export_routes(db, tempo):
     assert "/v1/export/tempo/pairing" in paths
     assert "/v1/export/tempo/unpaired" in paths
     assert "/v1/export/tempo/tracker" in paths
+    assert "/v1/export/tempo/conflict" in paths
 
 
 # ---------------------------------------------------------------------------
@@ -632,3 +650,136 @@ def test_tracker_endpoint_beagle_filename_and_header(authed_client, db, tempo):
     # One row per in-scope sample (the two above), header + 2 rows.
     assert len(lines) == 3
     assert [ln.split("\t")[0] for ln in lines[1:]] == ["T1-N", "T1-T"]
+
+
+# ---------------------------------------------------------------------------
+# E3: build_conflict_tsv — beagle's sample_conflict.txt
+# ---------------------------------------------------------------------------
+
+# Byte-equal to the header line beagle's
+# create_conflict_samples_txt_file writes (beagle
+# runner/operator/tempo_mpgen_operator/tempo_mpgen_operator.py, verified
+# 2026-11-19): the 8 sample fields (beagle's settings.py metadata keys:
+# CMO_SAMPLE_NAME_METADATA_KEY, PATIENT_ID_METADATA_KEY,
+# SAMPLE_ID_METADATA_KEY, SAMPLE_CLASS_METADATA_KEY,
+# CMO_SAMPLE_CLASS_METADATA_KEY plus the literal runMode/baitSet/runDate)
+# followed by "Conflict Reason", tab-joined, no trailing tab.
+BEAGLE_CONFLICT_HEADER = (
+    "cmoSampleName\tcmoPatientId\tprimaryId\tsampleClass"
+    "\trunMode\tsampleType\tbaitSet\trunDate\tConflict Reason"
+)
+
+
+def _conflict_rows(db):
+    lines = build_conflict_tsv(db).splitlines()
+    return lines[0], [dict(zip(CONFLICT_HEADER, ln.split("\t"))) for ln in lines[1:]]
+
+
+def test_conflict_tsv_header_byte_equal_to_beagle(db, tempo):
+    # No samples at all: the file is header-only, and the header is
+    # still byte-equal to beagle's.
+    lines = build_conflict_tsv(db).splitlines()
+    # The acceptance criterion: byte-equal to beagle's conflict header.
+    assert lines[0] == BEAGLE_CONFLICT_HEADER
+    assert len(BEAGLE_CONFLICT_HEADER.split("\t")) == 9
+    assert not BEAGLE_CONFLICT_HEADER.endswith("\t")
+    assert build_conflict_tsv(db).endswith("\n")
+    # The module constant is the same byte string (single source).
+    assert "\t".join(CONFLICT_HEADER) == BEAGLE_CONFLICT_HEADER
+    # The first 8 columns are the unpaired file's 8 fields (beagle
+    # reuses the same field list for both files).
+    assert CONFLICT_HEADER[:8] == UNPAIRED_HEADER[:8]
+
+
+def test_conflict_tsv_samples_without_errors_never_appear(db, tempo):
+    # errors NULL (the ingest default): never appears.
+    _sample(db, "P-T1", "A-T", TUMOR, "C-1")
+    # errors empty list: never appears (non-null only means non-null AND
+    # non-empty).
+    _sample(db, "P-T2", "B-T", TUMOR, "C-2", errors=[])
+    # errors with one entry: the only row.
+    _sample(db, "P-T3", "C-T", TUMOR, "C-3", errors=["bad sample class"])
+
+    header, rows = _conflict_rows(db)
+    assert header == BEAGLE_CONFLICT_HEADER
+    assert [r["cmoSampleName"] for r in rows] == ["C-T"]
+    assert rows[0]["Conflict Reason"] == "bad sample class"
+
+
+def test_conflict_tsv_errors_joined_into_reason_flattened(db, tempo):
+    from datetime import date
+
+    _sample(
+        db, "P-T1", "T1-T", TUMOR, "C-1",
+        errors=[
+            "bad\ttab in error",
+            "second\nline error",
+            "third error",
+        ],
+        sequencing_date=date(2026, 10, 5),
+    )
+
+    _, rows = _conflict_rows(db)
+    assert len(rows) == 1
+    row = rows[0]
+    # Joined with ";" (beagle's conflict-join convention); tabs and
+    # newlines flattened to spaces so the cell can never break the TSV
+    # grid — every row keeps exactly 9 columns.
+    assert row["Conflict Reason"] == (
+        "bad tab in error;second line error;third error"
+    )
+    assert len(row) == len(CONFLICT_HEADER)
+    # The 8 sample fields still resolve for a conflict row.
+    assert row["cmoPatientId"] == "C-1"
+    assert row["primaryId"] == "P-T1"
+    assert row["sampleClass"] == "T"
+    assert row["runMode"] == "NovaSeq X 1000"
+    assert row["sampleType"] == "tissue"
+    assert row["baitSet"] == "agilent"
+    assert row["runDate"] == "2026-10-05"
+
+
+def test_conflict_tsv_rows_ordered_by_cmo_name(db, tempo):
+    # Created in reverse name order to pin the deterministic ordering;
+    # a normal and a tumor (both classes can carry validation errors).
+    _sample(db, "P-T2", "Z-T", TUMOR, "C-Z", errors=["e2"])
+    _sample(db, "P-N1", "A-N", NORMAL, "C-A", errors=["e1"])
+    _sample(db, "P-T1", "A-T", TUMOR, "C-A", errors=["e3"])
+
+    _, rows = _conflict_rows(db)
+    assert [r["cmoSampleName"] for r in rows] == ["A-N", "A-T", "Z-T"]
+    assert [r["Conflict Reason"] for r in rows] == ["e1", "e3", "e2"]
+    assert [r["sampleClass"] for r in rows] == ["N", "T", "T"]
+
+
+def test_conflict_tsv_logic_agnostic(db, tempo):
+    # In the TEMPO logic family (registered bait set): appears when it
+    # has errors, not otherwise.
+    _sample(db, "P-T1", "A-T", TUMOR, "C-1", errors=["in-family error"])
+    _sample(db, "P-T2", "B-T", TUMOR, "C-2")  # in family, no errors
+    # Unregistered bait set: in NO logic's family — conflict is
+    # logic-agnostic, so its errors still surface (spec: all samples
+    # with errors).
+    _sample(db, "P-X1", "X-T", TUMOR, "C-X", bait_set="other", errors=["stray error"])
+
+    _, rows = _conflict_rows(db)
+    assert [r["cmoSampleName"] for r in rows] == ["A-T", "X-T"]
+
+
+def test_conflict_endpoint_beagle_filename_and_header(authed_client, db, tempo):
+    _sample(db, "P-T1", "T1-T", TUMOR, "C-1", errors=["bad primaryId"])
+    _sample(db, "P-T2", "T2-T", TUMOR, "C-2")  # no errors -> absent
+
+    resp = authed_client.get("/v1/export/tempo/conflict")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.headers["content-disposition"] == (
+        f'attachment; filename="{CONFLICT_FILENAME}"'
+    )
+    lines = resp.text.splitlines()
+    assert lines[0] == BEAGLE_CONFLICT_HEADER
+    # Only the erroring sample: header + 1 row.
+    assert len(lines) == 2
+    row = dict(zip(CONFLICT_HEADER, lines[1].split("\t")))
+    assert row["cmoSampleName"] == "T1-T"
+    assert row["Conflict Reason"] == "bad primaryId"

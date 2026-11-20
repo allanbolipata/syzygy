@@ -31,7 +31,15 @@ follow the spec's resolution order (sample column ->
 empty cell), never raising on a missing key; DMP samples put
 ``primary_id`` in the ``Collaborator_ID_(or_DMP_Sample_ID)`` column.
 
-E3 (conflict TSV) extends this module with its own builder.
+E3 (ticket E3) adds ``build_conflict_tsv``: beagle's
+``sample_conflict.txt`` — the byte-equal conflict header
+(``CONFLICT_HEADER``, the 8 sample fields + ``Conflict Reason``), one row
+per sample whose ``errors`` is non-null and non-empty (ingest validation
+failures — per the spec's DECIDED v1, Syzygy's closest concept to
+beagle's cross-file metadata conflicts), logic-agnostic (the spec scopes
+conflict to *all* samples with errors, unlike the pairing-logic-scoped
+builders). ``Conflict Reason`` is the error strings joined with ``;``
+(beagle's conflict-join convention), tabs/newlines flattened.
 """
 from __future__ import annotations
 
@@ -47,10 +55,12 @@ from syzygy.pairing_strategies import PairingStrategy, get_pairing_strategy
 from syzygy.schemas import TumorOrNormal
 
 #: beagle's operator filenames (create_pairing_file /
-#: create_unpaired_txt_file / create_tracker_file).
+#: create_unpaired_txt_file / create_tracker_file /
+#: create_conflict_samples_txt_file).
 PAIRING_FILENAME = "sample_pairing.txt"
 UNPAIRED_FILENAME = "sample_unpaired.txt"
 TRACKER_FILENAME = "sample_tracker.txt"
+CONFLICT_FILENAME = "sample_conflict.txt"
 
 #: beagle's unpaired file: the 8 conflict-file fields + the reason column.
 UNPAIRED_HEADER: tuple[str, ...] = (
@@ -63,6 +73,31 @@ UNPAIRED_HEADER: tuple[str, ...] = (
     "baitSet",
     "runDate",
     "Possible Reason?",
+)
+
+#: beagle's conflict header — byte-equal to what
+#: ``TempoMpgenOperator.create_conflict_samples_txt_file`` writes (beagle
+#: ``runner/operator/tempo_mpgen_operator/tempo_mpgen_operator.py``): the
+#: 8 sample fields followed by ``Conflict Reason``, tab-joined, no
+#: trailing tab. The field names are beagle's ``settings.py`` metadata
+#: keys (``CMO_SAMPLE_NAME_METADATA_KEY`` -> cmoSampleName,
+#: ``PATIENT_ID_METADATA_KEY`` -> cmoPatientId,
+#: ``SAMPLE_ID_METADATA_KEY`` -> primaryId,
+#: ``SAMPLE_CLASS_METADATA_KEY`` -> sampleClass,
+#: ``CMO_SAMPLE_CLASS_METADATA_KEY`` -> sampleType) plus the literal
+#: ``runMode`` / ``baitSet`` / ``runDate`` — verified against the beagle
+#: source 2026-11-19. The same 8 fields head the unpaired file
+#: (``UNPAIRED_HEADER``).
+CONFLICT_HEADER: tuple[str, ...] = (
+    "cmoSampleName",
+    "cmoPatientId",
+    "primaryId",
+    "sampleClass",
+    "runMode",
+    "sampleType",
+    "baitSet",
+    "runDate",
+    "Conflict Reason",
 )
 
 #: beagle's tracker header — byte-equal to what
@@ -389,3 +424,56 @@ def build_tracker_tsv(db: Session, logic_name: str) -> str:
     ).all()
     ordered = sorted(samples, key=lambda s: (s.cmo_sample_name, s.id))
     return _tsv([TRACKER_HEADER] + [_tracker_row(s) for s in ordered])
+
+
+# ---------------------------------------------------------------------------
+# build_conflict_tsv — beagle's sample_conflict.txt (ticket E3)
+# ---------------------------------------------------------------------------
+
+
+def _conflict_reason(sample: Sample) -> str:
+    """The ``Conflict Reason`` cell: the sample's ingest validation
+    errors (``Sample.errors``) joined with ``;`` — beagle's
+    conflict-join convention (``";".join(conflicts)`` in
+    ``tempo_patient.create_conflict_string``) — each part sanitized so
+    tabs and newlines can never break the column grid."""
+    parts = (_cell_str(error) for error in sample.errors)
+    return ";".join(part for part in parts if part)
+
+
+def build_conflict_tsv(db: Session) -> str:
+    """beagle's ``sample_conflict.txt`` (ticket E3).
+
+    Header is byte-equal to beagle's conflict header
+    (``CONFLICT_HEADER``). Rows are every sample whose ``errors`` is
+    non-null and non-empty — ingest validation failures, the spec's
+    DECIDED v1 source for the conflict file (beagle's own semantics are
+    cross-file metadata conflicts; Syzygy's closest concept is
+    ``Sample.errors``). Scope is logic-agnostic (spec: conflict = all
+    samples with errors, unlike the pairing-logic-scoped builders),
+    ordered by ``cmo_sample_name`` (ties broken by id). ``Conflict
+    Reason`` is the error strings joined with ``;`` with tabs/newlines
+    flattened. Samples without errors (``errors`` null or empty) never
+    appear; with no error rows the file is header-only.
+    """
+    samples = db.scalars(select(Sample)).all()
+    ordered = sorted(
+        (s for s in samples if s.errors),
+        key=lambda s: (s.cmo_sample_name or "", s.id),
+    )
+    rows = [CONFLICT_HEADER]
+    for sample in ordered:
+        rows.append(
+            (
+                _cell_str(sample.cmo_sample_name),  # cmoSampleName
+                _cell_str(sample.patient__cmo),  # cmoPatientId
+                _cell_str(sample.primary_id),  # primaryId
+                _class_cell(sample),  # sampleClass
+                _cell_str(sample.run_mode),  # runMode
+                _cell_str(sample.sample_type),  # sampleType
+                _cell_str(sample.bait_set),  # baitSet
+                _run_date(sample.sequencing_date),  # runDate
+                _conflict_reason(sample),  # Conflict Reason
+            )
+        )
+    return _tsv(rows)
