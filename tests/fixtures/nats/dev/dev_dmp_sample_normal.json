@@ -1,15 +1,31 @@
 {
-  "sample": "P-00DEV09-N01-IM3",
-  "type": "N",
-  "assay": "IM3",
-  "anon_id": "dev09n01im3",
-  "patient": {
-    "cmo": "DEV09",
-    "dmp": "P-00DEV09"
+  "path": "/dmp/mirror/impact468/I/N/ISFAKE-P-00DEV09-N01-IM3.bam",
+  "metadata": {
+    "sample": "P-00DEV09-N01-IM3",
+    "type": "N",
+    "assay": "IM3",
+    "anon_id": "dev09n01im3",
+    "patient": {
+      "cmo": "DEV09",
+      "dmp": "P-00DEV09"
+    },
+    "coverage": 98,
+    "project_name": "poolDEV9",
+    "sample_type": "0",
+    "external_id": "EXT-DEV09-N01",
+    "qc_status": "pass",
+    "part_c_consent": 1
   },
-  "coverage": 98,
-  "project_name": "poolDEV9",
-  "sample_type": "0",
-  "external_id": "EXT-DEV09-N01",
-  "qc_status": "pass"
+  "pathChecks": {
+    "mirror": {
+      "status": "OK",
+      "size_bytes": 4098771223,
+      "checked_at": "2026-11-18T08:30:00"
+    },
+    "dms": {
+      "status": "MISSING",
+      "size_bytes": 0,
+      "checked_at": "2026-11-18T08:30:00"
+    }
+  }
 }

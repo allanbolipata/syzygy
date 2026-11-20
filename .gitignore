@@ -3,8 +3,8 @@ clickup_ticket.md
 __pycache__/
 *.pyc
 .pytest_cache/
-.venv/
-venv/
+.venv
+venv
 .env
 .env.bak*
 docs/audit/

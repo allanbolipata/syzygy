@@ -10,6 +10,7 @@ stable ordering.
 """
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import asyncio
@@ -34,10 +35,15 @@ from syzygy.routers.pairings import (
     PAIR_EXPORT_COLUMNS,
     DMP_DEFAULT_EXPORT_KEYS,
     PAIR_DEFAULT_EXPORT_KEYS,
+    TEMPO_DEFAULT_EXPORT_KEYS,
 )
 from syzygy.schemas import TumorOrNormal
 
 BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+# PRT2 static-UI assertions (same convention as test_logic_gating_ui.py):
+# the app.js default column sets, read once at import.
+APP_JS = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -938,6 +944,95 @@ def test_bam_exists_map_empty_when_beagle_unset(monkeypatch):
     assert pairings._beagle_bam_exists_map({"P-1-T01-IM6"}) == {}
 
 
+# ---------------------------------------------------------------------------
+# (h) DA4 end-to-end: ACELA envelope ingest -> remap -> DMP report.
+#
+# Card accept: a pathChecks-OK sample reports bam_exists=1, a MISSING one
+# reports 0; a sample that never received an envelope renders exactly as
+# before (beagle unset -> the remap fallback -> 0).
+# ---------------------------------------------------------------------------
+
+
+def _acela_envelope(db, sample_id, stype, patient_dmp, path, mirror_status="OK"):
+    """Ingest a DMP sample through the REAL NATS ingest path (the ACELA
+    envelope: {path, metadata, pathChecks} — the DA2 surface)."""
+    from syzygy.nats_ingest import handle_dmp_sample
+
+    result = handle_dmp_sample(db, {
+        "path": path,
+        "metadata": {
+            "sample": sample_id,
+            "type": stype,
+            "assay": "IM6",
+            "patient": {"cmo": f"ACEL{patient_dmp[-2:]}", "dmp": patient_dmp},
+            "cmo_assay": "IMPACT468",
+        },
+        "pathChecks": {
+            "mirror": {"status": mirror_status, "size_bytes": 1, "checked_at": "t"}
+        },
+    })
+    assert result["status"] == "ok", result
+
+
+def test_acela_envelope_flows_ingest_remap_report(db, export_stream, monkeypatch):
+    """DA4 accept, end to end: ingest -> remap -> report. The bam_exists the
+    envelope stored reaches the export pair file and the report stats; a
+    sample without any envelope renders exactly as it did before DA4."""
+    import syzygy.routers.pairings as pairings
+    from syzygy.pairing_service import trigger_dmp_pairing
+
+    # Beagle unset: the remap's DA1 fallback (stored bam_exists) decides.
+    monkeypatch.setattr(pairings.settings, "beagle_database_url", None)
+    monkeypatch.setattr(pairings, "_beagle_engine_cache", None)
+
+    _logic(db, "DMP", "dmp")
+    # The pair: both sides ingested via ACELA envelopes — the tumor's
+    # pathChecks OK (bam_exists 1), the normal's MISSING (bam_exists 0).
+    _acela_envelope(db, "P-00045910-T01-IM6", "T", "P-00045910",
+                    "/dmp/mirror/impact468/T/045910T.bam")
+    _acela_envelope(db, "P-00045910-N01-IM6", "N", "P-00045910",
+                    "/dmp/mirror/impact468/N/045910N.bam",
+                    mirror_status="MISSING")
+    # A legacy flat tumor that never received an envelope (no bam keys).
+    _dmp_sample(db, "P-00045911-T01-IM6", TumorOrNormal.TUMOR.value,
+                BASE_DATE + timedelta(hours=1), patient_dmp="P-00045911")
+
+    # The real cascade pairs the envelope pair (the strategy-side remap
+    # caller) and leaves P-00045911 unmatched.
+    result = trigger_dmp_pairing(db)
+    assert result["paired"] == 1
+    assert result["unpaired"] == 1
+
+    # Export pair file: bam_exists comes from the stored envelope.
+    lines = _export_lines("DMP", db, fmt="tsv")
+    header = lines[0].split("\t")
+    by = {h: i for i, h in enumerate(header)}
+    rows = {line.split("\t")[by["tumor_sample"]]: line.split("\t")
+            for line in lines[1:]}
+    pair = rows["P-00045910-T01-IM6"]
+    assert pair[by["tumor_bam_exists"]] == "1"     # pathChecks OK
+    assert pair[by["normal_bam_exists"]] == "0"    # pathChecks MISSING
+    legacy = rows["P-00045911-T01-IM6"]
+    # Rendered exactly as before DA4: 0 (unresolvable), NA on the NA side.
+    assert legacy[by["tumor_bam_exists"]] == "0"
+    assert legacy[by["normal_bam_exists"]] == "NA"
+
+    # Report stats: the flagged pair row (normal side bam_exists == "0")
+    # lists BOTH sides — the reference's samples_with_bams_missing
+    # semantics (either side of a flagged row is listed; pinned by
+    # test_dmp_report_stats.py::test_samples_with_bams_missing_lists_both_sides
+    # and the R conformance suite). The OK tumor's own bam_exists column
+    # is proven "1" above in the export pair file. The legacy flat tumor
+    # (unmatched, never enveloped) surfaces as missing as before.
+    report = pairing_report("DMP", 1, 50, db, q=None)
+    assert report.summary.tn_pairs == 1
+    assert report.summary.unmatched_tumors == 1
+    missing = report.warnings.samples_with_bams_missing
+    assert missing == [
+        "P-00045910-T01-IM6",       # flagged row: tumor side listed too
+        "P-00045910-N01-IM6",       # pathChecks MISSING
+        "P-00045911-T01-IM6",       # legacy flat: still 0
+    ]
 # --- PRT1: include_unpaired toggle (paired-only default in the UI) ---------
 #
 # The pair-report UI's "show unpaired" toggle sends include_unpaired=false
@@ -1060,3 +1155,104 @@ def test_export_include_unpaired_noop_for_non_dmp(db, export_stream):
     on = _export_lines("ARGOS", db, include_unpaired=True)
     off = _export_lines("ARGOS", db, include_unpaired=False)
     assert on == off
+
+
+# --- PRT2: TEMPO default columns (both CMO sample-name columns) -------------
+#
+# The TEMPO pair report shows TUMOR_CMO_SAMPLE_NAME and
+# NORMAL_CMO_SAMPLE_NAME BY DEFAULT: the UI default column set (app.js
+# TEMPO_DEFAULT_KEYS, via defaultSelectionFor for a fresh report) and the
+# export default (server TEMPO_DEFAULT_EXPORT_KEYS, used when the columns
+# param is omitted). Every other logic keeps its current default set
+# byte-identical.
+
+def test_tempo_default_keys_are_pair_defaults_plus_cmo_names():
+    """The shared pair-report default set is byte-identical to before
+    (other logics unchanged); TEMPO's is exactly that set plus both CMO
+    sample-name columns, in that order."""
+    assert PAIR_DEFAULT_EXPORT_KEYS == [
+        "tumor_primary_id",
+        "normal_primary_id",
+        "tumor_bait_set",
+    ]
+    assert TEMPO_DEFAULT_EXPORT_KEYS == [
+        "tumor_primary_id",
+        "normal_primary_id",
+        "tumor_bait_set",
+        "tumor_cmo_sample_name",
+        "normal_cmo_sample_name",
+    ]
+
+
+def test_resolve_export_columns_tempo_default(db):
+    tempo = _logic(db, "TEMPO", "tempo")
+    argos = _logic(db, "ARGOS", "argos")
+    tempo_defs = _resolve_export_columns(tempo, None)
+    assert [c["header"] for c in tempo_defs] == [
+        "TUMOR_SAMPLE", "NORMAL_SAMPLE", "BAIT_SET",
+        "TUMOR_CMO_SAMPLE_NAME", "NORMAL_CMO_SAMPLE_NAME",
+    ]
+    # A non-TEMPO, non-DMP logic: the old default set, byte-identical.
+    assert [c["header"] for c in _resolve_export_columns(argos, None)] == [
+        "TUMOR_SAMPLE", "NORMAL_SAMPLE", "BAIT_SET",
+    ]
+    # An explicit columns param still wins, in the requested order.
+    explicit = _resolve_export_columns(
+        tempo, "normal_cmo_sample_name,tumor_primary_id")
+    assert [c["header"] for c in explicit] == [
+        "NORMAL_CMO_SAMPLE_NAME", "TUMOR_SAMPLE",
+    ]
+
+
+def test_export_tempo_default_includes_cmo_names(db, export_stream):
+    """A fresh TEMPO export (columns param omitted) shows both CMO
+    sample-name columns by default, with each side's own value."""
+    logic = _logic(db, "TEMPO", "tempo")
+    for i in range(2):
+        tumor = _sample(db, f"PRT2-T{i}", "IMPACT", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"PRT2-N{i}", "IMPACT", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        tumor.bait_set = "AC1"
+        normal.bait_set = "AC1"
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    db.flush()
+
+    lines = _export_lines("TEMPO", db)
+    assert len(lines) == 1 + 2
+    assert lines[0] == ("TUMOR_SAMPLE,NORMAL_SAMPLE,BAIT_SET,"
+                        "TUMOR_CMO_SAMPLE_NAME,NORMAL_CMO_SAMPLE_NAME")
+    # Newest first; the CMO cells carry each sample's cmo_sample_name
+    # (the fixture sets CMO_<primary_id>).
+    assert lines[1] == "PRT2-T1,PRT2-N1,AC1,CMO_PRT2-T1,CMO_PRT2-N1"
+    assert lines[2] == "PRT2-T0,PRT2-N0,AC1,CMO_PRT2-T0,CMO_PRT2-N0"
+
+
+def test_export_non_tempo_defaults_byte_identical(db, export_stream):
+    """PRT2: every non-TEMPO, non-DMP logic keeps the old 3-column default
+    export set (no CMO columns) — the DMP 15-column pair-file default is
+    already pinned by test_export_header_columns_match_report_model."""
+    _logic(db, "ARGOS", "argos")
+    _logic(db, "ACCESS", "access")
+    for name in ("ARGOS", "ACCESS"):
+        lines = _export_lines(name, db)
+        assert len(lines) == 1  # header only (empty logic)
+        assert lines[0] == "TUMOR_SAMPLE,NORMAL_SAMPLE,BAIT_SET"
+
+
+def test_ui_tempo_default_column_set():
+    """Static-UI (app.js): a fresh TEMPO report (no saved column prefs)
+    selects both CMO sample-name columns by default via
+    defaultSelectionFor -> TEMPO_DEFAULT_KEYS, and every other non-DMP
+    logic keeps the plain PAIR_DEFAULT_KEYS set."""
+    # The TEMPO default set: the pair default plus both CMO sample-name keys.
+    assert ('const TEMPO_DEFAULT_KEYS = [...PAIR_DEFAULT_KEYS, '
+            '"tumor_cmo_sample_name", "normal_cmo_sample_name"];') in APP_JS
+    # The shared pair default is unchanged.
+    assert ('const PAIR_DEFAULT_KEYS = ["tumor_primary_id", '
+            '"normal_primary_id", "tumor_bait_set"];') in APP_JS
+    # The TEMPO detector and the defaultSelectionFor branch.
+    assert "function isTempoLogic(logicName) {" in APP_JS
+    assert 'logicName.toUpperCase() === "TEMPO"' in APP_JS
+    assert ("return new Set(isTempoLogic(logicName) ? TEMPO_DEFAULT_KEYS "
+            ": PAIR_DEFAULT_KEYS);") in APP_JS

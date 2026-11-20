@@ -1881,6 +1881,12 @@ const PAIR_COLUMNS = [
   { key: "created_date", header: "CREATED_DATE", group: "Pairing", text: (r) => pairDate(r.created_date) },
 ];
 const PAIR_DEFAULT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"];
+/* PRT2: the TEMPO report's default column set — the pair-report default
+ * plus both CMO sample-name columns, which the TEMPO report shows by
+ * default. Every other non-DMP logic keeps PAIR_DEFAULT_KEYS unchanged.
+ * Mirrors the server's TEMPO_DEFAULT_EXPORT_KEYS (export default follows
+ * the same set when the columns param is omitted). */
+const TEMPO_DEFAULT_KEYS = [...PAIR_DEFAULT_KEYS, "tumor_cmo_sample_name", "normal_cmo_sample_name"];
 const PAIR_GROUPS = ["Tumor sample", "Normal sample", "Pairing"];
 
 /* DMP pair-report columns: the reference's 15-column pair file (spec
@@ -2068,13 +2074,20 @@ function isDmpLogic(logicName) {
   const l = PAIRING_LOGICS.find((x) => x.name === logicName);
   return !!logicName && (l ? l.strategy_name === "dmp" || logicName.toUpperCase() === "DMP" : logicName.toUpperCase() === "DMP");
 }
+/* PRT2: TEMPO owns its own default column set (TEMPO_DEFAULT_KEYS). */
+function isTempoLogic(logicName) {
+  return !!logicName && logicName.toUpperCase() === "TEMPO";
+}
 function columnsForLogic(logicName) {
   if (isHarmonyLogic(logicName)) return HARMONY_COLUMNS;
   return isDmpLogic(logicName) ? DMP_COLUMNS : PAIR_COLUMNS;
 }
 function defaultSelectionFor(logicName) {
   if (isHarmonyLogic(logicName)) return new Set(HARMONY_DEFAULT_KEYS);
-  return new Set(isDmpLogic(logicName) ? DMP_DEFAULT_KEYS : PAIR_DEFAULT_KEYS);
+  if (isDmpLogic(logicName)) return new Set(DMP_DEFAULT_KEYS);
+  // PRT2: TEMPO shows both CMO sample-name columns by default; every other
+  // non-DMP logic keeps the plain pair-report default set.
+  return new Set(isTempoLogic(logicName) ? TEMPO_DEFAULT_KEYS : PAIR_DEFAULT_KEYS);
 }
 function selectionFor(logicName) {
   if (!logicName) return new Set();
@@ -2158,9 +2171,10 @@ function renderPrGroups() {
   }
 }
 
-/* HARMONY cells: the endpoint already resolves display values (em-dash
- * placeholders for missing bam paths, null for the absent side); consent
- * renders "true"/"false"/empty per the endpoint's value. */
+/* HARMONY cells: the endpoint already resolves display values (the stored
+ * ACELA bam path, em-dash when a sample never received an envelope, null
+ * for the absent side); consent renders "true"/"false"/empty per the
+ * endpoint's value. */
 function harmonyCellText(r, key) {
   const v = r[key];
   if (key === "consent") return v === null || v === undefined ? "" : (v ? "true" : "false");
@@ -2173,7 +2187,8 @@ function harmonyCellText(r, key) {
  * the name as the Samples-tab search term; the patient column is
  * coalesce(tumor, normal).patient__dmp — a DMP id — so it goes through the
  * same conditional DMP-patient flow (no-op when no patient record matches).
- * The bam-path columns keep their em-dash placeholder rendering untouched. */
+ * The bam-path columns render the endpoint's value untouched (the stored
+ * ACELA path, or the em-dash placeholder for samples without one). */
 function harmonyCellHtml(r, key) {
   const text = harmonyCellText(r, key);
   if (text === "") return "";
