@@ -995,6 +995,14 @@ def _beagle_bam_exists_map(sample_names) -> dict:
 
 # The frontend default column sets (app.js PAIR_DEFAULT_KEYS / DMP_COLUMNS).
 PAIR_DEFAULT_EXPORT_KEYS = ["tumor_primary_id", "normal_primary_id", "tumor_bait_set"]
+# The TEMPO logic's default export set (PRT2): the pair-report default plus
+# both CMO sample-name columns — the TEMPO report shows them by default.
+# Every other non-DMP logic keeps PAIR_DEFAULT_EXPORT_KEYS unchanged.
+TEMPO_DEFAULT_EXPORT_KEYS = [
+    *PAIR_DEFAULT_EXPORT_KEYS,
+    "tumor_cmo_sample_name",
+    "normal_cmo_sample_name",
+]
 DMP_DEFAULT_EXPORT_KEYS = [
     "tumor_sample", "patient", "tumor_idx", "tumor_IM_ver", "tumor_bamname",
     "tumor_group", "tumor_matched", "tumor_bam_exists", "tumor_bam_coverage",
@@ -1006,6 +1014,11 @@ _EXPORT_COLUMNS_BY_KEY = {c["key"]: c for c in PAIR_EXPORT_COLUMNS}
 _EXPORT_COLUMNS_BY_KEY.update({c["key"]: c for c in DMP_EXPORT_COLUMNS})
 
 
+def _is_tempo_logic(logic: PairingLogic) -> bool:
+    """True for the TEMPO logic row (PRT2: it owns its own default set)."""
+    return bool(logic) and (logic.name or "").upper() == "TEMPO"
+
+
 def _resolve_export_columns(logic: PairingLogic, columns: Optional[str]) -> list:
     """Resolve the requested export columns (comma-separated keys) into an
     ordered list of column defs, or the logic's default set when omitted /
@@ -1013,14 +1026,20 @@ def _resolve_export_columns(logic: PairingLogic, columns: Optional[str]) -> list
 
     DMP logics export the reference pair file (4/8): the selectable columns
     are exactly its 15 columns (spec c) — pair-report keys are not valid
-    there. Other logics keep the pair-report column set.
+    there. TEMPO (PRT2) defaults to the pair-report set plus both CMO
+    sample-name columns. Other logics keep the pair-report default set.
     """
     keys = None
     if columns is not None:
         keys = [k.strip() for k in columns.split(",") if k.strip()]
     dmp = _is_dmp_strategy(logic)
     if not keys:
-        keys = DMP_DEFAULT_EXPORT_KEYS if dmp else PAIR_DEFAULT_EXPORT_KEYS
+        if dmp:
+            keys = DMP_DEFAULT_EXPORT_KEYS
+        elif _is_tempo_logic(logic):
+            keys = TEMPO_DEFAULT_EXPORT_KEYS
+        else:
+            keys = PAIR_DEFAULT_EXPORT_KEYS
     defs = []
     for k in keys:
         if dmp and k not in _DMP_COLUMN_INDEX:

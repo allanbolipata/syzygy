@@ -10,6 +10,7 @@ stable ordering.
 """
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import asyncio
@@ -34,10 +35,15 @@ from syzygy.routers.pairings import (
     PAIR_EXPORT_COLUMNS,
     DMP_DEFAULT_EXPORT_KEYS,
     PAIR_DEFAULT_EXPORT_KEYS,
+    TEMPO_DEFAULT_EXPORT_KEYS,
 )
 from syzygy.schemas import TumorOrNormal
 
 BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+# PRT2 static-UI assertions (same convention as test_logic_gating_ui.py):
+# the app.js default column sets, read once at import.
+APP_JS = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -1060,3 +1066,104 @@ def test_export_include_unpaired_noop_for_non_dmp(db, export_stream):
     on = _export_lines("ARGOS", db, include_unpaired=True)
     off = _export_lines("ARGOS", db, include_unpaired=False)
     assert on == off
+
+
+# --- PRT2: TEMPO default columns (both CMO sample-name columns) -------------
+#
+# The TEMPO pair report shows TUMOR_CMO_SAMPLE_NAME and
+# NORMAL_CMO_SAMPLE_NAME BY DEFAULT: the UI default column set (app.js
+# TEMPO_DEFAULT_KEYS, via defaultSelectionFor for a fresh report) and the
+# export default (server TEMPO_DEFAULT_EXPORT_KEYS, used when the columns
+# param is omitted). Every other logic keeps its current default set
+# byte-identical.
+
+def test_tempo_default_keys_are_pair_defaults_plus_cmo_names():
+    """The shared pair-report default set is byte-identical to before
+    (other logics unchanged); TEMPO's is exactly that set plus both CMO
+    sample-name columns, in that order."""
+    assert PAIR_DEFAULT_EXPORT_KEYS == [
+        "tumor_primary_id",
+        "normal_primary_id",
+        "tumor_bait_set",
+    ]
+    assert TEMPO_DEFAULT_EXPORT_KEYS == [
+        "tumor_primary_id",
+        "normal_primary_id",
+        "tumor_bait_set",
+        "tumor_cmo_sample_name",
+        "normal_cmo_sample_name",
+    ]
+
+
+def test_resolve_export_columns_tempo_default(db):
+    tempo = _logic(db, "TEMPO", "tempo")
+    argos = _logic(db, "ARGOS", "argos")
+    tempo_defs = _resolve_export_columns(tempo, None)
+    assert [c["header"] for c in tempo_defs] == [
+        "TUMOR_SAMPLE", "NORMAL_SAMPLE", "BAIT_SET",
+        "TUMOR_CMO_SAMPLE_NAME", "NORMAL_CMO_SAMPLE_NAME",
+    ]
+    # A non-TEMPO, non-DMP logic: the old default set, byte-identical.
+    assert [c["header"] for c in _resolve_export_columns(argos, None)] == [
+        "TUMOR_SAMPLE", "NORMAL_SAMPLE", "BAIT_SET",
+    ]
+    # An explicit columns param still wins, in the requested order.
+    explicit = _resolve_export_columns(
+        tempo, "normal_cmo_sample_name,tumor_primary_id")
+    assert [c["header"] for c in explicit] == [
+        "NORMAL_CMO_SAMPLE_NAME", "TUMOR_SAMPLE",
+    ]
+
+
+def test_export_tempo_default_includes_cmo_names(db, export_stream):
+    """A fresh TEMPO export (columns param omitted) shows both CMO
+    sample-name columns by default, with each side's own value."""
+    logic = _logic(db, "TEMPO", "tempo")
+    for i in range(2):
+        tumor = _sample(db, f"PRT2-T{i}", "IMPACT", TumorOrNormal.TUMOR.value,
+                        BASE_DATE + timedelta(minutes=i))
+        normal = _sample(db, f"PRT2-N{i}", "IMPACT", TumorOrNormal.NORMAL.value,
+                         BASE_DATE + timedelta(minutes=i))
+        tumor.bait_set = "AC1"
+        normal.bait_set = "AC1"
+        _pairing(db, logic, tumor, normal, BASE_DATE + timedelta(minutes=i))
+    db.flush()
+
+    lines = _export_lines("TEMPO", db)
+    assert len(lines) == 1 + 2
+    assert lines[0] == ("TUMOR_SAMPLE,NORMAL_SAMPLE,BAIT_SET,"
+                        "TUMOR_CMO_SAMPLE_NAME,NORMAL_CMO_SAMPLE_NAME")
+    # Newest first; the CMO cells carry each sample's cmo_sample_name
+    # (the fixture sets CMO_<primary_id>).
+    assert lines[1] == "PRT2-T1,PRT2-N1,AC1,CMO_PRT2-T1,CMO_PRT2-N1"
+    assert lines[2] == "PRT2-T0,PRT2-N0,AC1,CMO_PRT2-T0,CMO_PRT2-N0"
+
+
+def test_export_non_tempo_defaults_byte_identical(db, export_stream):
+    """PRT2: every non-TEMPO, non-DMP logic keeps the old 3-column default
+    export set (no CMO columns) — the DMP 15-column pair-file default is
+    already pinned by test_export_header_columns_match_report_model."""
+    _logic(db, "ARGOS", "argos")
+    _logic(db, "ACCESS", "access")
+    for name in ("ARGOS", "ACCESS"):
+        lines = _export_lines(name, db)
+        assert len(lines) == 1  # header only (empty logic)
+        assert lines[0] == "TUMOR_SAMPLE,NORMAL_SAMPLE,BAIT_SET"
+
+
+def test_ui_tempo_default_column_set():
+    """Static-UI (app.js): a fresh TEMPO report (no saved column prefs)
+    selects both CMO sample-name columns by default via
+    defaultSelectionFor -> TEMPO_DEFAULT_KEYS, and every other non-DMP
+    logic keeps the plain PAIR_DEFAULT_KEYS set."""
+    # The TEMPO default set: the pair default plus both CMO sample-name keys.
+    assert ('const TEMPO_DEFAULT_KEYS = [...PAIR_DEFAULT_KEYS, '
+            '"tumor_cmo_sample_name", "normal_cmo_sample_name"];') in APP_JS
+    # The shared pair default is unchanged.
+    assert ('const PAIR_DEFAULT_KEYS = ["tumor_primary_id", '
+            '"normal_primary_id", "tumor_bait_set"];') in APP_JS
+    # The TEMPO detector and the defaultSelectionFor branch.
+    assert "function isTempoLogic(logicName) {" in APP_JS
+    assert 'logicName.toUpperCase() === "TEMPO"' in APP_JS
+    assert ("return new Set(isTempoLogic(logicName) ? TEMPO_DEFAULT_KEYS "
+            ": PAIR_DEFAULT_KEYS);") in APP_JS
