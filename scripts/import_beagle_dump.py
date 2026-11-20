@@ -71,13 +71,15 @@ if _REPO not in sys.path:
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
+from fastapi import HTTPException
+
 from syzygy.database import engine
 from syzygy.dmp_translator import to_dmp_sample_kwargs
-from syzygy.models import PairingLogic, Sample
+from syzygy.models import DMP_LOGIC_NAME, PairingLogic, Sample
 from syzygy.pairing_service import (
     ensure_pooled_machine,
-    trigger_pairing,
-    trigger_pairing_for_normal,
+    trigger_dmp_pairing,
+    trigger_pairing_for_unpaired_tumors,
 )
 
 # File group holding the DMP data structure.
@@ -415,16 +417,6 @@ def main() -> None:
 
     db = Session(engine, future=True)
     try:
-        argos_logic = (
-            db.execute(sa.select(PairingLogic).where(PairingLogic.name == args.argos_name)).scalar_one_or_none()
-            if args.trigger
-            else None
-        )
-        dmp_logic = (
-            db.execute(sa.select(PairingLogic).where(PairingLogic.name == args.dmp_name)).scalar_one_or_none()
-            if args.trigger_dmp
-            else None
-        )
 
         # ---- Phase 1: DMP samples (file group "DMP BAMs") -----------------
         print(f"[1/4] Reading DMP records (file group {DMP_FILEGROUP!r}) ...")
@@ -455,35 +447,35 @@ def main() -> None:
                 print(f"    - {count} x {reason}")
         dmp_created, dmp_updated = upsert_samples(db, dmp_list)
         print(f"  upserted: {dmp_created} created, {dmp_updated} updated")
-        dmp_pids = [s["primary_id"] for s in dmp_list]
         del dmp_list, dmp_samples
 
         # ---- Phase 2: optional automatic DMP pairing ----------------------
+        # Bulk engine (same path as POST /pairing/trigger-dmp): one SQL
+        # sweep of unpaired DMP tumors, tumor-driven cascade, batched
+        # commits (BULK_PASS_COMMIT_BATCH_SIZE per commit). The old
+        # per-sample trigger loop recomputed each patient's row set once
+        # per sample — O(tumors x normals) queries per patient plus a
+        # commit per attempt — which is day-scale on a full beagle dump.
         if args.trigger_dmp:
-            if dmp_logic is None:
-                print(f"[2/5] SKIP: pairing logic {args.dmp_name!r} not found.")
+            if args.dmp_name != DMP_LOGIC_NAME:
+                print(
+                    f"  note: bulk pass pairs under the canonical "
+                    f"{DMP_LOGIC_NAME!r} logic (requested {args.dmp_name!r})"
+                )
+            print("[2/5] Automatic DMP pairing (bulk pass) ...")
+            try:
+                dmp_summary = trigger_dmp_pairing(db)
+            except HTTPException as exc:
+                print(f"[2/5] SKIP: {exc.detail}")
             else:
-                print(f"[2/5] Automatic pairing (logic {dmp_logic.name!r}) for DMP samples ...")
-                dmp_paired = 0
-                for i, pid in enumerate(dmp_pids, 1):
-                    sample = db.execute(
-                        sa.select(Sample).where(Sample.primary_id == pid)
-                    ).scalar_one_or_none()
-                    if sample is None:
-                        continue
-                    try:
-                        if sample.tumor_or_normal == "TUMOR":
-                            trigger_pairing(db, sample, dmp_logic, "automatic")
-                        else:
-                            trigger_pairing_for_normal(db, sample, dmp_logic)
-                    except ValueError:
-                        db.rollback()
-                        dmp_paired += 1
-                        continue
-                    dmp_paired += 1
-                    if i % 2000 == 0:
-                        print(f"  ...{i}/{len(dmp_pids)}", flush=True)
-                print(f"  pairing attempts: {dmp_paired}")
+                print(
+                    f"  scanned: {dmp_summary['scanned']}, paired: {dmp_summary['paired']}, "
+                    f"already paired: {dmp_summary['already_paired']}, "
+                    f"unpaired: {dmp_summary['unpaired']}, "
+                    f"missing patient__dmp: {dmp_summary['missing_patient__dmp']}"
+                )
+                if dmp_summary.get("needs_follow_up"):
+                    print(f"  needs follow-up pass: {dmp_summary['needs_follow_up']}")
         else:
             print("[2/5] No --trigger-dmp: skipping automatic DMP pairing.")
 
@@ -519,7 +511,6 @@ def main() -> None:
                 print(f"    - {count} x {reason}")
         lims_created, lims_updated = upsert_samples(db, lims_list)
         print(f"  upserted: {lims_created} created, {lims_updated} updated")
-        lims_pids = [s["primary_id"] for s in lims_list]
         del lims_list, lims_samples
 
         # ---- Phase 4: pooled normals ---------------------------------------
@@ -539,31 +530,26 @@ def main() -> None:
         print(f"  upserted: {pooled_created} created, {pooled_updated} updated")
 
         # ---- Phase 5: optional automatic pairing (LIMS/IGO) ---------------
-        paired = 0
+        # Bulk backfill (same engine as POST /pairing/trigger-all): scans
+        # unpaired non-DMP tumors once, resolves each tumor's logic from
+        # its bait set (so argos AND tempo tumors pair under their own
+        # logic — the old loop forced everything through the argos logic),
+        # and never replaces existing pairings.
         if args.trigger:
-            if argos_logic is None:
-                print(f"[5/5] SKIP: pairing logic {args.argos_name!r} not found.")
-            else:
-                print(f"[5/5] Automatic pairing (logic {argos_logic.name!r}) for LIMS/IGO samples ...")
-                for i, pid in enumerate(lims_pids, 1):
-                    sample = db.execute(
-                        sa.select(Sample).where(Sample.primary_id == pid)
-                    ).scalar_one_or_none()
-                    if sample is None:
-                        continue
-                    try:
-                        if sample.tumor_or_normal == "TUMOR":
-                            trigger_pairing(db, sample, argos_logic, "automatic")
-                        else:
-                            trigger_pairing_for_normal(db, sample, argos_logic)
-                    except ValueError:
-                        db.rollback()
-                        paired += 1
-                        continue
-                    paired += 1
-                    if i % 2000 == 0:
-                        print(f"  ...{i}/{len(lims_pids)}", flush=True)
-                print(f"  pairing attempts: {paired}")
+            print(
+                "[5/5] Automatic pairing for LIMS/IGO samples "
+                "(bulk backfill; logic resolved per tumor bait set) ..."
+            )
+            lims_summary = trigger_pairing_for_unpaired_tumors(db)
+            print(
+                f"  scanned: {lims_summary['scanned']}, paired: {lims_summary['paired']}, "
+                f"already paired: {lims_summary['already_paired']}, "
+                f"unpaired: {lims_summary['unpaired']}, skipped "
+                f"dmp/no-logic/inactive: "
+                f"{lims_summary['skipped_dmp']}/"
+                f"{lims_summary['skipped_no_logic']}/"
+                f"{lims_summary['skipped_inactive_logic']}"
+            )
         else:
             print("[5/5] No --trigger: skipping automatic pairing.")
 
