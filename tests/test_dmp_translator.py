@@ -289,16 +289,13 @@ def test_non_envelope_record_passes_through_unchanged():
     assert flatten_acela_record(legacy) == legacy
 
 
-def test_consent_sourced_from_part_c_consent():
-    # part_c_consent is the agreed consent source (ACELA contract):
-    # 1 -> consented, 0 -> not consented; absent -> placeholder False.
+def test_part_c_consent_does_NOT_drive_consent():
+    # Allan 2026-11-20: part_c_consent is NOT the consent source (the real
+    # field comes from ACELA later, TBD). It is stored verbatim as metadata
+    # and must never wire into Sample.consent — placeholder False stands.
     kw = to_dmp_sample_kwargs("P-0001234-T01-IM6", flatten_acela_record(_acela()))
-    assert kw["consent"] is True
-    meta_zero = _meta(part_c_consent=0)
-    assert to_dmp_sample_kwargs("P-1", meta_zero)["consent"] is False
-    meta_absent = _meta()
-    meta_absent.pop("part_c_consent")
-    assert to_dmp_sample_kwargs("P-1", meta_absent)["consent"] is False
+    assert kw["consent"] is False          # even though part_c_consent == 1
+    assert kw["additional_metadata"]["part_c_consent"] == 1  # stored verbatim
 
 
 def test_remap_bam_exists_falls_back_to_stored_metadata():

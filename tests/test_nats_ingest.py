@@ -267,7 +267,9 @@ def test_dmp_acela_envelope_ingest(db):
     )
     assert sample is not None
     assert sample.file_group == "DMP BAMs"
-    assert sample.consent is True
+    # consent stays the placeholder: part_c_consent is NOT the consent
+    # source (Allan 2026-11-20; real ACELA consent field TBD).
+    assert sample.consent is False
     meta = sample.additional_metadata
     assert meta["bam_path"] == "/dmp/mirror/impact468/I/N/dev.bam"
     assert meta["bam_exists"] == 1
