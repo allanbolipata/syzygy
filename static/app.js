@@ -355,6 +355,20 @@ function showView(name) {
     // Entering the Pair Report: drop any stale search so the user always
     // lands on the full list for the current logic.
     resetPrSearch();
+    // Re-opening the view is a fresh visit: drop the session-cached DMP
+    // summary/warnings and re-fetch them (fresh GET /pairing/report-stats/),
+    // so a snapshot taken mid-import or before a pairing run never lingers
+    // across a re-entry. The "computing over the full report…" pending
+    // affordance covers the re-fetch (loadDmpReportStats paints it) and the
+    // summary strip is reset to its pending state for the same reason;
+    // paging later re-caches and keeps using the cache.
+    if (viewLogic && isDmpLogic(viewLogic)) {
+      invalidateDmpStats(viewLogic);
+      pairsState.dmpSummary = null;
+      pairsState.dmpWarnings = null;
+      loadPrOverviewStats();
+      loadDmpReportStats(viewLogic);
+    }
   }
   if (prev === "pairs" && !isPairs) {
     // Leaving the Pair Report: clear the search too, so returning later
@@ -2452,6 +2466,17 @@ function renderDmpWarnings() {
  * The pair table paints without them. */
 let dmpStatsCache = {}; // logic name -> { summary, warnings }
 let dmpStatsAbort = null;
+
+/* Drop one logic's cached stats so the next loadDmpReportStats fetches
+ * fresh numbers from /pairing/report-stats/. Called on fresh Pair Report
+ * entries only — the view being (re)opened (showView) and the View's logic
+ * switching (loadPairs) — so a snapshot taken mid-import or before a
+ * pairing run can't survive into a new visit. Intra-session paging never
+ * calls this: the page path keeps reading the cache (the stats are page/
+ * query independent, which is exactly what the cache is for). */
+function invalidateDmpStats(logic) {
+  if (logic) delete dmpStatsCache[logic];
+}
 async function loadDmpReportStats(logic) {
   if (!isDmpLogic(logic)) return;
   const cached = dmpStatsCache[logic];
@@ -2477,6 +2502,12 @@ async function loadDmpReportStats(logic) {
     pairsState.dmpWarnings = dmpStatsCache[logic].warnings;
     pairsState.dmpStatsPending = false;
     renderPairsTable(); // repaint the DMP count line/overview with real numbers
+    // The summary strip (#pr-overview-stats) is only repainted by
+    // loadPrOverviewStats — the page path already calls it on page 0, but a
+    // re-fetch triggered by a view re-entry has no page load behind it, so
+    // paint the strip here too (synchronous for DMP: it reads
+    // pairsState.dmpSummary, no extra request).
+    loadPrOverviewStats();
   } catch (e) {
     if (e && e.name === "AbortError") return;
     pairsState.dmpStatsPending = false;
@@ -2648,6 +2679,12 @@ async function loadPairs() {
   // logic/query and is dropped.
   invalidatePrPrefetch();
   pairsState.logic = logic;
+  // A fresh load is a fresh visit: drop this logic's cached stats so
+  // loadDmpReportStats re-fetches instead of repainting a stale snapshot
+  // (this is the View logic-switch path; init is covered too — its cache
+  // is empty). Paging afterwards re-caches and the cache is used until the
+  // next fresh entry (showView re-entry or another logic switch).
+  invalidateDmpStats(logic);
   // The previous logic's server count is stale until the new one lands.
   pairsState.pairedCount = null;
   // Same for the DMP extras: the previous logic's summary/warnings must
