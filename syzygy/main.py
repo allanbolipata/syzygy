@@ -18,6 +18,7 @@ from syzygy.schema_check import find_missing_columns
 from syzygy.auth import get_current_user, router as auth_router
 from syzygy.routers.audit import router as audit_router
 from syzygy.routers.bait_sets import router as bait_sets_router
+from syzygy.routers.exports import router as exports_router
 from syzygy.routers.machines import router as machines_router
 from syzygy.routers.nats_ingest import router as nats_ingest_router
 from syzygy.routers.patients import router as patients_router
@@ -159,6 +160,12 @@ app.include_router(
 )
 app.include_router(
     audit_router, prefix="/v1/audit", dependencies=[Depends(get_current_user)]
+)
+# beagle TEMPO operator-file exports (ticket E1): pairing + unpaired TSVs,
+# text/plain downloads with beagle's filenames; auth required like the
+# other /v1 routers.
+app.include_router(
+    exports_router, prefix="/v1", dependencies=[Depends(get_current_user)]
 )
 
 
