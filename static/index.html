@@ -436,6 +436,7 @@
       <button id="pn-next">Next</button>
     </div>
     <p class="hint">Click a row to open its matches &amp; overrides.</p>
+    <p class="hint">No path column: the beagle source (<code>file_system_poolednormal</code>) carries only raw FASTQ paths, which are dropped at ingest and live in restricted source locations &mdash; not surfaced here.</p>
   </section>
 
   <section class="panel">
@@ -446,6 +447,7 @@
       to a sequencer family (<code>novaseq</code>/<code>hiseq</code>) and must agree
       with the tumor's run-mode family. <code>machine_type</code> is display-only.
     </p>
+    <p class="hint">A <strong>legacy fallback for samples without runIds</strong>: runId-bearing samples pair beagle-exact (PR&nbsp;#36) and skip this table, so it is kept, not obsolete.</p>
     <div class="actions">
       <label>machine_name
         <input id="pm-name">
