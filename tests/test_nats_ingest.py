@@ -298,6 +298,20 @@ def test_dmp_acela_recheck_updates_bam_exists(db):
     assert sample.additional_metadata["bam_exists"] == 0
 
 
+def test_dmp_envelope_non_dict_metadata_error_not_crash(db):
+    # An envelope whose metadata is not a dict is NOT an envelope (DA1
+    # pass-through): with no top-level 'sample' id the handler reports an
+    # error result — it must not crash and must not create a row.
+    result = dispatch(db, DMP_SAMPLE, {
+        "path": "/dmp/mirror/impact468/I/N/dev.bam",
+        "metadata": "corrupt",
+        "pathChecks": {"mirror": {"status": "OK", "size_bytes": 1, "checked_at": "t"}},
+    })
+    assert result["status"] == "error"
+    assert "sample" in result["detail"]
+    assert db.scalar(select(Sample).limit(1)) is None
+
+
 def test_router_dispatch_returns_200_shape(monkeypatch, db, caplog):
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(database.settings, "nats_ingest_token", "secret")

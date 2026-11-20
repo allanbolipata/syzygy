@@ -36,7 +36,7 @@ from syzygy.bait_sets import resolve_bait_set_logic
 from syzygy.cohort.cohort_crf import write_crf
 from syzygy.cohort.cohort_schema import validate_cohort_request, validate_report
 from syzygy.cohort.cohort_validation import classify_cohort
-from syzygy.dmp_translator import to_dmp_sample_kwargs
+from syzygy.dmp_translator import flatten_acela_record, to_dmp_sample_kwargs
 from syzygy.pairing_service import (
     ensure_pooled_machine,
     trigger_pairing,
@@ -917,7 +917,17 @@ def handle_dmp_sample(
 
     The payload is the DMP record in the exact format syzygy already
     stores (docs/dmp_reference_alignment.md, section f) — NOT a
-    key-file-shaped payload. The record is upserted as-is via
+    key-file-shaped payload. Since the ACELA contract (2026-11-20) the
+    payload may be the flat record OR the ACELA envelope
+    ``{path, metadata, pathChecks}``: envelopes are flattened through
+    ``flatten_acela_record`` — the single flatten point — at entry,
+    before the ``sample`` id check, so both shapes store the same
+    vocabulary (the metadata keys plus ``bam_path`` / ``path_checks`` /
+    ``bam_exists``). A non-dict ``metadata`` marks the payload as NOT an
+    envelope (DA1 pass-through): it then fails the missing-``sample``
+    check below and is reported as an error result, not a crash.
+
+    The record is upserted as-is via
     ``to_dmp_sample_kwargs``: mapped keys become Sample columns,
     everything else merges into ``additional_metadata`` (same behavior
     as the beagle dump import path). No key-file fields are parsed.
@@ -936,6 +946,11 @@ def handle_dmp_sample(
     if not isinstance(payload, dict):
         logger.warning("nats dmp-sample: payload is not a JSON object")
         return {"status": "error", "detail": "DMP payload must be a JSON object"}
+
+    # ACELA envelope -> flat DMP vocabulary at the single flatten point
+    # (design DECIDED 2026-11-20, DMP_ACELA_ENVELOPE_TICKETS.md); legacy
+    # flat records pass through unchanged.
+    payload = flatten_acela_record(payload)
 
     sample_id = payload.get("sample")
     if not isinstance(sample_id, str) or not sample_id.strip():
@@ -974,6 +989,10 @@ def handle_dmp_sample(
 
     metadata = kwargs.pop("additional_metadata")
     if metadata:
+        # The new record's keys overwrite the stored ones — including
+        # bam_exists flipping to 0 when a re-sent envelope's pathChecks
+        # failed (0 survives unmapped_metadata, so the update clobbers the
+        # stored 1); keys the new record does not carry are preserved.
         merged = dict(sample.additional_metadata or {})
         merged.update(metadata)
         sample.additional_metadata = merged
