@@ -356,6 +356,16 @@ def build_samples(
             if not kwargs.get("gene_panel"):
                 kwargs["gene_panel"] = "unknown"
             kwargs["file_group"] = DMP_FILEGROUP
+            # Provenance for upsert_samples: was patient__dmp taken from
+            # the record's explicit patient.dmp, or imputed from the
+            # sample name by to_dmp_sample_kwargs (or absent)? A stored
+            # non-empty patient__dmp is only ever overwritten by an
+            # explicit record value (t_9e6c5cd6).
+            source_patient = entry["kwargs"].get("patient")
+            kwargs["_dmp_patient_explicit"] = bool(
+                isinstance(source_patient, dict)
+                and str(source_patient.get("dmp") or "").strip()
+            )
         else:
             kwargs, reason = to_sample_kwargs(entry["kwargs"])
             if kwargs is None:
@@ -382,12 +392,24 @@ def upsert_samples(db: Session, samples: list[dict[str, Any]]) -> tuple[int, int
 
     created = updated = 0
     for idx, kwargs in enumerate(samples, 1):
+        dmp_patient_explicit = kwargs.pop("_dmp_patient_explicit", False)
         row = db.get(Sample, existing.get(kwargs["primary_id"]))
         if row is None:
             row = Sample(**kwargs)
             db.add(row)
             created += 1
         else:
+            if (
+                kwargs.get("sample_type") == "DMP"
+                and not dmp_patient_explicit
+                and (row.patient__dmp or "").strip()
+            ):
+                # Imputed (or absent) patient value on re-import: a stored
+                # non-empty patient__dmp always wins — explicit record
+                # values are the only thing that may overwrite it
+                # (t_9e6c5cd6: the stored value may have been imputed at
+                # first import, set by the backfill, or corrected by hand).
+                kwargs["patient__dmp"] = row.patient__dmp
             for key, value in kwargs.items():
                 setattr(row, key, value)
             updated += 1
