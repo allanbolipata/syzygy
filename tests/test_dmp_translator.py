@@ -2,9 +2,11 @@ import pytest
 
 from syzygy.dmp_translator import (
     ASSAY_MAPPING,
+    DMP_NAME_RE,
     DMP_REF_COLUMNS,
     EXCLUDED_DMP_KEYS,
     flatten_acela_record,
+    parse_dmp_patient,
     remap_dmp_record,
     to_dmp_sample_kwargs,
 )
@@ -64,11 +66,53 @@ def test_identifiers_now_stored_in_columns():
     assert kw["anon_id"] == "anon-0001234"
     # "C-" prefix rule on patient__cmo is unchanged.
     assert kw["patient__cmo"] == "C-TEST123"
-    # Absent patient/anon_id -> None columns.
+    # Absent patient/anon_id: patient__dmp is imputed from the sample
+    # name's reference P- prefix (t_9e6c5cd6); anon_id stays None.
     kw2 = to_dmp_sample_kwargs("P-1-T01-IM6", _meta(patient=None, anon_id=None))
-    assert kw2["patient__dmp"] is None
+    assert kw2["patient__dmp"] == "P-1"
     assert kw2["anon_id"] is None
     assert kw2["patient__cmo"] is None
+    # An unparseable sample name has nothing to impute from -> None.
+    kw3 = to_dmp_sample_kwargs("ISFAKE-T01", _meta(patient=None))
+    assert kw3["patient__dmp"] is None
+
+
+def test_patient_dmp_imputed_from_name_when_absent():
+    # Beagle DMP records carry the P- id only in the sample name (no
+    # explicit patient.dmp): ingest imputes patient__dmp with the
+    # reference parse so HARMONY's stored-column check can see the row
+    # (t_9e6c5cd6). An explicit patient.dmp always wins over the parse.
+    kw = to_dmp_sample_kwargs("P-7000011-T01-IM6", _meta(patient=None, type="T"))
+    assert kw["patient__dmp"] == "P-7000011"
+    kw2 = to_dmp_sample_kwargs(
+        "P-7000011-T01-IM6", _meta(patient={"dmp": "P-0009999"}, type="T")
+    )
+    assert kw2["patient__dmp"] == "P-0009999"
+    # An empty-string patient.dmp is absent: the imputation applies.
+    kw3 = to_dmp_sample_kwargs(
+        "P-7000011-T01-IM6", _meta(patient={"dmp": ""}, type="T")
+    )
+    assert kw3["patient__dmp"] == "P-7000011"
+
+
+def test_parse_dmp_patient_matches_reference_parse():
+    # The imputation parse is the remap_dmp_record name parse (spec g):
+    # group 1 of the P-<digits>-<code>-<ver> pattern, leftmost/unanchored.
+    assert parse_dmp_patient("P-7000011-T01-IM6") == "P-7000011"
+    assert parse_dmp_patient("P-0001234-N01-IM6") == "P-0001234"
+    assert parse_dmp_patient("X-P-42-A1-B2") == "P-42"
+    # No full triple -> no patient (matches the dmp_patient_key
+    # generated column's regexp_match returning NULL).
+    assert parse_dmp_patient("P-42-A1") is None
+    assert parse_dmp_patient("ISFAKE-T01") is None
+    assert parse_dmp_patient(None) is None
+    assert parse_dmp_patient("") is None
+    # A P- id containing letters is not a reference patient id.
+    assert parse_dmp_patient("P-00ISFAK01-T01-IM6") is None
+    # Shared regex keeps the same capture groups remap_dmp_record uses.
+    m = DMP_NAME_RE.search("P-7000011-T01-IM6")
+    assert m is not None
+    assert m.groups() == ("P-7000011", "T01", "IM6")
 
 
 def test_consent_placeholder_false():
@@ -216,7 +260,11 @@ def test_remap_explicit_fields_take_precedence():
 
 
 def test_remap_patient_falls_back_to_name_parse():
+    # Ingest now imputes patient__dmp from the name (t_9e6c5cd6), so a
+    # NULL stored column only exists on pre-imputation rows: simulate
+    # one to exercise remap_dmp_record's own name-parse fallback.
     s = _dmp_sample(patient=None)
+    s.patient__dmp = None
     assert s.patient__dmp is None
     assert remap_dmp_record(s)["patient"] == "P-0001234"
 

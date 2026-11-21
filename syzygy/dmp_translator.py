@@ -27,7 +27,11 @@ record -> syzygy Sample):
     sample              -> primary_id            (cmo_sample_name fallback)
     external_id         -> cmo_sample_name       (DMP's CMO sample label)
     patient.cmo         -> patient__cmo            ("C-" prefixed)
-    patient.dmp         -> patient__dmp            (as-is, no prefix)
+    patient.dmp         -> patient__dmp            (as-is, no prefix; when
+                                                    absent, imputed from the
+                                                    sample name's reference
+                                                    P- prefix —
+                                                    parse_dmp_patient)
     anon_id             -> anon_id
     cmo_assay           -> gene_panel            (fallback: ASSAY_MAPPING[assay])
     type ("T"/"N")      -> tumor_or_normal       (TUMOR / NORMAL)
@@ -163,6 +167,36 @@ def flatten_acela_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return flat
 
 
+#: The reference DMP sample-name parse, shared by every code path that
+#: resolves a DMP patient from the name: ``remap_dmp_record`` (spec g
+#: fallback), the ingest-time ``patient__dmp`` imputation
+#: (``to_dmp_sample_kwargs`` / ``parse_dmp_patient``), and the
+#: ``dmp_patient_key`` generated column (alembic 0004 /
+#: scripts/migrate_dmp_generated_columns.py, the same pattern in SQL).
+#: A DMP sample name carries patient / tumor-code / IM_ver as
+#: ``P-<digits>-<code>-<ver>`` (e.g. ``P-0001234-N01-IM6``); group 1 is
+#: the patient id. Leftmost, unanchored — the exact search
+#: ``remap_dmp_record`` has always run (docs/dmp_reference_alignment.md,
+#: caveat 1).
+DMP_NAME_RE = re.compile(r"(P-\d+)-(\w+)-(\w+)")
+
+
+def parse_dmp_patient(primary_id: Optional[str]) -> Optional[str]:
+    """The ``P-…`` patient id parsed out of a DMP sample name, or None.
+
+    The same parse ``remap_dmp_record`` falls back to when the stored
+    ``patient__dmp`` column is NULL (spec g) — group 1 of ``DMP_NAME_RE``.
+    Beagle DMP records carry the P- id ONLY in the sample name (the
+    payload has no explicit ``patient.dmp``), so ingest imputes
+    ``patient__dmp`` with this parse: HARMONY's pairing deliberately
+    checks the stored column only (no name-parse fallback), and a NULL
+    ``patient__dmp`` made ~87,802 DMP tumors invisible to it
+    (staging audit 2026-11-20).
+    """
+    match = DMP_NAME_RE.search(primary_id or "")
+    return match.group(1) if match else None
+
+
 def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
     """Build ``Sample`` kwargs for one DMP record (the entire record).
 
@@ -181,12 +215,23 @@ def to_dmp_sample_kwargs(sample_id: str, meta: dict) -> dict:
 
     patient = meta.get("patient") or {}
     patient_cmo = patient.get("cmo")
+    patient_dmp = patient.get("dmp") or None
+    if not patient_dmp:
+        # No explicit patient.dmp: impute from the sample name with the
+        # reference parse (the same one remap_dmp_record falls back to).
+        # Beagle DMP records carry the P- id only in the sample name, and
+        # HARMONY's stored-column patient check sees only what is stored
+        # here (t_9e6c5cd6). Explicit values always win — this only fills
+        # an absent one — and the ingest callers never let the imputed
+        # value overwrite a stored non-empty value on update.
+        patient_dmp = parse_dmp_patient(sample_id)
     kw: dict[str, Any] = dict(
         primary_id=sample_id,
         cmo_sample_name=meta.get("external_id") or sample_id,
         patient__cmo=f"C-{patient_cmo}" if patient_cmo else None,
-        # Stored as-is (e.g. "P-0045965") — no prefix; None when absent.
-        patient__dmp=patient.get("dmp") or None,
+        # Stored as-is (e.g. "P-0045965") — no prefix; imputed from the
+        # sample name's reference P- prefix when the record carries none.
+        patient__dmp=patient_dmp,
         anon_id=meta.get("anon_id") or None,
         request_id=None,
         sample_type="DMP",
@@ -282,7 +327,7 @@ def remap_dmp_record(sample, bam_exists: int = 0) -> Dict[str, Any]:
     # envelope's pathChecks), else 0.
     bam_exists = bam_exists or meta.get("bam_exists") or 0
     primary_id = sample.primary_id or ""
-    match = re.search(r"(P-\d+)-(\w+)-(\w+)", primary_id)
+    match = DMP_NAME_RE.search(primary_id)
     idx = match.group(2) if match else ""
     ver = match.group(3) if match else ""
     patient = sample.patient__dmp

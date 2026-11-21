@@ -329,3 +329,74 @@ def test_dump_dmp_rerun_idempotent(db):
     assert meta["bam_exists"] == 1
     assert meta["bam_path"] == "/dmp/mirror/impact468/I/N/isfake01.bam"
     assert meta["path_checks"]["mirror"]["status"] == "OK"
+
+
+# ---------------------------------------------------------------------------
+# patient__dmp imputation from the sample name (t_9e6c5cd6): beagle DMP
+# records carry the P- id only in the sample name (no explicit
+# patient.dmp) — the shape that left ~87,802 tumors with NULL
+# patient__dmp, invisible to HARMONY's stored-column pairing check.
+# ---------------------------------------------------------------------------
+
+
+def _dmp_flat_no_patient(**overrides):
+    """A legacy flat DMP record with no explicit patient — the beagle
+    shape the imputation targets. Synthetic values only."""
+    record = {
+        "sample": "P-7000011-T01-IM6",
+        "type": "T",
+        "assay": "IM6",
+        "cmo_assay": "IMPACT468",
+        "anon_id": "t7000011t01im6",
+        "coverage": 600,
+        "project_name": "POOL7000011",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_dump_dmp_imputes_patient_from_name(db):
+    """A DMP record with no explicit patient has patient__dmp imputed
+    from the sample name at import (t_9e6c5cd6)."""
+    rows = [("DMP BAMs", _dmp_flat_no_patient())]
+    dmp_list, skipped, _ = build_samples(merge_dmp_samples(rows), is_dmp=True)
+    assert skipped == []
+    assert dmp_list[0]["patient__dmp"] == "P-7000011"
+    created, updated = upsert_samples(db, dmp_list)
+    assert (created, updated) == (1, 0)
+    row = db.scalar(select(Sample).where(Sample.primary_id == "P-7000011-T01-IM6"))
+    assert row is not None
+    assert row.patient__dmp == "P-7000011"
+    assert row.patient__cmo is None
+    assert row.sample_type == "DMP"
+
+
+def test_dump_dmp_reimport_never_overwrites_stored_patient(db):
+    """Re-importing a record with no explicit patient never clobbers a
+    stored non-empty patient__dmp (a backfill or manual correction
+    survives); an explicit record value still wins (t_9e6c5cd6)."""
+    rows = [("DMP BAMs", _dmp_flat_no_patient())]
+
+    def build():
+        out, skipped, _ = build_samples(merge_dmp_samples(rows), is_dmp=True)
+        assert skipped == []
+        return out
+
+    upsert_samples(db, build())
+    row = db.scalar(select(Sample).where(Sample.primary_id == "P-7000011-T01-IM6"))
+    assert row.patient__dmp == "P-7000011"
+    # A stored value set after import (backfill or manual correction)…
+    row.patient__dmp = "P-000CORR"
+    db.commit()
+    upsert_samples(db, build())
+    row = db.scalar(select(Sample).where(Sample.primary_id == "P-7000011-T01-IM6"))
+    assert row.patient__dmp == "P-000CORR"
+    # …is only replaced by an explicit record value.
+    explicit_rows = [
+        ("DMP BAMs", _dmp_flat_no_patient(patient={"dmp": "P-000EXPL"})),
+    ]
+    out, skipped, _ = build_samples(merge_dmp_samples(explicit_rows), is_dmp=True)
+    assert skipped == []
+    upsert_samples(db, out)
+    row = db.scalar(select(Sample).where(Sample.primary_id == "P-7000011-T01-IM6"))
+    assert row.patient__dmp == "P-000EXPL"

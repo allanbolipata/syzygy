@@ -211,6 +211,56 @@ def test_dmp_partial_without_type_backfills_stored(db):
     assert row.additional_metadata["coverage"] == 55
 
 
+# ---------------------------------------------------------------------------
+# patient__dmp imputation from the sample name (t_9e6c5cd6): beagle DMP
+# records carry the P- id only in the sample name, so ingest fills the
+# stored column HARMONY's pairing checks — explicit values always win,
+# and a re-arriving record without an explicit patient never clobbers.
+# ---------------------------------------------------------------------------
+
+
+def test_dmp_no_explicit_patient_imputes_from_name(db):
+    rec = _dmp_record(sample="P-8800456-T01-IM6")
+    del rec["patient"]
+    result = dispatch(db, DMP_SAMPLE, rec)
+    assert result["status"] == "ok"
+    assert result["summary"]["action"] == "created"
+    row = db.scalar(select(Sample).where(Sample.primary_id == "P-8800456-T01-IM6"))
+    assert row is not None
+    assert row.patient__dmp == "P-8800456"
+    assert row.patient__cmo is None
+
+
+def test_dmp_explicit_patient_beats_name_imputation(db):
+    rec = _dmp_record(sample="P-8800456-T01-IM6", patient={"dmp": "P-0009999"})
+    assert dispatch(db, DMP_SAMPLE, rec)["status"] == "ok"
+    row = db.scalar(select(Sample).where(Sample.primary_id == "P-8800456-T01-IM6"))
+    assert row is not None
+    assert row.patient__dmp == "P-0009999"
+
+
+def test_dmp_unparseable_name_without_patient_stays_null(db):
+    rec = _dmp_record(sample="ISFAKE-T01")
+    del rec["patient"]
+    assert dispatch(db, DMP_SAMPLE, rec)["status"] == "ok"
+    row = db.scalar(select(Sample).where(Sample.primary_id == "ISFAKE-T01"))
+    assert row is not None
+    assert row.patient__dmp is None
+
+
+def test_dmp_reingest_without_patient_never_clobbers_stored(db):
+    # A record that re-arrives with no explicit patient.dmp leaves the
+    # stored value as-is (a backfill or manual correction survives).
+    assert dispatch(db, DMP_SAMPLE, _dmp_record())["status"] == "ok"
+    row = _get_dmp_row(db)
+    row.patient__dmp = "P-000CORR"
+    db.commit()
+    rec = _dmp_record()
+    del rec["patient"]
+    assert dispatch(db, DMP_SAMPLE, rec)["status"] == "ok"
+    assert _get_dmp_row(db).patient__dmp == "P-000CORR"
+
+
 def test_dmp_new_record_without_type_rejected(db):
     rec = _dmp_record()
     del rec["type"]
