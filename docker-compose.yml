@@ -113,9 +113,10 @@ services:
 
   # Standalone SMILE listener: the ONLY way inbound SMILE / DMP / cohort
   # messages reach the app (the app never connects to NATS itself). One
-  # process, two supervised JetStream consumers (legacy
+  # process, three supervised JetStream consumers (legacy
   # `MDB_STREAM.server.cpt-gateway.>` durable syzygy, tempo
-  # `MDB_STREAM.syzygy.inbound.>` durable syzygy-tmp;
+  # `MDB_STREAM.syzygy.inbound.>` durable syzygy-tmp, dmp
+  # `MDB_STREAM.server.dmp-gateway.dmp-sample` durable syzygy-dmp;
   # see listener/run.py), each POSTing to the app's internal ingest
   # endpoint with X-NATS-Token. Consumers restart themselves with backoff;
   # `restart: unless-stopped` covers a hard crash.
@@ -123,7 +124,8 @@ services:
   # Run exactly ONE instance: the durable names fan out per-stream, so a
   # second instance would share a durable and load-balance deliveries
   # instead of shadowing. Also confirm no other org consumer (e.g. beagle)
-  # already holds durables named syzygy / syzygy-tmp on the prod stream.
+  # already holds durables named syzygy / syzygy-tmp / syzygy-dmp on the
+  # prod stream.
   #
   # NATS_URL is REQUIRED and points at the org-run SMILE gateway's
   # JetStream server — there is no bundled nats service in production and
@@ -145,6 +147,8 @@ services:
       NATS_DURABLE: ${NATS_DURABLE:-syzygy}
       NATS_TEMPO_FILTER_SUBJECT: ${NATS_TEMPO_FILTER_SUBJECT:-MDB_STREAM.syzygy.inbound.>}
       NATS_TEMPO_DURABLE: ${NATS_TEMPO_DURABLE:-syzygy-tmp}
+      NATS_DMP_FILTER_SUBJECT: ${NATS_DMP_FILTER_SUBJECT:-MDB_STREAM.server.dmp-gateway.dmp-sample}
+      NATS_DMP_DURABLE: ${NATS_DMP_DURABLE:-syzygy-dmp}
       # In-network app target (the prod app serves 8000; 8123 is dev-only).
       SYZYGY_APP_URL: ${SYZYGY_APP_URL:-http://app:8000}
       # Same host variable as the app's NATS_INGEST_TOKEN above — the two

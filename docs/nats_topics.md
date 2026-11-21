@@ -37,14 +37,20 @@ Live on `dev`. Consumed by the smile-listener (durable `syzygy` on
   sample (e.g. flip to TUMOR, update `sampleMetadataList`); can trigger
   pairing. Handler: `handle_sample_update`.
 
-## Inbound — DMP sample (source: Acela) — ⚠️ pending
+## Inbound — DMP sample (source: Acela)
+
+Consumed by the listener's dmp client (durable `syzygy-dmp` on
+`MDB_STREAM.server.dmp-gateway.dmp-sample`). The legacy durable's filter is
+scoped to `server.cpt-gateway.>` and deliberately does NOT cover this
+subject — the DMP route keeps its own filter/durable rather than widening
+it (widening to `server.>` would consume our own outbound result subject
+and turn ack-always into 422 noise).
 
 - **`MDB_STREAM.server.dmp-gateway.dmp-sample`** — upsert DMP pair-sample
   records as-is (`dmp_translator.to_dmp_sample_kwargs`).
   Handler: `handle_dmp_sample` in `syzygy/nats_ingest.py`.
-  **The actual source service is Acela, not a "dmp-gateway" — this route
-  still needs to be established with them**, so the subject name (and the
-  source tier in it) are open for change once agreed.
+  **The actual source service is Acela, not a "dmp-gateway" — the subject
+  name (and the source tier in it) are open for change once agreed.**
 
 ## Inbound — tempo (cohort flow)
 
@@ -102,10 +108,10 @@ subjects** above.
 
 1. **Acela route (DMP sample):** establish the route with the Acela service;
    decide whether `MDB_STREAM.server.dmp-gateway.dmp-sample` is renamed to
-   reflect the real source. Note: the legacy durable's filter is now
-   `server.cpt-gateway.>` (excludes `server.syzygy.outbound.`), so the
-   agreed DMP subject also needs its own filter/durable or a deliberate
-   filter widening — being on the stream is not the same as being consumed.
+   reflect the real source. The listener now consumes this subject via its
+   own durable `syzygy-dmp` (filter `MDB_STREAM.server.dmp-gateway.dmp-sample`);
+   if the subject is renamed, update that filter in `listener/run.py` and both
+   compose files, and re-run `init_nats_stream.py` to add the new subject.
 
 ## Settled
 
