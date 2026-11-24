@@ -97,16 +97,17 @@ services:
     restart: "no"
 
   # Standalone smile-client consumers: one durable per client family,
-  # both in a single process (see listener/run.py). The legacy consumer
-  # on MDB_STREAM.server.cpt-gateway.> receives the cmo subjects; the
-  # tempo consumer on MDB_STREAM.syzygy.inbound.> receives the cohort
-  # subjects. The legacy filter is deliberately NOT the broad server.>:
-  # our own outbound result subject lives under server.syzygy.outbound.
-  # and would otherwise be consumed back (422 noise). The DMP sample
-  # subject (server.dmp-gateway.dmp-sample) is unrouted until the Acela
-  # route is agreed — it then needs its own filter/durable. Separate
-  # durables, so JetStream fans the stream out independently (each keeps
-  # its own redelivery position).
+  # all three in a single process (see listener/run.py). The legacy
+  # consumer on MDB_STREAM.server.cpt-gateway.> receives the cmo
+  # subjects; the tempo consumer on MDB_STREAM.syzygy.inbound.>
+  # receives the cohort subjects; the dmp consumer on
+  # MDB_STREAM.server.dmp-gateway.dmp-sample receives the DMP sample
+  # (Acela) subject. The legacy filter is deliberately NOT the broad
+  # server.>: our own outbound result subject lives under
+  # server.syzygy.outbound. and would otherwise be consumed back (422
+  # noise) — the DMP route therefore keeps its own filter/durable.
+  # Separate durables, so JetStream fans the stream out independently
+  # (each keeps its own redelivery position).
   # Each POSTs its messages to the app's internal ingest endpoint.
   smile-listener:
     build: ./listener
@@ -117,6 +118,8 @@ services:
       NATS_DURABLE: "syzygy"
       NATS_TEMPO_FILTER_SUBJECT: "MDB_STREAM.syzygy.inbound.>"
       NATS_TEMPO_DURABLE: "syzygy-tmp"
+      NATS_DMP_FILTER_SUBJECT: "MDB_STREAM.server.dmp-gateway.dmp-sample"
+      NATS_DMP_DURABLE: "syzygy-dmp"
       SYZYGY_APP_URL: http://app:8123
       SYZYGY_NATS_TOKEN: dev-syzygy-nats-token
       # Cohort result subject (one alias, see x-cohort-result-subject); the

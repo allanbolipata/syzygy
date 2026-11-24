@@ -7,16 +7,18 @@ uvicorn's shutdown clean and mirrors beagle's separate-consumer-process
 pattern. The app itself never connects to NATS; this process POSTs every
 consumed message to the app's internal ingest endpoint.
 
-Two SmileClients run in one process, one asyncio task each:
+Three SmileClients run in one process, one asyncio task each:
 
 * legacy — ``MDB_STREAM.server.cpt-gateway.>``  (durable ``syzygy``)
 * tempo  — ``MDB_STREAM.syzygy.inbound.>``      (durable ``syzygy-tmp``)
+* dmp    — ``MDB_STREAM.server.dmp-gateway.dmp-sample``
+           (durable ``syzygy-dmp``)
 
 Each client is supervised independently: a dead consumer task is
 restarted with backoff, and a failure of one client never takes the
-other down. The two clients keep separate durable consumers on the same
-JetStream stream, so the server fans the stream out independently —
-each durable has its own redelivery position (shadow mode).
+others down. The three clients keep separate durable consumers on the
+same JetStream stream, so the server fans the stream out independently
+— each durable has its own redelivery position (shadow mode).
 
 This module owns the process's SIGINT/SIGTERM handlers. The upstream
 client installs process-wide handlers via ``signal.signal()`` inside
@@ -88,9 +90,8 @@ def build_config() -> dict:
         # subject lives under server.syzygy.outbound., so a broad
         # server.> filter would make this durable consume our OWN
         # published results (ack-always turns that into 422 noise, not a
-        # loop). The DMP route is not agreed yet (docs/nats_topics.md);
-        # when it lands it needs its own filter/durable or a widening by
-        # explicit agreement.
+        # loop). The DMP route keeps its own filter/durable
+        # (build_dmp_config) instead of widening this one.
         default_filter="MDB_STREAM.server.cpt-gateway.>",
         default_durable="syzygy",
     )
@@ -104,6 +105,20 @@ def build_tempo_config() -> dict:
         durable_env="NATS_TEMPO_DURABLE",
         default_filter="MDB_STREAM.syzygy.inbound.>",
         default_durable="syzygy-tmp",
+    )
+
+
+def build_dmp_config() -> dict:
+    """Config for the dmp (DMP sample / Acela) client
+    (NATS_DMP_FILTER_SUBJECT / NATS_DMP_DURABLE)."""
+    return _build_config(
+        filter_env="NATS_DMP_FILTER_SUBJECT",
+        durable_env="NATS_DMP_DURABLE",
+        # Exact subject, no wildcard: the DMP sample route is a single
+        # subject on MDB_STREAM. Its own durable keeps its own delivery
+        # position instead of widening the legacy cpt-gateway filter.
+        default_filter="MDB_STREAM.server.dmp-gateway.dmp-sample",
+        default_durable="syzygy-dmp",
     )
 
 
@@ -224,8 +239,9 @@ async def _flusher_loop(tempo: SmileClient, shutdown: asyncio.Event) -> None:
 async def _run() -> None:
     legacy = SmileClient(build_config())
     tempo = SmileClient(build_tempo_config())
+    dmp = SmileClient(build_dmp_config())
     shutdown = asyncio.Event()
-    _install_signals(asyncio.get_running_loop(), shutdown, (legacy, tempo))
+    _install_signals(asyncio.get_running_loop(), shutdown, (legacy, tempo, dmp))
 
     # Hand the tempo client's JetStream context to the bridge (fast-path
     # publish). The bridge holds no NATS connection of its own; the provider
@@ -233,7 +249,7 @@ async def _run() -> None:
     smile_bridge.set_js_context_provider(lambda: _tempo_js_context(tempo))
 
     # One task per client in one loop; the supervisors keep the clients
-    # independent — a failure of one must not kill the other.
+    # independent — a failure of one must not kill the others.
     legacy_task = asyncio.create_task(
         _supervise("legacy", legacy, legacy.filter_subject, shutdown),
         name="smile-listener-legacy",
@@ -241,6 +257,10 @@ async def _run() -> None:
     tempo_task = asyncio.create_task(
         _supervise("tempo", tempo, tempo.filter_subject, shutdown),
         name="smile-listener-tempo",
+    )
+    dmp_task = asyncio.create_task(
+        _supervise("dmp", dmp, dmp.filter_subject, shutdown),
+        name="smile-listener-dmp",
     )
     # Optional outbox flusher (COHORT_PUBLISH_ENABLED, default off): retries
     # any report the fast-path publish could not deliver.
@@ -253,13 +273,13 @@ async def _run() -> None:
     try:
         await shutdown.wait()
     finally:
-        logger.info("shutting down: stopping both consumers")
+        logger.info("shutting down: stopping all consumers")
         # Make the consumers wind down promptly: their stop events are set
         # (so start_consuming leaves its loop) and _disconnect() ends their
         # message iterators so they cannot sit blocked in `async for`.
-        for client in (legacy, tempo):
+        for client in (legacy, tempo, dmp):
             await client._disconnect()
-        tasks = [legacy_task, tempo_task]
+        tasks = [legacy_task, tempo_task, dmp_task]
         if flusher_task is not None:
             tasks.append(flusher_task)
         done, pending = await asyncio.wait(tasks, timeout=SHUTDOWN_GRACE_S)
