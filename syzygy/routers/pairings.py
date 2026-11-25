@@ -7,7 +7,6 @@ other logics (e.g. ARGOS) — ``POST /pairing/trigger`` refuses the DMP
 strategy, which is reserved for the automatic trigger.
 """
 import json
-import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
@@ -45,6 +44,7 @@ from syzygy.auth import (
 )
 from syzygy.bait_sets import allowed_logics_condition, consent_gate_condition
 from syzygy.dmp_translator import remap_dmp_record
+from syzygy import dmp_stats_sql
 from syzygy.database import SessionLocal, get_db, settings
 from syzygy.models import PairingLogic, PairingTable, Sample
 from syzygy.pairing_service import (
@@ -1216,30 +1216,6 @@ def _sanitize_filename(name: str) -> str:
 # filters rows only).
 # ---------------------------------------------------------------------------
 
-# The reference's NA sentinel as rendered by _dmp_pair_cells.
-DMP_REF_NA = "NA"
-
-# The reference's low-coverage thresholds (pair_tumor_with_normal.R): tumor
-# coverage < 100 (numeric), normal coverage < 50 (character column — see
-# _dmp_report_stats warning 5 and the spec e quirk).
-DMP_TUMOR_COVERAGE_THRESHOLD = 100.0
-DMP_NORMAL_COVERAGE_THRESHOLD = "50"
-
-
-def _ref_coverage_numeric(value: str):
-    """R's ``as.numeric`` cast for a rendered coverage cell: a finite float
-    when the cell parses as one, None (R's NA) for the literal "NA", empty,
-    or unparseable values — as.numeric coerces non-numeric strings (including
-    NaN/Inf tokens) to NA."""
-    if value is None or value == DMP_REF_NA:
-        return None
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
-
-
 def _dedup(values) -> list:
     """Deduplicate, preserving first-seen order — the warning buckets list
     affected samples, not pair rows (a shared normal or a fan-out tumor
@@ -1547,107 +1523,28 @@ def _dmp_report_stats_cached(db: Session, logic: PairingLogic, consent_gated: bo
 
 def _dmp_report_stats(db: Session, logic: PairingLogic, consent_gated: bool = False):
     """The reference's 3 summary counts and 5 QC warnings (spec d/e) for
-    the logic's full DMP pair frame, in the exact row sets and conditions
-    pair_tumor_with_normal.R implements:
+    the logic's full DMP pair frame.
 
-    summary (over the final 15-column frame):
-      patients         = distinct patient among rows with tumor_matched
-                         == "Matched"
-      tn_pairs         = rows with tumor_matched == "Matched"
-      unmatched_tumors = rows with tumor_matched != "Matched"
-    warnings (each a deduplicated list of affected samples):
-      1 matched_tumors_without_normal
-        rows with tumor_matched == "Matched" and NA normal_bamname
-      2 tumor_samples_with_multiple_ambiguous_normals
-        count: tumor_bamname groups of >1 row among MATCHED rows;
-        list: the tumor_sample of ALL rows (matched or not) whose
-        tumor_bamname is in that set — the reference's file is written
-        without the matched filter
-      3 samples_with_bams_missing
-        rows with tumor_bam_exists == "0" or normal_bam_exists == "0";
-        both sides' samples are listed (a NA normal side contributes
-        nothing)
-      4 low_coverage_tumors
-        rows with (!is.na(tumor_bamname) & is.na(coverage)) |
-        (coverage < 100) — coverage is the reference's as.numeric cast of
-        the rendered cell; the second disjunct applies regardless of the
-        bamname (a no-bamname row with low present coverage flags), and a
-        row that is NA on both is dropped
-      5 low_coverage_normals
-        rows with (!is.na(normal_bamname) & is.na(coverage)) |
-        (coverage < 50) — the reference's normal-side column is
-        character-typed (spec e quirk), so the threshold applies
-        lexicographically to the rendered cell; same NA propagation as 4
+    The frame semantics (row sets, NA handling, thresholds — everything
+    pair_tumor_with_normal.R implements, documented in
+    docs/dmp_reference_alignment.md sections d/e) are implemented as SQL in
+    ``syzygy.dmp_stats_sql``: the frame is a UNION ALL of the latest paired
+    rows and the unmatched DMP tumor rows, and each count/warning bucket is
+    one set-based aggregate. This replaced a Python walk of the whole frame
+    (~450k rows on a full import, minutes per request); the equivalence
+    tests in tests/test_dmp_report_stats.py pin the SQL against the
+    reference formulas cell-for-cell.
+
+    bam_exists note: the SQL path reads the ingest-time
+    ``additional_metadata.bam_exists`` (ACELA pathChecks result) and does
+    not consult the beagle file records — the frame's bam_exists is
+    therefore the ingest-time value, which is what the DMP ingest pipeline
+    maintains going forward.
     """
-    ci = _DMP_COLUMN_INDEX
-    patients: set = set()
-    tn_pairs = 0
-    unmatched_tumors = 0
-    w_no_normal: list = []
-    w_bams_missing: list = []
-    w_low_tumors: list = []
-    w_low_normals: list = []
-    row_bams: list = []            # (tumor_bamname, tumor_sample) per row
-    matched_bam_counts: dict = {}
-    for cells in _iter_dmp_pair_cells(db, logic, consent_gated):
-        tumor_sample = cells[ci["tumor_sample"]]
-        matched = cells[ci["tumor_matched"]] == "Matched"
-        if matched:
-            tn_pairs += 1
-            patients.add(cells[ci["patient"]])
-            bamname = cells[ci["tumor_bamname"]]
-            matched_bam_counts[bamname] = matched_bam_counts.get(bamname, 0) + 1
-            # The reference's core QC case: the DMP program flagged the
-            # tumor matched but no normal BAM could be found.
-            if cells[ci["normal_bamname"]] == DMP_REF_NA:
-                w_no_normal.append(tumor_sample)
-        else:
-            unmatched_tumors += 1
-        row_bams.append((cells[ci["tumor_bamname"]], tumor_sample))
-        if cells[ci["tumor_bam_exists"]] == "0" or cells[ci["normal_bam_exists"]] == "0":
-            w_bams_missing.append(tumor_sample)
-            if cells[ci["normal_sample"]] != DMP_REF_NA:
-                w_bams_missing.append(cells[ci["normal_sample"]])
-        # Warnings 4/5 mirror the reference's exact NA propagation:
-        #   (!is.na(bamname) & is.na(coverage)) | (coverage < threshold)
-        # The second disjunct does NOT require a non-NA bamname — a row
-        # with no bamname but a present, low coverage is flagged too; a
-        # row that is NA on both sides evaluates NA and is dropped.
-        t_bn = cells[ci["tumor_bamname"]]
-        t_cov = _ref_coverage_numeric(cells[ci["tumor_bam_coverage"]])
-        if (t_bn != DMP_REF_NA and t_cov is None) or (
-            t_cov is not None and t_cov < DMP_TUMOR_COVERAGE_THRESHOLD
-        ):
-            if tumor_sample != DMP_REF_NA:
-                w_low_tumors.append(tumor_sample)
-        n_bn = cells[ci["normal_bamname"]]
-        n_cov_cell = cells[ci["normal_bam_coverage"]]
-        # The reference's normal-side column is character-typed (spec e
-        # quirk), so the threshold applies lexicographically to the
-        # rendered cell.
-        if (n_bn != DMP_REF_NA and n_cov_cell == DMP_REF_NA) or (
-            n_cov_cell != DMP_REF_NA and n_cov_cell < DMP_NORMAL_COVERAGE_THRESHOLD
-        ):
-            if cells[ci["normal_sample"]] != DMP_REF_NA:
-                w_low_normals.append(cells[ci["normal_sample"]])
-    ambiguous_bams = {b for b, n in matched_bam_counts.items() if n > 1 and b != DMP_REF_NA}
-    # The reference's file lists all rows (matched or not) whose
-    # tumor_bamname is ambiguous; an NA tumor_bamname never matches
-    # (dplyr's group_by drops NA groups, and NA %in% ... evaluates NA).
-    w_ambiguous = [s for b, s in row_bams if b in ambiguous_bams]
+    summary, warnings = dmp_stats_sql.compute_stats(db, logic.id, consent_gated)
     return (
-        DmpSummaryRead(
-            patients=len(patients),
-            tn_pairs=tn_pairs,
-            unmatched_tumors=unmatched_tumors,
-        ),
-        DmpWarningsRead(
-            matched_tumors_without_normal=_dedup(w_no_normal),
-            tumor_samples_with_multiple_ambiguous_normals=_dedup(w_ambiguous),
-            samples_with_bams_missing=_dedup(w_bams_missing),
-            low_coverage_tumors=_dedup(w_low_tumors),
-            low_coverage_normals=_dedup(w_low_normals),
-        ),
+        DmpSummaryRead(**summary),
+        DmpWarningsRead(**warnings),
     )
 
 
