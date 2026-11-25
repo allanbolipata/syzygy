@@ -169,7 +169,18 @@ def case(db, engine, monkeypatch, request):
         # The fixture payloads omit the assay keys; inject a constant CMO
         # panel — the frame cells and the DMP pairing keys never read
         # gene_panel, it only satisfies samples.gene_panel NOT NULL.
-        kwargs = to_dmp_sample_kwargs(sid, {**meta, "cmo_assay": "IMPACT468"})
+        # bam_exists is injected from the same c.bamnames ground truth the
+        # beagle stub serves (the export path) and the SQL stats read
+        # (additional_metadata), so both paths see one answer.
+        bamname = meta.get("bamname") or meta.get("anon_id")
+        kwargs = to_dmp_sample_kwargs(
+            sid,
+            {
+                **meta,
+                "cmo_assay": "IMPACT468",
+                "bam_exists": 1 if bamname in c.bamnames else 0,
+            },
+        )
         s = Sample(**kwargs, created_date=BASE_DATE - timedelta(seconds=36000 + i))
         db.add(s)
         by_name[sid] = s

@@ -333,29 +333,25 @@ def test_single_bamname_row_not_ambiguous(db):
 # ---------------------------------------------------------------------------
 
 
-def test_samples_with_bams_missing_lists_both_sides(db, monkeypatch):
+def test_samples_with_bams_missing_lists_both_sides(db):
     """Rows with either side's bam_exists == "0"; both sides' samples are
-    listed (a NA normal side contributes nothing)."""
+    listed (a NA normal side contributes nothing). bam_exists is the
+    ingest-time additional_metadata value the SQL stats read (the ACELA
+    pathChecks result); absent means 0."""
     logic = _logic(db)
-    a_t = _dmp_sample(db, "P-1000051-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000051", "ANA-T1")
-    a_n = _dmp_sample(db, "P-1000051-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000051", "ANA-N1")
+    a_t = _dmp_sample(db, "P-1000051-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000051", "ANA-T1", meta={"bam_exists": 1})
+    a_n = _dmp_sample(db, "P-1000051-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000051", "ANA-N1", meta={"bam_exists": 0})
     _pairing(db, logic, a_t, a_n, BASE_DATE + timedelta(seconds=10))
-    b_t = _dmp_sample(db, "P-1000052-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(seconds=1), "P-1000052", "ANB-T1")
-    b_n = _dmp_sample(db, "P-1000052-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(seconds=1), "P-1000052", "ANB-N1")
+    b_t = _dmp_sample(db, "P-1000052-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(seconds=1), "P-1000052", "ANB-T1", meta={"bam_exists": 0})
+    b_n = _dmp_sample(db, "P-1000052-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(seconds=1), "P-1000052", "ANB-N1", meta={"bam_exists": 1})
     _pairing(db, logic, b_t, b_n, BASE_DATE + timedelta(seconds=11))
     c_t = _dmp_sample(db, "P-1000053-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(hours=1), "P-1000053", "ANC-T1")
-    d_t = _dmp_sample(db, "P-1000054-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(hours=2), "P-1000054", "AND-T1")
-    d_n = _dmp_sample(db, "P-1000054-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(hours=2), "P-1000054", "AND-N1")
+    d_t = _dmp_sample(db, "P-1000054-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(hours=2), "P-1000054", "AND-T1", meta={"bam_exists": 1})
+    d_n = _dmp_sample(db, "P-1000054-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(hours=2), "P-1000054", "AND-N1", meta={"bam_exists": 1})
     _pairing(db, logic, d_t, d_n, BASE_DATE + timedelta(seconds=12))
-    # beagle: A's normal has an empty path; B's tumor has none at all;
-    # D's sides are both present (clean).
-    _stub_beagle(monkeypatch, [
-        (a_t.primary_id, True),
-        (a_n.primary_id, False),
-        (b_n.primary_id, True),
-        (d_t.primary_id, True),
-        (d_n.primary_id, True),
-    ])
+    # A's normal has bam_exists 0; B's tumor has bam_exists 0; C is
+    # unmatched with no metadata (absent -> 0); D's sides are both present
+    # (clean).
 
     r = _report(db)
     assert set(r.warnings.samples_with_bams_missing) == {
@@ -376,13 +372,12 @@ def test_samples_with_bams_missing_lists_both_sides(db, monkeypatch):
     ]
 
 
-def test_bams_present_clean(db, monkeypatch):
-    """Every side with a beagle path is clean: the bucket stays empty."""
+def test_bams_present_clean(db):
+    """Every side with bam_exists 1 is clean: the bucket stays empty."""
     logic = _logic(db)
-    t1 = _dmp_sample(db, "P-1000055-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000055", "ANT-T1")
-    n1 = _dmp_sample(db, "P-1000055-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000055", "ANT-N1")
+    t1 = _dmp_sample(db, "P-1000055-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000055", "ANT-T1", meta={"bam_exists": 1})
+    n1 = _dmp_sample(db, "P-1000055-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000055", "ANT-N1", meta={"bam_exists": 1})
     _pairing(db, logic, t1, n1, BASE_DATE + timedelta(seconds=5))
-    _stub_beagle(monkeypatch, _present(t1.primary_id, n1.primary_id))
 
     r = _report(db)
     assert r.warnings.samples_with_bams_missing == []
@@ -536,40 +531,36 @@ def test_combined_case(db, monkeypatch):
     # coverage 700: NOT flagged by warning 5 — its string "700" is not
     # lexicographically < "50" (the reference's character-typed
     # comparison, spec e quirk).
-    a_t = _dmp_sample(db, "P-1000081-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000081", "ANA-T", meta={"coverage": 80})
-    a_n = _dmp_sample(db, "P-1000081-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000081", "ANA-N", meta={"coverage": 700})
+    a_t = _dmp_sample(db, "P-1000081-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000081", "ANA-T", meta={"coverage": 80, "bam_exists": 1})
+    a_n = _dmp_sample(db, "P-1000081-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000081", "ANA-N", meta={"coverage": 700, "bam_exists": 1})
     _pairing(db, logic, a_t, a_n, BASE_DATE + timedelta(seconds=2))
     # B: two tumor records sharing bamname ANB-T, both paired + matched
     # (ambiguity — the same tumor sample name on two rows; pairing rows
     # are unique per tumor record)
-    b1 = _dmp_sample(db, "P-1000082-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000082", "ANB-T", meta={"coverage": 300})
-    b1n = _dmp_sample(db, "P-1000082-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000082", "ANB-N1", meta={"coverage": 800})
+    b1 = _dmp_sample(db, "P-1000082-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000082", "ANB-T", meta={"coverage": 300, "bam_exists": 1})
+    b1n = _dmp_sample(db, "P-1000082-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000082", "ANB-N1", meta={"coverage": 800, "bam_exists": 1})
     _pairing(db, logic, b1, b1n, BASE_DATE + timedelta(seconds=0))
-    b2 = _dmp_sample(db, "P-1000082-T02-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(seconds=1), "P-1000082", "ANB-T", meta={"coverage": 300})
-    b2n = _dmp_sample(db, "P-1000082-N02-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(seconds=1), "P-1000082", "ANB-N2", meta={"coverage": 750})
+    b2 = _dmp_sample(db, "P-1000082-T02-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(seconds=1), "P-1000082", "ANB-T", meta={"coverage": 300, "bam_exists": 1})
+    b2n = _dmp_sample(db, "P-1000082-N02-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(seconds=1), "P-1000082", "ANB-N2", meta={"coverage": 750, "bam_exists": 1})
     _pairing(db, logic, b2, b2n, BASE_DATE + timedelta(seconds=1))
     # C: unpaired, explicit matched_tag Matched -> warning 1 (+ summary
-    # matched row), no beagle record -> warning 3, NA coverage with a
+    # matched row), no bam_exists -> warning 3, NA coverage with a
     # bamname -> warning 4
     c_t = _dmp_sample(
         db, "P-1000083-T01-IM6", TumorOrNormal.TUMOR,
         BASE_DATE + timedelta(hours=1, minutes=5), "P-1000083", "ANC-T",
         meta={"matched_tag": "Matched"},
     )
-    # D: unpaired, no tag -> Unmatched; no beagle record -> warning 3.
+    # D: unpaired, no tag -> Unmatched; no bam_exists -> warning 3.
     # Coverage 300 keeps it out of warning 4 (NA-coverage-with-bamname
     # would flag it there too).
     d_t = _dmp_sample(db, "P-1000084-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(hours=1), "P-1000084", "AND-T", meta={"coverage": 300})
     # E: matched pair, normal coverage NA (with bamname) -> warning 5
-    e_t = _dmp_sample(db, "P-1000085-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(seconds=3), "P-1000085", "ANE-T", meta={"coverage": 300})
-    e_n = _dmp_sample(db, "P-1000085-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(seconds=3), "P-1000085", "ANE-N")
+    e_t = _dmp_sample(db, "P-1000085-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE + timedelta(seconds=3), "P-1000085", "ANE-T", meta={"coverage": 300, "bam_exists": 1})
+    e_n = _dmp_sample(db, "P-1000085-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE + timedelta(seconds=3), "P-1000085", "ANE-N", meta={"bam_exists": 1})
     _pairing(db, logic, e_t, e_n, BASE_DATE + timedelta(seconds=3))
-    # beagle: only the paired A/B/E sides have records.
-    _stub_beagle(monkeypatch, _present(
-        a_t.primary_id, a_n.primary_id,
-        b1.primary_id, b1n.primary_id, b2.primary_id, b2n.primary_id,
-        e_t.primary_id, e_n.primary_id,
-    ))
+    # bam_exists: only the paired A/B/E sides have bam_exists 1; C and D
+    # carry none (absent -> 0).
 
     r = _report(db)
     # summary: matched rows = A, B1, B2, E, C (explicit tag) — 4 patients
@@ -588,17 +579,16 @@ def test_combined_case(db, monkeypatch):
     assert r.warnings.low_coverage_normals == [e_n.primary_id]
 
 
-def test_clean_set_produces_zero_counts_and_empty_warnings(db, monkeypatch):
+def test_clean_set_produces_zero_counts_and_empty_warnings(db):
     """A fully clean frame: every count zero/one as expected, every
     warning bucket empty."""
     logic = _logic(db)
-    t1 = _dmp_sample(db, "P-1000091-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000091", "ANT-T1", meta={"coverage": 300})
+    t1 = _dmp_sample(db, "P-1000091-T01-IM6", TumorOrNormal.TUMOR, BASE_DATE, "P-1000091", "ANT-T1", meta={"coverage": 300, "bam_exists": 1})
     # normal coverage 588: "588" is not lexicographically < "50" (the
     # reference's character-typed comparison — spec e quirk), so the clean
     # set stays clean.
-    n1 = _dmp_sample(db, "P-1000091-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000091", "ANT-N1", meta={"coverage": 588})
+    n1 = _dmp_sample(db, "P-1000091-N01-IM6", TumorOrNormal.NORMAL, BASE_DATE, "P-1000091", "ANT-N1", meta={"coverage": 588, "bam_exists": 1})
     _pairing(db, logic, t1, n1, BASE_DATE + timedelta(seconds=5))
-    _stub_beagle(monkeypatch, _present(t1.primary_id, n1.primary_id))
 
     r = _report(db)
     assert r.summary.patients == 1
